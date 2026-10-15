@@ -140,18 +140,21 @@ new GPU work (continue.md "Before any GPU work").
      audit and its follow-ups are tracked as Q5 below.
    See the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
 2. **ref13 mode-mechanism probe** (separate diagnostic, not qualification).
-   - [ ] The historical tuning set of 15 reference draws falls into 6 byte
+   - [x] The historical tuning set of 15 reference draws falls into 6 byte
      classes, with a recurring
      mode at `longer`/r0 in 3/15. Look for a discrete runtime choice:
-     autotune/plan selection, NCCL algorithm, routing tie. *Partly
-     answered by the 2026-10-15 probe:* routing ties follow gate-input
-     divergence rather than causing it, and the vLLM collective dispatch is
-     identical across draws. Plan selection and NCCL algorithm remain
-     unobserved.
-   - [ ] Keep probes in separate diagnostic attempts. If a runtime policy
-     can be pinned, propose an amendment before changing qualification
-     (H4 may become unnecessary); do not mix profiles. Evidence:
-     `q2-ref13-investigation-20261012/`.
+     autotune/plan selection, NCCL algorithm, routing tie. **Answered
+     2026-10-15:** it is not a discrete choice. Short16 variation (including
+     `longer`/r0) is the fused-MoE FP32 atomic accumulation order. It first
+     appears at layer 3 with byte-identical inputs (HSL, 96/96), and
+     `EXL3_FUSED_MOE=0` removes all variation below 2,052 tokens. Routing
+     flips follow; collective dispatch is identical.
+   - [ ] Keep probes in separate diagnostic attempts. A pinnable runtime
+     policy now exists (`EXL3_FUSED_MOE=0`, deterministic below 2,052 tokens),
+     but it is **not neutral**: it moves 4 short16 items to 1.19–1.93× the H3
+     limit. Adopting it, or any indexer-order pin, for qualification needs a
+     registered amendment and a new campaign; no such decision has been made.
+     Do not mix profiles. Evidence: `q2-ref13-investigation-20261012/`.
 3. **C2 — layer-0 norm-output intervention** (plan §Experiment C2). Substitute
    reference-exact gated-norm output (v24 ≡ reference-exact 32/32) at layer
    0 on both ranks, then trace o_proj → reduced attention → FFN inputs → L3
@@ -221,10 +224,25 @@ new GPU work (continue.md "Before any GPU work").
      `l1-refexact-f099-02` completed all four eight-request windows using
      the repaired image and v5 overlay; every container exited zero.
      Candidate observer matches 8/8; reference matches only 1/8.
-   - [ ] Establish reference observer verifiability, then perform guarded
-     L1 bisection. The current receipt withholds attribution; no final
-     paired binding or L1 bisect was produced. Do not relax the observer
-     guard or retry unchanged for a byte match. See the [L1 record](docs/design/l1-execution-20261014.md).
+   - [x] Establish reference observer verifiability. **Done 2026-10-15**
+     ([result](docs/design/l1-fusedoff-observer-result-20261015.md)), from
+     `l1-fusedoff-f099-01`:
+     - O1 passed (reference 8/8, candidate 8/8).
+     - O2 passed: the layer-0/1 reference captures are byte-identical to the
+       fused-on `f099-02` captures.
+   - [ ] Guarded L1 bisection. The registered bisect ran and gave **no
+     attribution** (`analysis_complete=false` on all four runs) because of
+     two tooling defects that predate the attempt:
+     - the candidate `hc_streams` capture is labeled BF16 but holds the
+       FP32 highway (`glm5_kda/forward_attention.rs:69–79`);
+     - `kda_layout` has no `[n,4,1] → [n,4]` binding for mHC `post`.
+
+     Next is a registered correction: fix the layout binding, then either
+     the Rust capture fix (new image) or an analysis-side FP32 reread.
+     Descriptively, every pairable layer-1 stage differs.
+     The `f099-02` receipt still withholds attribution
+     ([L1 record](docs/design/l1-execution-20261014.md)). Do not relax a
+     guard, retry unchanged or add a tolerance.
 5. **G-fallbacks**, in the plan's order (G2, G3, G4, G1, G5, G6/G7), each
    preceded by its G8/G9 binding. See "M1 diagnostic backlog" below.
 
@@ -395,11 +413,22 @@ new GPU work (continue.md "Before any GPU work").
     prepared in `p0-trace-prep-20261011/` (11 CPU tests, re-verified);
     **no live profiler run yet**. CPU command review complete 2026-10-13
     (`p0-trace-prep-20261011/REVIEW-20261013.md`, first pass ready for
-    testing): interfaces/descriptors PASS; two decisions owed before
-    `--execute` — the image pin (`src-8b6b47f14d5b` vs current production
-    `src-48624a8605de`) and the three-run schedule (short prefill /
-    near-limit / decode-heavy capped ≤600 output tokens for the ~5-min
-    nsys collection limit).
+    testing): interfaces/descriptors PASS.
+    **2026-10-15:** both owed decisions are taken and the schedule ran
+    (3/3 runs complete, both ranks).
+    [Attribution record](docs/design/p0-attribution-20261015.md), observed
+    instrumented and single-shot:
+    - Both phases are GPU-bound: kernels are busy for 95–100% of each phase.
+    - Prefill is about 97% packed EXL3 GEMMs (routed MoE 55%, projections 42%).
+    - Decode is projections 45%, NCCL SendRecv 25% and routed MoE 21%.
+    - Still owed for P0: NCU counters on the dominant kernels, ≥ 3 matched
+      uninstrumented repeats with independent timing, and the targets.
+    - Image pinned to `src-4ee96c12b44c` (`sha256:82173ea6…`), the newest
+      image with a full neutrality proof. The production `src-48624a8605de`
+      is the 2026-10-10 build.
+    - Three-run schedule as reviewed: 128/64, 3500/64 and 128/600 tokens.
+    - The re-pinned driver copy and its runs are in `p0-trace-20261015/`; the
+      original prep is unchanged.
   - Unqualified diagnostic: decode ~0.45 s/token and 2573-token TTFT ~139 s
     (`p0-unqualified-baseline-20261010/`). **Decode speed is the dominant
     serving problem: trace it before any other P item.**

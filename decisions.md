@@ -7,6 +7,76 @@ this file references them, it does not duplicate them. Newest first.
 Superseded entries are kept as one-line stubs marked **SUPERSEDED**, so the
 audit trail survives; their full text is in git history.
 
+## 2026-10-15 — L1 fused-off result: observer verified, bisect blocked by tooling (major)
+
+- Result: `l1-fusedoff-f099-01` passed O1 (8/8 per engine) and O2 (layer-0/1
+  reference captures byte-identical to fused-on `f099-02`). The reference
+  observer blocker is closed. The registered bisect returned
+  `analysis_complete=false` on all four runs, so there is no attribution.
+- Cause: two defects that predate the attempt.
+  - The candidate captures the FP32 `hc_streams` highway labeled BF16, with
+    half its bytes (`glm5_kda/forward_attention.rs:69–79`).
+  - `kda_layout` lacks the mHC `post` `[n,4,1] → [n,4]` binding.
+- Decision: no rerun and no post-hoc tolerance. The next step is a
+  registered correction. The operator chooses between the Rust capture fix
+  (new image, neutrality proof, fresh collection) and an analysis-side FP32
+  reread (half-token coverage). The FP32-versus-BF16 highway lead goes to
+  the G-list only after its two source checks.
+  See the [result](docs/design/l1-fusedoff-observer-result-20261015.md).
+
+## 2026-10-15 — L1 observer verifiability through a fused-off reference (major)
+
+- Choices:
+  - (a) Apply a layer-scoped observer rule to the existing `f099-02`
+    receipt. Rejected: that is a post-hoc criterion.
+  - (b) Retry `f099-02` unchanged. Rejected.
+  - (c) A fresh, pre-registered attempt that changes one reference variable,
+    `EXL3_FUSED_MOE=0`, plus a cross-attempt capture comparator (O2).
+  - (d) Wait for a deterministic-reference qualification amendment.
+- Decision: **(c)**. See the
+  [registration](docs/design/l1-fusedoff-observer-registration.md).
+- Why:
+  - The 2026-10-15 HSL, determinism and indexer results place all reference
+    variation in rows of at most 2,051 tokens at the layer-3+ fused-MoE
+    accumulation.
+  - L1 rows are at most 128 tokens, and L1 captures layers 0/1, which run
+    before routed MoE.
+  - With the fused path off, the unchanged observer rule becomes decidable.
+  - O2 ties the layer-0/1 captures back to the fused-on profile.
+  - The collector, overlay and bisect are unchanged; the only new code is a
+    read-only comparator.
+- Operator instruction 2026-10-15: "do the L1 work".
+
+## 2026-10-15 — reference kit stays unmodified; Atlas-side determinism only (major)
+
+- Choices: patch the reference's fused-MoE accumulation or indexer top-k
+  order, or leave the reference kit as installed.
+- Decision: **leave it as installed.** The Atlas determinism audit and its
+  follow-ups are Q5 in todo.md (decision recorded there first; logged here
+  for the audit trail).
+- Scope note: a runtime environment setting the installed plugin already
+  reads (`EXL3_FUSED_MOE`) is a profile choice, not a kit modification. Its
+  loop path is not a neutral pin. Using it for qualification would need its
+  own amendment.
+
+## 2026-10-15 — P0 profiler image re-pinned to `src-4ee96c12b44c` (minor)
+
+- `docs/plans/P0-IMAGE-PIN-20261014.md` pinned `src-48624a8605de` on the
+  premise that it carries `f099ac58`. It does not:
+  - `48624a8605de` is the 2026-10-10 production build;
+  - `f099ac58` first ships in `src-4ee96c12b44c` (`sha256:82173ea6…`).
+- That plan's own rationale (trace the binary that will be optimized)
+  selects `4ee96c12`, the newest image with a full neutrality proof. It is
+  already loaded on both ranks.
+- The near-limit run uses 3,500 input tokens, as the review set it. The
+  plan's "8–12k" exceeds the 4,096-token context.
+- The re-pinned driver is a copy in `$EV/p0-trace-20261015/driver/`. The
+  descriptors are unchanged, only the image token is replaced, the image ID
+  is asserted, and its 11 tests pass. The original prep is untouched.
+- Sequencing: operator asked for the P0 tracing to run alongside the L1
+  preparation. P0 used the GPUs first; L1 collection follows. There is one
+  experiment owner at a time.
+
 ## 2026-10-14 — GPU-iteration tooling: image cycle, G8/G9 binding, probe pre-Spark package (major)
 
 - Choices: (a) keep re-deriving the build→transfer→fingerprint→neutrality

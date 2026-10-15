@@ -95,16 +95,60 @@ impl NativeMoeFfn {
             activation.validate()?;
             policy.validate()?;
             gpu.require_bf16_gemm_numerics(spark_runtime::gpu::Bf16GemmNumerics::CublasLt)?;
+
+            // Use optimized kernels when policy requests cooperative MMA
+            let use_opt = policy.cooperative_mma();
+
             let kernels = [
                 gpu.kernel("residual_add", "bf16_to_f32")?,
                 gpu.kernel("exl3_moe", "exl3_topk_sigmoid")?,
-                gpu.kernel("exl3_moe_precision", "exl3_moe_input_hadamard_f16")?,
-                gpu.kernel("exl3_moe_mma", "exl3_moe_mul1_matmul_precision_mma")?,
-                gpu.kernel("exl3_moe_precision", "exl3_moe_output_hadamard_precision")?,
-                gpu.kernel("exl3_moe_precision", "exl3_moe_combine_f32")?,
-                gpu.kernel("exl3_moe_precision", "exl3_moe_activate_down_hadamard")?,
-                gpu.kernel("exl3_moe_precision", "exl3_moe_route_counts")?,
-                gpu.kernel("exl3_moe_precision", "exl3_moe_down_weighted_output")?,
+                if use_opt {
+                    gpu.kernel(
+                        "exl3_moe_precision_opt",
+                        "exl3_moe_fused_input_hadamard_f16",
+                    )?
+                } else {
+                    gpu.kernel("exl3_moe_precision", "exl3_moe_input_hadamard_f16")?
+                },
+                if use_opt {
+                    gpu.kernel("exl3_moe_mma_opt", "exl3_moe_mul1_matmul_coop_mma")?
+                } else {
+                    gpu.kernel("exl3_moe_mma", "exl3_moe_mul1_matmul_precision_mma")?
+                },
+                if use_opt {
+                    gpu.kernel(
+                        "exl3_moe_precision_opt",
+                        "exl3_moe_fused_output_hadamard_precision",
+                    )?
+                } else {
+                    gpu.kernel("exl3_moe_precision", "exl3_moe_output_hadamard_precision")?
+                },
+                if use_opt {
+                    gpu.kernel("exl3_moe_precision_opt", "exl3_moe_fused_combine_f32")?
+                } else {
+                    gpu.kernel("exl3_moe_precision", "exl3_moe_combine_f32")?
+                },
+                if use_opt {
+                    gpu.kernel(
+                        "exl3_moe_precision_opt",
+                        "exl3_moe_fused_activate_down_hadamard",
+                    )?
+                } else {
+                    gpu.kernel("exl3_moe_precision", "exl3_moe_activate_down_hadamard")?
+                },
+                if use_opt {
+                    gpu.kernel("exl3_moe_precision_opt", "exl3_moe_route_counts")?
+                } else {
+                    gpu.kernel("exl3_moe_precision", "exl3_moe_route_counts")?
+                },
+                if use_opt {
+                    gpu.kernel(
+                        "exl3_moe_precision_opt",
+                        "exl3_moe_fused_down_weighted_output",
+                    )?
+                } else {
+                    gpu.kernel("exl3_moe_precision", "exl3_moe_down_weighted_output")?
+                },
             ];
             let geometry = MoeScratchGeometry::new(config, capacity, stream)?;
             let borrowed = match &scratch {

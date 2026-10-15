@@ -35,7 +35,7 @@ impl Exl3InputPrecision {
 }
 
 /// Reusable activation scratch and resolved kernels, bound to one compute
-/// stream. All launches on this workspace use that stream, so asynchronous
+/// stream. All launches on this stream use that stream, so asynchronous
 /// stages cannot overwrite another stream's pending intermediate values.
 /// Callers must use the backend/device that owns the shard and workspace.
 pub struct Exl3LinearWorkspace {
@@ -46,6 +46,7 @@ pub struct Exl3LinearWorkspace {
     buffers: [DevicePtr; 2],
     kernels: [KernelHandle; 3],
     numerics: Option<Exl3LinearNumerics>,
+    fused: bool,
 }
 
 impl Exl3LinearWorkspace {
@@ -71,7 +72,7 @@ impl Exl3LinearWorkspace {
         stream: u64,
         input_precision: Exl3InputPrecision,
     ) -> Result<Self> {
-        Self::build(gpu, k, n, capacity, stream, input_precision, None)
+        Self::build(gpu, k, n, capacity, stream, input_precision, None, false)
     }
 
     /// Explicit cooperative arithmetic; unsupported geometry fails before GPU
@@ -93,6 +94,28 @@ impl Exl3LinearWorkspace {
             stream,
             Exl3InputPrecision::F16,
             Some(numerics),
+            false,
+        )
+    }
+
+    /// Fused kernel variant: single launch does input hadamard + matmul + output hadamard.
+    /// Eliminates intermediate global memory round-trips. Requires K <= 11136.
+    pub fn new_fused(
+        gpu: &dyn GpuBackend,
+        k: usize,
+        n: usize,
+        capacity: usize,
+        stream: u64,
+    ) -> Result<Self> {
+        Self::build(
+            gpu,
+            k,
+            n,
+            capacity,
+            stream,
+            Exl3InputPrecision::F16,
+            None,
+            true,
         )
     }
 
@@ -107,23 +130,34 @@ impl Exl3LinearWorkspace {
     ) -> Result<()> {
         numerics.validate(k, n, capacity)?;
         Self::dimensions(k, n, capacity)?;
-        Self::resolve_kernels(gpu, Exl3InputPrecision::F16, true).map(|_| ())
+        Self::resolve_kernels(gpu, Exl3InputPrecision::F16, true, false).map(|_| ())
     }
 
     fn resolve_kernels(
         gpu: &dyn GpuBackend,
         input_precision: Exl3InputPrecision,
         cooperative: bool,
+        fused: bool,
     ) -> Result<[KernelHandle; 3]> {
-        Ok([
-            gpu.kernel("exl3", input_precision.kernel_name())?,
-            if cooperative {
-                gpu.kernel("exl3_linear_mma", "exl3_mul1_matmul_mma")?
-            } else {
-                gpu.kernel("exl3", "exl3_mul1_matmul")?
-            },
-            gpu.kernel("exl3", "exl3_output_hadamard")?,
-        ])
+        if fused {
+            // Fused kernel: single launch does input hadamard + matmul + output hadamard
+            // No intermediate scratch buffers needed for xh/yh
+            Ok([
+                gpu.kernel("exl3_linear_mma_opt", "exl3_fused_linear")?,
+                KernelHandle(0), // Not used in fused path
+                KernelHandle(0), // Not used in fused path
+            ])
+        } else {
+            Ok([
+                gpu.kernel("exl3", input_precision.kernel_name())?,
+                if cooperative {
+                    gpu.kernel("exl3_linear_mma", "exl3_mul1_matmul_mma")?
+                } else {
+                    gpu.kernel("exl3", "exl3_mul1_matmul")?
+                },
+                gpu.kernel("exl3", "exl3_output_hadamard")?,
+            ])
+        }
     }
 
     fn dimensions(k: usize, n: usize, capacity: usize) -> Result<[u32; 2]> {
@@ -150,16 +184,33 @@ impl Exl3LinearWorkspace {
         stream: u64,
         input_precision: Exl3InputPrecision,
         numerics: Option<Exl3LinearNumerics>,
+        fused: bool,
     ) -> Result<Self> {
         let [k_arg, n_arg] = Self::dimensions(k, n, capacity)?;
-        let scratch_size = |width: usize| {
-            capacity
-                .checked_mul(width)
-                .and_then(|elements| elements.checked_mul(4))
-                .context("EXL3 activation scratch size overflow")
+
+        // Fused kernel doesn't need intermediate xh/yh scratch buffers
+        let (sizes, kernels) = if fused {
+            // Only need to verify shared memory constraints
+            if k > 11136 {
+                anyhow::bail!("EXL3 fused kernel requires K <= 11136 for shared memory limits");
+            }
+            // No scratch buffers needed for fused path
+            (
+                [0, 0],
+                Self::resolve_kernels(gpu, input_precision, numerics.is_some(), fused)?,
+            ) // sizes don't matter, won't allocate
+        } else {
+            let scratch_size = |width: usize| {
+                capacity
+                    .checked_mul(width)
+                    .and_then(|elements| elements.checked_mul(4))
+                    .context("EXL3 activation scratch size overflow")
+            };
+            let sizes = [scratch_size(k)?, scratch_size(n)?];
+            let kernels = Self::resolve_kernels(gpu, input_precision, numerics.is_some(), fused)?;
+            (sizes, kernels)
         };
-        let sizes = [scratch_size(k)?, scratch_size(n)?];
-        let kernels = Self::resolve_kernels(gpu, input_precision, numerics.is_some())?;
+
         let mut result = Self {
             k: k_arg,
             n: n_arg,
@@ -168,18 +219,21 @@ impl Exl3LinearWorkspace {
             buffers: [DevicePtr::NULL; 2],
             kernels,
             numerics,
+            fused,
         };
-        for (slot, size) in sizes.into_iter().enumerate() {
-            match gpu.alloc(size) {
-                Ok(ptr) => result.buffers[slot] = ptr,
-                Err(error) => {
-                    let cleanup = result.release(gpu);
-                    return Err(match cleanup {
-                        Ok(()) => error,
-                        Err(cleanup) => {
-                            error.context(format!("EXL3 scratch cleanup also failed: {cleanup:#}"))
-                        }
-                    });
+
+        if !fused {
+            for (slot, size) in sizes.into_iter().enumerate() {
+                match gpu.alloc(size) {
+                    Ok(ptr) => result.buffers[slot] = ptr,
+                    Err(error) => {
+                        let cleanup = result.release(gpu);
+                        return Err(match cleanup {
+                            Ok(()) => error,
+                            Err(cleanup) => error
+                                .context(format!("EXL3 scratch cleanup also failed: {cleanup:#}")),
+                        });
+                    }
                 }
             }
         }
@@ -197,7 +251,11 @@ impl Exl3LinearWorkspace {
         output: DevicePtr,
         rows: usize,
     ) -> Result<()> {
-        self.launch_output(gpu, shard, input, output, rows, self.kernels[2])
+        if self.fused {
+            self.launch_fused(gpu, shard, input, output, rows)
+        } else {
+            self.launch_output(gpu, shard, input, output, rows, self.kernels[2])
+        }
     }
 
     /// Native F32 vocabulary logits without intermediate BF16 rounding.
@@ -209,8 +267,61 @@ impl Exl3LinearWorkspace {
         output: DevicePtr,
         rows: usize,
     ) -> Result<()> {
+        if self.fused {
+            // Fused kernel doesn't support F32 output path yet
+            anyhow::bail!("EXL3 fused kernel does not support F32 output");
+        }
         let kernel = gpu.kernel("exl3", "exl3_output_hadamard_f32")?;
         self.launch_output(gpu, shard, input, output, rows, kernel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_fused(
+        &self,
+        gpu: &dyn GpuBackend,
+        shard: &Exl3DeviceShard,
+        input: DevicePtr,
+        output: DevicePtr,
+        rows: usize,
+    ) -> Result<()> {
+        ensure!(
+            rows <= self.capacity as usize,
+            "EXL3 batch exceeds workspace capacity"
+        );
+        ensure!(
+            shard.plan().in_features() == self.k as usize
+                && shard.plan().out_features() == self.n as usize,
+            "EXL3 shard dimensions do not match workspace"
+        );
+        if let Some(numerics) = self.numerics {
+            ensure!(
+                shard.plan().bits() == numerics.bits,
+                "EXL3 checkpoint bits differ from explicit numerical profile"
+            );
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        ensure!(
+            !input.is_null() && !output.is_null(),
+            "EXL3 activation buffers must be non-null"
+        );
+        let [trellis, input_scale, output_scale] = shard.buffers()?;
+        let rows = rows as u32;
+
+        KernelLaunch::new(gpu, self.kernels[0])
+            .grid([self.n.div_ceil(128), rows, 1])
+            .block([128, 1, 1])
+            .arg_ptr(input)
+            .arg_ptr(input_scale)
+            .arg_ptr(trellis)
+            .arg_ptr(output_scale)
+            .arg_ptr(output)
+            .arg_u32(rows)
+            .arg_u32(self.n)
+            .arg_u32(self.k)
+            .arg_u32(u32::from(shard.plan().bits()))
+            .launch(self.stream)
     }
 
     #[allow(clippy::too_many_arguments)]
