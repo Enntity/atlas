@@ -169,8 +169,16 @@ pub fn process_decode_logits(
                         .iter()
                         .zip(active.iter())
                         .any(|(&tok, a)| crate::scheduler::fast_greedy::raw_pick_masked(a, tok));
+                    // A pick a content-loop steer could touch (`loop_steer`)
+                    // is applied by the host pipeline, row by row.
+                    let may_steer = t
+                        .iter()
+                        .zip(active.iter())
+                        .any(|(&tok, a)| crate::scheduler::loop_steer::span_may_steer(a, &[tok]));
                     if hit_mask {
                         THINK_MASK_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        None
+                    } else if may_steer {
                         None
                     } else {
                         Some(t.into_iter().map(|tok| (tok, None)).collect())

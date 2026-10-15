@@ -72,7 +72,12 @@ pub(in crate::scheduler) fn pick_row(
             .grammar_state
             .as_mut()
             .is_none_or(|gs| !gs.fill_bitmask() || gs.is_token_allowed(top1));
-        if allowed && !raw_pick_masked(a, top1) {
+        // A pick a content-loop steer could touch (`loop_steer`) is applied
+        // by the host pipeline.
+        if allowed
+            && !raw_pick_masked(a, top1)
+            && !crate::scheduler::loop_steer::span_may_steer(a, &[top1])
+        {
             return Ok(top1);
         }
     }
