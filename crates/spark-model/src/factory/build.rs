@@ -194,6 +194,14 @@ pub fn build_model(
         && let Some(ref sub) = args.drafter_config.dflash_config
     {
         config.dflash_capture_layers = sub.target_layer_ids.clone();
+        // The window the head keeps (`DflashHead::ctx_window_len`): the
+        // served one (Lightning admission's, else the caller's) capped at
+        // max_seq_len.
+        let served = lightning_dspark_policy
+            .as_ref()
+            .map(|policy| policy.profile().attention.swa_window)
+            .or(args.window_size);
+        config.dflash_ctx_window = Some(served.unwrap_or(max_seq_len).min(max_seq_len));
         tracing::info!(
             "DFlash: target layer capture indices = {:?} (drafter target_layer_ids, used directly)",
             config.dflash_capture_layers,
