@@ -21,7 +21,16 @@ impl MoeLayer {
             anyhow::ensure!(ptr == expected, "changed down allocation before release");
             log.release_origin(log.store(), origin, gpu)
         };
-        self.transpose_unified_down_owned(gpu, config, 16, false, true, Some(&mut release))
+        let mut freed = Vec::new();
+        self.transpose_unified_down_owned(
+            gpu,
+            config,
+            16,
+            false,
+            true,
+            Some(&mut release),
+            &mut freed,
+        )
     }
 
     pub(super) fn validate_checkpoint_down(

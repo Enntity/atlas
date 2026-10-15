@@ -262,7 +262,6 @@ impl MoeLayer {
 
         // ATLAS_GLM_DET_TRACE stages before routing (the rest are in forward_prefill_finish).
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
-        let det_rows = sp.map_or((0, num_tokens), |sp| (sp.row0, sp.rows));
         let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
         // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs).

@@ -51,7 +51,6 @@ fn exercise_emit(decode: bool, tools: bool, boundary: Option<u32>, suppress: boo
             Instant::now(),
             Some(END),
             Some(START),
-            None,
             Some(OPEN),
             None,
             false,

@@ -81,10 +81,14 @@ fn run(
     mode: usize,
 ) -> Result<()> {
     match mode {
-        0 => layer.transpose_for_prefill_unified(gpu, config),
-        1 => layer.transpose_for_prefill_unified_keep_shared(gpu, config),
+        0 => layer.transpose_for_prefill_unified(gpu, config).map(|_| ()),
+        1 => layer
+            .transpose_for_prefill_unified_keep_shared(gpu, config)
+            .map(|_| ()),
         2 => layer.transpose_for_prefill_hybrid(gpu, config),
-        3 => layer.transpose_for_prefill_unified_inner(gpu, config, true, false),
+        3 => layer
+            .transpose_for_prefill_unified_inner(gpu, config, true, false)
+            .map(|_| ()),
         _ => unreachable!(),
     }
 }

@@ -67,11 +67,7 @@ impl MoeLayer {
             self.weights.shared_expert.gate_proj.weight = DevicePtr::NULL;
             self.weights.shared_expert.gate_proj.weight_scale = DevicePtr::NULL;
             free_original(gpu, freed, self.weights.shared_expert.up_proj.weight)?;
-            free_original(
-                gpu,
-                freed,
-                self.weights.shared_expert.up_proj.weight_scale,
-            )?;
+            free_original(gpu, freed, self.weights.shared_expert.up_proj.weight_scale)?;
             self.weights.shared_expert.up_proj.weight = DevicePtr::NULL;
             self.weights.shared_expert.up_proj.weight_scale = DevicePtr::NULL;
         }
@@ -97,7 +93,7 @@ impl MoeLayer {
             None,
             &mut freed_down,
         )?;
-        freed.extend(freed_down);
+        freed.append(&mut freed_down);
         Ok(freed_down)
     }
 
@@ -157,7 +153,6 @@ impl MoeLayer {
                     } else if !inplace {
                         free_original(gpu, freed, expert.down_proj.weight)?;
                         free_original(gpu, freed, expert.down_proj.weight_scale)?;
-                    }
                     }
                     expert.down_proj.weight = DevicePtr::NULL;
                     expert.down_proj.weight_scale = DevicePtr::NULL;

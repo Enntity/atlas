@@ -44,10 +44,19 @@ fn isolated_shared_down_phases_preserve_native_routed_gate_up_and_no_ready() {
                     .transpose_unified_shared_gate_up(&gpu, &config)
                     .unwrap();
                 if !keep && !keep_shared {
-                    layer.release_unified_shared_gate_up(&gpu, &config).unwrap();
+                    layer
+                        .release_unified_shared_gate_up(&gpu, &config, &mut Vec::new())
+                        .unwrap();
                 }
                 layer
-                    .transpose_unified_down_phase(&gpu, &config, gs, keep, keep_shared)
+                    .transpose_unified_down_phase(
+                        &gpu,
+                        &config,
+                        gs,
+                        keep,
+                        keep_shared,
+                        &mut Vec::new(),
+                    )
                     .unwrap();
                 assert_eq!(
                     [table_ptrs(&layer.gate_ptrs), table_ptrs(&layer.up_ptrs)],
@@ -108,7 +117,9 @@ fn isolated_shared_release_preserves_null_and_zero_inter_conditions() {
         for inter in [0, 32] {
             let gpu = RecordingGpu::new(false);
             let (mut layer, config, originals) = fixture(&gpu, 16, true, shared, inter);
-            layer.release_unified_shared_gate_up(&gpu, &config).unwrap();
+            layer
+                .release_unified_shared_gate_up(&gpu, &config, &mut Vec::new())
+                .unwrap();
             let expected: Vec<_> = if shared && inter > 0 {
                 [originals[4].gate_proj, originals[4].up_proj]
                     .into_iter()
@@ -132,7 +143,7 @@ fn isolated_down_preserves_gate_up_without_shared_gate_presence() {
     let (mut layer, config, originals) = fixture(&gpu, 16, true, true, 32);
     layer.weights.shared_expert.gate_proj = QuantizedWeight::null();
     layer
-        .transpose_unified_down_phase(&gpu, &config, 16, false, false)
+        .transpose_unified_down_phase(&gpu, &config, 16, false, false, &mut Vec::new())
         .unwrap();
     assert!(layer.shared_down_t.is_some());
     assert!(layer.weights.shared_expert.down_proj.is_null());

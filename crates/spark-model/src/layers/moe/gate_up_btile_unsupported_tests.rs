@@ -24,7 +24,9 @@ fn actual_native_converters_refuse_published_storage_without_work() {
         let result = match case {
             0 => layer.transpose_for_prefill(&gpu, &config),
             1 => layer.transpose_gate_up_for_prefill(&gpu, &config),
-            2 => layer.transpose_for_prefill_unified(&gpu, &config),
+            2 => layer
+                .transpose_for_prefill_unified(&gpu, &config)
+                .map(|_| ()),
             3 => layer.transpose_for_prefill_hybrid(&gpu, &config),
             4 => layer.build_cutlass_grouped_sfb(&gpu, &config, 91),
             5 => layer.repack_nvfp4_mmq_unified(&gpu, &config),

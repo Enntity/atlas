@@ -15,10 +15,14 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
-        let kernel = self.gpu.kernel("kda", "kda_commit_records")?;
+        let ctas = ops::kda_commit_ctas()?;
+        let kernel = ops::kda_commit_kernel(self.gpu.as_ref(), ctas)?;
         let heads = self.ssm_pool.h_bytes / (128 * 128 * 4);
         let conv_bytes = self.config.ssm_conv_state_bytes();
         let mut conv_plan = Vec::new();
+        // Pointer pairs only (src = records, dst = h_state): `bytes: 1`
+        // lets the strided-run check see addresses, not blob widths.
+        let mut commits = Vec::new();
         let mut ssm_layer_idx = 0usize;
         for (i, layer_state) in seq.layer_states.iter_mut().enumerate() {
             if self.config.layer_type(i) != LayerType::LinearAttention {
@@ -33,17 +37,13 @@ impl TransformerModel {
                 "KDA records commit: layer {i} has no records for {} rows",
                 rows.end
             );
-            ops::kda_commit_records(
-                self.gpu.as_ref(),
-                kernel,
-                ssm.h_state,
-                ssm.kda_records
+            commits.push(StateCopy {
+                src: ssm
+                    .kda_records
                     .offset(rows.start * self.ssm_pool.kda_record_row_bytes),
-                heads * ops::KDA_RECORD_FLOATS,
-                rows.len() as u32,
-                heads as u32,
-                stream,
-            )?;
+                dst: ssm.h_state,
+                bytes: 1,
+            });
             if rewind_conv {
                 conv_plan.push(StateCopy {
                     src: self
@@ -54,6 +54,34 @@ impl TransformerModel {
                 });
             }
             ssm_layer_idx += 1;
+        }
+        let launch = |c: &StateCopy, state_pitch: usize, records_pitch: usize, layers: usize| {
+            anyhow::ensure!(
+                state_pitch.is_multiple_of(4) && records_pitch.is_multiple_of(4),
+                "KDA records commit: layer pitches {state_pitch}/{records_pitch} not in floats"
+            );
+            ops::kda_commit_records(
+                self.gpu.as_ref(),
+                kernel,
+                c.dst,
+                state_pitch / 4,
+                c.src,
+                records_pitch / 4,
+                heads * ops::KDA_RECORD_FLOATS,
+                rows.len() as u32,
+                heads as u32,
+                layers as u32,
+                ctas,
+                stream,
+            )
+        };
+        match copy_plan_as_strided_run(&commits).filter(|_| batched_ssm_copy_enabled()) {
+            Some(run) => launch(&commits[0], run.dst_pitch, run.src_pitch, run.height)?,
+            None => {
+                for c in &commits {
+                    launch(c, 0, 0, 1)?;
+                }
+            }
         }
         run_ssm_state_copies(self.gpu.as_ref(), &[], &conv_plan, stream)
     }

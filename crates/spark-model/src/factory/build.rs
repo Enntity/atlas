@@ -616,8 +616,8 @@ pub fn build_model(
         sparse_index,
         glm_cache_plan.and_then(|p| p.shard()).is_some(),
     );
-    let reserve_net = reserve_net
-        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
+    let reserve_net =
+        reserve_net + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
