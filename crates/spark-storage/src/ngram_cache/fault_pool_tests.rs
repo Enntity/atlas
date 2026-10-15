@@ -97,7 +97,7 @@ fn panicking_fetch_errors_the_batch_and_workers_survive() {
                     scales: None,
                 };
                 let r = pool.run(&faults(64, Some(at)), &ptrs);
-                let e = r.err().expect("a panicked row must fail the batch");
+                let e = r.expect_err("a panicked row must fail the batch");
                 assert!(format!("{e:#}").contains("panicked"), "{e:#}");
                 for (slot, &b) in arena.iter().enumerate() {
                     assert_eq!(b == 1, slot != at as usize, "slot {slot}, panic at {at}");

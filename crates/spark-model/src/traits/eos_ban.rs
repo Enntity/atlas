@@ -227,6 +227,20 @@ mod eos_ban_tests {
     }
 
     #[test]
+    fn an_unbounded_min_tokens_saturates_the_floor() {
+        // `min_tokens` reaches here unvalidated; `prompt_len + min_tokens`
+        // wrapped in release to a floor below the prompt (no ban at all).
+        let ban = EosBan::new(100, usize::MAX, &[7]);
+        assert_eq!(ban.floor, usize::MAX);
+        assert_eq!(ban.row_mask(usize::MAX - 1, 8), 0);
+        assert_eq!(ban.row_mask(1 << 40, 64), u64::MAX);
+        assert_eq!(EosBan::banned_draft_depth(ban.floor, usize::MAX, 7), 0);
+        assert_eq!(EosBan::banned_draft_depth(ban.floor, 1 << 40, 7), 7);
+        let t = EosBan::targeted(100, usize::MAX, &[7, 9], &[]);
+        assert_eq!((t.floor, t.target), (usize::MAX, true));
+    }
+
+    #[test]
     fn split_head_bans_model_end_tokens_on_every_rank() {
         // A worker rank's sequence carries the default ban (no ids), yet GLM's
         // <|user|> lives in its vocabulary half.

@@ -49,7 +49,10 @@ impl Qwen4ExpMoeRows {
         let fit = config.num_experts <= 512;
         if units && !fit {
             WARNED.call_once(|| {
-                tracing::warn!("qwen4_exp MoE units off: {} experts > 512", config.num_experts)
+                tracing::warn!(
+                    "qwen4_exp MoE units off: {} experts > 512",
+                    config.num_experts
+                )
             });
         }
         (tc && fit, units && fit)
