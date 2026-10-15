@@ -648,7 +648,12 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_qg_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch3")?,
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            w4a16_gemv_qg_batch4_k: super::super::try_kernel(
+            // The qwen4_exp exact K=4 verify's Q+gate tier: only the
+            // qwen3.8-flash-next target ships it (glm-5.3-flash's shadow of
+            // w4a16_gemv.cu is shadow-exempt for it), so other models never
+            // issue the lookup.
+            w4a16_gemv_qg_batch4_k: gate(
+                config.model_type == "qwen4_exp",
                 gpu,
                 "w4a16_gemv",
                 "w4a16_gemv_qg_batch4",
