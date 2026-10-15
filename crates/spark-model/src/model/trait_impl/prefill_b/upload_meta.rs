@@ -11,6 +11,7 @@ use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::super::super::types::TransformerModel;
+use crate::request_local::request_local;
 use crate::traits::SequenceState;
 
 pub(in crate::model) struct MetaLayout {
@@ -81,6 +82,11 @@ impl TransformerModel {
         meta_region_bytes: usize,
         stream: u64,
     ) -> Result<MetaLayout> {
+        // The processed rows are this chunk's uncached tail.
+        debug_assert!(
+            proc_start >= chunk_start && proc_start + proc_count <= chunk_start + chunk_len,
+            "processed range {proc_start}+{proc_count} outside chunk {chunk_start}+{chunk_len}"
+        );
         // MRoPE-interleaved packs three u32 position streams (T, H, W).
         let use_mrope = self.config.mrope_interleaved;
         let pos_stream_bytes = proc_count * 4;
@@ -131,19 +137,20 @@ impl TransformerModel {
                 // token at a time.
                 let (pad_id, video_pad_id) = self.vision_pad_ids();
                 let is_pad = |tok: u32| tok == pad_id || tok == video_pad_id;
-                let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
                 let glm_vision = self.config.vision.as_ref().filter(|v| v.is_glm5_next);
-                // GLM's expanded video has structural text tokens between
-                // frame planes, and post-media text inherits the compressed
-                // position base. Build against the complete prompt and slice
-                // the processed range below; looking only at this chunk loses
-                // the active video frame at a chunk boundary.
-                let have_vision = !grids.is_empty()
-                    && if glm_vision.is_some() {
-                        tokens.iter().copied().any(is_pad)
-                    } else {
-                        chunk_tokens.iter().copied().any(is_pad)
-                    };
+                // Both walkers build against the prompt from position 0 and
+                // slice the processed range: text after an image keeps the
+                // image's compressed position base in every later chunk, an
+                // item straddling a chunk boundary keeps its plane, and a
+                // later chunk's item takes its own grid. (A chunk-local walk
+                // restarted each chunk at the linear position and at item 0.)
+                // GLM's expanded video also has structural text tokens
+                // between frame planes, which only the complete prompt shows.
+                let end = proc_start
+                    .checked_add(proc_count)
+                    .filter(|&end| end <= tokens.len())
+                    .ok_or_else(|| request_local("MRoPE position range exceeds the prompt"))?;
+                let have_vision = !grids.is_empty() && tokens[..end].iter().copied().any(is_pad);
 
                 if have_vision {
                     stg.positions.clear();
@@ -156,13 +163,12 @@ impl TransformerModel {
                     } else {
                         grids.len()
                     };
+                    let (mut full_t, mut full_h, mut full_w) = (Vec::new(), Vec::new(), Vec::new());
                     if let Some(v) = glm_vision {
                         // GLM-5 expands a video into per-frame image markers
                         // and timestamp text. The generic contiguous-pad
                         // walker would skip the boundary/timestamp tokens and
                         // assign the following image to the wrong grid.
-                        let (mut full_t, mut full_h, mut full_w) =
-                            (Vec::new(), Vec::new(), Vec::new());
                         mrope_pos::build_glm5(
                             tokens,
                             &grids,
@@ -179,35 +185,33 @@ impl TransformerModel {
                             &mut full_h,
                             &mut full_w,
                         );
-                        let end = proc_start.checked_add(proc_count).ok_or_else(|| {
-                            anyhow::anyhow!("GLM-5 MRoPE position range overflow")
-                        })?;
-                        if end > full_t.len() || end > full_h.len() || end > full_w.len() {
-                            anyhow::bail!(
-                                "GLM-5 MRoPE position range {}..{} exceeds prompt length {}",
-                                proc_start,
-                                end,
-                                full_t.len()
-                            );
-                        }
-                        stg.positions.extend_from_slice(&full_t[proc_start..end]);
-                        stg.positions_h.extend_from_slice(&full_h[proc_start..end]);
-                        stg.positions_w.extend_from_slice(&full_w[proc_start..end]);
                     } else {
-                        let current_pos: u32 = proc_start as u32;
                         mrope_pos::build(
-                            chunk_tokens,
+                            &tokens[..end],
                             &grids,
                             grid_base,
                             grid_hi,
-                            current_pos,
+                            0,
                             pad_id,
                             video_pad_id,
-                            &mut stg.positions,
-                            &mut stg.positions_h,
-                            &mut stg.positions_w,
+                            &mut full_t,
+                            &mut full_h,
+                            &mut full_w,
                         );
                     }
+                    // A run the walker pushed past `end` (an item straddling
+                    // it) is sliced off; a walk shorter than `end` means the
+                    // placeholders and grids disagree. Every rank decides that
+                    // from the same tokens and grids (`request_local`).
+                    if end > full_t.len() || end > full_h.len() || end > full_w.len() {
+                        return Err(request_local(format!(
+                            "MRoPE position range {proc_start}..{end} exceeds the {} walked positions",
+                            full_t.len()
+                        )));
+                    }
+                    stg.positions.extend_from_slice(&full_t[proc_start..end]);
+                    stg.positions_h.extend_from_slice(&full_h[proc_start..end]);
+                    stg.positions_w.extend_from_slice(&full_w[proc_start..end]);
                 } else {
                     stg.positions_h.extend_from_slice(&stg.positions);
                     stg.positions_w.extend_from_slice(&stg.positions);
@@ -228,12 +232,11 @@ impl TransformerModel {
                     }));
             }
 
-            // The MRoPE+vision arm above REBUILDS `positions` from the chunk's
-            // pad-token runs (one entry per text token, `gh*gw` per image run)
-            // instead of from `proc_count`, so its length is data-dependent —
-            // it tracks `chunk_len`, and `proc_count <= chunk_len` only because
-            // every `ProcRange::Compute` arm caps it there. `put_prefix_at`
-            // carries that check: each stream contributes exactly `proc_count`
+            // The MRoPE+vision arm above REBUILDS `positions` from the
+            // prompt's pad-token runs (one entry per text token, `gh*gw` per
+            // image run) instead of from `proc_count`, then slices
+            // `proc_start..proc_start + proc_count`. `put_prefix_at` still
+            // carries the check: each stream contributes exactly `proc_count`
             // elements or the pack is refused.
             //
             // The DESTINATION bound used to be missing here entirely — the only
