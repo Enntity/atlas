@@ -29,6 +29,7 @@ pub mod model;
 pub mod precision_schedule;
 pub mod preflight;
 pub mod quant_format;
+pub mod request_local;
 pub mod speculative;
 pub mod ssm_reserve;
 pub mod tp_shard;
