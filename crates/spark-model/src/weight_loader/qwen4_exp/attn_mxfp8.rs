@@ -16,9 +16,9 @@
 //! 24.8M weights; BF16 49.5 MB, MXFP8 25.5 MB, the NVFP4 requantization the
 //! NVFP4 release decodes ~14 MB. Exactness, not bandwidth, is the reason.
 //!
-//! The QSA indexer's `index_qk_proj` (also MXFP8) is NOT covered: the indexer
-//! reads the store's BF16 tensor directly (`attach::attach_qsa`), so it needs
-//! a BF16 dequant from the checkpoint loader, and decode keeps reading BF16.
+//! The QSA indexer's `index_qk_proj` (also MXFP8) gets no twin: the indexer
+//! kernels read BF16, so `attach::attach_qsa` takes its exact BF16 dequant
+//! through `dense_auto`, for decode and prefill alike.
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
