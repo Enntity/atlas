@@ -735,11 +735,19 @@ pub struct QuantizationConfig {
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
-/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (`"NVFP4"`, `"MXFP8"`, `"W4A16_NVFP4"`, `"FP8_PB_WO"`, …) plus its scaling
+/// group when given.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
+    /// How the block scales are STORED, when not plainly: `"csf"` means each
+    /// `weight_scale` ships as a compressed `nvfp4_csf_fixed` +
+    /// `nvfp4_csf_exceptions` pair (nvidia FP4-Local's routed experts). The
+    /// safetensors loaders decode those at upload regardless of this field
+    /// (`spark_runtime::weights::nvfp4_csf`); it is read to REPORT the format.
+    /// Empty for plain scales.
+    pub weight_scale_encoding: String,
 }
 
 /// Whether a ModelOpt `quant_algo` label means NVFP4-packed weights.
