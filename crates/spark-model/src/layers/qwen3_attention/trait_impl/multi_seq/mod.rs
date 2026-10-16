@@ -33,6 +33,7 @@ mod qkv;
 mod qkv_dp4a;
 mod qkv_exact4;
 mod qkv_fp8;
+mod qkv_mx;
 mod qsa_rows;
 #[cfg(test)]
 mod tests;

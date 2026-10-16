@@ -35,11 +35,20 @@ pub(super) fn attach_qsa(
         // Already device-resident in the store; the indexer holds the
         // pointers (the store keeps the weights alive for the model's
         // lifetime, same as every other layer weight).
+        // The indexer kernels read these as BF16. FP4-Local ships
+        // `index_qk_proj` MXFP8: unless the checkpoint loader has replaced
+        // it with its BF16 dequant, refuse rather than score keys with E4M3
+        // bytes read as BF16.
         let up = |name: &str| -> Result<spark_runtime::gpu::DevicePtr> {
-            Ok(store
+            let t = store
                 .get(&format!("{lp}.self_attn.indexer.{name}"))
-                .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?
-                .ptr)
+                .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?;
+            anyhow::ensure!(
+                t.dtype == spark_runtime::weights::WeightDtype::BF16,
+                "qwen4_exp layer {i}: indexer {name} is {:?}; the QSA indexer reads BF16",
+                t.dtype
+            );
+            Ok(t.ptr)
         };
         // The projection through `dense_auto`, not the raw store pointer:
         // FP4-Local ships it MXFP8, and the indexer kernels read BF16. On the

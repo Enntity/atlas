@@ -77,6 +77,7 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 // compiler ran. `attach` is also the better name: the module is the three
 // per-layer attach helpers.
 mod attach;
+mod attn_mxfp8;
 mod ffn;
 mod format;
 mod gdn_fp8;
@@ -340,7 +341,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                         .get(attn_idx)
                         .copied()
                         .unwrap_or(KvCacheDtype::Bf16);
-                    let l = crate::weight_loader::qwen35::load_layers::attention_arms::build_full_attention_nvfp4(
+                    let l = attn_mxfp8::build_full_attention(
                         i, store, &lp, gpu, variant, config, h, absmax_k, quantize_k, stream,
                         kv_dtype, attn_idx, input_norm, post_attn_norm, ffn,
                     )
