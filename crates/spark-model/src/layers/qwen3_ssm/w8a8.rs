@@ -23,7 +23,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use super::Qwen3SsmLayer;
 use super::exact_rows::GdnProj;
 use crate::layer::ForwardContext;
-use crate::layers::ops::{MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MxW8a8, W8a8Swap, qwen4exp_w8a8};
+use crate::layers::ops::{
+    MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MxW8a8, W8a8Swap, qwen4exp_w8a8, undo_on_err,
+};
 
 /// The W8A8 operands of the two projections, and the activation quant.
 pub(crate) struct GdnW8a8 {
@@ -59,13 +61,10 @@ impl Qwen3SsmLayer {
         );
         let quant = gpu.kernel(MXFP8_ACT_MODULE, MX_QUANT_KERNEL)?;
         let qkvz = MxW8a8::from_twin(gpu, &mx.qkvz.0, mx.qkvz.1, m_max, stream)?;
-        let out = match MxW8a8::from_twin(gpu, &mx.out.0, mx.out.1, m_max, stream) {
-            Ok(out) => out,
-            Err(e) => {
-                qkvz.free(gpu)?;
-                return Err(e);
-            }
-        };
+        let out = undo_on_err(
+            MxW8a8::from_twin(gpu, &mx.out.0, mx.out.1, m_max, stream),
+            || qkvz.free(gpu),
+        )?;
         let allocated = qkvz.owned_bytes() + out.owned_bytes();
         let bf16 = vec![
             (

@@ -75,10 +75,7 @@ impl MxW8a8 {
             }
             mx_prepare(n, k, m_max, stream)
         })();
-        if let Err(e) = built {
-            gpu.free(sf)?;
-            return Err(e);
-        }
+        undo_on_err(built, || gpu.free(sf))?;
         Ok(Self {
             data: twin.data,
             sf,
@@ -109,6 +106,17 @@ impl MxW8a8 {
             stream,
         )
     }
+}
+
+/// `r`, after running `undo` if it is an error. An `undo` that fails too is
+/// logged, not returned: the caller gets the error that made it undo.
+pub fn undo_on_err<T>(r: Result<T>, undo: impl FnOnce() -> Result<()>) -> Result<T> {
+    if r.is_err()
+        && let Err(e) = undo()
+    {
+        tracing::warn!("MXFP8 W8A8: cleanup after a failed install failed too: {e:#}");
+    }
+    r
 }
 
 /// What installing W8A8 prefill on a layer did: the bytes its operands
@@ -219,4 +227,26 @@ pub fn mx_prepare(n: usize, k: usize, m_max: usize, stream: u64) -> Result<()> {
 /// Milliseconds [`mx_prepare`] has spent in this process.
 pub fn mx_prepare_ms() -> f64 {
     PREPARED.lock().unwrap().1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::undo_on_err;
+
+    #[test]
+    fn a_failed_undo_never_hides_the_error_that_caused_it() {
+        let failed = || -> anyhow::Result<u8> { anyhow::bail!("tune") };
+        let e = undo_on_err(failed(), || anyhow::bail!("free")).unwrap_err();
+        assert_eq!(e.to_string(), "tune");
+        let mut undone = false;
+        let e = undo_on_err(failed(), || {
+            undone = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(undone && e.to_string() == "tune");
+        // Nothing to undo on success.
+        let r = undo_on_err(Ok(7), || panic!("undo on success"));
+        assert_eq!(r.unwrap(), 7);
+    }
 }

@@ -27,7 +27,7 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
 use crate::layers::ops::{
-    MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MxAct, MxW8a8, W8a8Swap, qwen4exp_w8a8,
+    MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MxAct, MxW8a8, W8a8Swap, qwen4exp_w8a8, undo_on_err,
 };
 use crate::layers::qwen4exp_sp_pipe as pipe;
 
@@ -69,17 +69,15 @@ impl Qwen3AttentionLayer {
             "W8A8 attention prefill needs the MXFP8 decode twins and the BF16 Q/K/V/O"
         );
         let quant = gpu.kernel(MXFP8_ACT_MODULE, MX_QUANT_KERNEL)?;
-        let mut proj = Vec::with_capacity(4);
+        let mut proj: Vec<MxW8a8> = Vec::with_capacity(4);
         for (nk, twin) in &self.dense_mx.twins {
-            match MxW8a8::from_twin(gpu, twin, *nk, m_max, stream) {
-                Ok(w) => proj.push(w),
-                Err(e) => {
-                    for w in proj {
-                        w.free(gpu)?;
-                    }
-                    return Err(e);
-                }
-            }
+            let w = undo_on_err(MxW8a8::from_twin(gpu, twin, *nk, m_max, stream), || {
+                // Free them all; the first failure is the one logged.
+                proj.drain(..)
+                    .map(|w| w.free(gpu))
+                    .fold(Ok(()), Result::and)
+            })?;
+            proj.push(w);
         }
         let proj: [MxW8a8; 4] = proj.try_into().expect("four twins");
         let allocated = proj.iter().map(MxW8a8::owned_bytes).sum();
