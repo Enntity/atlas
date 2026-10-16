@@ -68,12 +68,13 @@ impl GdnProjections {
         )
     }
 
-    /// The format for this checkpoint: an MXFP8 one decodes its own bytes
-    /// unless `ATLAS_QWEN4EXP_MXFP8_DECODE=0`, and refuses the requantizing
-    /// options beside them (each would be a second decode format).
-    pub(crate) fn for_checkpoint(self, store: &WeightStore, config: &ModelConfig) -> Result<Self> {
-        let mxfp8 = super::gdn_mxfp8::checkpoint_is_mxfp8(store, config)?
-            && super::gdn_mxfp8::mxfp8_decode_requested()?;
+    /// The format for this checkpoint (`mxfp8_backbone`: `Qwen4ExpFormat`'s
+    /// detection): an MXFP8 one decodes its own bytes unless
+    /// `ATLAS_QWEN4EXP_MXFP8_DECODE=0`, and refuses the requantizing options
+    /// beside them (each would be a second decode format). The switch is not
+    /// read for any other checkpoint.
+    pub(crate) fn for_checkpoint(self, mxfp8_backbone: bool) -> Result<Self> {
+        let mxfp8 = mxfp8_backbone && super::gdn_mxfp8::mxfp8_decode_requested()?;
         Self::with_mxfp8(self, mxfp8)
     }
 
@@ -87,12 +88,6 @@ impl GdnProjections {
                  ATLAS_QWEN4EXP_MXFP8_DECODE=0 to use it instead"
             ),
         })
-    }
-
-    /// Whether the build adds a decode copy beside (or instead of) the BF16
-    /// one: the FP8 options and MXFP8.
-    pub(crate) fn decode_copy(self) -> bool {
-        matches!(self, Self::Fp8Decode | Self::Fp8Full | Self::Mxfp8Decode)
     }
 
     fn parse(bf16_gdn: Option<&str>, fp8_gdn: Option<&str>) -> Result<Self> {
@@ -142,8 +137,7 @@ impl GdnProjections {
     }
 }
 
-/// The BF16 GDN build plus its decode copy: FP8 (see the module docs) or
-/// the checkpoint's MXFP8 (`gdn_mxfp8`).
+/// The BF16 GDN build plus its FP8 copy; see the module docs.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build(
     layer_idx: usize,
@@ -155,22 +149,8 @@ pub(super) fn build(
     input_norm: DenseWeight,
     post_attn_norm: DenseWeight,
     ffn: FfnComponent,
-    gdn: GdnProjections,
+    keep_bf16_prefill: bool,
 ) -> Result<Box<dyn TransformerLayer>> {
-    if gdn == GdnProjections::Mxfp8Decode {
-        return super::gdn_mxfp8::build(
-            layer_idx,
-            store,
-            lp,
-            gpu,
-            variant,
-            config,
-            input_norm,
-            post_attn_norm,
-            ffn,
-        );
-    }
-    let keep_bf16_prefill = gdn == GdnProjections::Fp8Decode;
     // A rank's block scales are the TP=1 ones only if its slice boundaries sit
     // on the 128 grid: QKVZ shards rows per [Q|K|V|Z] segment, out_proj
     // columns. Checked, not assumed.
@@ -256,10 +236,6 @@ mod tests {
             assert!(e.to_string().contains("MXFP8_DECODE=0"), "{other:?}: {e}");
         }
         assert_eq!(Mxfp8Decode.fp8_word(), 0);
-        assert_eq!(
-            [Bf16, Nvfp4, Fp8Decode, Fp8Full, Mxfp8Decode].map(GdnProjections::decode_copy),
-            [false, false, true, true, true]
-        );
     }
 
     #[test]

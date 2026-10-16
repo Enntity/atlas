@@ -26,7 +26,7 @@
 //! the GDN bytes.
 
 use anyhow::{Context, Result, bail};
-use atlas_core::config::{LayerType, ModelConfig};
+use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
@@ -60,21 +60,6 @@ fn parse(value: Option<&str>) -> Result<bool> {
 const QKV: &str = "in_proj_qkv";
 const Z: &str = "in_proj_z";
 const OUT: &str = "out_proj";
-
-/// Whether this checkpoint ships the GDN projections as MXFP8, read off the
-/// first linear-attention layer (`in_proj_qkv`; `build` checks every layer's
-/// three tensors as it takes them).
-pub(super) fn checkpoint_is_mxfp8(store: &WeightStore, config: &ModelConfig) -> Result<bool> {
-    let Some(i) = config
-        .layer_types
-        .iter()
-        .position(|t| *t == LayerType::LinearAttention)
-    else {
-        return Ok(false);
-    };
-    let prefix = format!("{}.linear_attn.{QKV}", config.layer_prefix(i));
-    Ok(raw_mxfp8(store, &prefix)?.is_some())
-}
 
 /// The BF16 GDN build plus the MXFP8 decode copies; see the module docs.
 #[allow(clippy::too_many_arguments)]

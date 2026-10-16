@@ -264,7 +264,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // requantizing them was a lossy round trip we chose, on 36 of 48
         // layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
         // the FP8 middle option (`gdn_fp8`).
-        let gdn = GdnProjections::from_env()?.for_checkpoint(store, config)?;
+        let gdn = GdnProjections::from_env()?.for_checkpoint(format.mxfp8_backbone)?;
         tracing::info!(
             "GDN projections: {} on the {} linear-attention layers",
             gdn.describe(),
@@ -323,11 +323,20 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                     )
                     .with_context(|| format!("qwen4_exp: GDN layer {i} (BF16)"))?
                 }
-                LayerType::LinearAttention if gdn.decode_copy() => {
-                    gdn_fp8::build(
-                        i, store, &lp, gpu, variant, config, input_norm, post_attn_norm, ffn, gdn,
+                LayerType::LinearAttention if gdn == GdnProjections::Mxfp8Decode => {
+                    gdn_mxfp8::build(
+                        i, store, &lp, gpu, variant, config, input_norm, post_attn_norm, ffn,
                     )
-                    .with_context(|| format!("qwen4_exp: GDN layer {i} ({gdn:?})"))?
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (MXFP8 decode)"))?
+                }
+                LayerType::LinearAttention
+                    if matches!(gdn, GdnProjections::Fp8Decode | GdnProjections::Fp8Full) =>
+                {
+                    gdn_fp8::build(
+                        i, store, &lp, gpu, variant, config, input_norm, post_attn_norm, ffn,
+                        gdn == GdnProjections::Fp8Decode,
+                    )
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (FP8)"))?
                 }
                 LayerType::LinearAttention => {
                     crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_nvfp4(
