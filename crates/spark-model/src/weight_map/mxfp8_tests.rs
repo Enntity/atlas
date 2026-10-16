@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! MXFP8 probe + exact BF16 expansion.
+//! Exact MXFP8 -> BF16 expansion (the probe is tested in `mxfp8_load_tests`).
 //!
 //! The golden is two real FP4-Local projections dequantized by PyTorch
 //! (`scripts/mxfp8_bf16_golden.py`, which also asserts the BF16 result equals
@@ -9,8 +9,6 @@
 
 use super::*;
 use sha2::{Digest, Sha256};
-use spark_runtime::weights::WeightTensor;
-use std::collections::HashMap;
 
 fn fixtures() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/mxfp8")
@@ -75,61 +73,4 @@ fn scales_outside_the_exact_range_are_refused() {
     }
     assert_eq!(mxfp8_scales_f32(&[127]).unwrap(), vec![1.0]);
     assert_eq!(mxfp8_scales_f32(&[118]).unwrap(), vec![2f32.powi(-9)]);
-}
-
-fn store(tensors: &[(&str, WeightDtype, &[usize])]) -> WeightStore {
-    let map: HashMap<String, WeightTensor> = tensors
-        .iter()
-        .map(|(n, d, s)| {
-            (
-                n.to_string(),
-                WeightTensor {
-                    ptr: DevicePtr::NULL,
-                    shape: s.to_vec(),
-                    dtype: *d,
-                },
-            )
-        })
-        .collect();
-    WeightStore::from_map(map)
-}
-
-#[test]
-fn probe_recognises_only_the_mxfp8_signature() {
-    use WeightDtype::*;
-    let p = "m.layers.0.linear_attn.out_proj";
-    let w = "m.layers.0.linear_attn.out_proj.weight";
-    let s = "m.layers.0.linear_attn.out_proj.weight_scale";
-
-    let got = mxfp8_source(
-        &store(&[(w, FP8E4M3, &[2560, 6144]), (s, UInt8, &[2560, 192])]),
-        p,
-    )
-    .unwrap()
-    .expect("MXFP8");
-    assert_eq!((got.n, got.k, got.weight.tiled), (2560, 6144, false));
-    // F8_E8M0-typed scales are the same format.
-    assert!(
-        mxfp8_source(
-            &store(&[(w, FP8E4M3, &[64, 64]), (s, FP8E8M0, &[64, 2])]),
-            p
-        )
-        .unwrap()
-        .is_some()
-    );
-
-    // Not MXFP8: BF16 weight; BF16 per-row scale (unsloth FP8); no scale;
-    // NVFP4 (U8 weight, E4M3 scale).
-    for t in [
-        store(&[(w, BF16, &[64, 64])]),
-        store(&[(w, FP8E4M3, &[64, 64]), (s, BF16, &[64, 1])]),
-        store(&[(w, FP8E4M3, &[64, 64])]),
-        store(&[(w, UInt8, &[64, 32]), (s, FP8E4M3, &[64, 4])]),
-    ] {
-        assert!(mxfp8_source(&t, p).unwrap().is_none());
-    }
-
-    // MXFP8 signature, wrong geometry: refused, not routed elsewhere.
-    assert!(mxfp8_source(&store(&[(w, FP8E4M3, &[64, 64]), (s, UInt8, &[64, 4])]), p).is_err());
-    assert!(mxfp8_source(&store(&[(w, FP8E4M3, &[64, 48]), (s, UInt8, &[64, 1])]), p).is_err());
 }

@@ -58,9 +58,8 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
     // exact, and the scale dtype the GPU branch below refuses. Every FP8 →
     // BF16 caller (`dense_auto`, `dense_auto_fp8_or_bf16`, `quantized_from_fp8`)
     // funnels through here, so this one probe covers all of them.
-    if let Some(src) = super::mxfp8::mxfp8_source(store, prefix)? {
-        return super::mxfp8::dequant_mxfp8_to_bf16(gpu, &src)
-            .with_context(|| format!("MXFP8 {prefix}"));
+    if let Some(raw) = super::raw_mxfp8(store, prefix)? {
+        return super::dequant_mxfp8_to_bf16(gpu, &raw).with_context(|| format!("MXFP8 {prefix}"));
     }
     let n = w.shape[0];
     let k = w.shape[1];

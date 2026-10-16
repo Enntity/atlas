@@ -22,7 +22,7 @@ use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use crate::weight_map::mxfp8_source;
+use crate::weight_map::mxfp8_geometry;
 
 /// A part of the backbone that ships MXFP8 on FP4-Local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,7 @@ impl Mxfp8Component {
 /// twice. A component listed in `ATLAS_QWEN4EXP_MXFP8_KEEP` (comma list of
 /// `gdn,attn,indexer,shared,vision`, or `all`) keeps it, which is the hook for
 /// an MXFP8-native decode path: decode reads the source through
-/// [`mxfp8_source`] while prefill keeps reading the BF16 copy.
+/// `raw_mxfp8` while prefill keeps reading the BF16 copy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Mxfp8Keep(u8);
 
@@ -161,7 +161,7 @@ pub(super) fn release_mxfp8_sources(
     let mut bytes = 0;
     for &c in components.iter().filter(|c| !keep.keeps(**c)) {
         for stem in c.stems(lp) {
-            if mxfp8_source(store, &stem)?.is_none() {
+            if mxfp8_geometry(store, &stem)?.is_none() {
                 continue;
             }
             for part in ["weight", "weight_scale"] {
@@ -223,7 +223,7 @@ impl Qwen4ExpFormat {
         probes.extend(first_attn.map(|p| format!("{p}.self_attn.q_proj")));
         let mut mxfp8 = 0;
         for p in &probes {
-            mxfp8 += mxfp8_source(store, p)?.is_some() as usize;
+            mxfp8 += mxfp8_geometry(store, p)?.is_some() as usize;
         }
         // All or none: a checkpoint with an MXFP8 GDN and a BF16 attention
         // is not a release anyone has published, and guessing which half is

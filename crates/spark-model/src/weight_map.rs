@@ -60,9 +60,9 @@ pub use model_a::*;
 pub use moe::*;
 #[cfg(test)]
 pub(crate) use mxfp8::mxfp8_to_bf16_host;
-pub use mxfp8::{Mxfp8Source, Mxfp8Weight, dequant_mxfp8_to_bf16, mxfp8_source};
+pub use mxfp8::{Mxfp8Weight, dequant_mxfp8_to_bf16};
 pub use mxfp8_load::{
-    MXFP8_GROUP, RawMxfp8, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8, release_raw_mxfp8,
+    RawMxfp8, mxfp8_cols_twin, mxfp8_geometry, mxfp8_rows_twin, raw_mxfp8, release_raw_mxfp8,
 };
 pub use nemotron::*;
 pub use nvfp4_detect::*;

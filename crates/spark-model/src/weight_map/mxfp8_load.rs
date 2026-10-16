@@ -13,10 +13,10 @@
 //!
 //! THE INTEGRATION SEAM is [`raw_mxfp8`] / [`release_raw_mxfp8`]: a loader
 //! that keeps the raw tensors in the [`WeightStore`] under their checkpoint
-//! names until the layer build has taken its twins needs nothing else. Take
-//! the twins BEFORE anything dequantizes the same tensor to BF16 (that
-//! dequant may release the raw bytes), and release the raw bytes after both
-//! have read them.
+//! names until the layer build has taken its twins needs nothing else. The
+//! twins and the exact BF16 dequant (`dense_auto`) read the same raw bytes,
+//! in either order, and neither releases them: the loader does, once, after
+//! both have read them. [`raw_mxfp8`] refuses bytes already released.
 //!
 //! TP slices are byte-identical to the matching slice of the full tensor:
 //! rows carry their own scales, so row (head) slices are plain row copies;
@@ -28,10 +28,8 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use super::Mxfp8Weight;
+use crate::layers::ops::MXFP8_BLOCK;
 use crate::tp_shard::segment_copy_plan;
-
-/// K values per UE8M0 scale.
-pub const MXFP8_GROUP: usize = 32;
 
 /// One checkpoint MXFP8 tensor as the store holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,44 +42,55 @@ pub struct RawMxfp8 {
     pub k: usize,
 }
 
-/// The raw MXFP8 tensor `<prefix>.weight` + `<prefix>.weight_scale`, or
-/// `None` when `prefix` is not MXFP8 in this checkpoint (BF16, FP8 with a
-/// per-tensor F32 or a 128-block `weight_scale_inv` scale, or no `.weight`
-/// at all: packed NVFP4 `.weight_packed`, EXL3 trellis). An E4M3 weight
-/// with a U8/E8M0 scale of any other shape is an error, not a fallback:
-/// nothing else in the tree reads that pairing, so it is a layout this code
-/// does not understand.
-pub fn raw_mxfp8(store: &WeightStore, prefix: &str) -> Result<Option<RawMxfp8>> {
+/// `(n, k)` when `<prefix>.weight` + `<prefix>.weight_scale` is a checkpoint
+/// MXFP8 projection, from dtypes and shapes alone; `None` when `prefix` is not
+/// MXFP8 in this checkpoint (BF16, FP8 with a per-tensor F32, a per-row BF16
+/// or a 128-block `weight_scale_inv` scale, or no `.weight` at all: packed
+/// NVFP4 `.weight_packed`, EXL3 trellis). MXFP8 is recognised by an E4M3
+/// weight with a ONE-BYTE `weight_scale` (U8 or F8_E8M0): no other FP8
+/// scheme in the tree stores its scale that way. So an E4M3 weight with a
+/// one-byte scale of any other shape is an error, not a fallback: it would
+/// otherwise fall through to a layout it is not.
+pub fn mxfp8_geometry(store: &WeightStore, prefix: &str) -> Result<Option<(usize, usize)>> {
     let (wname, sname) = (format!("{prefix}.weight"), format!("{prefix}.weight_scale"));
-    let Ok(w) = store.get(&wname) else {
+    let (Ok(w), Ok(s)) = (store.get(&wname), store.get(&sname)) else {
         return Ok(None);
     };
-    if w.dtype != WeightDtype::FP8E4M3 || !store.contains(&sname) {
-        return Ok(None);
-    }
-    let s = store.get(&sname)?;
-    if !matches!(s.dtype, WeightDtype::UInt8 | WeightDtype::FP8E8M0) {
+    if w.dtype != WeightDtype::FP8E4M3
+        || !matches!(s.dtype, WeightDtype::UInt8 | WeightDtype::FP8E8M0)
+    {
         return Ok(None);
     }
     let [n, k] = w.shape[..] else {
         bail!("{wname}: MXFP8 weight must be 2-D, got {:?}", w.shape);
     };
     ensure!(
-        n > 0 && k > 0 && k.is_multiple_of(MXFP8_GROUP) && s.shape == [n, k / MXFP8_GROUP],
+        n > 0 && k > 0 && k.is_multiple_of(MXFP8_BLOCK) && s.shape == [n, k / MXFP8_BLOCK],
         "{prefix}: E4M3 weight {:?} with a {:?} scale {:?} is not MXFP8 \
          ([n, k] + [n, k/32], k % 32 == 0)",
         w.shape,
         s.dtype,
         s.shape,
     );
+    Ok(Some((n, k)))
+}
+
+/// The raw MXFP8 tensor `<prefix>.weight` + `<prefix>.weight_scale` (see
+/// [`mxfp8_geometry`] for what counts), with its device pointers. Refuses
+/// bytes [`release_raw_mxfp8`] already freed rather than hand out a dangling
+/// pointer.
+pub fn raw_mxfp8(store: &WeightStore, prefix: &str) -> Result<Option<RawMxfp8>> {
+    let Some((n, k)) = mxfp8_geometry(store, prefix)? else {
+        return Ok(None);
+    };
+    let (wname, sname) = (format!("{prefix}.weight"), format!("{prefix}.weight_scale"));
     ensure!(
         !store.was_reclaimed(&wname) && !store.was_reclaimed(&sname),
-        "{prefix}: the raw MXFP8 bytes were released before the decode twin read them \
-         (take twins before dequantizing the same tensor)"
+        "{prefix}: the raw MXFP8 bytes were released before every consumer read them"
     );
     Ok(Some(RawMxfp8 {
-        data: w.ptr,
-        scales: s.ptr,
+        data: store.get(&wname)?.ptr,
+        scales: store.get(&sname)?.ptr,
         n,
         k,
     }))
@@ -119,14 +128,14 @@ pub fn mxfp8_rows_twin(
             raw.k,
         );
         let (data, local) = segment_copy_plan(segments, k, tp_rank, tp_size)?;
-        let (scales, _) = segment_copy_plan(segments, k / MXFP8_GROUP, tp_rank, tp_size)?;
+        let (scales, _) = segment_copy_plan(segments, k / MXFP8_BLOCK, tp_rank, tp_size)?;
         plans.push((rows, data, scales));
         rows += local;
     }
-    let twin = alloc_twin(gpu, rows, k)?;
+    let twin = Mxfp8Weight::alloc(gpu, rows, k)?;
     let copy = || -> Result<()> {
         for ((raw, _), (first, data, scales)) in parts.iter().zip(&plans) {
-            let (dst_w, dst_s) = (first * k, first * k / MXFP8_GROUP);
+            let (dst_w, dst_s) = (first * k, first * k / MXFP8_BLOCK);
             for op in data {
                 let dst = twin.data.offset(dst_w + op.dst_off);
                 gpu.copy_d2d_async(raw.data.offset(op.src_off), dst, op.len, stream)?;
@@ -160,12 +169,12 @@ pub fn mxfp8_cols_twin(
     );
     let lk = k / tp_size;
     ensure!(
-        lk.is_multiple_of(MXFP8_GROUP),
+        lk.is_multiple_of(MXFP8_BLOCK),
         "mxfp8_cols_twin: a rank's {lk} columns of k={k} split a 32-value scale block; \
          its MXFP8 scales would not be the checkpoint's"
     );
-    let (g, lg) = (k / MXFP8_GROUP, lk / MXFP8_GROUP);
-    let twin = alloc_twin(gpu, n, lk)?;
+    let (g, lg) = (k / MXFP8_BLOCK, lk / MXFP8_BLOCK);
+    let twin = Mxfp8Weight::alloc(gpu, n, lk)?;
     let copy = || -> Result<()> {
         let (src_w, src_s) = (
             raw.data.offset(tp_rank * lk),
@@ -176,22 +185,6 @@ pub fn mxfp8_cols_twin(
         gpu.synchronize(stream)
     };
     finish(gpu, twin, copy()).map(|t| (t, n, lk))
-}
-
-fn alloc_twin(gpu: &dyn GpuBackend, n: usize, k: usize) -> Result<Mxfp8Weight> {
-    let data = gpu.alloc(n * k)?;
-    let scales = match gpu.alloc(n * k / MXFP8_GROUP) {
-        Ok(p) => p,
-        Err(e) => {
-            gpu.free(data)?;
-            return Err(e);
-        }
-    };
-    Ok(Mxfp8Weight {
-        data,
-        scales,
-        tiled: false,
-    })
 }
 
 /// The twin, or its buffers freed and the copy's error.

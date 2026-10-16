@@ -210,7 +210,7 @@ fn every_mxfp8_tensor_is_a_known_component_and_probes_clean() {
     }
     for s in &stems {
         assert!(known.contains(s), "{s} is MXFP8 but in no component");
-        assert!(mxfp8_source(&store, s).unwrap().is_some(), "{s}");
+        assert!(mxfp8_geometry(&store, s).unwrap().is_some(), "{s}");
     }
 }
 

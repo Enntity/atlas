@@ -9,15 +9,15 @@
 //! backbone) stores `X.weight` F8_E4M3 `[n, k]` next to `X.weight_scale` U8
 //! UE8M0 `[n, k/32]` — byte-for-byte the untiled [`Mxfp8Weight`] layout.
 //!
-//! For those, [`mxfp8_source`] is the per-tensor probe ("is this projection
-//! MXFP8, and where are its bytes"), and [`dequant_mxfp8_to_bf16`] is the
-//! exact BF16 expansion every existing BF16 arm can load unchanged.
+//! For those, `mxfp8_load::raw_mxfp8` is the per-tensor probe ("is this
+//! projection MXFP8, and where are its bytes"), and [`dequant_mxfp8_to_bf16`]
+//! is the exact BF16 expansion every existing BF16 arm can load unchanged.
 
 use anyhow::{Context, Result, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
-use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use super::DenseWeight;
+use super::{DenseWeight, RawMxfp8};
+use crate::layers::ops::MXFP8_BLOCK;
 
 /// MXFP8 twin of a projection: E4M3 `[n, k]` + E8M0 `[n, k/32]`.
 #[derive(Debug, Clone, Copy)]
@@ -29,9 +29,6 @@ pub struct Mxfp8Weight {
     pub tiled: bool,
 }
 
-/// Values per E8M0 scale block.
-const BLOCK: usize = 32;
-
 /// E8M0 exponents whose scale keeps EVERY E4M3 value exact in BF16.
 ///
 /// E4M3 values are multiples of 2^-9 with at most 4 significant bits, up to
@@ -42,56 +39,24 @@ const BLOCK: usize = 32;
 /// outside is refused rather than rounded: this path promises exactness.
 const EXACT_E8M0: std::ops::RangeInclusive<u8> = 3..=246;
 
-/// A checkpoint-native MXFP8 projection in the store.
-#[derive(Debug, Clone, Copy)]
-pub struct Mxfp8Source {
-    /// `data` = `X.weight`, `scales` = `X.weight_scale`, untiled.
-    pub weight: Mxfp8Weight,
-    pub n: usize,
-    pub k: usize,
-}
-
-/// Is `{prefix}.weight` a checkpoint MXFP8 projection?
-///
-/// `Ok(None)` for anything else, including the other FP8 layouts (BF16/F32
-/// block or per-row scales, `weight_scale_inv`, DeepSeek-V4's `.scale`).
-/// MXFP8 is recognised by an E4M3 weight with a ONE-BYTE `weight_scale`
-/// (U8 or F8_E8M0): no other FP8 scheme in the tree stores its scale that way.
-/// A tensor that matches that signature but has the wrong scale geometry is an
-/// error — it would otherwise fall through to a layout it is not.
-pub fn mxfp8_source(store: &WeightStore, prefix: &str) -> Result<Option<Mxfp8Source>> {
-    let (Ok(w), Ok(s)) = (
-        store.get(&format!("{prefix}.weight")),
-        store.get(&format!("{prefix}.weight_scale")),
-    ) else {
-        return Ok(None);
-    };
-    if w.dtype != WeightDtype::FP8E4M3
-        || !matches!(s.dtype, WeightDtype::UInt8 | WeightDtype::FP8E8M0)
-    {
-        return Ok(None);
-    }
-    ensure!(
-        w.shape.len() == 2 && w.shape[1].is_multiple_of(BLOCK),
-        "{prefix}: MXFP8 weight must be [n, k] with k % 32 == 0, got {:?}",
-        w.shape
-    );
-    let (n, k) = (w.shape[0], w.shape[1]);
-    ensure!(
-        s.shape == [n, k / BLOCK],
-        "{prefix}: MXFP8 scale is {:?}, expected [{n}, {}] for a [{n}, {k}] weight",
-        s.shape,
-        k / BLOCK
-    );
-    Ok(Some(Mxfp8Source {
-        weight: Mxfp8Weight {
-            data: w.ptr,
-            scales: s.ptr,
+impl Mxfp8Weight {
+    /// Untiled twin buffers for an `[n, k]` weight: E4M3 data `n*k` bytes and
+    /// E8M0 scales `n*k/32`, the data freed again if the scales do not fit.
+    pub fn alloc(gpu: &dyn GpuBackend, n: usize, k: usize) -> Result<Self> {
+        let data = gpu.alloc(n * k)?;
+        let scales = match gpu.alloc(n * k / MXFP8_BLOCK) {
+            Ok(p) => p,
+            Err(e) => {
+                gpu.free(data)?;
+                return Err(e);
+            }
+        };
+        Ok(Self {
+            data,
+            scales,
             tiled: false,
-        },
-        n,
-        k,
-    }))
+        })
+    }
 }
 
 /// UE8M0 scale bytes as f32 multipliers, refusing any that would make the
@@ -122,7 +87,7 @@ pub(crate) fn mxfp8_to_bf16_host(
     k: usize,
 ) -> Result<Vec<u16>> {
     ensure!(
-        data.len() == n * k && scales.len() * BLOCK == n * k,
+        data.len() == n * k && scales.len() * MXFP8_BLOCK == n * k,
         "MXFP8 host dequant: {} data / {} scale bytes for [{n}, {k}]",
         data.len(),
         scales.len()
@@ -132,7 +97,7 @@ pub(crate) fn mxfp8_to_bf16_host(
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let v = atlas_core::numeric::fp8_e4m3_to_f32(b) * mult[i / BLOCK];
+            let v = atlas_core::numeric::fp8_e4m3_to_f32(b) * mult[i / MXFP8_BLOCK];
             // Exact by construction (`EXACT_E8M0`), so RNE never rounds here:
             // the result's low 16 f32 bits are zero.
             atlas_core::numeric::f32_to_bf16(v)
@@ -151,14 +116,14 @@ pub(crate) fn mxfp8_to_bf16_host(
 /// to f32 on the host: the scale matrix is k/32 bytes a row, so the D2H, the
 /// widening and the H2D are a few MB for the largest projection.
 ///
-/// The source stays in the store. Whether to release it once the BF16 copy
-/// exists is the model loader's call: it is the copy an MXFP8-native decode
-/// path would read.
-pub fn dequant_mxfp8_to_bf16(gpu: &dyn GpuBackend, src: &Mxfp8Source) -> Result<DenseWeight> {
+/// The source stays in the store: the MXFP8 decode twins (`mxfp8_load`) read
+/// the same bytes, and the model loader releases them once both have
+/// (`release_raw_mxfp8`).
+pub fn dequant_mxfp8_to_bf16(gpu: &dyn GpuBackend, src: &RawMxfp8) -> Result<DenseWeight> {
     use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
     let (n, k) = (src.n, src.k);
-    let mut e8m0 = vec![0u8; n * k / BLOCK];
-    gpu.copy_d2h(src.weight.scales, &mut e8m0)
+    let mut e8m0 = vec![0u8; n * k / MXFP8_BLOCK];
+    gpu.copy_d2h(src.scales, &mut e8m0)
         .context("MXFP8 scale D2H")?;
     let mult = mxfp8_scales_f32(&e8m0)?;
     let mult_bytes: Vec<u8> = mult.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -176,14 +141,14 @@ pub fn dequant_mxfp8_to_bf16(gpu: &dyn GpuBackend, src: &Mxfp8Source) -> Result<
             KernelLaunch::new(gpu, kernel)
                 .grid([div_ceil(k as u32, 64), div_ceil(n as u32, 4), 1])
                 .block([64, 4, 1])
-                .arg_ptr(src.weight.data)
+                .arg_ptr(src.data)
                 .arg_ptr(scale_f32)
                 .arg_ptr(out)
                 .arg_u32(n as u32)
                 .arg_u32(k as u32)
                 .arg_u32(1) // block_n: one scale row per weight row
-                .arg_u32(BLOCK as u32) // block_k
-                .arg_u32((k / BLOCK) as u32) // scale row stride
+                .arg_u32(MXFP8_BLOCK as u32) // block_k
+                .arg_u32((k / MXFP8_BLOCK) as u32) // scale row stride
                 .arg_u32(1) // scale_is_fp32
                 .launch(stream)
         })
