@@ -391,23 +391,18 @@ impl BlockDiffusionDraftHead {
             w.weight.0 != 0,
             "DFlash MXFP8 twin of a dropped BF16 weight"
         );
-        let data = gpu.alloc(n * k)?;
-        let scales = gpu.alloc(n * k / ops::MXFP8_BLOCK)?;
+        let mx = Mxfp8Weight::alloc(gpu, n, k)?;
         ops::mxfp8_quantize(
             gpu,
             quant,
             w.weight,
-            data,
-            scales,
+            mx.data,
+            mx.scales,
             n,
             k,
             gpu.default_stream(),
         )?;
-        Ok(Mxfp8Weight {
-            data,
-            scales,
-            tiled: false,
-        })
+        Ok(mx)
     }
 
     /// `out[m, n] = input[m, k] · Wᵀ` from an NVFP4 twin on the tensor-core

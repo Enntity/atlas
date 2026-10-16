@@ -58,24 +58,18 @@ pub(crate) fn prepare_shard_mxfp8(
     let shard = vocab / 2;
     let start = config.ep_rank * shard;
     let quantize = gpu.kernel("mxfp8_gemv", "mxfp8_quantize_bf16")?;
-    let data = gpu.alloc(shard * h)?;
-    let scales = gpu.alloc(shard * h / ops::MXFP8_BLOCK)?;
+    let mut w = crate::weight_map::Mxfp8Weight::alloc(gpu, shard, h)?;
     let stream = gpu.default_stream();
     ops::mxfp8_quantize(
         gpu,
         quantize,
         lm_head.offset(start * h * 2),
-        data,
-        scales,
+        w.data,
+        w.scales,
         shard,
         h,
         stream,
     )?;
-    let mut w = crate::weight_map::Mxfp8Weight {
-        data,
-        scales,
-        tiled: false,
-    };
     ops::mxfp8_tile_if_requested(gpu, &mut w, shard, h, stream)?;
     gpu.synchronize(stream)?;
     let _ = SHARD_MX.set((start, w));
