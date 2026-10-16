@@ -545,3 +545,7 @@ impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
 
 #[cfg(test)]
 mod teardown_tests;
+
+#[cfg(test)]
+#[path = "weights/csf_load_tests.rs"]
+mod csf_load_tests;

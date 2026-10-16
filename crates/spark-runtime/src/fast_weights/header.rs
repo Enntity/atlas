@@ -149,6 +149,13 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             "F8_E4M3" => (WeightDtype::FP8E4M3, false),
             "F8_E8M0" => (WeightDtype::FP8E8M0, false),
             "I64" => (WeightDtype::Int64, false),
+            // CSF exception words. Never stored: the copy loop hands both CSF
+            // halves to `CsfAssembler`, which re-derives the element width
+            // from byte length against shape. `UInt8` is only the staging
+            // container here; U32 anywhere else is still refused below.
+            "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
+                (WeightDtype::UInt8, false)
+            }
             other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
         };
         let shape: Vec<usize> = info["shape"]

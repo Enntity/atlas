@@ -2,7 +2,8 @@
 //! Single-shard buffered/direct I/O and upload; extracted without changing order.
 use super::{direct_io, header::parse_header};
 use crate::gpu::GpuBackend;
-use crate::weights::{WeightTensor, evict_page_cache, f16_to_bf16_bytes};
+use crate::weights::nvfp4_csf::{CsfAssembler, csf_part};
+use crate::weights::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
@@ -31,6 +32,7 @@ pub(super) fn load_shard_fast(
     out: &mut HashMap<String, WeightTensor>,
     deferred_out: &mut HashMap<String, crate::weights::DeferredTensor>,
     offload_logged: &mut bool,
+    csf: &mut CsfAssembler,
 ) -> Result<()> {
     // Header parsing uses a buffered fd — header is a few KB, cache pollution
     // is negligible and buffered I/O handles short reads cleanly.
@@ -136,6 +138,34 @@ pub(super) fn load_shard_fast(
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
+        // CSF-compressed NVFP4 scales: the halves are paired (possibly across
+        // shards) and only the decoded E4M3 `weight_scale` is uploaded.
+        if csf_part(&meta.name).is_some() {
+            if let Some(scale) = csf.offer(&meta.name, &meta.shape, raw)? {
+                anyhow::ensure!(
+                    !defer_fn(&scale.name),
+                    "{} is CSF-compressed but expert TP defers it to be read from \
+                     disk as a slice; decode-then-slice is not implemented, so \
+                     expert TP cannot serve this checkpoint",
+                    scale.name
+                );
+                anyhow::ensure!(
+                    !out.contains_key(&scale.name),
+                    "{} is in the checkpoint both plain and CSF-compressed",
+                    scale.name
+                );
+                let ptr = upload(gpu, &scale.name, &scale.bytes, offload_logged)?;
+                out.insert(
+                    scale.name,
+                    WeightTensor {
+                        ptr,
+                        shape: scale.shape,
+                        dtype: WeightDtype::FP8E4M3,
+                    },
+                );
+            }
+            continue;
+        }
         // F16 shards: convert bytes to BF16 before upload (same length,
         // different bit layout — meta.dtype is already staged as BF16).
         let converted: Vec<u8>;
@@ -146,28 +176,7 @@ pub(super) fn load_shard_fast(
             raw
         };
 
-        let ptr = match gpu.alloc(meta.len) {
-            Ok(p) => {
-                gpu.copy_h2d(src, p)?;
-                p
-            }
-            Err(_) => {
-                if !*offload_logged {
-                    tracing::warn!(
-                        "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
-                        meta.name,
-                        meta.len
-                    );
-                    *offload_logged = true;
-                }
-                let p = gpu.alloc_managed(meta.len)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, meta.len);
-                }
-                p
-            }
-        };
-
+        let ptr = upload(gpu, &meta.name, src, offload_logged)?;
         out.insert(
             meta.name.clone(),
             WeightTensor {
@@ -189,6 +198,37 @@ pub(super) fn load_shard_fast(
     evict_page_cache(&buffered_file);
     drop(buffered_file);
     Ok(())
+}
+
+/// GPU-alloc and copy one tensor's bytes, falling back to managed (UVM)
+/// memory when the device allocation fails.
+fn upload(
+    gpu: &dyn GpuBackend,
+    name: &str,
+    src: &[u8],
+    offload_logged: &mut bool,
+) -> Result<crate::gpu::DevicePtr> {
+    Ok(match gpu.alloc(src.len()) {
+        Ok(p) => {
+            gpu.copy_h2d(src, p)?;
+            p
+        }
+        Err(_) => {
+            if !*offload_logged {
+                tracing::warn!(
+                    "GPU alloc failed for {} ({} bytes) — switching to managed (UVM) memory",
+                    name,
+                    src.len()
+                );
+                *offload_logged = true;
+            }
+            let p = gpu.alloc_managed(src.len())?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), p.0 as *mut u8, src.len());
+            }
+            p
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]
