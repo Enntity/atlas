@@ -87,7 +87,7 @@ mod mtp;
 mod ple;
 mod probe;
 
-pub use format::{Mxfp8Component, Mxfp8Keep, Qwen4ExpFormat};
+pub use format::{Mxfp8Component, Qwen4ExpFormat};
 pub(crate) use gdn_fp8::GdnProjections;
 pub(crate) use gdn_mxfp8::mxfp8_decode_requested;
 pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
@@ -376,16 +376,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             if let Some(p) = ple_layer {
                 attach::attach_ple(&mut layer, i, p)?;
             }
-            // Every MXFP8 projection of this layer now has its exact BF16 copy
-            // inside the layer; the checkpoint bytes are dead unless a
-            // component is kept for an MXFP8-native path (`Mxfp8Keep`).
+            // Every reader of this layer's MXFP8 bytes is done: the GDN and
+            // QSA decode twins, the exact BF16 dequants (prefill, the QSA
+            // indexer's `index_qk_proj` in `attach_qsa` above), and the
+            // shared expert, whose BF16 dequant `build_moe` requantized to
+            // NVFP4. This is the one place they are released.
             if format.mxfp8_backbone {
                 mxfp8_released += format::release_mxfp8_sources(
                     store,
                     gpu,
                     &lp,
                     format::layer_components(config.layer_types[i]),
-                    format.keep,
                 )?;
             }
             layers.push(layer);
@@ -396,10 +397,17 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         }
         if format.mxfp8_backbone {
             tracing::info!(
-                "qwen4_exp: MXFP8 backbone loaded as exact BF16 copies; released {:.2} GB \
-                 of MXFP8 source bytes (kept resident: {:?})",
+                "qwen4_exp: MXFP8 backbone loaded: GDN/QSA decode reads {}, prefill their \
+                 exact BF16 dequant; QSA indexer exact BF16; shared expert BF16 dequant \
+                 requantized to NVFP4 (the fused MoE kernels read NVFP4; the BF16 releases' \
+                 shared expert takes the same requantization). Released {:.2} GB of MXFP8 \
+                 source bytes",
+                if gdn == GdnProjections::Mxfp8Decode {
+                    "the checkpoint's MXFP8 bytes"
+                } else {
+                    "the exact BF16 dequant (ATLAS_QWEN4EXP_MXFP8_DECODE=0)"
+                },
                 mxfp8_released as f64 / 1e9,
-                format.keep,
             );
         }
         tracing::info!(
@@ -510,9 +518,8 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         let ve = crate::weight_loader::qwen35::Qwen35WeightLoader
             .load_vision_encoder(store, config, gpu)?;
         // FP4-Local's ViT attention is MXFP8: the encoder now holds its exact
-        // BF16 copies, so the sources go unless `Mxfp8Keep` says vision.
+        // BF16 copies, and nothing else reads the sources.
         if let (Some(_), Some(v)) = (&ve, &config.vision) {
-            let keep = Mxfp8Keep::from_env()?;
             let mut released = 0;
             for b in 0..v.depth {
                 released += format::release_mxfp8_sources(
@@ -520,7 +527,6 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                     gpu,
                     &format!("model.visual.blocks.{b}"),
                     &[Mxfp8Component::Vision],
-                    keep,
                 )?;
             }
             if released > 0 {

@@ -33,7 +33,6 @@ use crate::tp_shard::TpAttentionDims;
 use crate::weight_loader::qwen35::load_layers::attention_arms::build_full_attention_nvfp4;
 use crate::weight_map::{
     DenseWeight, Mxfp8Weight, Nvfp4Variant, RawMxfp8, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8,
-    release_raw_mxfp8,
 };
 
 const PROJ: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
@@ -91,8 +90,8 @@ pub(super) fn build_full_attention(
         .zip(PROJ)
         .map(|(r, name)| r.with_context(|| format!("{p}: {name} is not MXFP8 beside the rest")))
         .collect::<Result<_>>()?;
-    // Twins first: the BF16 build dequantizes the same tensors and may
-    // release their raw bytes (`mxfp8_load`'s contract).
+    // The twins and the BF16 build below read the same raw bytes; the
+    // loader's per-layer sweep (`format::release_mxfp8_sources`) frees them.
     let twins = if mxfp8_decode_requested()? {
         Some(twins(gpu, config, &raws, stream)?)
     } else {
@@ -109,9 +108,6 @@ pub(super) fn build_full_attention(
             .and_then(|a| a.downcast_mut::<crate::layers::Qwen3AttentionLayer>())
             .with_context(|| format!("{p}: not a Qwen3AttentionLayer"))?
             .install_dense_mxfp8(twins)?;
-    }
-    for name in PROJ {
-        release_raw_mxfp8(store, gpu, &format!("{p}.{name}"))?;
     }
     Ok(layer)
 }

@@ -213,14 +213,3 @@ fn every_mxfp8_tensor_is_a_known_component_and_probes_clean() {
         assert!(mxfp8_geometry(&store, s).unwrap().is_some(), "{s}");
     }
 }
-
-#[test]
-fn keep_policy_parses() {
-    use Mxfp8Component::*;
-    let k = Mxfp8Keep::parse(Some("gdn, shared")).unwrap();
-    assert!(k.keeps(Gdn) && k.keeps(SharedExpert) && !k.keeps(Attn) && !k.keeps(Vision));
-    let all = Mxfp8Keep::parse(Some("all")).unwrap();
-    assert!(Mxfp8Component::ALL.iter().all(|c| all.keeps(*c)));
-    assert_eq!(Mxfp8Keep::parse(None).unwrap(), Mxfp8Keep::default());
-    assert!(Mxfp8Keep::parse(Some("gdn,bogus")).is_err());
-}

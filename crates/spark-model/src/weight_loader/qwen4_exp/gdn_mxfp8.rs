@@ -34,9 +34,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::FfnComponent;
 use crate::tp_shard::TpGdnDims;
 use crate::weight_loader::qwen35::load_layers::linear_attn_arms::dense_bf16_layer;
-use crate::weight_map::{
-    DenseWeight, Nvfp4Variant, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8, release_raw_mxfp8,
-};
+use crate::weight_map::{DenseWeight, Nvfp4Variant, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8};
 
 /// `ATLAS_QWEN4EXP_MXFP8_DECODE` as set (read once): unset or `1` decodes an
 /// MXFP8 checkpoint's own bytes, `0` its BF16 dequant.
@@ -98,8 +96,8 @@ pub(super) fn build(
             .with_context(|| format!("{prefix}: not MXFP8 in a checkpoint whose GDN is"))
     };
     let (qkv, z, out) = (raw(QKV)?, raw(Z)?, raw(OUT)?);
-    // The twins first: the BF16 build dequantizes the same tensors and may
-    // release their raw bytes (`mxfp8_load`'s contract).
+    // The twins and the BF16 build below read the same raw bytes; the
+    // loader's per-layer sweep (`format::release_mxfp8_sources`) frees them.
     let dims = TpGdnDims::from_config(config);
     let (rank, size, stream) = (dims.tp_rank, dims.tp_size, gpu.default_stream());
     let value = [dims.full_value_dim()];
@@ -124,9 +122,6 @@ pub(super) fn build(
         ffn,
     )?;
     layer.install_mxfp8_decode(gpu, config, (qkvz_w, [qn, qk]), (out_w, [on, ok]))?;
-    for name in [QKV, Z, OUT] {
-        release_raw_mxfp8(store, gpu, &format!("{la}.{name}"))?;
-    }
     Ok(Box::new(layer))
 }
 

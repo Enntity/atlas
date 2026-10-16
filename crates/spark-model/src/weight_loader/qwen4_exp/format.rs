@@ -14,15 +14,15 @@
 //! the exact MXFP8 -> BF16 expansion in `dense_auto`, the ViT NVFP4 linears
 //! are dequantized by `vision_dense_auto`, and the MTP experts load natively
 //! (`mtp.rs`). What lives here is the REPORT (one line saying which format
-//! loaded) and the one decision the format adds: whether each MXFP8 tensor's
-//! source bytes stay resident after its BF16 copy is built.
+//! loaded) and the release of each MXFP8 tensor's source bytes once every
+//! reader has read them.
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore};
 
-use crate::weight_map::mxfp8_geometry;
+use crate::weight_map::{mxfp8_geometry, release_raw_mxfp8};
 
 /// A part of the backbone that ships MXFP8 on FP4-Local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,24 +40,6 @@ pub enum Mxfp8Component {
 }
 
 impl Mxfp8Component {
-    const ALL: [Self; 5] = [
-        Self::Gdn,
-        Self::Attn,
-        Self::Indexer,
-        Self::SharedExpert,
-        Self::Vision,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Gdn => "gdn",
-            Self::Attn => "attn",
-            Self::Indexer => "indexer",
-            Self::SharedExpert => "shared",
-            Self::Vision => "vision",
-        }
-    }
-
     /// The tensor stems of this component in decoder layer `lp` (or, for
     /// `Vision`, ViT block `lp`).
     pub fn stems(self, lp: &str) -> Vec<String> {
@@ -87,90 +69,34 @@ impl Mxfp8Component {
     }
 }
 
-/// Which MXFP8 components keep their checkpoint bytes resident.
+/// Release the MXFP8 sources of `components` under `lp`. Returns the bytes
+/// released.
 ///
-/// Every MXFP8 tensor is expanded to the exact BF16 copy the existing arms
-/// load. By DEFAULT the MXFP8 source is then released — the BF16 copy is all
-/// the current kernels read, and keeping both would cost the 2.8 GB backbone
-/// twice. A component listed in `ATLAS_QWEN4EXP_MXFP8_KEEP` (comma list of
-/// `gdn,attn,indexer,shared,vision`, or `all`) keeps it, which is the hook for
-/// an MXFP8-native decode path: decode reads the source through
-/// `raw_mxfp8` while prefill keeps reading the BF16 copy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Mxfp8Keep(u8);
-
-impl Mxfp8Keep {
-    pub fn from_env() -> Result<Self> {
-        Self::parse(std::env::var("ATLAS_QWEN4EXP_MXFP8_KEEP").ok().as_deref())
-    }
-
-    fn parse(v: Option<&str>) -> Result<Self> {
-        let mut bits = 0u8;
-        for word in v
-            .unwrap_or("")
-            .split(',')
-            .map(str::trim)
-            .filter(|w| !w.is_empty())
-        {
-            if word == "all" {
-                bits = u8::MAX;
-                continue;
-            }
-            let Some(c) = Mxfp8Component::ALL.iter().find(|c| c.name() == word) else {
-                bail!(
-                    "ATLAS_QWEN4EXP_MXFP8_KEEP: unknown component {word:?} \
-                     (gdn, attn, indexer, shared, vision, all)"
-                );
-            };
-            bits |= 1 << *c as u8;
-        }
-        Ok(Self(bits))
-    }
-
-    pub fn keeps(self, c: Mxfp8Component) -> bool {
-        self.0 & (1 << c as u8) != 0
-    }
-
-    fn describe(self) -> String {
-        let kept: Vec<_> = Mxfp8Component::ALL
-            .iter()
-            .filter(|c| self.keeps(**c))
-            .map(|c| c.name())
-            .collect();
-        if kept.is_empty() {
-            "none (BF16 copies only)".into()
-        } else {
-            kept.join(",")
-        }
-    }
-}
-
-/// Release the MXFP8 sources of `components` under `lp` once their BF16
-/// copies exist, unless `keep` says otherwise. Returns the bytes released.
-///
-/// Called after a layer is fully built: by then every consumer of these
-/// tensors (`dense_auto` and friends) has its BF16 copy, and nothing in the
-/// loader reads the FP8 bytes again.
+/// The ONE release point for a decoder layer's MXFP8 bytes, called after the
+/// layer is fully built: by then every consumer has read them (the decode
+/// twins, the exact BF16 copies `dense_auto` makes, and the QSA indexer's
+/// `index_qk_proj` in `attach_qsa`), and nothing in the loader reads them
+/// again. A stem that is not MXFP8 is skipped.
 pub(super) fn release_mxfp8_sources(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     lp: &str,
     components: &[Mxfp8Component],
-    keep: Mxfp8Keep,
 ) -> Result<usize> {
     let mut bytes = 0;
-    for &c in components.iter().filter(|c| !keep.keeps(**c)) {
+    for c in components {
         for stem in c.stems(lp) {
             if mxfp8_geometry(store, &stem)?.is_none() {
                 continue;
             }
             for part in ["weight", "weight_scale"] {
                 let name = format!("{stem}.{part}");
-                bytes += store.get(&name)?.byte_size();
-                store
-                    .reclaim(gpu, &name)
-                    .with_context(|| format!("releasing MXFP8 source {name}"))?;
+                if !store.was_reclaimed(&name) {
+                    bytes += store.get(&name)?.byte_size();
+                }
             }
+            release_raw_mxfp8(store, gpu, &stem)
+                .with_context(|| format!("releasing MXFP8 source {stem}"))?;
         }
     }
     Ok(bytes)
@@ -205,7 +131,6 @@ pub struct Qwen4ExpFormat {
     pub ple_table: Option<WeightDtype>,
     /// F32 norm tensors (`hc_norm`, PLE `norm_*`) that load rounded to BF16.
     pub f32_norms: usize,
-    pub keep: Mxfp8Keep,
 }
 
 impl Qwen4ExpFormat {
@@ -265,7 +190,6 @@ impl Qwen4ExpFormat {
                 == Some(WeightDtype::UInt8),
             ple_table,
             f32_norms,
-            keep: Mxfp8Keep::from_env()?,
         })
     }
 
@@ -277,8 +201,7 @@ impl Qwen4ExpFormat {
     pub fn log(&self) {
         tracing::info!(
             "qwen4_exp checkpoint format: {} — backbone {}, routed-expert scales {}, \
-             ViT MLP {}, MTP experts {}, PLE table {:?}, {} F32 norm(s) rounded to BF16 (RNE); \
-             MXFP8 sources kept resident: {}",
+             ViT MLP {}, MTP experts {}, PLE table {:?}, {} F32 norm(s) rounded to BF16 (RNE)",
             if self.is_fp4_local() {
                 "FP4-Local"
             } else {
@@ -306,11 +229,6 @@ impl Qwen4ExpFormat {
             },
             self.ple_table,
             self.f32_norms,
-            if self.mxfp8_backbone {
-                self.keep.describe()
-            } else {
-                "n/a".into()
-            },
         );
     }
 }
