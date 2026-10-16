@@ -1079,6 +1079,8 @@ extern "C" __global__ void hc_pre_mix(
 #ifndef HUM_BD
 #define HUM_BD 32
 #endif
+// The MX epilogue quantizes a CTA's columns as whole 32-value MXFP8 blocks.
+static_assert(HUM_BD % 32 == 0, "HUM_BD must be a whole number of MXFP8 blocks");
 #ifndef HUM_MINB
 #define HUM_MINB 2
 #endif
