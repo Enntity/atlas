@@ -172,3 +172,72 @@ fn fp4local_gpu_first_layers_load_exactly() {
         }
     }
 }
+
+/// The two FP4-Local components outside the decoder layers: the ViT (MXFP8
+/// attention, W4A16 NVFP4 MLP + merger) and the MTP draft module (native
+/// NVFP4 experts). Same environment as above; ~12 GB resident.
+#[test]
+#[ignore]
+fn fp4local_gpu_vision_and_mtp_load() {
+    let dir = PathBuf::from(std::env::var("ATLAS_FP4L_CKPT").expect("ATLAS_FP4L_CKPT"));
+    assert_eq!(
+        std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS").as_deref(),
+        Ok("4")
+    );
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL=qwen3.8-flash-next");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let mut config = atlas_core::config::parse_config(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let mut loader = FastSafetensorsLoader::new();
+    loader.skip_activation_scales = true;
+    loader.demand_paged_patterns = vec![".ple.ple_embedding.ngram_embedding.shard_".into()];
+    let store = loader.load(&dir, g, 0).unwrap();
+    spark_runtime::weights::auto_detect_weight_prefix(&store, &mut config);
+    config.num_hidden_layers = LAYERS;
+    config.layer_types.truncate(LAYERS);
+    config.max_seq_len = 4096;
+    config.max_batch_tokens = 2048;
+
+    // The W4A16 ViT linears expand to the host reference of the kernel's
+    // documented arithmetic: bf16_rne(e2m1 * f32(e4m3 * scale_2)).
+    const E2M1: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+    for stem in [
+        "model.visual.blocks.0.mlp.linear_fc2",
+        "model.visual.merger.linear_fc1",
+    ] {
+        let (w, ws) = read(&dir, &format!("{stem}.weight"));
+        let (s, _) = read(&dir, &format!("{stem}.weight_scale"));
+        let (s2, _) = read(&dir, &format!("{stem}.weight_scale_2"));
+        let s2 = f32::from_le_bytes(s2[..4].try_into().unwrap());
+        let (n, k) = (ws[0], ws[1] * 2);
+        let want: Vec<u8> = (0..n * k)
+            .flat_map(|i| {
+                let (r, c) = (i / k, i % k);
+                let byte = w[r * k / 2 + c / 2];
+                let nib = if c % 2 == 1 { byte >> 4 } else { byte & 15 };
+                let scale = atlas_core::numeric::fp8_e4m3_to_f32(s[r * k / 16 + c / 16]) * s2;
+                atlas_core::numeric::f32_to_bf16(E2M1[nib as usize] * scale).to_le_bytes()
+            })
+            .collect();
+        let got = crate::weight_map::dequant_nvfp4_to_bf16(&store, stem, n, k, g).unwrap();
+        assert_eq!(d2h(g, got.weight, want.len()), want, "{stem}");
+        g.free(got.weight).unwrap();
+    }
+    let ve = Qwen4ExpWeightLoader
+        .load_vision_encoder(&store, &config, g)
+        .unwrap();
+    assert!(ve.is_some(), "vision tower must load");
+    assert!(store.was_reclaimed("model.visual.blocks.26.attn.qkv.weight"));
+    eprintln!("ViT: W4A16 expansion == host reference; tower built");
+
+    let mtp = load_qwen4exp_mtp_module(&store, &config, g, &[KvCacheDtype::Bf16]).unwrap();
+    assert!(mtp.is_some(), "MTP module must load");
+    eprintln!("MTP draft module built from native NVFP4 experts");
+}
