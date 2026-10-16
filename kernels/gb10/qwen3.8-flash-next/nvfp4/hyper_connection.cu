@@ -1312,8 +1312,9 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
                           inv_hc, nullptr, nullptr, 0);
 }
 
-// hc_up_mix_bf16_nt with `y` (also) emitted as MXFP8 (see hc_up_mix_body).
-// Opt-in: nothing dispatches it yet. Same grid and block.
+// hc_up_mix_bf16_nt with `y` (also) emitted as MXFP8 (see hc_up_mix_body),
+// for ATLAS_QWEN4EXP_PREFILL_W8A8 (`qwen4exp_prefill_hc.rs` launches it when
+// a W8A8 producer is armed). Same grid and block.
 extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt_mx(
     const __nv_bfloat16* __restrict__ low,
     const __nv_bfloat16* __restrict__ up_wt,
