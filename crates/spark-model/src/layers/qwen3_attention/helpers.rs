@@ -63,23 +63,17 @@ impl Qwen3AttentionLayer {
         );
         let stream = gpu.default_stream();
         for &(weight, n, k) in weights {
-            let data = gpu.alloc(n * k)?;
-            let scales = gpu.alloc(n * k / crate::layers::ops::MXFP8_BLOCK)?;
+            let mut mx = crate::weight_map::Mxfp8Weight::alloc(gpu, n, k)?;
             crate::layers::ops::mxfp8_quantize(
                 gpu,
                 self.mxfp8_quantize_k,
                 weight,
-                data,
-                scales,
+                mx.data,
+                mx.scales,
                 n,
                 k,
                 stream,
             )?;
-            let mut mx = crate::weight_map::Mxfp8Weight {
-                data,
-                scales,
-                tiled: false,
-            };
             if self
                 .mla
                 .as_ref()
