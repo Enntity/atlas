@@ -56,7 +56,10 @@ impl W8a8Load {
         } else {
             return Ok(());
         }
-        .context("ATLAS_QWEN4EXP_PREFILL_W8A8 install")?;
+        .context(
+            "ATLAS_QWEN4EXP_PREFILL_W8A8 install (set ATLAS_QWEN4EXP_PREFILL_W8A8=0 to prefill \
+             in BF16)",
+        )?;
         self.free(gpu, swap)
     }
 
