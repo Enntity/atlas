@@ -25,7 +25,7 @@ use crate::model::{
     verify_pieces,
 };
 use crate::speculative::glm_repair_policy;
-use crate::weight_loader::qwen4_exp::GdnProjections;
+use crate::weight_loader::qwen4_exp::{GdnProjections, mxfp8_decode_requested};
 
 use super::while_on;
 
@@ -289,6 +289,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_BF16_GDN", || {
         Ok((GdnProjections::from_env()? == GdnProjections::Nvfp4) as u64)
+    }),
+    // Whether an MXFP8 checkpoint's GDN decodes its own bytes or their BF16
+    // dequant: two summation orders in one out_proj all-reduce.
+    ("ATLAS_QWEN4EXP_MXFP8_DECODE", || {
+        Ok(mxfp8_decode_requested()? as u64)
     }),
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {
