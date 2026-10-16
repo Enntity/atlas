@@ -375,7 +375,8 @@ fn tune(ctx: &Ctx, p: &Problem, [m, n, k]: [u32; 3], ptrs: [u64; 3], stream: u64
 }
 
 /// The cached algorithm for `m` rows of `n x k`, described (`None` before
-/// its bucket's first GEMM).
+/// its key's first GEMM).
+#[cfg(any(test, feature = "test-utils"))]
 pub fn mx_algo_description(n: u32, k: u32, m: u32) -> Option<String> {
     let cache = CACHE.lock().unwrap();
     let a = cache.iter().find(|e| e.0 == key_here(n, k, m))?.1;
@@ -386,6 +387,7 @@ pub fn mx_algo_description(n: u32, k: u32, m: u32) -> Option<String> {
 /// (`in_order_only`: as [`candidates`]): `(description, in_order, ms per
 /// launch)` by CUDA events (benches; the output is overwritten). Candidates
 /// that refuse the problem are skipped.
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_mx_candidate_times(
     act_fp8: u64,

@@ -35,7 +35,8 @@ pub fn mx_lt_scale_bytes(rows: usize, k: usize) -> usize {
 
 /// Byte offset of scale `(outer, inner)` in the tiled layout (the host twin
 /// of `mx_sf_offset`): 128 x 4 tiles of 512 bytes, row-major over
-/// `(outer / 128, inner_pad / 4)`.
+/// `(outer / 128, inner_pad / 4)`. Tests only: the device code has its own.
+#[cfg(test)]
 pub fn mx_lt_sf_offset(outer: usize, inner: usize, inner_pad: usize) -> usize {
     let tile = (outer / 128) * (inner_pad / 4) + inner / 4;
     tile * 512 + (outer % 32) * 16 + ((outer % 128) / 32) * 4 + inner % 4
