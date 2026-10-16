@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! GPU tests (`#[ignore]`; a GB10 and a kernel target with `mxfp8_act_quant`)
-//! for the MXFP8 W8A8 prefill operands and GEMM:
+//! GPU tests (`#[ignore]`; a GB10 and a kernel target with `mxfp8_act_quant`,
+//! the fused producer's the qwen3.8-flash-next one) for the MXFP8 W8A8
+//! prefill operands:
 //!
 //! - `mxfp8_quant_act_bf16` against the ModelOpt host reference, byte for
 //!   byte, over random BF16 blocks across the whole exponent range plus zero,
 //!   inf, NaN, -0, subnormal and exact-power blocks;
 //! - `mxfp8_lt_scale_tile` against the host relayout (random scales, a TP K
-//!   slice through `src_ld`, and with `ATLAS_FP4L_CKPT` real scales).
+//!   slice through `src_ld`, and with `ATLAS_FP4L_CKPT` real scales);
+//! - `hc_up_mix_bf16_nt_mx` against `hc_up_mix_bf16_nt` then the quant.
 //!
 //! The GEMM's checks and bench are in `mxfp8_gemm_test_gpu.rs`.
 //!
@@ -18,6 +20,7 @@
 
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::KernelLaunch;
 
 use super::super::mxfp8::rows_gpu_tests::real::tensor;
 use super::super::mxfp8::rows_gpu_tests::{Rng, backend, upload};
@@ -199,6 +202,119 @@ fn mxfp8_lt_scale_tile_matches_the_host_relayout() -> Result<()> {
         assert_eq!(bad, 0, "{label}: relayout differs from the host's");
         gpu.free(dsrc)?;
         gpu.free(ddst)?;
+    }
+    Ok(())
+}
+
+/// Random BF16 of magnitude ~`scale`.
+fn bf16_noise(rng: &mut Rng, n: usize, scale: f64) -> Vec<u16> {
+    (0..n)
+        .map(|_| {
+            let v = ((unit(rng) - 0.5) * 2.0 * scale) as f32;
+            (v.to_bits() >> 16) as u16
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "needs a GB10 GPU and the qwen3.8-flash-next kernel target"]
+fn hc_up_mix_mx_equals_hc_up_mix_then_quant() -> Result<()> {
+    let gpu = backend()?;
+    let stream = gpu.default_stream();
+    let (quant, _) = kernels(gpu)?;
+    let plain = gpu.kernel("hyper_connection", "hc_up_mix_bf16_nt")?;
+    let fused = gpu.kernel("hyper_connection", "hc_up_mix_bf16_nt_mx")?;
+    let (h, rank, hc) = (2560usize, 320usize, 4usize);
+    let mut rng = Rng(0x00c0_11a9);
+    for t in [1000usize, 2048] {
+        let low = upload(gpu, &u16_bytes(&bf16_noise(&mut rng, t * rank, 0.5)))?;
+        let up_wt = upload(gpu, &u16_bytes(&bf16_noise(&mut rng, hc * h * rank, 0.1)))?;
+        let normed = upload(gpu, &u16_bytes(&bf16_noise(&mut rng, t * hc * h, 4.0)))?;
+        let inj_pre = upload(gpu, &u16_bytes(&bf16_noise(&mut rng, t * hc, 2.0)))?;
+        let sf_bytes = mx_lt_scale_bytes(t, h);
+        let y = [gpu.alloc(t * h * 2)?, gpu.alloc(t * h * 2)?];
+        let inj = [gpu.alloc(t * hc * 4)?, gpu.alloc(t * hc * 4)?];
+        let q = [gpu.alloc(t * h)?, gpu.alloc(t * h)?, gpu.alloc(t * h)?];
+        let sf = [
+            gpu.alloc(sf_bytes)?,
+            gpu.alloc(sf_bytes)?,
+            gpu.alloc(sf_bytes)?,
+        ];
+        for &p in &sf {
+            gpu.memset(p, 0xaa, sf_bytes)?;
+        }
+        let grid = [(h / 32) as u32, t.div_ceil(128) as u32, 1];
+        let inv_hc = 1.0f32 / hc as f32;
+        // Reference: the plain kernel, then the standalone quant of its `y`.
+        KernelLaunch::new(gpu, plain)
+            .grid(grid)
+            .block([256, 1, 1])
+            .arg_ptr(low)
+            .arg_ptr(up_wt)
+            .arg_ptr(normed)
+            .arg_ptr(inj_pre)
+            .arg_ptr(y[0])
+            .arg_ptr(inj[0])
+            .arg_u32(t as u32)
+            .arg_u32(h as u32)
+            .arg_u32(rank as u32)
+            .arg_f32(inv_hc)
+            .launch(stream)?;
+        mxfp8_quant_act(
+            gpu, quant, y[0], h as u32, q[0], sf[0], t as u32, h as u32, stream,
+        )?;
+        // Fused, with and without the BF16 `y`.
+        for (i, y_out) in [(1usize, y[1]), (2, DevicePtr::NULL)] {
+            KernelLaunch::new(gpu, fused)
+                .grid(grid)
+                .block([256, 1, 1])
+                .arg_ptr(low)
+                .arg_ptr(up_wt)
+                .arg_ptr(normed)
+                .arg_ptr(inj_pre)
+                .arg_ptr(y_out)
+                .arg_ptr(inj[1])
+                .arg_ptr(q[i])
+                .arg_ptr(sf[i])
+                .arg_u32(t as u32)
+                .arg_u32(h as u32)
+                .arg_u32(rank as u32)
+                .arg_f32(inv_hc)
+                .arg_u32(mx_lt_inner_pad(h) as u32)
+                .launch(stream)?;
+        }
+        gpu.synchronize(stream)?;
+        let same = |a: DevicePtr, b: DevicePtr, n: usize| -> Result<usize> {
+            let (x, y) = (down(gpu, a, n)?, down(gpu, b, n)?);
+            Ok(x.iter().zip(&y).filter(|(p, q)| p != q).count())
+        };
+        let checks = [
+            ("y", same(y[0], y[1], t * h * 2)?),
+            ("inj", same(inj[0], inj[1], t * hc * 4)?),
+            ("E4M3", same(q[0], q[1], t * h)?),
+            ("scales", same(sf[0], sf[1], sf_bytes)?),
+            ("E4M3 (no y)", same(q[0], q[2], t * h)?),
+            ("scales (no y)", same(sf[0], sf[2], sf_bytes)?),
+        ];
+        println!("hc_up_mix_mx T={t}: differing bytes {checks:?}");
+        assert!(checks.iter().all(|c| c.1 == 0), "fused != plain + quant");
+        // And the reference quant is ModelOpt's rule on the plain `y`.
+        let yb = down(gpu, y[0], t * h * 2)?;
+        let yv: Vec<u16> = yb
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let (q_host, _) = quant_rows(&yv, t, h);
+        assert!(down(gpu, q[0], t * h)? == q_host, "quant of y != host");
+        for p in [low, up_wt, normed, inj_pre]
+            .into_iter()
+            .chain(y)
+            .chain(inj)
+            .chain(q)
+            .chain(sf)
+        {
+            gpu.free(p)?;
+        }
     }
     Ok(())
 }

@@ -10,7 +10,7 @@
 //!   row-major `weight_scale` `[n, k/32]` -> the tiled layout, once at load.
 //!
 //! A producer kernel can emit the same bytes itself through the header's
-//! device functions.
+//! device functions (`hc_up_mix_bf16_nt_mx` does).
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
