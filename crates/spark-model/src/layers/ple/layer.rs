@@ -61,6 +61,11 @@ pub struct PleLayer {
     /// Device VA of the table's per-slot f32 dequant scale array, `None` for a
     /// BF16 table. Its presence is what selects the FP8 gather.
     scale_va: Option<u64>,
+    /// NVFP4 global scale, `Some` for a packed NVFP4 table (`ngram_nvfp4`),
+    /// whose rows carry their block scales. Selects `embed_nvfp4_k`.
+    nvfp4_global: Option<f32>,
+    /// Resolved only for an NVFP4 table, so other targets need not ship it.
+    embed_nvfp4_k: KernelHandle,
     /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
     trellis: Option<ngram_trellis::NgramTrellis>,
     gemm_k: KernelHandle,
@@ -134,6 +139,8 @@ impl PleLayer {
             let scaled = cache.scale_dev_va()?.is_some();
             if let Some(t) = trellis.as_ref() {
                 ngram_trellis::check_packed_stride(stride, t, scaled)?;
+            } else if cache.nvfp4_global_scale().is_some() {
+                ngram_nvfp4::check_packed_stride(stride, head_dim, scaled)?;
             } else {
                 gather_matches_element_size(stride, head_dim, scaled)?;
             }
@@ -160,6 +167,18 @@ impl PleLayer {
                 #[cfg(feature = "cuda")]
                 NgramTable::Cached(c) => c.scale_dev_va()?,
                 _ => None,
+            },
+            nvfp4_global: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) => c.nvfp4_global_scale(),
+                _ => None,
+            },
+            embed_nvfp4_k: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) if c.nvfp4_global_scale().is_some() => {
+                    gpu.kernel("embed_from_argmax", "batched_embed_nvfp4")?
+                }
+                _ => KernelHandle(0),
             },
             trellis,
             embed_fp8_k: gpu.kernel("embed_from_argmax", "batched_embed_fp8")?,
@@ -396,6 +415,8 @@ pub(crate) mod warm;
 
 #[path = "gather_guard.rs"]
 mod gather_guard;
+#[path = "ngram_nvfp4.rs"]
+pub(crate) mod ngram_nvfp4;
 #[path = "ngram_trellis.rs"]
 pub(crate) mod ngram_trellis;
 #[cfg(feature = "cuda")]

@@ -323,6 +323,7 @@ pub(super) fn load(
         // cache copies those bytes; host dequant expands each row to 160
         // BF16 before the GEMM. See `layers/ple/ngram_trellis.rs`.
         spark_runtime::weights::WeightDtype::Int16 => 2,
+        spark_runtime::weights::WeightDtype::UInt8 => 1, // NVFP4 code pairs: ple_nvfp4.rs
         other => anyhow::bail!(
             "PLE: n-gram table is {other:?}; the row cache gathers BF16, \
              F8_E4M3, or I16 rows (`batched_embed` / `batched_embed_fp8`)"
@@ -334,7 +335,10 @@ pub(super) fn load(
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
     let (slots, slots_from) = slots_from_env(span, heads);
-    let mut cache = if single.is_some() {
+    let nvfp4 = matches!(dtype, spark_runtime::weights::WeightDtype::UInt8);
+    let mut cache = if nvfp4 {
+        nvfp4::open(store, &lp, &shards, rows_per as u64, head_dim, slots, gpu)
+    } else if single.is_some() {
         let (path, off) = &shards[0];
         spark_storage::NgramRowCache::open_at(
             path,
@@ -367,7 +371,7 @@ pub(super) fn load(
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
     // magnitudes and the whole n-gram contribution is off by a constant
     // factor — fluent output, wrong logits.
-    if elem == 1 {
+    if elem == 1 && !nvfp4 {
         let name = format!("{lp}.ple_embedding.ngram_embedding.weight_scale");
         let scale = bf16_scalar(store, &name, gpu)?;
         cache
@@ -430,7 +434,7 @@ pub(super) fn load(
             }),
         )
     } else {
-        (head_dim, None)
+        (if nvfp4 { head_dim * 2 } else { head_dim }, None)
     };
 
     PleLayer::new(
@@ -451,6 +455,10 @@ pub(super) fn load(
     .map(Some)
     .context("PLE: layer construction")
 }
+
+#[cfg(feature = "cuda")]
+#[path = "ple_nvfp4.rs"]
+mod nvfp4;
 
 /// Non-CUDA builds have no NVMe row cache — it serves rows out of a pinned,
 /// GPU-addressable arena — so a PLE model cannot be served here. REFUSE

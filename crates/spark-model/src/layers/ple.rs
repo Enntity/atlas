@@ -73,3 +73,6 @@ pub(crate) use layer::verify_snapshots_enabled;
 // construct PLE layers, so the import is unused there.
 #[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 pub(crate) use layer::ngram_trellis;
+// The loader packs the NVFP4 table in this row layout (cuda builds only).
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
+pub(crate) use layer::ngram_nvfp4;

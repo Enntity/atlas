@@ -189,7 +189,8 @@ impl PleLayer {
 
     /// The row gather, dispatched on element type.
     ///
-    /// FP8 rows carry a per-slot scale; BF16 rows do not. Split out of
+    /// FP8 rows carry a per-slot scale; BF16 rows do not; NVFP4 rows carry
+    /// their block scales inline plus one global scale. Split out of
     /// `layer.rs` for the 500-LoC cap.
     pub(super) fn gather_embed_dispatch(
         &self,
@@ -199,6 +200,23 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
+        // NVFP4 rows carry their own block scales; the cache that holds them
+        // is the one that reports a global scale (and has no scale array).
+        if let Some(global) = self.nvfp4_global {
+            return ops::batched_embed_nvfp4(
+                gpu,
+                self.embed_nvfp4_k,
+                self.slots_dev,
+                DevicePtr(table_va),
+                self.emb,
+                global,
+                (num_tokens * heads) as u32,
+                self.head_dim as u32,
+                super::ngram_nvfp4::packed_stride(self.head_dim) as u32,
+                stream,
+            )
+            .context("PLE row gather (nvfp4)");
+        }
         // Dispatch on the PRESENCE OF THE SCALE, not a dtype flag: it keeps
         // "the bytes are E4M3" and "there is something to multiply by" from
         // being able to disagree.
