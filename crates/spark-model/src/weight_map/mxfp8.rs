@@ -201,3 +201,7 @@ pub fn dequant_mxfp8_to_bf16(gpu: &dyn GpuBackend, src: &Mxfp8Source) -> Result<
 #[cfg(test)]
 #[path = "mxfp8_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "mxfp8_gpu_tests.rs"]
+mod gpu_tests;
