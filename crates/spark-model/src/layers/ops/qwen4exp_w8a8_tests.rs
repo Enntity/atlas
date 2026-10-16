@@ -83,14 +83,14 @@ fn a_produced_collapse_saves_its_rows_from_the_quant() {
     let gpu = MockGpuBackend::new();
     let b = arena(&gpu);
     let (x, h, k) = (b.norm_output(), 2048usize, KernelHandle(0xDEAD));
-    drop(Producer::arm(&b, x, ROWS, 256, 256, h).unwrap());
+    drop(Producer::arm(&b, x, ROWS, 256, 256, h).unwrap().unwrap());
     assert!(
         take_target(256, h as u32).is_none(),
         "dropping a producer disarms it"
     );
 
     // SP rank 1: this rank collapses rows [256, 512) of the pass.
-    let p = Producer::arm(&b, x, ROWS, 256, 256, h).unwrap();
+    let p = Producer::arm(&b, x, ROWS, 256, 256, h).unwrap().unwrap();
     let t = take_target(256, h as u32).unwrap();
     assert!(
         take_target(256, h as u32).is_none(),
@@ -119,14 +119,14 @@ fn an_unproduced_collapse_leaves_nothing_pending() {
     let b = arena(&gpu);
     let (x, h, k) = (b.norm_output(), 2048usize, KernelHandle(0xDEAD));
     // Armed, but the collapse took the default arm (never marked).
-    let p = Producer::arm(&b, x, ROWS, 0, ROWS, h).unwrap();
+    let p = Producer::arm(&b, x, ROWS, 0, ROWS, h).unwrap().unwrap();
     let _ = take_target(ROWS as u32, h as u32);
     p.finish();
     let n0 = gpu.launch_count();
     activation(&gpu, k, &b, x, ROWS, h, 0).unwrap();
     assert_eq!(quant_rows(&gpu, n0, h), vec![ROWS]);
     // Off the tile grid: not armed at all.
-    assert!(Producer::arm(&b, x, ROWS, 100, 100, h).is_none());
+    assert!(Producer::arm(&b, x, ROWS, 100, 100, h).unwrap().is_none());
     assert!(take_target(100, h as u32).is_none());
 }
 
@@ -138,5 +138,23 @@ fn the_scratch_refuses_what_it_cannot_hold() {
     let k = KernelHandle(0xDEAD);
     let e = activation(&gpu, k, &b, x, ROWS + 128, 1 << 14, 0).unwrap_err();
     assert!(e.to_string().contains("FP8 scratch"), "{e}");
-    assert!(Producer::arm(&b, x, ROWS * 4, 0, ROWS, 1 << 14).is_none());
+    assert!(
+        Producer::arm(&b, x, ROWS * 4, 0, ROWS, 1 << 14)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_producer_whose_rows_overrun_the_pass_is_an_error() {
+    let gpu = MockGpuBackend::new();
+    let b = arena(&gpu);
+    let (x, h) = (b.norm_output(), 2048usize);
+    for (row0, rows) in [(256, 512), (0, ROWS + 1), (ROWS, 1), (128, usize::MAX)] {
+        let e = Producer::arm(&b, x, ROWS, row0, rows, h).err();
+        assert!(e.is_some(), "rows [{row0}, +{rows}) armed");
+        assert!(take_target(rows as u32, h as u32).is_none());
+    }
+    // Up to the end is fine.
+    assert!(Producer::arm(&b, x, ROWS, 384, 128, h).unwrap().is_some());
 }

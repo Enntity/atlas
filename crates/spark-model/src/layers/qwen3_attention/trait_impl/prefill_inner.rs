@@ -632,7 +632,7 @@ impl Qwen3AttentionLayer {
             // ATLAS_QWEN4EXP_PREFILL_W8A8: the collapse also writes its rows of
             // the q/k/v input as MXFP8 where it can (`w8a8.rs`).
             let row0 = sp.map_or(0, |sp| sp.row0);
-            let mx = self.w8a8_producer(ctx, normed, num_tokens, row0, n as usize);
+            let mx = self.w8a8_producer(ctx, normed, num_tokens, row0, n as usize)?;
             crate::layers::qwen4exp_sp_pipe::collapse_and_gather(
                 sp,
                 normed,

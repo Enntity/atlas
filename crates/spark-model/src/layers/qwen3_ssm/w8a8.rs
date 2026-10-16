@@ -127,8 +127,10 @@ impl Qwen3SsmLayer {
         total: usize,
         row0: usize,
         rows: usize,
-    ) -> Option<qwen4exp_w8a8::Producer> {
-        self.w8a8()?;
+    ) -> Result<Option<qwen4exp_w8a8::Producer>> {
+        if self.w8a8().is_none() {
+            return Ok(None);
+        }
         let h = ctx.config.hidden_size;
         qwen4exp_w8a8::Producer::arm(ctx.buffers, x, total, row0, rows, h)
     }

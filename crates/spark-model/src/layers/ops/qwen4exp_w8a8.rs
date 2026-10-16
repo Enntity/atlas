@@ -39,7 +39,7 @@
 
 use std::cell::Cell;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
@@ -112,7 +112,9 @@ impl Producer {
     /// Arm the next collapse of `rows` rows x `hidden`, which writes rows
     /// `[row0, row0 + rows)` of `x` (`[total, hidden]` BF16, the input the
     /// W8A8 projections then read). `None` (and nothing armed) when `row0`
-    /// is off the scale tile grid or the scratch cannot hold `total` rows.
+    /// is off the scale tile grid or the scratch cannot hold `total` rows;
+    /// an error when the rows overrun `total` (the collapse would write past
+    /// the activation image the scratch was checked for).
     pub fn arm(
         buffers: &BufferArena,
         x: DevicePtr,
@@ -120,11 +122,19 @@ impl Producer {
         row0: usize,
         rows: usize,
         hidden: usize,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         PENDING.with(|p| p.set(None));
         PRODUCED.with(|p| p.set(false));
-        let act = mx_act_scratch(buffers, total, hidden).ok()?;
-        let act = act.rows_from(row0, hidden).ok()?;
+        ensure!(
+            row0.checked_add(rows).is_some_and(|end| end <= total),
+            "W8A8 producer: rows [{row0}, {row0} + {rows}) of a {total}-row pass"
+        );
+        let Ok(act) = mx_act_scratch(buffers, total, hidden) else {
+            return Ok(None);
+        };
+        let Ok(act) = act.rows_from(row0, hidden) else {
+            return Ok(None);
+        };
         TARGET.with(|t| {
             t.set(Some(Target {
                 act,
@@ -132,7 +142,7 @@ impl Producer {
                 hidden: hidden as u32,
             }))
         });
-        Some(Self {
+        Ok(Some(Self {
             pending: Pending {
                 x,
                 total,
@@ -140,7 +150,7 @@ impl Producer {
                 row0,
                 rows,
             },
-        })
+        }))
     }
 
     /// The collapse ran: leave its rows pending if it produced them.

@@ -185,7 +185,7 @@ impl Qwen3SsmLayer {
         // ATLAS_QWEN4EXP_PREFILL_W8A8: the collapse also writes its rows of the
         // qkvz input as MXFP8 where it can (`w8a8.rs`).
         let row0 = sp.map_or(0, |sp| sp.row0);
-        let mx = self.w8a8_producer(ctx, hidden, num_tokens, row0, n as usize);
+        let mx = self.w8a8_producer(ctx, hidden, num_tokens, row0, n as usize)?;
         crate::layers::qwen4exp_sp_pipe::collapse_and_gather(
             sp,
             hidden,
