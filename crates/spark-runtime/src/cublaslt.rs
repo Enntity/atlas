@@ -23,9 +23,13 @@ pub use fp8::{
 };
 mod mx_algo;
 pub use grouped::bf16_grouped_gemm_act_weight_t;
+#[cfg(any(test, feature = "test-utils"))]
+pub use mx_algo::mx_per_bucket;
 pub use mx_algo::{
     MX_CANDIDATES, fp8_gemm_mx_candidate_times, fp8_gemm_mx_prepare, mx_algo_description,
 };
+mod mx_sweep;
+pub use mx_sweep::{MX_SWEEP, MxSweepShape};
 mod tf32;
 pub use tf32::tf32_gemm_act_weight_t;
 mod fixed_algo;

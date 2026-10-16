@@ -13,7 +13,7 @@ use super::super::super::mxfp8::rows_gpu_tests::{Rng, backend, upload};
 use super::super::gpu_tests::{kernels, u16_bytes};
 use super::super::tests::e4m3_to_f32;
 use super::super::*;
-use super::{SHAPES, operands, quantized};
+use super::{operands, quantized, shapes};
 
 /// Median ms per call of `f` (5 runs of `iters` back-to-back calls).
 pub(in super::super) fn time_ms(
@@ -64,7 +64,8 @@ fn mxfp8_gemm_bench_against_bf16_cublaslt() -> Result<()> {
     // Per M: [bf16 heuristic, bf16 rowinv, mx tuned, quant] ms summed over a
     // 16K-token prompt.
     let mut total = [[0f64; 4]; 4];
-    for s in &SHAPES {
+    // The TP2 rank's shapes: the totals below are one rank's prompt.
+    for s in shapes()?.iter().filter(|s| s.label.starts_with("tp2 ")) {
         let (n, k) = (s.n, s.k);
         let o = operands(gpu, s, 16384, &mut rng)?;
         // BF16 twin of the weight (exact) for the baseline.
@@ -75,13 +76,13 @@ fn mxfp8_gemm_bench_against_bf16_cublaslt() -> Result<()> {
             })
             .collect();
         let wbf = upload(gpu, &u16_bytes(&wb))?;
-        // Layers of this kind per TP2 rank, and whether it quantizes its own
-        // input (kv and the indexer share the q projection's).
+        // GEMMs of this shape per TP2 rank, and whether it quantizes its own
+        // input (k and v, two GEMMs a layer, share the q projection's).
         let (layers, own_quant) = match s.label {
-            "gdn qkvz" | "gdn out" => (36.0, true),
-            "qsa q" | "qsa o" => (12.0, true),
-            "qsa kv" | "qsa indexer" => (12.0, false),
-            _ => (48.0, true),
+            "tp2 gdn qkvz" | "tp2 gdn out" => (36.0, true),
+            "tp2 qsa q" | "tp2 qsa o" => (12.0, true),
+            "tp2 qsa k, v" => (24.0, false),
+            other => anyhow::bail!("no per-rank GEMM count for {other:?}"),
         };
         for (mi, &m) in MS.iter().enumerate() {
             let (q, sf) = quantized(gpu, &o, k, 0, m)?;
