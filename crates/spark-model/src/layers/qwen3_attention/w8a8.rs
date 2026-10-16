@@ -19,13 +19,15 @@
 //! a BF16 one (`prefill/paged_qkv.rs`, `prefill/cache_skip_qkv.rs`,
 //! `prefill/paged_oproj.rs`). The QSA indexer's `index_qk_proj` is its own
 //! BF16 weight, untouched. LoRA folds its delta beside the BF16 arms only,
-//! so a layer with an adapter refuses W8A8 at its first prefill.
+//! so an adapter with a q/k/v/o delta and W8A8 refuse each other on a layer
+//! at install, whichever comes second (an FFN- or MoE-only adapter is fine).
 
 use anyhow::{Context, Result, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
+use crate::layers::ops::lora_delta::LoraAttnWeights;
 use crate::layers::ops::{
     MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MxAct, MxW8a8, W8a8Swap, qwen4exp_w8a8, undo_on_err,
 };
@@ -38,8 +40,15 @@ pub(crate) struct AttnW8a8 {
     quant: KernelHandle,
 }
 
-const LORA: &str = "ATLAS_QWEN4EXP_PREFILL_W8A8 projections carry no LoRA delta; \
-                    set ATLAS_QWEN4EXP_PREFILL_W8A8=0 to serve an adapter";
+/// Why a q/k/v/o adapter and W8A8 prefill refuse each other.
+pub(super) const LORA: &str = "ATLAS_QWEN4EXP_PREFILL_W8A8 projections carry no LoRA delta; \
+                               set ATLAS_QWEN4EXP_PREFILL_W8A8=0 to serve an adapter on \
+                               q/k/v/o";
+
+/// Whether `lora` carries a delta for q, k, v or o (W8A8 prefill folds none).
+pub(super) fn adapts_projections(lora: Option<&LoraAttnWeights>) -> bool {
+    lora.is_some_and(|l| [l.q, l.k, l.v, l.o].iter().any(Option::is_some))
+}
 
 impl Qwen3AttentionLayer {
     /// Install the W8A8 prefill over the MXFP8 decode twins
@@ -62,6 +71,7 @@ impl Qwen3AttentionLayer {
             &mut self.attn.v_proj.weight,
             &mut o_bf16.weight,
         ];
+        ensure!(!adapts_projections(self.lora.as_ref()), LORA);
         ensure!(
             self.dense_mx.twins.len() == 4
                 && self.dense_mx.w8a8.is_none()
@@ -90,10 +100,8 @@ impl Qwen3AttentionLayer {
         Ok(W8a8Swap { allocated, bf16 })
     }
 
-    fn w8a8(&self) -> Result<Option<&AttnW8a8>> {
-        let w = self.dense_mx.w8a8.as_ref();
-        ensure!(w.is_none() || self.lora.is_none(), LORA);
-        Ok(w)
+    fn w8a8(&self) -> Option<&AttnW8a8> {
+        self.dense_mx.w8a8.as_ref()
     }
 
     /// The MXFP8 image of the q/k/v input `normed` (`[n, hidden]`); `None`
@@ -105,7 +113,7 @@ impl Qwen3AttentionLayer {
         n: u32,
         stream: u64,
     ) -> Result<Option<MxAct>> {
-        let Some(w) = self.w8a8()? else {
+        let Some(w) = self.w8a8() else {
             return Ok(None);
         };
         let (gpu, k) = (ctx.gpu, w.proj[0].k);
@@ -123,7 +131,7 @@ impl Qwen3AttentionLayer {
         [n, out_dim]: [u32; 2],
         stream: u64,
     ) -> Result<()> {
-        let w = self.w8a8()?.context("W8A8 q/k/v without W8A8 weights")?;
+        let w = self.w8a8().context("W8A8 q/k/v without W8A8 weights")?;
         let p = &w.proj[slot];
         ensure!(
             p.n == out_dim as usize,
@@ -145,7 +153,7 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let Some(w) = self.w8a8()? else {
+        let Some(w) = self.w8a8() else {
             return Ok(false);
         };
         let (o, (h, kd)) = (&w.proj[3], (h as usize, kd as usize));
@@ -182,8 +190,59 @@ impl Qwen3AttentionLayer {
         row0: usize,
         rows: usize,
     ) -> Option<qwen4exp_w8a8::Producer> {
-        self.dense_mx.w8a8.as_ref()?;
+        self.w8a8()?;
         let h = ctx.config.hidden_size;
         qwen4exp_w8a8::Producer::arm(ctx.buffers, x, total, row0, rows, h)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use spark_runtime::gpu::DevicePtr;
+    use spark_runtime::gpu::mock::MockGpuBackend;
+
+    use super::adapts_projections;
+    use crate::layers::ops::lora_delta::{LoraAttnWeights, LoraKernels, LoraPair};
+    use crate::weight_map::DenseWeight;
+
+    #[test]
+    fn only_a_q_k_v_or_o_delta_conflicts_with_w8a8() {
+        let none = LoraAttnWeights {
+            layer_idx: 3,
+            q: None,
+            k: None,
+            v: None,
+            o: None,
+            kernels: LoraKernels::new(&MockGpuBackend::new()).unwrap(),
+            q_route: None,
+            k_route: None,
+            v_route: None,
+            o_route: None,
+        };
+        assert!(!adapts_projections(None));
+        assert!(!adapts_projections(Some(&none)), "FFN / MoE only");
+        let w = DenseWeight {
+            weight: DevicePtr(0x100),
+        };
+        let pair = LoraPair {
+            a: w,
+            b: w,
+            rank: 8,
+            k_in: 2560,
+            n_out: 256,
+            scale: 1.0,
+            max_rank: 8,
+        };
+        let set: [fn(&mut LoraAttnWeights, LoraPair); 4] = [
+            |l, p| l.q = Some(p),
+            |l, p| l.k = Some(p),
+            |l, p| l.v = Some(p),
+            |l, p| l.o = Some(p),
+        ];
+        for (i, set) in set.into_iter().enumerate() {
+            let mut l = none;
+            set(&mut l, pair);
+            assert!(adapts_projections(Some(&l)), "projection {i}");
+        }
     }
 }
