@@ -166,8 +166,10 @@ fn raw_tensor_is_recognised_by_dtype_and_shape_only() {
     };
     assert_eq!(raw_mxfp8(&mx, "p").unwrap(), Some(want));
     assert!(raw_mxfp8(&mx, "e").unwrap().is_some());
-    // Not MXFP8: BF16; FP8 with a per-tensor F32 scale; FP8 with a 128-block
-    // `weight_scale_inv` (no `weight_scale`).
+    assert_eq!(mxfp8_geometry(&mx, "p").unwrap(), Some((640, 2560)));
+    // Not MXFP8: BF16; FP8 with a per-tensor F32 scale; FP8 with a per-row
+    // BF16 scale (unsloth FP8); FP8 with a 128-block `weight_scale_inv` (no
+    // `weight_scale`); packed NVFP4 (U8 weight, E4M3 scale).
     for other in [
         store(&[("p.weight", vec![640, 2560], BF16, 0x1000)]),
         store(&[
@@ -176,12 +178,29 @@ fn raw_tensor_is_recognised_by_dtype_and_shape_only() {
         ]),
         store(&[
             ("p.weight", vec![640, 2560], FP8E4M3, 0x1000),
+            ("p.weight_scale", vec![640, 1], BF16, 0x2000),
+        ]),
+        store(&[
+            ("p.weight", vec![640, 2560], FP8E4M3, 0x1000),
             ("p.weight_scale_inv", vec![5, 20], FP32, 0x2000),
+        ]),
+        store(&[
+            ("p.weight", vec![640, 1280], UInt8, 0x1000),
+            ("p.weight_scale", vec![640, 160], FP8E4M3, 0x2000),
         ]),
     ] {
         assert_eq!(raw_mxfp8(&other, "p").unwrap(), None);
+        assert_eq!(mxfp8_geometry(&other, "p").unwrap(), None);
     }
-    // An E4M3 weight beside a U8 scale of any other shape is refused.
+    // An E4M3 weight beside a U8 scale of any other shape (or K off the
+    // 32 grid) is refused.
+    for weight in [vec![640, 2560 + 16], vec![640, 2560, 1]] {
+        let bad = store(&[
+            ("p.weight", weight, FP8E4M3, 0x1000),
+            ("p.weight_scale", vec![640, 80], UInt8, 0x2000),
+        ]);
+        assert!(mxfp8_geometry(&bad, "p").is_err());
+    }
     for scale in [vec![640, 20], vec![80, 640], vec![640 * 80]] {
         let bad = store(&[
             ("p.weight", vec![640, 2560], FP8E4M3, 0x1000),
@@ -207,4 +226,6 @@ fn released_raw_bytes_are_refused_not_read() {
     release_raw_mxfp8(&st, &gpu, "p").unwrap(); // idempotent
     let e = raw_mxfp8(&st, "p").unwrap_err();
     assert!(e.to_string().contains("released"), "{e}");
+    // The geometry probe reads dtypes and shapes only, so it still answers.
+    assert_eq!(mxfp8_geometry(&st, "p").unwrap(), Some((64, 64)));
 }

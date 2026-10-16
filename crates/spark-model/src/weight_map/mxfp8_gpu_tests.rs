@@ -25,19 +25,16 @@ fn up(g: &dyn GpuBackend, bytes: &[u8]) -> DevicePtr {
 }
 
 fn kernel_vs_host(g: &dyn GpuBackend, data: &[u8], scales: &[u8], n: usize, k: usize) -> Vec<u16> {
-    let src = Mxfp8Source {
-        weight: Mxfp8Weight {
-            data: up(g, data),
-            scales: up(g, scales),
-            tiled: false,
-        },
+    let src = RawMxfp8 {
+        data: up(g, data),
+        scales: up(g, scales),
         n,
         k,
     };
     let out = dequant_mxfp8_to_bf16(g, &src).unwrap();
     let mut got = vec![0u8; n * k * 2];
     g.copy_d2h(out.weight, &mut got).unwrap();
-    for p in [out.weight, src.weight.data, src.weight.scales] {
+    for p in [out.weight, src.data, src.scales] {
         g.free(p).unwrap();
     }
     let got: Vec<u16> = got
@@ -94,7 +91,7 @@ fn mxfp8_gpu_kernel_matches_host_on_every_code_and_edge_exponent() {
         })
         .collect();
     let edges = [*EXACT_E8M0.start(), *EXACT_E8M0.end(), 127];
-    let scales: Vec<u8> = (0..n * k / BLOCK)
+    let scales: Vec<u8> = (0..n * k / MXFP8_BLOCK)
         .map(|i| {
             if i < 3 * 8 {
                 edges[i / 8]
