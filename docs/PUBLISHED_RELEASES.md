@@ -39,12 +39,18 @@ commits.
 
 | | SparkGLM | SparkQwen |
 |---|---|---|
-| Product `main` pin (2026-10-15) | `sparkglm/atlas-20261015-vision` @ `16315004` ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261015-vision` @ `1954e759` ([sparkqwen#7](https://github.com/Enntity/sparkqwen/pull/7)) |
+| Product `main` pin | `sparkglm/atlas-20261015-vision` @ `16315004`, 2026-10-15 ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261016-fp4local` @ `9f64bf6b`, 2026-10-16 ([sparkqwen#8](https://github.com/Enntity/sparkqwen/pull/8)) |
 | Shared layer | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
 | Atlas-Inf base | `7ffd183f` | same |
-| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261013-prefill` @ `fcf9735f` |
+| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261015-vision` @ `1954e759` |
 
 The pinned engines are the current `sparkglm`, `sparkqwen` and
 `spark-shared` branch heads. Their measurements (text output, vision, fill, RigMark and a
 same-prompt speed comparison against production) are in each product's
-`results/2026-10-15-shared-engine/`.
+`results/2026-10-15-shared-engine/`. SparkQwen's FP4-Local release adds the
+FP4-Local series on the `sparkqwen` layer: NVIDIA's
+`nvidia/Qwen3.8-Flash-Next-FP4-Local` checkpoint (the product's new default)
+with lossless CSF scale decoding, MXFP8 decode, W8A8 MXFP8 prefill, a packed
+NVFP4 PLE table and native NVFP4 MTP experts; the NVFP4 checkpoint loads as
+before. Its measurements, including RigMark through the release image, are in
+SparkQwen's `results/2026-10-16-fp4local/`.
