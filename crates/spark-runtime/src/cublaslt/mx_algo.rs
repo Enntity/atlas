@@ -13,17 +13,22 @@
 //! Why only in-order candidates (no split-K, no reduction scheme): under one
 //! such kernel every output is one FP32 accumulation of the block-scaled k32
 //! MMAs over K in order, whatever the tile, the row count or the row's
-//! position in the pass, so they all give the same bytes, and a bucket may
-//! take any of them without breaking the row invariance the qwen4_exp
-//! prefill keeps (`ATLAS_QWEN4EXP_PREFILL_ROWINV`: a token's output
+//! position in the pass, so they should all give the same bytes, and a
+//! bucket may then take any of them without breaking the row invariance the
+//! qwen4_exp prefill keeps (`ATLAS_QWEN4EXP_PREFILL_ROWINV`: a token's output
 //! independent of the pass's height and of where it starts). The heuristic's
 //! split-K candidates (splitK -2, reduction 2) are not: they differed from
 //! the in-order bytes in 1-17 outputs at many (shape, M) points, and are
 //! sometimes its FIRST pick (13.0.0 offers only a split-K kernel for the
 //! TP2 indexer 320x2560 at 64 and 100 rows unless asked for in-order ones).
-//! `mxfp8_act_test_gpu.rs` (spark-model) checks this byte for byte on both
-//! 13.0.0 and 13.1.1: every candidate, M = 1 .. 16384 at odd offsets, every
-//! FP4-Local TP2 shape -- in-order candidates never differed.
+//!
+//! "Should" is checked, not assumed: `mxfp8_gemm_test_gpu.rs` (spark-model)
+//! runs every candidate at M = 1 .. 16384 and odd pass offsets on each shape
+//! of [`super::mx_sweep::MX_SWEEP`] and compares byte for byte. A GEMM takes
+//! a kernel per bucket only where that sweep passed for its `(N, K)` on the
+//! linked cuBLASLt ([`super::mx_sweep::verified`]); every other GEMM runs ONE
+//! in-order kernel for all row counts, tuned once at the largest bucket it is
+//! prepared for, which is row-invariant by itself (`fixed_algo`'s argument).
 //!
 //! Timing runs on the caller's own operands (the output is rewritten by the
 //! real call that follows) and synchronizes `stream`, once per key; never
@@ -67,32 +72,24 @@ pub(super) fn bucket(m: u32) -> u32 {
         .clamp(MIN_BUCKET, MAX_BUCKET)
 }
 
-/// cuBLASLt versions ([`super::version`]) on which `mxfp8_gemm_test_gpu.rs`
-/// found every in-order candidate byte-identical across row counts and pass
-/// offsets: 13.0.0 (the runtime image) and 13.1.1. On any other version
-/// every row count shares ONE in-order kernel (the first call's pick), which
-/// is row-invariant by itself (`fixed_algo`'s argument), at some speed.
-const MX_VERIFIED_LT: [usize; 2] = [130000, 130101];
-
-/// Whether this cuBLASLt may take a kernel per row bucket.
-fn per_bucket() -> bool {
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
-        let v = super::version();
-        let ok = MX_VERIFIED_LT.contains(&v);
-        if !ok {
-            tracing::warn!(
-                "cuBLASLt MXFP8: {v} is not a version the per-bucket kernel choice was \
-                 verified on ({MX_VERIFIED_LT:?}); one kernel serves every row count"
-            );
-        }
-        ok
-    })
+/// The cache key `m` rows of `n x k` are served from on cuBLASLt `version`:
+/// their row bucket where the sweep verified the shape on that version, else
+/// 0, one entry for every row count.
+fn key(version: usize, n: u32, k: u32, m: u32) -> Key {
+    let per_bucket = super::mx_sweep::verified(version, n, k);
+    (n, k, if per_bucket { bucket(m) } else { 0 })
 }
 
-/// The cache key `m` rows of `n x k` are served from.
-fn key(n: u32, k: u32, m: u32) -> Key {
-    (n, k, if per_bucket() { bucket(m) } else { 0 })
+/// [`key`] on the linked cuBLASLt.
+fn key_here(n: u32, k: u32, m: u32) -> Key {
+    key(super::version(), n, k, m)
+}
+
+/// Whether `n x k` takes a kernel per row bucket on the linked cuBLASLt
+/// (else one kernel serves every row count).
+#[cfg(any(test, feature = "test-utils"))]
+pub fn mx_per_bucket(n: u32, k: u32) -> bool {
+    super::mx_sweep::verified(super::version(), n, k)
 }
 
 /// `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK`.
@@ -243,7 +240,7 @@ pub(super) fn select(
     ptrs: [u64; 3],
     stream: u64,
 ) -> Result<Algo> {
-    let key = key(n, k, m);
+    let key = key_here(n, k, m);
     let cached = CACHE
         .lock()
         .unwrap()
@@ -328,10 +325,16 @@ fn tune(ctx: &Ctx, p: &Problem, [m, n, k]: [u32; 3], ptrs: [u64; 3], stream: u64
     let best = (0..fit.len())
         .min_by(|&i, &j| times[i].total_cmp(&times[j]))
         .expect("non-empty");
+    let rows = match key_here(n, k, m).2 {
+        0 => format!(
+            "every row count (not swept on cuBLASLt {}: one kernel)",
+            super::version()
+        ),
+        b => format!("the {b}-row bucket"),
+    };
     tracing::info!(
-        "cuBLASLt MXFP8 {n}x{k}, {}-row bucket (tuned at {m} rows): {} at {:.3} ms \
+        "cuBLASLt MXFP8 {n}x{k}, {rows}, tuned at {m} rows: {} at {:.3} ms \
          ({} in-order of {offered} offered; the first ran {:.3} ms)",
-        bucket(m),
         description(&fit[best]),
         times[best],
         fit.len(),
@@ -344,7 +347,7 @@ fn tune(ctx: &Ctx, p: &Problem, [m, n, k]: [u32; 3], ptrs: [u64; 3], stream: u64
 /// its bucket's first GEMM).
 pub fn mx_algo_description(n: u32, k: u32, m: u32) -> Option<String> {
     let cache = CACHE.lock().unwrap();
-    let a = cache.iter().find(|e| e.0 == key(n, k, m))?.1;
+    let a = cache.iter().find(|e| e.0 == key_here(n, k, m))?.1;
     Some(description(&a))
 }
 
@@ -423,7 +426,7 @@ pub fn fp8_gemm_mx_prepare(n: u32, k: u32, m_max: u32, stream: u64) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::bucket;
+    use super::{bucket, key};
 
     #[test]
     fn rows_map_to_power_of_two_buckets_within_64_to_16384() {
@@ -437,5 +440,28 @@ mod tests {
         assert_eq!(bucket(16046), 16384);
         assert_eq!(bucket(40000), 16384);
         assert_eq!(bucket(u32::MAX), 16384);
+    }
+
+    #[test]
+    fn only_a_swept_shape_on_its_swept_cublaslt_gets_a_key_per_bucket() {
+        // Swept on 13.0.0 and 13.1.1: one key per bucket.
+        for v in [130000, 130101] {
+            assert_eq!(key(v, 8192, 2560, 1), (8192, 2560, 64));
+            assert_eq!(key(v, 8192, 2560, 100), (8192, 2560, 128));
+            assert_eq!(key(v, 2560, 3072, 16046), (2560, 3072, 16384));
+        }
+        // Another version, a shape not swept yet, one never swept: a
+        // single key for every row count.
+        for (v, n, k) in [
+            (130200, 8192, 2560),
+            (0, 6144, 2560),
+            (130000, 256, 2560),
+            (130101, 16384, 2560),
+            (130000, 320, 2560),
+        ] {
+            for m in [1, 64, 65, 2048, 16384, 40000] {
+                assert_eq!(key(v, n, k, m), (n, k, 0), "{v} {n}x{k} m={m}");
+            }
+        }
     }
 }

@@ -2,15 +2,17 @@
 
 //! GPU tests (`#[ignore]`; a GB10, cuBLASLt with MXFP8 and a kernel target
 //! with `mxfp8_act_quant`) of `cublaslt::fp8_gemm_act_weight_t_mx` at the
-//! TP2 per-rank FP4-Local prefill shapes (real weights with
-//! `ATLAS_FP4L_CKPT`, else random codes at the checkpoint's scale range):
+//! FP4-Local prefill shapes of `cublaslt::MX_SWEEP` (TP2 rank 0's cut and
+//! TP1; real weights with `ATLAS_FP4L_CKPT`, else random codes at the
+//! checkpoint's scale range):
 //!
 //! - against an f64 host reference on sampled outputs;
 //! - every cuBLASLt candidate (the unmasked heuristic list and the
 //!   in-order-only one tuning asks for) at M = 1 .. 16384 and odd pass
 //!   offsets, against one reference: every in-order kernel must give the
-//!   same bytes (the row invariance `mx_algo` relies on); split-K
-//!   differences are reported;
+//!   same bytes (what lets `mx_algo` choose a kernel per row bucket for a
+//!   shape this passes on: `MX_SWEEP`'s `verified_on`, see `mx_sweep.rs`);
+//!   split-K differences are reported;
 //! - a microbench (`bench`) of the tuned GEMM against BF16 cuBLASLt plus the
 //!   quant's cost.
 //!
@@ -29,8 +31,9 @@ use super::gpu_tests::{down, kernels, u16_bytes, unit};
 use super::tests::{bf16, e4m3_to_f32, quant_rows};
 use super::*;
 
-/// A TP2 rank's MXFP8 projection: `(label, n, k)` and how to cut it from
-/// the checkpoint: row ranges of stacked tensors, or a K column range.
+/// A swept MXFP8 projection: `(label, n, k)` from `cublaslt::MX_SWEEP` and
+/// how to cut it from the checkpoint: row ranges of stacked tensors, or a K
+/// column range.
 pub(super) struct Shape {
     label: &'static str,
     n: usize,
@@ -42,85 +45,75 @@ pub(super) struct Shape {
     layer: usize,
 }
 
-/// The FP4-Local prefill projections a TP2 rank runs (rank 0's cut).
-pub(super) const SHAPES: [Shape; 8] = [
-    Shape {
-        label: "gdn qkvz",
-        n: 8192,
-        k: 2560,
-        rows: &[
-            (
-                "linear_attn.in_proj_qkv",
-                &[(0, 1024), (2048, 3072), (4096, 7168)],
-            ),
-            ("linear_attn.in_proj_z", &[(0, 3072)]),
-        ],
-        cols: None,
-        layer: 0,
-    },
-    Shape {
-        label: "gdn out",
-        n: 2560,
-        k: 3072,
-        rows: &[],
-        cols: Some(("linear_attn.out_proj", 0)),
-        layer: 0,
-    },
-    Shape {
-        label: "qsa q",
-        n: 6144,
-        k: 2560,
-        rows: &[("self_attn.q_proj", &[(0, 6144)])],
-        cols: None,
-        layer: 3,
-    },
-    Shape {
-        label: "qsa kv",
-        n: 512,
-        k: 2560,
-        rows: &[
-            ("self_attn.k_proj", &[(0, 256)]),
-            ("self_attn.v_proj", &[(0, 256)]),
-        ],
-        cols: None,
-        layer: 3,
-    },
-    Shape {
-        label: "qsa o",
-        n: 2560,
-        k: 3072,
-        rows: &[],
-        cols: Some(("self_attn.o_proj", 0)),
-        layer: 3,
-    },
-    Shape {
-        label: "qsa indexer",
-        n: 320,
-        k: 2560,
-        rows: &[("self_attn.indexer.index_qk_proj", &[(0, 320)])],
-        cols: None,
-        layer: 3,
-    },
-    Shape {
-        label: "shared gate_up",
-        n: 640,
-        k: 2560,
-        rows: &[
-            ("mlp.shared_expert.gate_proj", &[(0, 320)]),
-            ("mlp.shared_expert.up_proj", &[(0, 320)]),
-        ],
-        cols: None,
-        layer: 0,
-    },
-    Shape {
-        label: "shared down",
-        n: 2560,
-        k: 320,
-        rows: &[],
-        cols: Some(("mlp.shared_expert.down_proj", 0)),
-        layer: 0,
-    },
-];
+type Cut = (
+    &'static [(&'static str, &'static [(usize, usize)])],
+    Option<(&'static str, usize)>,
+    usize,
+);
+
+/// Where each `MX_SWEEP` label's weight comes from: TP2 is rank 0's cut,
+/// TP1 the whole projection. GDN layer 0, QSA layer 3.
+fn cut(label: &str) -> Option<Cut> {
+    const QKV: &str = "linear_attn.in_proj_qkv";
+    const Z: &str = "linear_attn.in_proj_z";
+    Some(match label {
+        "tp2 gdn qkvz" => (
+            &[
+                (QKV, &[(0, 1024), (2048, 3072), (4096, 7168)]),
+                (Z, &[(0, 3072)]),
+            ],
+            None,
+            0,
+        ),
+        "tp1 gdn qkvz" => (&[(QKV, &[(0, 10240)]), (Z, &[(0, 6144)])], None, 0),
+        "tp2 gdn out" | "tp1 gdn out" => (&[], Some(("linear_attn.out_proj", 0)), 0),
+        "tp2 qsa q" => (&[("self_attn.q_proj", &[(0, 6144)])], None, 3),
+        "tp1 qsa q" => (&[("self_attn.q_proj", &[(0, 12288)])], None, 3),
+        "tp2 qsa k, v" => (&[("self_attn.k_proj", &[(0, 256)])], None, 3),
+        "tp1 qsa k, v" => (&[("self_attn.k_proj", &[(0, 512)])], None, 3),
+        "tp2 qsa o" | "tp1 qsa o" => (&[], Some(("self_attn.o_proj", 0)), 3),
+        _ => return None,
+    })
+}
+
+/// Every shape of `cublaslt::MX_SWEEP`, with its cut.
+pub(super) fn shapes() -> Result<Vec<Shape>> {
+    cublaslt::MX_SWEEP
+        .iter()
+        .map(|s| {
+            let (rows, cols, layer) = cut(s.label)
+                .with_context(|| format!("MX_SWEEP's {:?} has no checkpoint cut", s.label))?;
+            Ok(Shape {
+                label: s.label,
+                n: s.n as usize,
+                k: s.k as usize,
+                rows,
+                cols,
+                layer,
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn every_swept_shape_has_a_checkpoint_cut() {
+    let shapes = shapes().unwrap();
+    assert_eq!(shapes.len(), cublaslt::MX_SWEEP.len());
+    for s in &shapes {
+        // A row cut stacks exactly n rows; a K cut takes k of the columns.
+        let stacked: usize = s
+            .rows
+            .iter()
+            .flat_map(|(_, r)| r.iter().map(|(lo, hi)| hi - lo))
+            .sum();
+        assert!(
+            (s.cols.is_some() && stacked == 0) || (s.cols.is_none() && stacked == s.n),
+            "{}: {stacked} rows for N = {}",
+            s.label,
+            s.n
+        );
+    }
+}
 
 /// Row-major `(E4M3 [n, k], UE8M0 [n, k/32])` for `s`: the checkpoint's cut
 /// with `ATLAS_FP4L_CKPT`, else random codes at the checkpoint's scale range.
@@ -265,20 +258,43 @@ const SWEEP: [(usize, usize); 11] = [
 ];
 const SWEEP_ROWS: usize = 16384 + 64;
 
+/// Whether a `mx_algo_description` names an in-order kernel.
+fn in_order(d: &str) -> bool {
+    d.contains("splitK=1 reduction=0") || d.contains("splitK=0 reduction=0")
+}
+
 #[test]
 #[ignore = "needs a GB10 GPU and cuBLASLt with MXFP8"]
-fn mxfp8_gemm_prepare_tunes_every_bucket_up_to_m_max() -> Result<()> {
+fn mxfp8_gemm_prepare_tunes_one_kernel_or_every_bucket_up_to_m_max() -> Result<()> {
     let gpu = backend()?;
-    // A shape no other test uses, so the cache starts empty for it.
+    let stream = gpu.default_stream();
+    let desc = cublaslt::mx_algo_description;
+    // Never swept: ONE kernel for every row count, above m_max too. A shape
+    // no other test uses, so the cache starts empty for it.
     let (n, k) = (384u32, 1536u32);
-    assert!(cublaslt::mx_algo_description(n, k, 64).is_none());
-    cublaslt::fp8_gemm_mx_prepare(n, k, 3000, gpu.default_stream())?;
-    for m in [1, 64, 65, 128, 1000, 2048, 3000, 4096] {
-        let d = cublaslt::mx_algo_description(n, k, m)
-            .with_context(|| format!("bucket of {m} rows untuned"))?;
-        assert!(d.contains("splitK=1 reduction=0"), "{m} rows: {d}");
+    assert!(!cublaslt::mx_per_bucket(n, k));
+    assert!(desc(n, k, 64).is_none());
+    cublaslt::fp8_gemm_mx_prepare(n, k, 3000, stream)?;
+    let one = desc(n, k, 1).context("untuned")?;
+    assert!(in_order(&one), "{one}");
+    for m in [64, 65, 1000, 3000, 4096, 4097, 16384] {
+        assert_eq!(desc(n, k, m).as_ref(), Some(&one), "{m} rows");
     }
-    assert!(cublaslt::mx_algo_description(n, k, 4097).is_none());
+    // Swept, on a cuBLASLt it passed on: a kernel per bucket up to m_max.
+    let s = cublaslt::MX_SWEEP[0];
+    if cublaslt::mx_per_bucket(s.n, s.k) {
+        let above_untuned = desc(s.n, s.k, 8192).is_none();
+        cublaslt::fp8_gemm_mx_prepare(s.n, s.k, 3000, stream)?;
+        for m in [1, 64, 65, 128, 1000, 2048, 3000, 4096] {
+            let d = desc(s.n, s.k, m).with_context(|| format!("bucket of {m} rows untuned"))?;
+            assert!(in_order(&d), "{m} rows: {d}");
+        }
+        if above_untuned {
+            assert!(desc(s.n, s.k, 8192).is_none(), "tuned past m_max");
+        }
+    } else {
+        println!("cuBLASLt {}: not a swept version", cublaslt::version());
+    }
     Ok(())
 }
 
@@ -289,7 +305,7 @@ fn mxfp8_gemm_is_correct_and_every_in_order_kernel_gives_the_same_rows() -> Resu
     let stream = gpu.default_stream();
     println!("cuBLASLt {}", cublaslt::version());
     let mut rng = Rng(0x0dd_ba11);
-    for s in &SHAPES {
+    for s in &shapes()? {
         let (n, k) = (s.n, s.k);
         let o = operands(gpu, s, SWEEP_ROWS, &mut rng)?;
         // Reference: the first in-order candidate over all SWEEP_ROWS rows.
