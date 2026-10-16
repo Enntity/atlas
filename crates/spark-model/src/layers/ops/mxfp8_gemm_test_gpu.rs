@@ -266,6 +266,23 @@ const SWEEP: [(usize, usize); 11] = [
 const SWEEP_ROWS: usize = 16384 + 64;
 
 #[test]
+#[ignore = "needs a GB10 GPU and cuBLASLt with MXFP8"]
+fn mxfp8_gemm_prepare_tunes_every_bucket_up_to_m_max() -> Result<()> {
+    let gpu = backend()?;
+    // A shape no other test uses, so the cache starts empty for it.
+    let (n, k) = (384u32, 1536u32);
+    assert!(cublaslt::mx_algo_description(n, k, 64).is_none());
+    cublaslt::fp8_gemm_mx_prepare(n, k, 3000, gpu.default_stream())?;
+    for m in [1, 64, 65, 128, 1000, 2048, 3000, 4096] {
+        let d = cublaslt::mx_algo_description(n, k, m)
+            .with_context(|| format!("bucket of {m} rows untuned"))?;
+        assert!(d.contains("splitK=1 reduction=0"), "{m} rows: {d}");
+    }
+    assert!(cublaslt::mx_algo_description(n, k, 4097).is_none());
+    Ok(())
+}
+
+#[test]
 #[ignore = "needs a GB10 GPU, cuBLASLt with MXFP8 and the mxfp8_act_quant kernels"]
 fn mxfp8_gemm_is_correct_and_every_in_order_kernel_gives_the_same_rows() -> Result<()> {
     let gpu = backend()?;
@@ -427,4 +444,4 @@ fn mxfp8_gemm_is_correct_and_every_in_order_kernel_gives_the_same_rows() -> Resu
 }
 
 #[path = "mxfp8_gemm_bench_gpu.rs"]
-mod bench;
+pub(super) mod bench;

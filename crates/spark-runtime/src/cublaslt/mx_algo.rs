@@ -67,6 +67,34 @@ pub(super) fn bucket(m: u32) -> u32 {
         .clamp(MIN_BUCKET, MAX_BUCKET)
 }
 
+/// cuBLASLt versions ([`super::version`]) on which `mxfp8_gemm_test_gpu.rs`
+/// found every in-order candidate byte-identical across row counts and pass
+/// offsets: 13.0.0 (the runtime image) and 13.1.1. On any other version
+/// every row count shares ONE in-order kernel (the first call's pick), which
+/// is row-invariant by itself (`fixed_algo`'s argument), at some speed.
+const MX_VERIFIED_LT: [usize; 2] = [130000, 130101];
+
+/// Whether this cuBLASLt may take a kernel per row bucket.
+fn per_bucket() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let v = super::version();
+        let ok = MX_VERIFIED_LT.contains(&v);
+        if !ok {
+            tracing::warn!(
+                "cuBLASLt MXFP8: {v} is not a version the per-bucket kernel choice was \
+                 verified on ({MX_VERIFIED_LT:?}); one kernel serves every row count"
+            );
+        }
+        ok
+    })
+}
+
+/// The cache key `m` rows of `n x k` are served from.
+fn key(n: u32, k: u32, m: u32) -> Key {
+    (n, k, if per_bucket() { bucket(m) } else { 0 })
+}
+
 /// `CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK`.
 const PREF_REDUCTION_SCHEME_MASK: u32 = 3;
 
@@ -217,7 +245,7 @@ pub(super) fn select(
     ptrs: [u64; 3],
     stream: u64,
 ) -> Result<Algo> {
-    let key = (n, k, bucket(m));
+    let key = key(n, k, m);
     let cached = CACHE
         .lock()
         .unwrap()
@@ -227,7 +255,8 @@ pub(super) fn select(
     if let Some(a) = cached {
         anyhow::ensure!(
             takes(ctx, p, &a),
-            "cuBLASLt MXFP8: the {n}x{k} kernel of the {}-row bucket ({}) refuses {m} rows",
+            "cuBLASLt MXFP8: the {n}x{k} kernel of the {}-row bucket (0: all) ({}) refuses \
+             {m} rows",
             key.2,
             description(&a)
         );
@@ -317,7 +346,7 @@ fn tune(ctx: &Ctx, p: &Problem, [m, n, k]: [u32; 3], ptrs: [u64; 3], stream: u64
 /// its bucket's first GEMM).
 pub fn mx_algo_description(n: u32, k: u32, m: u32) -> Option<String> {
     let cache = CACHE.lock().unwrap();
-    let a = cache.iter().find(|e| e.0 == (n, k, bucket(m)))?.1;
+    let a = cache.iter().find(|e| e.0 == key(n, k, m))?.1;
     Some(description(&a))
 }
 
