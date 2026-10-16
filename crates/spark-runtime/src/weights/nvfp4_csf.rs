@@ -224,7 +224,8 @@ struct Part {
 /// The disk loaders (`SafetensorsLoader`, `FastSafetensorsLoader`) route CSF
 /// parts here instead of uploading them, so the store only ever sees the
 /// decoded `weight_scale`, and the U32 exception stream (a dtype the store
-/// does not carry) never reaches it.
+/// does not carry) never reaches it. The RDMA weight tier, which copies
+/// tensors as they are, refuses CSF parts.
 ///
 /// It is also the one place that knows which scales came from a pair, so the
 /// loaders report every plain tensor too ([`Self::note_plain`]): a scale both
