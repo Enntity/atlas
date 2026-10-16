@@ -77,7 +77,7 @@ enum MtpExpertLayout {
     /// RadixArk: fused `[E,2I,H]` + `[E,H,I]` BF16 tensors.
     StackedBf16,
     /// nvidia NVFP4 release: per-expert `experts.{e}.{gate,up,down}_proj.weight`
-    /// + `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
+    /// plus `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
     /// `quantized_layers` map entry `mtp.layers.0.mlp.experts`.
     PerExpertFp8BlockScaled,
     /// nvidia FP4-Local: per-expert standard ModelOpt NVFP4 (`weight` U8
