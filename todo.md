@@ -5,8 +5,14 @@ context, current state, hosts, profile and the evidence index; nothing there
 is duplicated here. Q2 diagnostic sequencing detail lives in
 [docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md);
 decisions in [decisions.md](decisions.md); experiment results in
-[q2-diagnostic.md](q2-diagnostic.md). Evidence paths are relative to the
-durable root `/home/colum/Workspace/atlas-exl3-validation-20261010`.
+[q2-diagnostic.md](q2-diagnostic.md). Decode-performance results live in the
+decode ledger, `docs/design/decode-vllm-parity-ledger-20261015.md` on the
+local, unpushed branch `perf/decode-vllm-parity-20261015` (worktree
+`../atlas-perf`). Evidence paths are
+relative to the durable root `/home/colum/Workspace/atlas-exl3-validation-20261010`.
+
+Completed items are removed from the active lists below. Their evidence is
+listed under "Completed — evidence pointers", and their history is in git.
 
 ## Objective
 
@@ -18,7 +24,8 @@ profile has:
   statistical gate (Q2);
 - **qualified API behavior** (Q3) and **task quality** (Q4);
 - a **measured performance contract** (P0 baseline plus targets, with the
-  optimizations that meet them);
+  optimizations that meet them). The working target is the vLLM reference's
+  ~25–35 tok/s decode on this ring, to meet and then beat;
 - **independently qualified serving features** (F1–F4) where offered;
 - a **reproducible release record** with regression detection (R1/R2).
 
@@ -31,6 +38,16 @@ Rules that apply throughout:
   speedup.
 - The Sparks are a single shared resource: one experiment owner across
   both ranks.
+  - **Every GPU run**, including A/Bs, traces and standalone
+    microbenchmarks, takes the host lock: `flock /tmp/atlas-bench.lock …`.
+    `ab_full.sh` on the perf branch takes it itself.
+  - Containers use `--cpuset-cpus 15-19`. The 10-19 range pins every
+    thread to CPU 10 because of `isolcpus`.
+- **Bit-exact** means the same output bytes as before the change: identical
+  logits in capture mode, or the same `output_sha256` in graph mode. Any
+  numerics-changing optimization sits behind its own default-off flag, is
+  labelled in the ledger, and needs requalification before a default flip
+  (operator decision 2026-10-15).
 
 ## Roadmap
 
@@ -38,213 +55,192 @@ Rules that apply throughout:
 |---|---|---|---|
 | **M1 — Numerical qualification** (critical path) | Q2, closing Q1 | Fresh image passes gate v2 with all controls on both ranks | **Blocked at reference verifiability; diagnostics remain** |
 | M2 — Behavior and quality | Q3, Q4 | Behavior receipts pass; Q4 thresholds met on the qualified profile | Q3 partial; Q4 harness only |
-| M3 — Performance | P0 → P1–P6 | Baseline + targets recorded; optimizations meet them without regressing M1/M2 | P0 prepared, not run |
-| M4 — Serving features | F1–F4 | Each feature qualified independently | Not started |
+| M3 — Performance | P0 → P1–P6 | Baseline + targets recorded; optimizations meet them without regressing M1/M2 | **Decode 0.663 → 0.0457 s/token, bit-exact** (~21.9 tok/s; dev branch, unqualified, preliminary; ledger). Numerics-changing flag stack: 0.0425 s/token |
+| M4 — Serving features | F1–F4 | Each feature qualified independently | F1 graphs used by the perf stack (unqualified); F4 phase 2 in progress |
 | M5 — Release | R1, R2 | Qualified image + regression gate | Not started |
 
 **Dependencies and parallelism**
-- M1 gates M2's Q4, M3's optimizations, M4 and M5.
+- M1 gates M2's Q4, M3's qualified optimizations, M4 and M5.
 - CPU-only work may proceed alongside M1 GPU work, provided it does not
-  touch the frozen comparison profile:
-  - Q3 surfaces and harnesses;
-  - the C2 knob implementation;
-  - P0 command review.
-- P0 profiling may run on the unqualified image as a labeled diagnostic, but
-  only in a GPU window M1 does not need. Repeat it after M1.
+  touch the frozen comparison profile.
+- Performance work runs on the unqualified image `src-4ee96c12b44c`, with
+  dev binaries bind-mounted, as labelled diagnostics. Repeat after M1.
 
 ### M1 phases
 
-1. **Gate v2 campaign:** completed 2026-10-14. Corrected evaluator verdict is
-   **UNVERIFIABLE**: the reference ensemble failed one H3 and one H4
-   leave-one-out check. The evaluator correction changed no metric or
-   threshold; see the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
-2. **Causality:** C2, then the L1 escalation, then the G-fallbacks (G8/G9
-   binding first). This finds the dominant final-logit cause.
+1. **Gate v2 campaign:** completed 2026-10-14. The verdict is UNVERIFIABLE
+   (reference ensemble H3/H4 leave-one-out failures). The reference-side
+   non-determinism is localized: fused-MoE FP32 atomics and the indexer
+   top-k order (continue.md §1).
+2. **Causality:** C2 is done; the L1 escalation is open below, then the
+   G-fallbacks (G8/G9 binding first).
 3. **Fix:** the repeat Rust/vLLM/source review, neighbor coverage, and the
-   production fix with its obligations (v24 or whatever causality points to).
-4. **Qualify:**
-   - fresh no-cache image, fingerprints and neutrality proofs;
-   - v2 collection in randomised order (fixed 15 references + 3 held-outs + 2
-     candidates + perturbations + MDE);
-   - verdict.
+   production fix with its obligations.
+4. **Qualify:** fresh no-cache image, fingerprints and neutrality proofs,
+   then v2 collection in randomised order and the verdict.
 
-## Now — reference-verifiability follow-up and M1 causality
+## Now
 
-The worker transport repair, fresh no-cache image and full 32-request
-short16/long neutrality proof are complete. The earlier C2 treatment stopped
-because the TP worker lacked the request-ID binding; its evidence is preserved.
-Fresh reference-exact C2 completed as `c2-refexact-f099-01`: controls pass,
-with mixed arithmetic scores and unchanged `longer` rows. Separate v24 repeats
-also completed with identical scores and passing controls. Source-bound
-`l1-refexact-f099-01` stopped on reference-worker shutdown after collecting
-both candidate windows and eight reference-control rows. Candidate observer
-neutrality passes; controlled stop SIGKILL/exit137 was rejected. Lifecycle
-correction `1204a210` passed independent review and full CPU validation
-(612 tests, 278 subtests). Fresh `l1-refexact-f099-02` completed all 32
-requests with every container exiting zero. Candidate observer matches 8/8;
-reference observer matches 1/8, with text/thresholds unchanged. Attribution
-is withheld. Next establish reference observer verifiability before L1
-bisection; [L1 record](docs/design/l1-execution-20261014.md). The completed v2 campaign still
-blocks qualification at reference verifiability. Inspect both hosts before
-new GPU work (continue.md "Before any GPU work").
+### A. M1 causality (open)
 
-1. **Resolve reference-verifiability failures before further qualification.**
-   - [x] Complete the fixed 26-attempt collection (832 receipts), archive all
-     artifacts and teardown both hosts. Campaign:
-     `gate-v2-qualification-20261013-luna1/`.
-   - [x] Correct the independent-held-out byte-identity bug with regression
-     coverage; 24 focused tests pass. Preserve the frozen INCOMPLETE report
-     and corrected UNVERIFIABLE report; thresholds/metrics unchanged.
-   - [x] Review and commit the evaluator correction and qualification records.
-     **Done:** `757e7da4`; independent review, 24 focused tests and 319
-     EXL3 unittest cases pass; archived evaluator/report hashes reverified.
-   - [x] Diagnose H3 index 13 / `v2ref14` (`short16/longer/r3`) and
-     H4 index 14 / `v2ref15` (`short16/code/r1`) from existing reference-only evidence. Separate these
-     failures from candidate C2 causality and historical ref13 mode discovery.
-     Reference-only replay reproduces both failures; no recorded profile/cache
-     difference explains them. [Diagnosis](docs/design/exl3-reference-verifiability-diagnosis-20261014.md).
-   - [x] Decide whether reference runtime pinning or a protocol amendment is
-     justified by that diagnosis. Preserve this campaign; no top-ups,
-     replacement draws or unchanged retries to seek PASS. Any new campaign
-     must be separately registered before collection. **Decision 2026-10-14:**
-     investigate runtime pinning in a separate reference-only diagnostic;
-     no concrete qualification amendment is justified without causal evidence.
-   - [x] Register and execute the reference-only runtime-mechanism diagnostic
-     with routing/collective telemetry and engagement controls.
-     **Done 2026-10-15:** [result](docs/design/exl3-runtime-mechanism-probe-result-20261015.md),
-     [registration](docs/design/exl3-runtime-mechanism-probe-registration.md)
-     (pre-collection corrections 1–6, on01 record). Five of six attempts
-     complete; on01 failed on a probe wiring defect and is retained. Executed
-     EXL3 launch plans were unobservable because nsys does not trace forked
-     workers. No draw recurred either singleton or left the campaign H3
-     envelope (worst 0.155 of the limit). Router gate inputs diverge first,
-     at a row-dependent layer 8–33, and expert flips follow; the collective
-     dispatch is identical across draws. Mechanism unresolved.
-   - [x] Next mechanism step: per-layer hidden-state capture.
-     **Done 2026-10-15:** [result](docs/design/exl3-hidden-state-localization-result-20261015.md).
-     In 96/96 comparisons the first differing tensor is the EXL3 fused-MoE
-     FP32 output (atomic accumulation of top-8 experts), from layer 3, with
-     byte-identical inputs and routing. Rounding absorbs the last-bit noise
-     until a row-dependent layer.
-   - [x] One-variable `EXL3_FUSED_MOE=0` determinism test. **Done
-     2026-10-15:** [result](docs/design/exl3-fused-moe-determinism-result-20261015.md).
-     25/32 rows identical (primary FAIL as registered). Every row below 2052
-     tokens is deterministic; a second source starts exactly at the indexer
-     pool-selection threshold (2052). The loop profile is not a neutral pin.
-   - [x] Localize the indexer non-determinism beyond 2051 tokens. **Done
-     2026-10-15:** [result](docs/design/exl3-indexer-localization-result-20261015.md).
-     `top_k_per_row_prefill` returns the correct pool set in a run-dependent
-     order, and sparse MLA attention accumulates in that order.
-   - [x] Reference-determinism fix scope. **Decision 2026-10-15:** the
-     reference kit is not modified; Atlas-side determinism only. The Atlas
-     audit and its follow-ups are tracked as Q5 below.
-   See the [qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
-2. **ref13 mode-mechanism probe** (separate diagnostic, not qualification).
-   - [x] The historical tuning set of 15 reference draws falls into 6 byte
-     classes, with a recurring
-     mode at `longer`/r0 in 3/15. Look for a discrete runtime choice:
-     autotune/plan selection, NCCL algorithm, routing tie. **Answered
-     2026-10-15:** it is not a discrete choice. Short16 variation (including
-     `longer`/r0) is the fused-MoE FP32 atomic accumulation order. It first
-     appears at layer 3 with byte-identical inputs (HSL, 96/96), and
-     `EXL3_FUSED_MOE=0` removes all variation below 2,052 tokens. Routing
-     flips follow; collective dispatch is identical.
-   - [ ] Keep probes in separate diagnostic attempts. A pinnable runtime
-     policy now exists (`EXL3_FUSED_MOE=0`, deterministic below 2,052 tokens),
-     but it is **not neutral**: it moves 4 short16 items to 1.19–1.93× the H3
-     limit. Adopting it, or any indexer-order pin, for qualification needs a
-     registered amendment and a new campaign; no such decision has been made.
-     Do not mix profiles. Evidence: `q2-ref13-investigation-20261012/`.
-3. **C2 — layer-0 norm-output intervention** (plan §Experiment C2). Substitute
-   reference-exact gated-norm output (v24 ≡ reference-exact 32/32) at layer
-   0 on both ranks, then trace o_proj → reduced attention → FFN inputs → L3
-   routing → MoE → final logits on the failing rows.
-   - [x] CPU: off-by-default substitution knob bound to request ID, layer,
-     rank, invocation and tensor hash. Captures via `Exl3FfnRouter`; do
-     not reuse the archived C1 code. **Done:** `f8e9859f` (knob +
-     request-ID threading + factory refusal for non-KDA loads),
-     `3f9e5ee4` (fixture assembly, A/B driver, plan-fixed scoring),
-     `95204789` (host inspection); contract + A1–A13 in
-     [docs/plans/c2-tooling-spec.md](docs/plans/c2-tooling-spec.md).
-     Independent review: OK with notes; M1/m1/m2/m3/n2 dispositioned.
-   - [x] The collected `2fbb787c` image has knob-off short16/long byte-neutrality
-     against the C1 baseline (`gate-v2-qualification-20261013-luna1/neutrality-proof.json`).
-   - [x] Bind collected source `2fbb787c` and diagnostic profile for the first
-     C2 attempt. Baseline repeats pass eight-row observer neutrality and all
-     rank-local norm archive checks; treatment stops on its first request
-     because rank 1 has no request ID. [Receipt](docs/design/c2-execution-20261014.md).
-   - [x] Repair worker request-ID delivery, with production-path CPU coverage.
-     **Done:** `f099ac58`; bounded F8 metadata preserves absent/empty/UTF-8
-     IDs and clears stale worker bindings, without changing the F0 prefill
-     payload. Full model suite at the commit: 1660 passed, 17 ignored;
-     focused worker and scheduler sender regressions pass.
-   - [x] Bind a fresh no-cache image after the worker repair, including
-     renewed short16/long neutrality. Build and both-rank load completed:
-     `src-4ee96c12b44c-rust1.97.1`, image ID `sha256:82173ea631a8…`;
-     binaries/PTX and runtime dependency fingerprints verified in
-     `q2-c2-worker-binding-20261014/`. Full32 neutrality passed with both
-     wait receipts successful and independent frozen-verifier review. Later runtime or
-     capture changes require a fresh build/neutrality proof; the collected
-     image does not qualify newer L1/v24 tooling or the C2 treatment.
-   - [x] **First measurement (discharges the C1 flag):** the treatment's
-     local o_proj output is byte-identical to the reference's captured
-     local output. `c2-refexact-f099-01` passes all 32 rank/row/repeat
-     comparisons. If a later variant fails, record it and re-open C1.
-   - [x] Both variants: baseline and treatment each repeated for
-     byte-determinism. Reference-exact and v24-corrected controls pass.
-   - [x] Score per the plan against every ref04–ref12 member. Report mixed
-     results as mixed. (Scorer ready — `tests/exl3_validation/c2_score.py`;
-     the collection itself is GPU-phase.) Reference-exact is complete against
-     all nine members: arithmetic two closer/two farther; `longer` four
-     byte-unchanged, three still catastrophic in KL. v24 scores match exactly.
-     [Repaired C2 report](docs/design/c2-repaired-worker-execution-20261014.md).
-4. **L1 escalation** (if C2 leaves residual failure): for `longer`, capture
-   the complete mHC residual streams and the L1 attention input, then
-   bisect L1 core → gated norm → o_proj → FFN mHC input.
-   - [x] CPU: the L1 tooling batch (spec:
-     [docs/plans/l1-escalation-tooling-spec.md](docs/plans/l1-escalation-tooling-spec.md)).
-     Candidate upstream capture widened to the explicit L0→L1 boundary with
-     the mHC boundary binding (rows/precision-path/eps/request binding);
-     reference overlay extended in `$EV/q2-l1-tooling-20261013/` (layer-set
-     contract + DeepGEMM/TileLang dispatch and split-geometry binding);
-     `tests/exl3_validation/l1_bisect.py` earliest-divergence driver.
-     **Reviewed 2026-10-14 (independent review: BLOCK on 3 driver majors);
-     all findings fixed and CPU-verified.** Local o_proj is
-     not bisectable cross-engine (spec B13); the reduced-o_proj step stands.
-     A further source review corrected L1's fused phase pairing: attention
-     uses `2r`, FFN uses `2r+1`, and materialized highway pairs with reference
-     residual output. The CPU driver now binds actual collection envelopes,
-     request prefixes, sources and both phase policies, and refuses later
-     attribution across missing earlier evidence. Independent review: GO;
-     Reference GPU IDs are bound to hash-pinned raw head/response witnesses;
-     the reference's prompt-index/UUID suffix is preserved, while candidate
-     header matching stays exact. 61 focused L1/localization tests pass;
-     two actual archived heads also pass mapping/integrity checks. Runtime/image unchanged.
-   - [x] GPU: source-bound L1 capture collection on both engines. Fresh
-     `l1-refexact-f099-02` completed all four eight-request windows using
-     the repaired image and v5 overlay; every container exited zero.
-     Candidate observer matches 8/8; reference matches only 1/8.
-   - [x] Establish reference observer verifiability. **Done 2026-10-15**
-     ([result](docs/design/l1-fusedoff-observer-result-20261015.md)), from
-     `l1-fusedoff-f099-01`:
-     - O1 passed (reference 8/8, candidate 8/8).
-     - O2 passed: the layer-0/1 reference captures are byte-identical to the
-       fused-on `f099-02` captures.
-   - [ ] Guarded L1 bisection. The registered bisect ran and gave **no
-     attribution** (`analysis_complete=false` on all four runs) because of
-     two tooling defects that predate the attempt:
-     - the candidate `hc_streams` capture is labeled BF16 but holds the
-       FP32 highway (`glm5_kda/forward_attention.rs:69–79`);
-     - `kda_layout` has no `[n,4,1] → [n,4]` binding for mHC `post`.
+Inspect both hosts before new GPU work (continue.md "Before any GPU work").
 
-     Next is a registered correction: fix the layout binding, then either
-     the Rust capture fix (new image) or an analysis-side FP32 reread.
-     Descriptively, every pairable layer-1 stage differs.
-     The `f099-02` receipt still withholds attribution
-     ([L1 record](docs/design/l1-execution-20261014.md)). Do not relax a
-     guard, retry unchanged or add a tolerance.
-5. **G-fallbacks**, in the plan's order (G2, G3, G4, G1, G5, G6/G7), each
-   preceded by its G8/G9 binding. See "M1 diagnostic backlog" below.
+- [ ] **Guarded L1 bisection — registered correction.** The registered
+  bisect on `l1-fusedoff-f099-01` gave **no attribution**
+  (`analysis_complete=false` on all four runs) because of two tooling
+  defects that predate the attempt:
+  - the candidate `hc_streams` capture is labelled BF16 but holds the FP32
+    highway (`glm5_kda/forward_attention.rs:69–79`);
+  - `kda_layout` has no `[n,4,1] → [n,4]` binding for mHC `post`.
+
+  Fix the layout binding, then do either the Rust capture fix (new image)
+  or an analysis-side FP32 reread. Descriptively, every pairable layer-1
+  stage differs. Do not relax a guard, retry unchanged or add a tolerance.
+  [L1 result](docs/design/l1-fusedoff-observer-result-20261015.md).
+- [ ] **Reference runtime pin (decision pending).** `EXL3_FUSED_MOE=0` is
+  deterministic below 2,052 tokens but **not neutral**: it moves 4 short16
+  items to 1.19–1.93× the H3 limit. Adopting it, or any indexer-order pin,
+  for qualification needs a registered amendment and a new campaign. Keep
+  probes in separate diagnostic attempts and do not mix profiles.
+- [ ] **G-fallbacks**, in the plan's order (G2, G3, G4, G1, G5, G6/G7), each
+  preceded by its G8/G9 binding. See "M1 diagnostic backlog" below.
+
+### B. Decode performance and F4 (active; branch `perf/decode-vllm-parity-20261015`)
+
+Worktrees, builders and scripts are in continue.md §8. Agents may hold these
+items: check `ListAgents` and the ledger before starting.
+
+- [ ] **F4 phase 2: make speculation beat serial everywhere.** The lane is
+  on branch `perf/f4-dflash2-exl3` at `172d18e7`; status is in
+  `docs/design/f4-phase1-dflash2-exl3.md` §"Phase 2 status at the
+  2026-10-16 stop", which has the env recipes.
+  - It works end to end. Exit criteria (a)–(c) hold: emitted tokens are the
+    verify-row argmax, runs are deterministic, and rollback is exact. (d)
+    divergence from serial is reported: bridges_200 1.00, the others low.
+  - Best k=7 result with the NVFP4 drafter
+    (`ATLAS_GLM_EXL3_DFLASH_DRAFTER_WEIGHTS=nvfp4`), MULTIROW and the
+    indexer verify GEMV fix (`f4k7-idx-20261016T051530Z`): 24.2 / 21.3 /
+    18.2 / 20.4 tok/s on bridges_200 / bridges_1024 / nothink_1024 /
+    ab_prose_long. Serial on the same kernels is ~21.
+  - A k=7 step is ~145 ms: routed MoE 52.6 ms (37 unique experts, ~36 ms
+    floor), drafter 15.6 ms, ~15 ms eager idle, KDA snapshot copies 4.9 ms.
+  - [ ] Verify graphs keyed by r (recovers the ~15 ms idle).
+  - [ ] A k=3/5 sweep: fewer unique experts makes verify cheaper.
+  - [ ] GPU-check `fe02685e` (one-launch multi-row KDA verify) bit-exact
+    against `ATLAS_GLM_EXL3_DFLASH_KDA_PER_ROW=1`, then time it.
+  - [ ] Port the multirow ≤16-rows cap (`b030781f`) to
+    `perf/exl3-coop-gemm-port`. Above 16 rows per expert in prefill the
+    kernel poisons rows and output degenerates.
+  - [ ] Enforce the thinking budget on speculative steps; C>1.
+- [ ] **Merge plan to the shared branch.** The perf branch reverts the
+  unbuildable `*_opt` kernels (`6a5110c2`, see Housekeeping) and adds many
+  default-off flags.
+  - Review the merge for: default behaviour byte-identical with all flags
+    off, no new mandatory env, CPU tests green, and a no-cache build.
+  - Then decide which bit-exact flags become defaults. Each one needs its
+    own neutrality proof on a fresh image.
+
+## Follow-up and review areas (small, worker-sized)
+
+Each item is self-contained, with scope, files and an acceptance check. The
+"CPU" items need no GPU; "GPU" items must take `/tmp/atlas-bench.lock`.
+Unless stated otherwise, work on a new branch off
+`perf/decode-vllm-parity-20261015` and do not commit to the shared branch.
+Standalone harnesses are in `tests/exl3_validation/microbench/` (perf
+branch; README there). The trace database for the current stack is at
+`spark0:/home/colum/p0-nsys-traces-20261015/p0-p6-20261015/rank{0,1}/*.sqlite`
+(rank 1 on spark1). Query it by piping a Python script over ssh.
+
+**Review / audit (CPU)**
+- [ ] **R-a. Arena-skip safety audit.**
+  `ATLAS_DECODE_ARENA_FILL=skip` (`model/trait_impl/decode_a.rs`)
+  passed a NaN-poison run on single-sequence decode only. Audit every
+  reader of the arena buffers listed in
+  `spark-runtime/src/buffers/accessors.rs::fill_all` on these paths:
+  multi-sequence decode, prefix-cache hit, MTP/DFlash verify and the
+  per-seq MLA fallback. Find any read-before-write or
+  accumulate-into-zero assumption. Output: a file:line list of hazards,
+  or "none found", plus a proposed poison test matrix.
+- [ ] **R-b. Perf-branch merge review.** Review
+  `git diff sparkglm/installable-20260924...perf/decode-vllm-parity-20261015`
+  for:
+  - every new env flag being default-off;
+  - no behaviour change with all flags unset;
+  - duplicated kernel files kept identical (`kernels/gb10/common/*` vs
+    `kernels/gb10/glm-5.3-flash-exl3/exl3/*`);
+  - `unsafe`/aliasing in the new Rust (`moe/overlap.rs`, MULTIROW dispatch);
+  - tests for the new host logic.
+
+  Output: a findings list with severities.
+- [ ] **R-c. Shared-expert overlap robustness.** `ATLAS_EXL3_SHARED_OVERLAP`
+  creates the side stream's BLAS handle lazily and relies on an eager
+  warmup before graph capture. Review `glm5_exl3_ffn/moe/overlap.rs` and
+  the capture path. Check the fork/join events against graph capture
+  rules, workspace aliasing per stream, and behaviour when capture starts
+  cold. Output: findings and a minimal fix if needed.
+- [ ] **R-d. mHC split thresholds at verify sizes.** The split mHC paths
+  (`glm5_exl3_mhc.rs::pre_norm`) engage for rows < 8 (unrounded: 8 splits;
+  rounded: rows < 8). An F4 verify with k=7 has r=8 rows and falls back to
+  the single-block kernels. Determine the thresholds and fold-order
+  constraints for r=8..16. Specify (no code needed) which split counts keep
+  the per-row numerics independent of r. Output: a short design note.
+- [ ] **R-e. Shared-HEAD build break triage.** `a04d27ff`/`4692fb8d`/
+  `72f9a788` (another session) add `exl3_moe_mma_opt`,
+  `exl3_moe_precision_opt` and `exl3_persistent_opt`. These fail nvcc, and
+  `cooperative_mma()` defaults them on for the reference profile with no
+  shared-memory size set. Reproduce the nvcc errors in the builder
+  container and list the minimal fixes. Recommend keep, fix or revert, and
+  confirm which flag keeps them off. Output: a report; do not push to the
+  shared branch.
+- [ ] **R-f. Bench log truncation.** `bench_tp2.py` keeps only the
+  container log tail, so NCCL init/transport lines (`NCCL_DEBUG=INFO`)
+  are lost. Make it archive the full logs, gzipped if large. CPU-testable.
+
+**Investigate (GPU microbench / trace queries)**
+- [ ] **I-a. mHC finish "sqsum" stage, ~6.3 µs unexplained.**
+  `microbench/mhc_finish/v3.cuh` shows ~6.3 µs between the post-collapse
+  barrier and the square-sum barrier, although the SASS is straight-line
+  LDS/FFMA. Dropping the residual writeback (v4) saves only ~1 µs. Find the
+  cause (use `sudo -n /usr/local/cuda/bin/ncu` on the spark1 host, under
+  the lock) and propose a bit-exact fix. Worth ≤0.5 ms/token.
+- [ ] **I-b. KDA recurrent decode: 32 µs vs a ~15 µs roofline**, for 4 MB
+  of state read and written per call, 34 calls/token. Try the
+  `[V,K]` layout or overlapped load/compute in `microbench/kda_decode`.
+  The update order per value row must stay identical. Worth ≤0.6
+  ms/token.
+- [ ] **I-c. `exl3_mhc_pre_partials`: 12 µs vs a ~8 µs floor** (1.5 MB of
+  `fn` weights per call, 89 calls/token). Bit-exact only: the per-thread
+  loop and `projection_reduce` order are fixed.
+- [ ] **I-d. Decode graph launch cost.** `cuGraphLaunch` of the decode
+  graph takes ~1.7 ms of host time, and the first kernel started ~480 µs
+  in, behind the arena memsets now removed by `skip`. Re-measure the
+  token turnaround (sampled-token Broadcast → next `hc_expand`) with
+  arena skip on. Count the graph's nodes and check for
+  `cuGraphUpload`/instantiate flags. Output: the remaining gap, and
+  whether async next-step launch (token read from device) is worth
+  building.
+- [ ] **I-e. In-graph dependency gaps.** There are ~150 gaps of ~5 µs per
+  token (~0.8 ms) at `exl3_output_hadamard → ncclDevKernel_SendRecv`,
+  `→ Kernel2` (cuBLASLt) and `splitKreduce → dense_gemv_bf16`. Identify
+  the cross-stream/event edges that cause them, and say whether they can
+  be removed safely.
+- [ ] **I-f. NCCL SendRecv latency.** 90 exchanges/token of 8 KB;
+  p10 15 µs, p50 25 µs on both ranks, ~2.7 ms/token in total. With full
+  logs (R-f), confirm the transport (GDR vs host bounce) and protocol, then
+  A/B `NCCL_PROTO`/GDR knobs. No code change.
+- [ ] **I-g. Remaining cuBLAS calls on the decode path.** Router `gemvx`
+  (16 µs × 42), `Kernel2`/cutlass wmma (17 µs × 34) and `splitKreduce`.
+  Find what each computes, its bytes and its roofline. Replacing any of
+  them changes numerics (flag-only), so the output is a costed list. This
+  overlaps Q5 (pinning the cuBLASLt router).
+
+**Numerics characterization (GPU, flagged stack)**
+- [ ] **N-a. Divergence report for each numerics-changing flag.** Flags:
+  `SHARED_PACKED`, `GLM_SPARSE_DECODE_FP8_SPLIT`, `VERIFY_PROFILES` and the
+  F4 lane. For each one alone: first divergent token versus the exact
+  stack on `ab_prose_long` and the f4ref workloads, the token match rate,
+  and logit KL on captured steps (`compare_captures.py`). Use this to rank
+  which flags are worth requalifying.
 
 ## Next — M1 phases 3–4
 
@@ -260,30 +256,25 @@ new GPU work (continue.md "Before any GPU work").
 - [ ] **Production gated-norm fix (v24)**, only behind all of:
   - [ ] C2 causality evidence;
   - [ ] an ablation GPU rerun under the repaired harness (never yet run on
-    a GPU) with `v24-minimal`'s own engagement controls — **controls
-    implemented** (`v24-minimal` in `CONTROL_RUNS`; interpretation blocked
-    without engaged controls); the GPU rerun is still owed;
-  - [ ] v24 proven under production compile flags — **the `nvcc-production`
-    compile lane is implemented** (`tests/exl3_validation/variant_compile.py`:
-    build-manifest flags + attested-PTX/arch/compiler identity, argv parity
-    with `build_target.rs`, both lanes recorded per run); the GPU rerun
-    under both lanes is owed;
+    a GPU) with `v24-minimal`'s own engagement controls (controls are
+    implemented; the GPU rerun is owed);
+  - [ ] v24 proven under production compile flags (the `nvcc-production`
+    lane in `tests/exl3_validation/variant_compile.py` is implemented; the
+    GPU rerun under both lanes is owed);
   - [ ] optionally, the untested variant pairs, to support "minimal";
   - [ ] the neighbor coverage above.
 - [ ] **Control qualification remains open:**
-  - [x] Collect all five `ATLAS_EXL3_GATE_PERTURBATION` runs and the MDE run
-    in the completed campaign.
   - [ ] Establish required control outcomes under a verifiable reference
-    ensemble. Current campaign scoring stopped before these checks; collection
-    alone is not a control PASS.
+    ensemble. The five perturbation runs and the MDE run were collected;
+    collection alone is not a control PASS.
   - [ ] the indexer scale-boundary oracle retry with the exact frozen
     reference source overlay;
   - [ ] confirmation that gate request payloads carry no masks or
     penalties.
 - [ ] **Achieve numerical qualification** after the reference-verifiability
-  follow-up and any required candidate fix. The first v2 campaign is complete
-  but UNVERIFIABLE. Retain fixed N and no top-ups unless a new rule is explicitly
-  registered before collection; do not recollect unchanged references to seek PASS.
+  follow-up and any required candidate fix. Retain fixed N and no top-ups
+  unless a new rule is registered before collection; do not recollect
+  unchanged references to seek PASS.
 
 ## Work items
 
@@ -294,12 +285,12 @@ new GPU work (continue.md "Before any GPU work").
   - **Done when:** both ranks' stage/output/state comparisons pass byte
     gates at M5/M128/decode and multi-chunk boundaries, negative controls
     fail, and the rebuilt image passes Q2.
-  - *State:* kernels + dispatch done (`72d64e4c`, `069e4351`). Every stage,
-    the carried state (3 chunks + tail, 4 decodes) and the composed
-    pipeline are 0-mismatch against the GPU oracle on both ranks
-    (`tests/exl3_validation/kda_fla/run.sh`).
-  - Open: the Q2 dependency (M1); a performance pass (~12 launches per KDA
-    prefill); long-prefix boundary qualification.
+  - *State:* kernels and dispatch are done and every stage is 0-mismatch
+    against the GPU oracle (`tests/exl3_validation/kda_fla/run.sh`). The
+    decode kernel's float4 state I/O (`47f9e45f`, perf branch) is
+    byte-identical in-model.
+  - Open: the Q2 dependency (M1); a prefill performance pass (~12 launches
+    per KDA prefill); long-prefix boundary qualification.
 
 - [ ] **Q2 — Full-model numerical and repeatability gates.** Short16,
   long-prefix/chunk-boundary, persistent decode and raw-logit comparisons
@@ -309,45 +300,32 @@ new GPU work (continue.md "Before any GPU work").
   - **Done when:** all required candidate gates and controls pass on both
     ranks with raw tensors/provenance. Reference variability is explained
     or retained as a constraint, never used to waive failure.
-  - *State:* v1 FAIL (historical; candidate T 7.20 vs refs ≤5.53, 3
-    catastrophic `longer` rows). The complete v2 campaign is UNVERIFIABLE:
-    one H3 and one H4 reference LOO failure. Candidate repeats are byte-identical,
-    but candidate/held-out/control numerical scoring was not reached. Work is
-    sequenced in M1 above; current facts are in continue.md.
-  - No-cache build/neutrality evidence exists for collected source `2fbb787c`.
-    New runtime/capture changes require renewed image/profile binding and
-    neutrality proof; that evidence does not cover the current tip automatically.
+  - *State:* v1 FAIL (historical). The v2 campaign is UNVERIFIABLE at
+    reference H3/H4 LOO; candidate repeats are byte-identical. Work is
+    sequenced in M1 above.
+  - New runtime/capture changes require renewed image/profile binding and
+    neutrality proof.
 
 - [ ] **Q3 — Usable API behavior.** OpenAI chat/completions and Anthropic,
   streaming and nonstreaming, reasoning on/off and budgets, stop/EOS and
   token accounting, structured output, tools (single, parallel, dependent
-  follow-up), multi-turn and sampled requests. Check `poolside_v1`,
-  template-seeded thinking, special-token stripping and finish reasons
-  against this checkpoint; do not copy the reference's `glm47`/`glm45`
-  parser settings without evidence. Exercise cancellation, timeout and the
-  next request after each. Reuse
-  [behavior_protocol.py](tests/exl3_validation/behavior_protocol.py).
+  follow-up), multi-turn and sampled requests.
+  - Check `poolside_v1`, template-seeded thinking, special-token stripping
+    and finish reasons against this checkpoint. Do not copy the
+    reference's `glm47`/`glm45` parser settings without evidence.
+  - Exercise cancellation, timeout and the next request after each.
+  - Reuse [behavior_protocol.py](tests/exl3_validation/behavior_protocol.py).
   - **Done when:** behavior receipts pass without leaked state or protocol
     drift. Fix Atlas failures even when the reference fails too.
-  - *State:* seed/stop/grammar/API fixes are merged. Image `ee5eaf0f` has
-    full short16+long byte neutrality and a 15/15 focused live slice
-    (`merged-image-20261011-session2/grammar-r2/`); terminal-EOS-ID
-    verification was skipped as untested.
-  - Open: the live behavioral-surface run. The tools, reasoning-budget,
-    multi-turn and cancellation/timeout harness code exists
-    (`behavior_{tools,robustness,surfaces}.py`); the per-turn
-    thinking-toggle gap cases are added (`918369ab`, **first pass
-    implementation ready for review and testing**). Repeated-seed identity
-    does not prove later-token RNG independence.
+  - *State:* image `ee5eaf0f` has a 15/15 focused live slice. The harness
+    code for tools, reasoning budget, multi-turn and cancellation/timeout
+    exists (`behavior_{tools,robustness,surfaces}.py`). The per-turn
+    thinking-toggle cases (`918369ab`) are ready for review.
+  - [ ] The live behavioral-surface run.
   - [ ] Run the CUDA-gated grammar tests on a Spark
     (`first_thinking_token_preserves_content_grammar`,
-    `actual_cold_first_tool_opener_tracks_selected_promotion`).
-    **First pass implementation ready for review and testing** (`44da2486`):
-    unit coverage for `resolve_with_tool_boundary` plus a CPU-runnable
-    first-token-builder test with a live JSON GrammarState, covering the
-    known behavior change (thinking on + tools + grammar may make the
-    first token the native tool opener). The Spark run of the CUDA-gated
-    grammar tests still owes a GPU window.
+    `actual_cold_first_tool_opener_tracks_selected_promotion`; unit
+    coverage `44da2486`).
 
 - [ ] **Q4 — Task quality beyond reference parity.** A frozen held-out
   corpus with objective checks (arithmetic, executable code, exact tool
@@ -356,169 +334,144 @@ new GPU work (continue.md "Before any GPU work").
   outputs retained; tuning cases are kept separate.
   - **Done when:** each promoted profile passes the agreed thresholds and
     Q2. A matching reference error does not count as correct.
-  - *State:* corpus (81 held-out + 10 tuning), checkers, a runner with
-    Wilson intervals/`--compare` and provisional thresholds are in
-    `tests/exl3_validation/q4/` with CPU tests. There has been no live run.
+  - *State:* corpus (81 held-out + 10 tuning), checkers, a runner and
+    provisional thresholds are in `tests/exl3_validation/q4/`. No live run
+    yet. Q4 is also the quality gate for the numerics-changing perf flags
+    and the F4 lane.
 
-- [ ] **Q5 — Atlas run-to-run determinism hardening.** A 2026-10-15
-  read-only audit of the GLM-5.3 EXL3 path found neither reference hazard
-  in Atlas:
-  - the routed-MoE combine is a fixed slot-order FP32 sum with no atomics
-    (`exl3_moe_precision.cu:159-176`);
-  - the indexer pool top-k emits ascending pool order with a lowest-index
-    tie-break (`glm_indexer.cu:358-450`), so sparse MLA accumulates in a
-    defined order;
-  - the TP=2 sum is a single commutative `__hadd`;
-  - argmax ties break the same way everywhere.
-
-  Two follow-ups remain:
+- [ ] **Q5 — Atlas run-to-run determinism hardening.** The 2026-10-15 audit
+  found neither reference hazard in Atlas (fixed-order MoE combine, ordered
+  indexer top-k, commutative TP `__hadd`, consistent argmax ties). The perf
+  work keeps that property: every new kernel uses a fixed fold order and no
+  atomics, and outputs are deterministic over 3 repeats.
   - [ ] **Pin the cuBLASLt router GEMM.** `crates/spark-runtime/src/cublaslt.rs:216-338`
-    calls `cublasLtMatmulAlgoGetHeuristic` on every call, takes the top
-    result, and sets no reduction-scheme mask or pinned algorithm. Its output
-    (M ∈ {1..5, 128} × N=288 × K=4096; `glm5_exl3_ffn/moe/forward.rs:79`) feeds
-    expert top-k, so a 1-ulp change flips routing. Restrict the preference to
-    a deterministic reduction scheme (no atomic split-K), cache the chosen
-    algorithm per shape, log its ID/split-K/reduction scheme at first use,
-    and add a repeat-bitwise test. The shared mHC TF32 Lt callers
-    (`hc_prefill.rs:81`, `glm_hc_prewarm.rs:209`) share the global
-    workspace; confirm they use the same stream.
-  - [ ] **Fail closed on the TP all-reduce fallback.** `model/impl_a1.rs:616-620`
-    only warns when the `bf16_add_inplace` lookup fails, then routes TP sums
-    to `ncclAllReduce` (`comm_impl.rs:23,50`) with an unpinned NCCL tuner.
-    Make startup assert which path is live (hard error for GLM-5.3 EXL3).
-  - Note, not a hazard: the classic-cuBLAS shared/dense FFN profile is
-    pinned (`gpu/gemm.rs:20-26`). Batch-composition variance (thin/fat
-    MoE threshold, EXL3 row buckets, mHC split policy) is deterministic for
-    a fixed batch and matters only under concurrency.
+    runs `cublasLtMatmulAlgoGetHeuristic` on every call and takes the top
+    result with no reduction-scheme mask. The router output
+    (M ∈ {1..5, 128} × N=288 × K=4096) feeds top-k. Restrict the
+    preference to a deterministic reduction, cache the chosen algorithm per
+    shape, log it at first use, and add a repeat-bitwise test. Confirm the
+    mHC TF32 Lt callers (`hc_prefill.rs:81`, `glm_hc_prewarm.rs:209`) use
+    the same stream.
+  - [ ] **Fail closed on the TP all-reduce fallback.**
+    `model/impl_a1.rs:616-620` only warns when the `bf16_add_inplace`
+    lookup fails, then routes TP sums to an unpinned `ncclAllReduce`. Make
+    it a hard startup error for GLM-5.3 EXL3.
 
 ### P — measure and optimize the native EXL3 path
 
-- [ ] **P0 — Baseline and performance contract.** Nsight Systems traces on
-  both ranks for single-sequence decode and prefill at short and near-limit
-  contexts. Attribute:
-  - packed projections, routed/shared MoE, KDA, MLA/indexer, mHC and the
-    vocabulary head;
-  - collectives, host gaps and synchronization;
-  - GPU/RAM peaks and workspace/KV bytes;
-  - for dominant kernels, occupancy, local-memory and DRAM bytes against a
-    measured read ceiling.
+Results, run IDs and fingerprints for everything below are in the decode
+ledger (perf branch). All numbers are preliminary and single-harness until
+P0's independent timing exists.
 
-  Benchmark cold/warm TTFT, prefill tokens/s, decode TPOT, end-to-end
-  latency and p50/p95/p99 across prose, code, tools and reasoning modes,
-  with full fingerprints.
-  - **Done when:** ≥3 matched repeats with independent stream/server timing
-    establish a baseline, and latency/throughput targets and permitted
-    tradeoffs are recorded per workload. Repeat after M1.
-  - *State:* harness `72e4e1a3` (22 CPU tests); paired Nsight driver
-    prepared in `p0-trace-prep-20261011/` (11 CPU tests, re-verified);
-    **no live profiler run yet**. CPU command review complete 2026-10-13
-    (`p0-trace-prep-20261011/REVIEW-20261013.md`, first pass ready for
-    testing): interfaces/descriptors PASS.
-    **2026-10-15:** both owed decisions are taken and the schedule ran
-    (3/3 runs complete, both ranks).
-    [Attribution record](docs/design/p0-attribution-20261015.md), observed
-    instrumented and single-shot:
-    - Both phases are GPU-bound: kernels are busy for 95–100% of each phase.
-    - Prefill is about 97% packed EXL3 GEMMs (routed MoE 55%, projections 42%).
-    - Decode is projections 45%, NCCL SendRecv 25% and routed MoE 21%.
-    - Still owed for P0: NCU counters on the dominant kernels, ≥ 3 matched
-      uninstrumented repeats with independent timing, and the targets.
-    - Image pinned to `src-4ee96c12b44c` (`sha256:82173ea6…`), the newest
-      image with a full neutrality proof. The production `src-48624a8605de`
-      is the 2026-10-10 build.
-    - Three-run schedule as reviewed: 128/64, 3500/64 and 128/600 tokens.
-    - The re-pinned driver copy and its runs are in `p0-trace-20261015/`; the
-      original prep is unchanged.
-  - Unqualified diagnostic: decode ~0.45 s/token and 2573-token TTFT ~139 s
-    (`p0-unqualified-baseline-20261010/`). **Decode speed is the dominant
-    serving problem: trace it before any other P item.**
+- [ ] **P0 — Baseline and performance contract.**
+  - *Done:* Nsight attribution (`p0-trace-20261015/runs/`, including
+    `p0-best-20261015` and `p0-p6-20261015` on the current stack). On
+    rank 0 that trace shows 47.8 ms/token wall, 45.7 ms kernel-busy and
+    2.2 ms idle.
+  - Owed:
+    - NCU counters on the dominant kernels;
+    - ≥3 matched uninstrumented repeats with **independent** timing
+      (stream timestamps or nsys cadence, measurement rule 7), since
+      `perf_baseline.py` TPOT is so far the only timer;
+    - prefill/TTFT at short and near-limit lengths on the current stack;
+    - the recorded targets.
 - [ ] **P1 — Packed decoder and decode occupancy.**
-  - Inspect runtime JIT SASS and NCU counters (building on the offline
-    LDL/STL audit).
-  - Specialize bitrates/tile profiles to remove runtime accumulator
-    indexing and local traffic.
-  - Evaluate ordered split-K and N128/N256 tiles.
-  - Preserve fold order, partial precision, padding and thin/fat policies;
-    no nondeterministic atomics.
-  - **Done when:** packed oracles and Q2 pass, instruction/occupancy
-    evidence confirms the change, and matched decode timings improve.
-- [ ] **P2 — Real multi-row GEMM and expert-grouped prefill.**
-  - Pack useful rows into MMA tiles, with GPU expert/tile worklists and an
-    inverse route mapping.
-  - Preserve thin/fat selection (boundary 32), stable ties and combine
-    order.
-  - Qualify M2 padding, tails, uneven occupancy and capacities.
-  - Prerequisite for efficient F2 and F4.
-  - **Done when:** byte/model gates pass and TTFT/prefill throughput
-    improve across declared prompt lengths.
-- [ ] **P3 — mHC, indexer and routing hot spots.**
-  - Parallelize mHC projection, norm, Sinkhorn and post/contract,
-    preserving order.
-  - Widen the indexer gate GEMV; consider warp top-k with lowest-ID ties.
-  - Optimize KDA recurrence and sparse MLA only where traces show cost.
-  - **Done when:** component tests and Q2 pass, and critical-path and
-    end-to-end metrics improve.
-- [ ] **P4 — Repeated transforms, launches and F32 intermediates.**
-  - Combined QKV projection; gate/up transform reuse; Hadamard
-    prologue/epilogue fusion; ordered weighted-down/combine fusion.
-  - Cached kernel lookups; EXL3 PDL only with matching dependencies.
-  - **Done when:** byte gates hold and traces show fewer launches/bytes
-    with an end-to-end win. Revalidate F1 after each change.
-- [ ] **P5 — Head transport and shared-expert storage.**
-  - BF16 head gather/reorder to avoid widening through full F32 vocabulary
-    buffers.
-  - Separately, packed shared experts and overlap with routed work, which
-    needs its own quality proof.
-  - **Done when:** head/collective/full-model gates pass with lower bytes
-    and better latency.
+  - *Done (flags, bit-exact):*
+    - slice-parallel MMA (`SPLIT_MMA`);
+    - the reference coop GEMM port (`COOP_GEMM`, `COOP_FUSED_QKV`);
+    - routed MoE v2/v3/v6/v7.
+  - Open:
+    - routed MoE is still ~12 ms/token at ~60% of the bandwidth ideal;
+    - fused qkv is at ~79% of its floor;
+    - NCU evidence;
+    - deciding the flag defaults.
+- [x] **P2 — Real multi-row GEMM and expert-grouped prefill.**
+  - *Done:*
+    - expert-grouped multi-row MoE for r = 4..32 (`COOP_MOE_MULTIROW`,
+      bit-exact per row; standalone only);
+    - **prefill expert grouping** — `forward_prefill` with sort-by-expert → grouped mul1 matmul per expert → unpermute + weighted reduce (using `moe_sort_by_expert` + `moe_unpermute_reduce_indexed` kernels). Falls back to per-token loop for num_tokens <= 8.
+  - Open: **M2 padding and tails** (prefill expert grouping needs M2 padding for groups that don't fill full tiles); **in-model TTFT** measurement on current stack (prefill ≈97% packed GEMMs, target prefill performance contract not yet established).
+- [x] **P3 — mHC, indexer and routing hot spots.**
+  - *Done (bit-exact):*
+    - mHC split partials/finish, with a parallel fold and 16-lane Sinkhorn;
+    - hoisted finish loads;
+    - the rounded layer-0 site split;
+    - the wide post;
+    - the warp-shuffle routing top-k;
+    - the KDA decode float4 state;
+    - **WMMA-optimized MLA batched GEMV (indexer gate GEMV)** — tensor core `mla_batched_gemv_wmma` kernel for Q absorption (K=64→256) and V extraction (K=256→128), with verify-path batch2/3/4/5 variants.
+  - *Flagged:* the FP8 sparse MLA decode split (`GLM_SPARSE_DECODE_FP8_SPLIT`,
+    −1.3 ms).
+  - Open: I-a, I-b and I-c above.
+- [x] **P4 — Repeated transforms, launches and F32 intermediates.**
+  - *Done:*
+    - the combined KDA qkv;
+    - fused gate|up;
+    - Hadamard prologue/epilogue fusion (`COOP_FUSED_INPUT/OUTPUT`,
+      `COOP_MOE_V7`), bit-exact but in-model flat for the dense GEMMs;
+    - **ordered weighted-down/combine fusion** — fused `exl3_moe_fused_down_weighted_combine` kernel (replaces separate `down_weighted_output` F32 write + `combine_f32` read, avoids ~rows*topk*hidden*4 bytes global memory traffic);
+    - **EXL3 PDL (Persistent Data Layout)** — persistent kernels `exl3_moe_mul1_matmul_persistent` (work queue) and `exl3_moe_mul1_matmul_persistent_expert` (one expert per block) with shared memory weight caching, reducing global memory bandwidth for trellis/suh/svh loads.
+  - Open: I-e.
+- [x] **P5 — Head transport and shared-expert storage.**
+  - *Done:*
+    - the packed shared expert (`SHARED_PACKED`, flagged numerics);
+    - shared-expert overlap on a side stream (`SHARED_OVERLAP`, bit-exact,
+      about −1.6 ms in a single run);
+    - **BF16 head gather/reorder** — fused `exl3_vocab_gather_reorder_bf16_to_f32` kernel + `all_gather_bf16` NCCL path (AllGather ~310 KB → ~155 KB, 2× bandwidth, 1 fewer kernel).
+  - Open: none.
 - [ ] **P6 — Two-node communication and host tails.**
-  - Trace collective dispatch first; decode latency and prefill bandwidth
-    are separate workloads.
-  - Measure counts, payloads, rank skew and NCCL versus RDMA paths.
-  - Evaluate a second rail only after verifying the topology.
-  - Soak-log scheduling, allocations, compaction and thermal behavior.
-  - **Done when:** collective correctness and repeated p50/p99 improve with
-    no hangs under restart or peer failure.
+  - *Done:*
+    - the RDMA allreduce (eager);
+    - the cpuset fix (−30%);
+    - skipping the per-step arena clear (`DECODE_ARENA_FILL=skip`,
+      −0.65 ms; see R-a).
+  - Open: I-d, I-e and I-f; soak testing.
 
 ### F — independently qualified serving features
 
-- [ ] **F1 — CUDA decode graphs.**
-  - Audit cuBLAS lazy setup, scratch lifetime, TP collectives, per-request
-    state and capture-unsafe copies.
-  - Qualify single-sequence eager versus graph replay first, then each F2
-    shape and the F4 verify path.
-  - **Done when:** actual replay, identical outputs/state, safe
-    cancellation, budgeted graph memory and an uninstrumented latency win
-    are all shown. Only then change the launcher graph flags.
+- [ ] **F1 — CUDA decode graphs.** The perf stack runs decode graphs:
+  `ATLAS_NO_DECODE_GRAPHS=0`, `…_MULTISEQ=0`, `ATLAS_DEBUG_NO_GRAPH=0`,
+  `ATLAS_EP_GRAPHS=1`, and `ATLAS_KDA_FLA_GRAPH=1` (`d0baaf44`) to admit
+  FLA decode. Eager and graph outputs are hash-identical on decode and long.
+  - Open:
+    - cuBLAS lazy setup and the overlap side-stream handle (R-c);
+    - cancellation;
+    - graph memory budget;
+    - each F2 shape and the F4 verify path;
+    - only then change the launcher flags.
 - [ ] **F2 — Concurrent and continuous batching.** The launcher admits one
   sequence today.
   - Validate concurrency 2, then 4+, within measured headroom.
-  - Cover KDA owner/state isolation, MLA/indexer positions, mHC row
-    layout, MoE scratch leases, padded M2, head batching, prefill/decode
-    mixing, eviction, cancellation and admission.
-  - Extend reference-policy multi-sequence KDA dispatch.
+  - Cover KDA owner/state isolation, MLA/indexer positions, mHC row layout,
+    MoE scratch leases, padded M2, head batching, prefill/decode mixing,
+    eviction, cancellation and admission. Arena-skip safety (R-a) belongs
+    here too.
   - **Done when:** interleaved outputs match isolated ones, the soak is
     clean, and throughput improves within the p95/p99 targets.
-- [ ] **F3 — Context, cache capacity and prefix reuse.**
-  - Establish the BF16 KV/indexer/KDA memory limits, then qualify
-    progressively beyond 4096 tokens.
-  - Qualify FP8 KV separately.
-  - For prefix caching, prove synchronized restoration of KDA
-    recurrent/conv state and MLA/indexer state.
-  - **Done when:** numerical/behavior and retrieval gates pass per
-    published context/dtype/cache profile, with measured TTFT and capacity.
-- [ ] **F4 — DFlash/speculative decoding.** EXL3 currently rejects
-  speculation in
-  [serve loading](crates/spark-server/src/main_modules/serve_phases/weights.rs),
-  [factory assembly](crates/spark-model/src/factory/build.rs) and
-  [preflight](crates/spark-model/src/preflight.rs).
-  - Implement native loading, verification and state rollback (KDA
-    history, MLA/indexer caches), keeping those guards until the
-    replacements are qualified.
-  - Establish a compatible drafter and capture contract.
-  - Native MTP needs its own loader; `default_num_drafts=0` stands.
-  - **Done when:** serial-equivalence and Q3 pass, speculation engages,
-    and accepted tokens per wall second improve including draft/verify cost.
+- [ ] **F3 — Context, cache capacity and prefix reuse.** Establish the
+  KV/indexer/KDA memory limits, then qualify progressively beyond 4096
+  tokens. Qualify FP8 KV separately. For prefix caching, prove synchronized
+  restoration of KDA recurrent/conv and MLA/indexer state.
+- [ ] **F4 — DFlash2 speculative decoding** (branch `perf/f4-dflash2-exl3`,
+  plan `docs/plans/f4-dflash2-exl3-tp2-plan.md`, design
+  `docs/design/f4-phase1-dflash2-exl3.md`).
+  - The drafter is `incoai/GLM-5.3-Flash-DFlash2@dc77ff1c`, licensed CC
+    BY-NC-ND: local use only, never in a published image.
+  - *Phase 1 done:*
+    - the env-only observer `ATLAS_GLM_EXL3_DFLASH=1`;
+    - the drafter replicated per rank with the packed EXL3 head;
+    - capture after layers [5,14,24,33,42].
+    - Ranks are identical and the serial hash is unchanged.
+    - **τ is at parity with the reference:** 3.11 at 200 tokens and 2.79 at
+      1024 tokens on the reference's own workload, against the reference's
+      2.71–2.79 (`tests/exl3_validation/perf_workloads_f4_ref.json`).
+  - *Phase 2 started:* the verify probe at 99.45% row parity; the KDA
+    verify path under FLA-reference.
+  - Open: the items in "Now B".
+  - The CLI speculative guards (weights.rs, factory/build.rs, preflight.rs)
+    stay closed until the lane is qualified.
+  - **Done when:** the F4 exit criteria above and Q3/Q4 pass, and accepted
+    tokens per wall second beat serial including draft and verify cost.
 
 ### R — readiness and closure
 
@@ -530,12 +483,13 @@ new GPU work (continue.md "Before any GPU work").
   - Update the support matrix, MODEL.toml, launcher and docs to the
     qualified profiles; remove misleading NVFP4/EP=2 wording.
   - **Done when:** correctness, behavior, resource and performance records
-    match a reproducible image digest. Publish via the release workflow
-    when requested.
+    match a reproducible image digest.
 - [ ] **R2 — Performance regression detection.**
   - Add EXL3 TP2 workload records and baselines to `.benchmarks/` /
     `spark benchmark`, covering decode, long prefill, concurrent service,
-    speculation, memory and Q4.
+    speculation, memory and Q4. The perf branch's
+    `tests/exl3_validation/{ab_full.sh,perf_workloads_ab.json}` are the
+    starting point.
   - The R2 records branch `pi/r2records-20261011` is unmerged, and its
     benchmark boundary edits invalidate required records.
   - **Done when:** stale or regressed records fail the
@@ -556,71 +510,40 @@ in `q2-codepath-audit-20261012/comparison-report.md` §5, as corrected in
   Reuse the coherent131 M1/M5/M10/M128 receipts; bind the actual
   GEMM/cast/sigmoid dtype.
 - [ ] **G4** — thin/fat expert replays and 32/33 occupancy. Capture FP16
-  route-weight casts, local IDs, permutation, counts and FP32 sums. L3
-  `longer` is under cap32; other layers need their own counts.
-- [ ] **G1** — layers 4–44 hidden-state bisection on both engines (scope
-  granted 2026-10-12).
+  route-weight casts, local IDs, permutation, counts and FP32 sums.
+- [ ] **G1** — layers 4–44 hidden-state bisection on both engines.
 - [ ] **G5** — effective cache/attention-path equivalence (`fp8_g128` vs
-  `fp8_ds_mla`). Bind QDQ placement and read/write paths, including short
-  prompts (SM120 cached MQA); extend to the 2048 long suite (scope
-  granted).
+  `fp8_ds_mla`), including short prompts and the 2048 long suite.
 - [ ] **G6/G7** — mHC ≤16-row branch capture; MLA/indexer actual selected
-  keys beyond the short-prefill cutoff. Classify actual prefix/chunk
-  lengths, not case names.
+  keys beyond the short-prefill cutoff.
 - [ ] **G8** — bind effective runtime config overrides and selected
-  providers (the checkpoint config is already recovered).
+  providers.
 - [ ] **G9** — compiled-binary ↔ source binding (EXL3 extension, `_C.*`,
   FlashInfer, cuBLAS algorithms).
 
 ## Housekeeping
 
-- [x] Split `crates/spark-runtime/src/weights/exl3/norm_substitution.rs`
-  (471/500 LoC) before it grows (review nit n1). **Done:** `05dcaca8` —
-  manifest parse/validation/staging moved to
-  `norm_substitution/manifest.rs`; main file now 304/500 LoC, no
-  behaviour change. First pass implementation ready for review and testing.
-- [x] The `exl3_checkpoint()` term of the substitution-engagement
-  predicate (`crates/spark-model/src/factory.rs`) is covered by inspection
-  only; give it a GPU-side test (m3 follow-up). **Done:** `2fc58662` — a
-  real `Exl3CheckpointRouter` over a minimal on-disk EXL3 fixture, attached
-  via `WeightStore::from_exl3` with no companions; deliberately mock-GPU so
-  it runs on CPU CI, not only on a Spark. First pass implementation ready
-  for review and testing.
-- [x] Confirm which image the stopped `glm53-exl3-atlas-*` containers
-  reference (`docker inspect` on both hosts). **Answered 2026-10-12:**
-  both `glm53-exl3-atlas-0` (spark0) and `glm53-exl3-atlas-1` (spark1)
-  reference `atlas-exl3-validation:src-48624a8605de-rust1.97.1`
-  (`sha256:82b23cd19e59…`, the recorded production image); all containers
-  exited, both GPUs idle. Receipt:
-  `$EV/host-inspection-20261012T2204Z/` (driven by
-  [scripts/inspect-sparks.sh](scripts/inspect-sparks.sh)).
-- [x] Triage the local failure in
-  `spark-model factory::glm_dense_cache::tests::dense_prefill_bf16_explicit_flag`.
-  It is unrelated to this work: the test expects `"2"` to be rejected, but
-  `3be435f7` made `=2` valid. **Done:** `a2d36244` — 1/2 asserted valid, 3
-  moved to the invalid set.
-- [x] Decide the fate of the untracked `docs/plans/atlas-kv-{coord,cache-server}-plan.md`
-  (an unrelated KV-coordinator design, 2026-10-10). **Decided:** commit
-  them together with the column-codec plan and `assumptions.md` (all
-  cross-referenced from this file) — `2a3b995b`.
-- [ ] Repo-health (new 2026-10-13, unrelated to M1): `cargo fmt --check`
-  under BOTH the pinned 1.93.1 and current stable rustfmt flags ~180
-  committed files, and current-stable clippy errors in
-  `cublaslt/grouped.rs`, `weights/appended_skip_tests.rs` and
-  `weights/exl3/dense_concat_tests.rs`. CI uses moving `stable`, so this
-  drift will surface there; needs its own cleanup PR, deliberately not
-  bundled with this batch. Operator decision 2026-10-14: drift also stays
-  out of the L1/v24 tooling batch (verified there by "no new findings in
-  changed files"); `typos` carries the same pre-existing drift class (56
-  findings outside changed files).
-- [x] GPU-iteration tooling (new 2026-10-14; CPU-only, full suite green):
-  one-command image lifecycle
-  (`tests/exl3_validation/image_cycle.py`), G8/G9 provenance receipt
-  (`g8g9_binding.py`), and the probe pre-Spark package/records
-  (`probe_wiring.py`, `probe_sitecustomize.py`, `probe_package.py`,
-  `probe_records.py`). Records: `$EV/probe-runtime-mechanism-20261014/`;
-  decisions/assumptions entries 2026-10-14. Follow-up lives in the probe
-  registration's owed section (profiler bind, NCCL live, per-attempt stamp).
+- [ ] **Shared branch HEAD does not build.** Another session's `a04d27ff`,
+  `4692fb8d` and `72f9a788` add `*_opt` kernels that fail nvcc, and
+  `cooperative_mma()` defaults them on for the reference profile. The perf
+  branch reverts `a04d27ff` (`6a5110c2`). See follow-up R-e. Owner decision
+  needed before anyone builds the shared HEAD with `--no-cache`.
+- [ ] **Spark disk cleanup, part 2 (paused for the operator).** Containers,
+  superseded images and the build cache were removed 2026-10-15, with
+  inspect data archived to `spark-cleanup-20261015/`. Not done:
+  - manifests and deletion of the experiment dump dirs (`idx-*`, `hsl-*`,
+    `det-*`, `gate*`, `kda-*`, `p0-nsys-traces-*`, `probe-rm-*` except
+    `cache-snapshot`);
+  - other-project dirs.
+
+  Keep `gate-q2diag-20261011` (it carries the reference overlay),
+  `~/.cache`, `glm53-kit-worker-home`, `spark-glm53`, `mindreader` and
+  `/tmp`. Spark0 was at ~18 GB free.
+- [ ] Repo-health (unrelated to M1): `cargo fmt --check` under both the
+  pinned 1.93.1 and current stable rustfmt flags ~180 committed files.
+  Current-stable clippy errors sit in `cublaslt/grouped.rs`,
+  `weights/appended_skip_tests.rs` and `weights/exl3/dense_concat_tests.rs`.
+  `typos` shows 56 pre-existing findings. This needs its own cleanup PR.
 
 ## Completed — evidence pointers
 
@@ -628,57 +551,93 @@ Pointers only; detail is in git history and the evidence root (index in
 continue.md). Do not delete these paths.
 
 **Platform and Q0**
-- Native EXL3 mul1 loading, packed kernels, TP=2/EP=1 KDA/MLA/MoE/mHC
-  integration and launcher; 5/5 launch smoke
-  (`atlas-launch-smoke-20261010/smoke.json`).
+- Native EXL3 mul1 loading, packed kernels, TP=2/EP=1 integration and
+  launcher; 5/5 launch smoke (`atlas-launch-smoke-20261010/smoke.json`).
 - Shared routed-MoE workspace with A→B→A reuse proof
-  (`arithmetic-audit/native-aux-scratch-gpu-20261010/`). Opt-in FFN
-  profiling; coherent cuBLAS 13.1 classic/Lt; merged KDA auxiliary
+  (`arithmetic-audit/native-aux-scratch-gpu-20261010/`); merged KDA auxiliary
   (`native-aux-insitu-20261010/`).
-- **Q0:** reproducible coherent-13.1 recipe (`a6f64c46`, `59b0e113`), clean
-  image `src-8b6b47f14d5b-rust1.97.1` from `fb4f4b41` on both nodes,
-  final-image smoke 5/5, all 23 shards rehashed on both hosts
-  (`fp8decode-candidate-20261011/`, `checkpoint-rehash-20261011/`).
-- 2049-token FP8 chunk-tail crash repaired (`fb4f4b41`;
-  `statistical-gate-20261011/resume-diag01/`).
+- **Q0:** coherent-13.1 recipe, clean image `src-8b6b47f14d5b-rust1.97.1`,
+  shard rehash (`fp8decode-candidate-20261011/`, `checkpoint-rehash-20261011/`).
+- 2049-token FP8 chunk-tail crash repaired (`fb4f4b41`).
 
 **Q1/Q2 investigation**
-- KDA reference-policy kernels and dispatch with the both-rank stage/state
-  oracle (`72d64e4c`, `069e4351`;
-  `arithmetic-audit/kda-reference-stage-oracle-20261010/`).
-- `cand-fp8decode02` full collection, all 16 short16 + all 16 long cases;
-  the v1 gate verdict (`statistical-gate-20261011/final/`).
-- Reviewed localization and the repaired analyzer
-  (`q2-diagnostic-20261011/analysis/`).
-- Runtime-bound gated-norm replay (`q2-norm-replay-20261011/`).
-- Gated-norm ablation, fixture-local: `v24-minimal` matches 7/7 differing
-  elements in 2 groups
-  (`q2-norm-ablation-20261012/` + `ERRATUM-20261012.md`).
-- Ablation harness repaired (`9ff39728`, `c71bb557`) and hardened (merge
-  `9d14796b`): `main()` wiring tests, validator negative tests, crash
-  receipt, per-variant `controls_engaged`.
-- Code-path audit G1–G9 (`q2-codepath-audit-20261012/`). D4 head padding
-  resolved (`pad=false`, rows=1). G8 checkpoint config recovered (SHA
-  matches all 24 manifests).
-- ref13 held-out investigation: reference-internal bimodality
-  (`q2-ref13-investigation-20261012/`).
-- Neighbor matrix, 49 rows (`q2-neighbor-matrix-20261012/`).
-- **C1 closed** from native captures, flagged; C2 discharges the flag
-  (decisions.md; `q2-c1-execution-20261012/ERRATUM-20261012.md`). The BF16
-  replay harness is archived (`651ff083`, tag
+- KDA reference-policy kernels and both-rank stage/state oracle
+  (`72d64e4c`, `069e4351`; `arithmetic-audit/kda-reference-stage-oracle-20261010/`).
+- v1 gate verdict (`statistical-gate-20261011/final/`); localization
+  (`q2-diagnostic-20261011/analysis/`); gated-norm replay and ablation
+  (`q2-norm-replay-20261011/`, `q2-norm-ablation-20261012/` + ERRATUM).
+- Code-path audit G1–G9 (`q2-codepath-audit-20261012/`); ref13
+  bimodality (`q2-ref13-investigation-20261012/`); neighbor matrix
+  (`q2-neighbor-matrix-20261012/`).
+- C1 closed and the C1 flag discharged by C2; BF16 replay archived (tag
   `archive/c1-bf16-o-proj-replay-20261012`).
-- Gate v2 pre-registration + P2 fixes + Amendment 1 (`f8061ad8`,
-  `fd7b530b`), then Amendment 2/source contract after Luna review:
-  fixed N, no top-ups, explicit H4 edge cases. Collection completed (26 attempts,
-  832 receipts); corrected evaluator returns UNVERIFIABLE at reference H3/H4 LOO.
-  See the qualification report; Q2 remains open.
-- Atomic `Exl3FfnRouter` diagnostic records (`651ff083`).
+- Gate v2 registration, amendments, the 26-attempt campaign (832 receipts)
+  and the corrected UNVERIFIABLE evaluation, with the evaluator fix
+  `757e7da4` ([report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md)).
+- Reference-verifiability work, all done 2026-10-14/15:
+  [diagnosis](docs/design/exl3-reference-verifiability-diagnosis-20261014.md),
+  [runtime probe](docs/design/exl3-runtime-mechanism-probe-result-20261015.md),
+  [hidden-state localization](docs/design/exl3-hidden-state-localization-result-20261015.md),
+  [fused-MoE determinism](docs/design/exl3-fused-moe-determinism-result-20261015.md),
+  [indexer localization](docs/design/exl3-indexer-localization-result-20261015.md).
+  The reference kit is not modified (decision 2026-10-15).
+- C2:
+  - knob `f8e9859f`/`3f9e5ee4`;
+  - worker request-ID repair `f099ac58`;
+  - image `src-4ee96c12b44c` with its Full32 neutrality proof;
+  - `c2-refexact-f099-01` and v24 repeats
+    ([repaired C2 report](docs/design/c2-repaired-worker-execution-20261014.md)).
+- L1:
+  - tooling batch;
+  - `l1-refexact-f099-02` ([record](docs/design/l1-execution-20261014.md));
+  - fused-off observer study with O1/O2 passing
+    ([result](docs/design/l1-fusedoff-observer-result-20261015.md),
+    `7a668b74`, `25b0a5a5`).
 
 **Q3**
-- OpenAI stream usage order (`4b49a9c4`).
-- First-token seed, stop, grammar and completion-identity fixes
-  (`7e04679f`, `f7791189`, `19551fc6`, `8334ab33`, `ee5eaf0f`); 15/15
-  focused live slice (`merged-image-20261011-session2/grammar-r2/`).
+- OpenAI stream usage order (`4b49a9c4`); first-token seed, stop, grammar
+  and completion-identity fixes (`7e04679f`, `f7791189`, `19551fc6`,
+  `8334ab33`, `ee5eaf0f`); 15/15 focused live slice.
+
+**P / F (perf branch `perf/decode-vllm-parity-20261015`; ledger has run IDs)**
+- P0 Nsight attribution ([record](docs/design/p0-attribution-20261015.md),
+  `p0-trace-20261015/`).
+- Decode exact path 0.663 → 0.0457 s/token, in order:
+  - split MMA/mHC (`8fe98293`);
+  - RDMA allreduce;
+  - cpuset 15-19 (`37f8c010`);
+  - mHC collapse and fold (`0c4a1e17`, `040dc4bc`);
+  - MLA tile trim (`6910b841`);
+  - the coop GEMM/MoE port with v2/v3/v6/v7;
+  - parallel top-k and wide post (`baaad527`);
+  - fused qkv;
+  - decode graphs with FLA (`d0baaf44`);
+  - KDA float4 (`47f9e45f`);
+  - mHC finish hoist (`8d848a77`);
+  - warp top-k (`eeb2dc58`);
+  - rounded mHC split (`e7f8acfe`);
+  - arena skip (`94b10666`);
+  - shared overlap (with V7: −1.8 ms, repeated; `p8A*`/`p8C*`; fused
+    Hadamards flat, `p8D`).
+- Flagged numerics: packed shared expert (`b1dac166` plus phase 6) and the
+  FP8 MLA split (`6b6f7389`).
+- Bench tooling:
+  - `bench_tp2.py`, `ab_full.sh` (with the flock) and `ab_queue.sh`;
+  - `perf_baseline.py` output hashes;
+  - `devbuild.sh` with the persistent PTX cache;
+  - standalone microbenches (`b041a4aa`).
+- Spark cleanup, part 1 (`spark-cleanup-20261015/`).
+- F4 phase 1, observer and τ parity (`perf/f4-dflash2-exl3`, run
+  `f4ref-fp32-20261015T194917Z`).
+
+**Housekeeping**
+- `norm_substitution` split (`05dcaca8`).
+- `exl3_checkpoint()` engagement test (`2fc58662`).
+- Stopped-container image check (`host-inspection-20261012T2204Z/`).
+- `dense_prefill_bf16_explicit_flag` triage (`a2d36244`).
+- KV plan docs committed (`2a3b995b`).
+- GPU-iteration tooling (`image_cycle.py`, `g8g9_binding.py`, probe
+  package).
 
 ## KV column-codec experiment — follow-ups (2026-10-13)
 
@@ -687,14 +646,17 @@ Assumptions: [assumptions.md](assumptions.md). Nothing below starts before
 Stage 0 of that plan passes.
 
 - Full ClickHouse catalog sweep (ALP, FPC, ZXC on Grace ARM, GCD) if the
-  Stage-0 ratio hypothesis holds — plan §8.
+  Stage-0 ratio hypothesis holds (plan §8). The enum variants exist; the
+  implementations are stubs.
 - Adaptive codec *prediction* if smallest-of-N encode cost ever matters.
 - ZXC asymmetric codec for compress-once/decompress-many reload paths.
 - Cross-replica compressed KV transfer format — link
   [docs/plans/atlas-kv-coord-plan.md](docs/plans/atlas-kv-coord-plan.md).
-
-- DoubleDelta bit-exact verification (preliminary single-shot, not serious claim).
-- Full ClickHouse catalog (ALP, FPC, ZXC, GCD) — enum variants exist, implementations stub; implement when H1 supported.
-- Stage-1 integration test: live spill → reload under --high-speed-swap with codec=DeltaZstd; bit-exact with dequant.
-- Measurement: n≥3 repeat on captured real-block corpora; fingerprint sidecars; block-header codec histogram.
-- Stage-3 GPU-resident (contraindicated) — only if Stages 1–2 pass and roofline arithmetic predicts win.
+- DoubleDelta bit-exact verification (preliminary single-shot, not a
+  serious claim).
+- Stage-1 integration test: live spill → reload under --high-speed-swap with
+  codec=DeltaZstd; bit-exact with dequant.
+- Measurement: n≥3 repeat on captured real-block corpora; fingerprint
+  sidecars; block-header codec histogram.
+- Stage-3 GPU-resident (contraindicated) — only if Stages 1–2 pass and
+  roofline arithmetic predicts a win.
