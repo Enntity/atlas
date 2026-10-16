@@ -99,3 +99,7 @@ impl W8a8Load {
         );
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "w8a8_gpu_tests.rs"]
+mod gpu_tests;
