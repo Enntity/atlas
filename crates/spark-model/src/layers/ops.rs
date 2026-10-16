@@ -239,6 +239,8 @@ pub mod qwen4exp_rowinv;
 mod qwen4exp_w4_rows;
 #[path = "ops/qwen4exp_w4_wide.rs"]
 mod qwen4exp_w4_wide;
+#[path = "ops/qwen4exp_w8a8.rs"]
+pub mod qwen4exp_w8a8;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
