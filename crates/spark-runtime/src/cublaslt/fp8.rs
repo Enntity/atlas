@@ -278,3 +278,81 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
     }
     Ok(())
 }
+
+/// MXFP8 W8A8 `out[M,N] = act[M,K] @ weight[N,K]ᵀ` → BF16 (FP32 accumulate),
+/// both operands E4M3 with one UE8M0 scale per 32 K values
+/// (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0` on A and B; TN only on GB10).
+/// ~1.9× the BF16 path on FP4-Local's prefill projections (160–177 vs 80–95
+/// TFLOPS on GB10).
+///
+/// Layouts (row-major, 16-byte aligned):
+/// * `weight_fp8` `[N, K]`, `act_fp8` `[M, K]` E4M3; `out` `[M, N]` BF16.
+/// * `weight_sf`, `act_sf`: cuBLASLt's tiled scale layout for `[N, K/32]` /
+///   `[M, K/32]` (`kernels/gb10/common/mxfp8_act_quant.cuh`), `round_up(rows,
+///   128) * round_up(K/32, 4)` bytes, columns past K/32 zero.
+///
+/// `K % 32 == 0`. The kernel is the bucket's tuned in-order one
+/// (`mx_algo`): the first call of a `(N, K, row bucket)` times the
+/// candidates on these operands and synchronizes `stream` (or call
+/// [`fp8_gemm_mx_prepare`](super::fp8_gemm_mx_prepare) at load).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_mx(
+    act_fp8: u64,
+    act_sf: u64,
+    weight_fp8: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        m > 0 && n > 0 && k > 0 && k.is_multiple_of(32),
+        "cuBLASLt MXFP8: {m}x{n}x{k} (K % 32 != 0 or an empty dimension)"
+    );
+    let ctx = ctx()?;
+    let p = super::fixed_algo::Problem::with(
+        m,
+        n,
+        k,
+        super::fixed_algo::Operands::Mxfp8 { weight_sf, act_sf },
+    )?;
+    let ptrs = [weight_fp8, act_fp8, out];
+    let algo = super::mx_algo::select(ctx, &p, [m, n, k], ptrs, stream)?;
+    super::mx_algo::matmul(ctx, &p, &algo, ptrs, stream)
+}
+
+/// [`fp8_gemm_act_weight_t_mx`] on the heuristic's `index`-th candidate for
+/// exactly these `m` rows (tests and benches: the tuned pick is not
+/// consulted or cached); `in_order_only` asks the heuristic for no-split-K
+/// kernels only, as tuning does. `Ok(None)`: no such candidate, or it
+/// refuses the problem; nothing launched. `Some((description, in_order))`
+/// otherwise.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_mx_candidate(
+    act_fp8: u64,
+    act_sf: u64,
+    weight_fp8: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    index: usize,
+    in_order_only: bool,
+    stream: u64,
+) -> Result<Option<(String, bool)>> {
+    use super::mx_algo::{candidates, description, in_order, matmul, takes};
+    let ctx = ctx()?;
+    let p = super::fixed_algo::Problem::with(
+        m,
+        n,
+        k,
+        super::fixed_algo::Operands::Mxfp8 { weight_sf, act_sf },
+    )?;
+    let Some(algo) = candidates(ctx, &p, in_order_only)?.get(index).copied() else {
+        return Ok(None);
+    };
+    if !takes(ctx, &p, &algo) {
+        return Ok(None);
+    }
+    matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)?;
+    Ok(Some((description(&algo), in_order(&algo))))
+}

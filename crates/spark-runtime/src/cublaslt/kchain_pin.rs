@@ -33,8 +33,8 @@ pub(super) const RESULT_BYTES: usize = 96;
 
 const CONFIG_ID: u32 = 0;
 const CONFIG_TILE_ID: u32 = 1;
-const CONFIG_SPLITK_NUM: u32 = 2;
-const CONFIG_REDUCTION_SCHEME: u32 = 3;
+pub(super) const CONFIG_SPLITK_NUM: u32 = 2;
+pub(super) const CONFIG_REDUCTION_SCHEME: u32 = 3;
 /// The CUTLASS sm80 tensor-op GEMM.
 const ALGO_SM80: i32 = 21;
 /// 256x128, then 128x256.
@@ -66,7 +66,7 @@ pub(super) fn applies(m: u32, n: u32, weight_nk: bool) -> bool {
     requested() && weight_nk && m >= 2048 && n >= 2048 && super::version() >= 130000
 }
 
-fn attr(algo: *const c_void, which: u32) -> Option<i32> {
+pub(super) fn attr(algo: *const c_void, which: u32) -> Option<i32> {
     let mut v = 0i32;
     let mut written = 0usize;
     // SAFETY: `algo` points at a heuristic result's algo field (64 bytes,
