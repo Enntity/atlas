@@ -44,6 +44,17 @@ use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
 use crate::weight_map::dense;
 
+/// The decoder layers that carry PLE. `ple_layer_ids` is ONE-indexed — the
+/// reference selects with `ple_layer_ids.index(layer_idx + 1)` — so `[2]`
+/// means decoder layer 1, `layers.1.ple`. Reading an id as a layer index
+/// probes one layer late (it once reported 0 shards on every checkpoint).
+pub(super) fn ple_decoder_layers(config: &ModelConfig) -> impl Iterator<Item = usize> + '_ {
+    config
+        .ple_layer_ids
+        .iter()
+        .filter_map(|&id| id.checked_sub(1))
+}
+
 /// Resident rows in the pinned arena. A forward's gather pins at most one
 /// scratch span of rows at once — `scratch_tokens * ngram_heads` — because
 /// the chunked pipeline resolves and releases a span at a time, so the
@@ -191,9 +202,7 @@ pub(super) fn load(
     if config.ple_layer_ids.is_empty() {
         return Ok(None);
     }
-    // `ple_layer_ids` is 1-INDEXED — the reference selects with
-    // `ple_layer_ids.index(layer_idx + 1)` — so `[2]` means MODEL LAYER 1.
-    if !config.ple_layer_ids.contains(&(layer_idx + 1)) {
+    if !ple_decoder_layers(config).any(|l| l == layer_idx) {
         return Ok(None);
     }
     let lp = format!("{}.ple", config.layer_prefix(layer_idx));

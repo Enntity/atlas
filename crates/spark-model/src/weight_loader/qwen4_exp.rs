@@ -440,7 +440,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                 "ATLAS_QWEN4EXP_NO_PLE=1: PLE n-gram injection at model layer {} \
                  is DISABLED. Output is wrong by construction — this arm exists \
                  to bisect the mHC spine, nothing else.",
-                config.ple_layer_ids[0].saturating_sub(1),
+                ple::ple_decoder_layers(config).next().unwrap_or(0),
             );
         }
         tracing::info!(
