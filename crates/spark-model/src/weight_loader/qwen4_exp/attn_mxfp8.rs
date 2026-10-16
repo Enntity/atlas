@@ -92,7 +92,7 @@ pub(super) fn build_full_attention(
         .collect::<Result<_>>()?;
     // The twins and the BF16 build below read the same raw bytes; the
     // loader's per-layer sweep (`format::release_mxfp8_sources`) frees them.
-    let twins = if mxfp8_decode_requested()? {
+    let twins = if mxfp8_decode_requested() {
         Some(twins(gpu, config, &raws, stream)?)
     } else {
         None

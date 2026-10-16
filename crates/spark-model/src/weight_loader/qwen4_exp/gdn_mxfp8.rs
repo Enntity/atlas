@@ -25,7 +25,7 @@
 //! fused BA + gates GEMV reads them, and at 0.5 MB a layer they are 0.2% of
 //! the GDN bytes.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
@@ -36,24 +36,19 @@ use crate::tp_shard::TpGdnDims;
 use crate::weight_loader::qwen35::load_layers::linear_attn_arms::dense_bf16_layer;
 use crate::weight_map::{DenseWeight, Nvfp4Variant, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8};
 
-/// `ATLAS_QWEN4EXP_MXFP8_DECODE` as set (read once): unset or `1` decodes an
-/// MXFP8 checkpoint's own bytes, `0` its BF16 dequant.
-pub(crate) fn mxfp8_decode_requested() -> Result<bool> {
-    static ON: std::sync::OnceLock<std::result::Result<bool, String>> = std::sync::OnceLock::new();
-    ON.get_or_init(|| {
-        parse(std::env::var("ATLAS_QWEN4EXP_MXFP8_DECODE").ok().as_deref())
-            .map_err(|e| e.to_string())
-    })
-    .clone()
-    .map_err(anyhow::Error::msg)
+/// `ATLAS_QWEN4EXP_MXFP8_DECODE` (read once): `0` decodes an MXFP8
+/// checkpoint's BF16 dequant, anything else (unset included) its own bytes.
+///
+/// Lenient like the other default-on switches (`!= "0"`): the startup-parity
+/// table reads it for EVERY model, and a refusal there would fail any TP
+/// boot, GLM included, over a variable only this checkpoint uses.
+pub(crate) fn mxfp8_decode_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse(std::env::var("ATLAS_QWEN4EXP_MXFP8_DECODE").ok().as_deref()))
 }
 
-fn parse(value: Option<&str>) -> Result<bool> {
-    match value {
-        None | Some("1") => Ok(true),
-        Some("0") => Ok(false),
-        Some(v) => bail!("ATLAS_QWEN4EXP_MXFP8_DECODE={v}: expected 0 or 1"),
-    }
+fn parse(value: Option<&str>) -> bool {
+    value != Some("0")
 }
 
 /// The GDN projection names whose MXFP8 bytes decode reads.
@@ -115,13 +110,17 @@ mod tests {
     use super::parse;
 
     #[test]
-    fn unset_or_one_is_on_and_zero_is_off() {
-        assert!(parse(None).unwrap());
-        assert!(parse(Some("1")).unwrap());
-        assert!(!parse(Some("0")).unwrap());
-        for v in ["", "true", "on", " 1"] {
-            let e = parse(Some(v)).unwrap_err();
-            assert!(e.to_string().contains("expected 0 or 1"), "{v:?}: {e}");
+    fn only_zero_is_off_and_garbage_is_the_default() {
+        assert!(!parse(Some("0")));
+        for v in [
+            None,
+            Some("1"),
+            Some(""),
+            Some("true"),
+            Some("off"),
+            Some(" 0"),
+        ] {
+            assert!(parse(v), "{v:?}");
         }
     }
 }

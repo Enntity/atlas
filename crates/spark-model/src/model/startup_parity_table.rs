@@ -293,7 +293,7 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // Whether an MXFP8 checkpoint's GDN decodes its own bytes or their BF16
     // dequant: two summation orders in one out_proj all-reduce.
     ("ATLAS_QWEN4EXP_MXFP8_DECODE", || {
-        Ok(mxfp8_decode_requested()? as u64)
+        Ok(mxfp8_decode_requested() as u64)
     }),
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {

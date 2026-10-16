@@ -74,7 +74,7 @@ impl GdnProjections {
     /// beside them (each would be a second decode format). The switch is not
     /// read for any other checkpoint.
     pub(crate) fn for_checkpoint(self, mxfp8_backbone: bool) -> Result<Self> {
-        let mxfp8 = mxfp8_backbone && super::gdn_mxfp8::mxfp8_decode_requested()?;
+        let mxfp8 = mxfp8_backbone && super::gdn_mxfp8::mxfp8_decode_requested();
         Self::with_mxfp8(self, mxfp8)
     }
 
