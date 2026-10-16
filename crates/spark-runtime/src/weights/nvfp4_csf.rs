@@ -75,12 +75,13 @@ pub fn csf_part(name: &str) -> Option<(&str, CsfPart)> {
 /// otherwise count the 3.6 GB compressed and miss 3.9 GB of the 7.5 GB that
 /// lands on the device.
 pub fn decoded_len(fixed_shape: &[usize]) -> Option<usize> {
-    let (rows, cols) = geometry(fixed_shape).ok()?;
-    Some(rows * cols)
+    geometry(fixed_shape).ok().map(|(_, _, total)| total)
 }
 
-/// `(rows, cols)` of the decoded matrix, from the fixed stream's shape.
-fn geometry(fixed_shape: &[usize]) -> Result<(usize, usize)> {
+/// `(rows, cols, rows * cols)` of the decoded matrix, from the fixed stream's
+/// shape. The shape comes from a file header, so every product is checked:
+/// unchecked, a hostile header wraps in a release build.
+fn geometry(fixed_shape: &[usize]) -> Result<(usize, usize, usize)> {
     ensure!(
         fixed_shape.len() == 2,
         "CSF fixed stream must be 2-D, got {fixed_shape:?}"
@@ -90,7 +91,39 @@ fn geometry(fixed_shape: &[usize]) -> Result<(usize, usize)> {
         slabs > 0 && width % SLAB == 0 && width / SLAB >= 2,
         "CSF fixed stream {fixed_shape:?} is not [rows/16, 16 * (1 + cols/2)]"
     );
-    Ok((slabs * SLAB, (width / SLAB - 1) * 2))
+    let rows = slabs.checked_mul(SLAB);
+    let cols = (width / SLAB - 1).checked_mul(2);
+    let (Some(rows), Some(cols)) = (rows, cols) else {
+        bail!("CSF fixed stream {fixed_shape:?}: decoded size overflows");
+    };
+    let total = rows
+        .checked_mul(cols)
+        .with_context(|| format!("CSF fixed stream {fixed_shape:?}: decoded size overflows"))?;
+    Ok((rows, cols, total))
+}
+
+/// Refuse a decoded `[rows, cols]` scale that is not the `[n, k/16]` E4M3
+/// matrix its packed NVFP4 weight `[n, k/2]` needs.
+fn check_against_weight(scale: &str, got: [usize; 2], weight: Option<&[usize]>) -> Result<()> {
+    let wname = scale
+        .strip_suffix("_scale")
+        .filter(|w| w.ends_with(".weight"))
+        .with_context(|| format!("CSF scale {scale} is not a `.weight_scale`"))?;
+    let Some(w) = weight else {
+        bail!("CSF scale {scale} decoded, but there is no `{wname}` for it to scale");
+    };
+    let want = match *w {
+        [n, k_packed] => k_packed
+            .checked_mul(2)
+            .filter(|k| k % 16 == 0)
+            .map(|k| [n, k / 16]),
+        _ => None,
+    };
+    ensure!(
+        want == Some(got),
+        "CSF scale {scale} decoded to {got:?}, but its weight `{wname}` {w:?} needs          {want:?} ([n, k/2] packed NVFP4 -> [n, k/16])"
+    );
+    Ok(())
 }
 
 /// Decode one CSF pair to the E4M3 `[rows, cols]` scale matrix, as raw bytes.
@@ -103,20 +136,20 @@ pub fn decode_nvfp4_csf(
     fixed_shape: &[usize],
     exceptions: &[u8],
 ) -> Result<(Vec<u8>, [usize; 2])> {
-    let (rows, cols) = geometry(fixed_shape)?;
+    let (rows, cols, total) = geometry(fixed_shape)?;
     let width = fixed_shape[1];
+    // `rows * cols` did not overflow, and the fixed stream is smaller.
+    let need = fixed_shape[0] * width;
     ensure!(
-        fixed.len() == fixed_shape[0] * width,
-        "CSF fixed stream holds {} bytes but its shape {fixed_shape:?} needs {}",
+        fixed.len() == need,
+        "CSF fixed stream holds {} bytes but its shape {fixed_shape:?} needs {need}",
         fixed.len(),
-        fixed_shape[0] * width,
     );
     ensure!(
         exceptions.len().is_multiple_of(4),
         "CSF exception stream is {} bytes, not a whole number of u32 words",
         exceptions.len()
     );
-    let total = rows * cols;
     ensure!(
         total <= 1 << POSITION_BITS,
         "CSF {rows}x{cols} matrix cannot be addressed by a {POSITION_BITS}-bit position"
@@ -188,13 +221,15 @@ struct Part {
 /// Pairs CSF halves as a loader streams tensors past it, in any order and
 /// across shards, and decodes each pair once both halves have arrived.
 ///
-/// Every safetensors loader routes CSF parts here instead of uploading them,
-/// so the store only ever sees the decoded `weight_scale`, and the U32
-/// exception stream (a dtype the store does not carry) never reaches it.
+/// The disk loaders (`SafetensorsLoader`, `FastSafetensorsLoader`) route CSF
+/// parts here instead of uploading them, so the store only ever sees the
+/// decoded `weight_scale`, and the U32 exception stream (a dtype the store
+/// does not carry) never reaches it.
 #[derive(Default)]
 pub struct CsfAssembler {
     pending: HashMap<String, (Option<Part>, Option<Part>)>,
-    decoded: usize,
+    /// Every scale decoded so far, with its `[rows, cols]`.
+    decoded: HashMap<String, [usize; 2]>,
     bytes_in: usize,
     bytes_out: usize,
     time: Duration,
@@ -215,19 +250,21 @@ impl CsfAssembler {
     ) -> Result<Option<DecodedScale>> {
         let (base, part) =
             csf_part(name).with_context(|| format!("{name} is not a CSF stream tensor"))?;
-        let elem = match part {
+        let elem: usize = match part {
             CsfPart::Fixed => 1,
             CsfPart::Exceptions => 4,
         };
         // The byte length against the header shape pins the dtype (U8 vs U32)
         // without trusting the dtype string: a stream with the other width
         // cannot satisfy both.
-        let numel: usize = shape.iter().product();
+        let want = shape
+            .iter()
+            .try_fold(elem, |n, &d| n.checked_mul(d))
+            .with_context(|| format!("{name}: shape {shape:?} overflows"))?;
         ensure!(
-            numel * elem == bytes.len(),
-            "{name}: {} bytes for shape {shape:?} — expected {} ({})",
+            want == bytes.len(),
+            "{name}: {} bytes for shape {shape:?} — expected {want} ({})",
             bytes.len(),
-            numel * elem,
             if elem == 1 { "U8" } else { "U32" },
         );
         let slot = self.pending.entry(base.to_string()).or_default();
@@ -250,7 +287,7 @@ impl CsfAssembler {
         let (out, [rows, cols]) = decode_nvfp4_csf(&fixed.bytes, &fixed.shape, &exc.bytes)
             .with_context(|| format!("decoding CSF scale {base}"))?;
         self.time += t.elapsed();
-        self.decoded += 1;
+        self.decoded.insert(base.to_string(), [rows, cols]);
         self.bytes_in += fixed.bytes.len() + exc.bytes.len();
         self.bytes_out += out.len();
         Ok(Some(DecodedScale {
@@ -260,10 +297,17 @@ impl CsfAssembler {
         }))
     }
 
-    /// Refuse a load that left a half without its partner, and log what the
-    /// decode cost. A lone half means a scale the model will look for and not
-    /// find — or worse, find stale — so it is an error, not a warning.
-    pub fn finish(self) -> Result<()> {
+    /// Refuse a load that left a half without its partner, or decoded a scale
+    /// that is not the `[n, k/16]` its packed weight `[n, k/2]` needs
+    /// (`weight_shape` looks a loaded or deferred tensor's shape up by name),
+    /// and log what the decode cost. A lone half means a scale the model will
+    /// look for and not find — or worse, find stale — so it is an error, not a
+    /// warning.
+    ///
+    /// The shape check runs here, at the end of the load and before any store
+    /// exists, rather than before each upload: a pair and its weight can sit
+    /// in different shards, in either order.
+    pub fn finish(self, weight_shape: impl Fn(&str) -> Option<Vec<usize>>) -> Result<()> {
         if !self.pending.is_empty() {
             let mut names: Vec<_> = self.pending.keys().take(4).cloned().collect();
             names.sort();
@@ -273,12 +317,16 @@ impl CsfAssembler {
                 self.pending.len()
             );
         }
-        if self.decoded > 0 {
+        for (name, &got) in &self.decoded {
+            let w = name.strip_suffix("_scale").and_then(&weight_shape);
+            check_against_weight(name, got, w.as_deref())?;
+        }
+        if !self.decoded.is_empty() {
             let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
             tracing::info!(
                 "Decoded {} CSF NVFP4 scale matrices: {:.2} GiB compressed -> {:.2} GiB E4M3 \
                  in {:.2} s on the load thread",
-                self.decoded,
+                self.decoded.len(),
                 gib(self.bytes_in),
                 gib(self.bytes_out),
                 self.time.as_secs_f64(),

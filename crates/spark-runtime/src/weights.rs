@@ -220,6 +220,19 @@ pub struct DeferredTensor {
     pub dtype: WeightDtype,
 }
 
+/// The shape of tensor `name` in a load's uploaded or deferred maps, for
+/// [`nvfp4_csf::CsfAssembler::finish`]'s scale-vs-weight check.
+pub(crate) fn loaded_shape(
+    uploaded: &HashMap<String, WeightTensor>,
+    deferred: &HashMap<String, DeferredTensor>,
+    name: &str,
+) -> Option<Vec<usize>> {
+    uploaded
+        .get(name)
+        .map(|t| t.shape.clone())
+        .or_else(|| deferred.get(name).map(|d| d.shape.clone()))
+}
+
 impl WeightStore {
     /// Create an empty weight store (for testing).
     pub fn empty() -> Self {

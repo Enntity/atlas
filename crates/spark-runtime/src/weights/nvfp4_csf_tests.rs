@@ -276,7 +276,7 @@ fn assembler_pairs_in_any_order_and_names_the_scale() {
         hex(&Sha256::digest(&d1.bytes)),
         g[2].case["decoded_sha256"].as_str().unwrap()
     );
-    a.finish().unwrap();
+    a.finish(|_| Some(vec![640, 1280])).unwrap();
 }
 
 #[test]
@@ -288,7 +288,7 @@ fn assembler_refuses_lone_duplicate_and_mistyped_halves() {
 
     let mut a = CsfAssembler::new();
     a.offer(&fixed, &g.fixed_shape, &g.fixed).unwrap();
-    let e = format!("{:#}", a.finish().unwrap_err());
+    let e = format!("{:#}", a.finish(|_| None).unwrap_err());
     assert!(e.contains("without a partner"), "{e}");
 
     let mut a = CsfAssembler::new();
@@ -300,6 +300,77 @@ fn assembler_refuses_lone_duplicate_and_mistyped_halves() {
     let mut a = CsfAssembler::new();
     assert!(a.offer(&exc, &[n], &g.exceptions[..n]).is_err());
     assert!(a.offer("x.weight_scale", &[1], &[0]).is_err());
+}
+
+/// Shapes come from a file header: every size computed from them must be
+/// checked, or a hostile header wraps in release builds (or panics in debug)
+/// instead of being refused.
+#[test]
+fn overflowing_shapes_are_refused_not_wrapped() {
+    let big = usize::MAX;
+    // geometry: slabs * 16 wraps.
+    expect_err(decode_nvfp4_csf(&[], &[big, 32], &[]), "overflow");
+    // geometry: rows * cols wraps (2^44 rows x ~2^41 cols).
+    let w = 16 * (1 + (1usize << 40));
+    expect_err(decode_nvfp4_csf(&[], &[1 << 40, w], &[]), "overflow");
+    // No rows at all.
+    expect_err(decode_nvfp4_csf(&[], &[0, 32], &[]), "not [rows/16");
+    // The pre-flight estimate gets None, not a wrapped size.
+    assert_eq!(decoded_len(&[big, 32]), None);
+    assert_eq!(decoded_len(&[1 << 40, w]), None);
+    assert_eq!(decoded_len(&[40, 1296]), Some(640 * 160));
+    // offer: the header's element count wraps, and so does count * 4.
+    let mut a = CsfAssembler::new();
+    let e = a.offer("x.weight_scale.nvfp4_csf_fixed", &[big, 2], &[0; 2]);
+    assert!(format!("{:#}", e.err().unwrap()).contains("overflow"));
+    let e = a.offer("x.weight_scale.nvfp4_csf_exceptions", &[big / 2], &[0; 4]);
+    assert!(format!("{:#}", e.err().unwrap()).contains("overflow"));
+}
+
+/// The decoded scale must be the one its packed weight `[n, k/2]` needs,
+/// `[n, k/16]`: a pair from another projection, or a weight from another
+/// layout, is refused rather than uploaded and read as scales.
+#[test]
+fn decoded_scales_are_checked_against_their_weights() {
+    let g = &golden()[0]; // [640, 160] E4M3: a [640, 2560] packed-NVFP4 weight
+    let name = "e.gate_proj.weight_scale";
+    let pair = |a: &mut CsfAssembler| {
+        a.offer(
+            &format!("{name}{CSF_FIXED_SUFFIX}"),
+            &g.fixed_shape,
+            &g.fixed,
+        )
+        .unwrap();
+        let n = g.exceptions.len() / 4;
+        a.offer(
+            &format!("{name}{CSF_EXCEPTIONS_SUFFIX}"),
+            &[n],
+            &g.exceptions,
+        )
+        .unwrap()
+        .expect("pair complete")
+    };
+    let finish = |weight: Option<Vec<usize>>| {
+        let mut a = CsfAssembler::new();
+        pair(&mut a);
+        a.finish(|n: &str| {
+            (n == "e.gate_proj.weight")
+                .then(|| weight.clone())
+                .flatten()
+        })
+    };
+    finish(Some(vec![640, 1280])).unwrap();
+    for (w, needle) in [
+        (Some(vec![640, 1288]), "needs"),       // k/16 = 161
+        (Some(vec![1280, 1280]), "needs"),      // rows differ
+        (Some(vec![640, 1280, 1]), "needs"),    // not 2-D
+        (Some(vec![640, 1281]), "needs"),       // k not a multiple of 16
+        (Some(vec![640, usize::MAX]), "needs"), // 2 * k_packed wraps
+        (None, "no `e.gate_proj.weight`"),
+    ] {
+        let e = format!("{:#}", finish(w.clone()).unwrap_err());
+        assert!(e.contains(needle), "{w:?}: {e}");
+    }
 }
 
 #[test]
@@ -363,6 +434,7 @@ fn csf_whole_checkpoint() {
     shards.sort();
     shards.dedup();
     let mut asm = CsfAssembler::new();
+    let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
     let (mut pairs, mut decode, mut bytes_out, mut io_bytes) =
         (0usize, Duration::ZERO, 0usize, 0usize);
     let (mut mx_tensors, mut mx_lo, mut mx_hi) = (0usize, u8::MAX, 0u8);
@@ -389,6 +461,12 @@ fn csf_whole_checkpoint() {
             (buf, shape)
         };
         for (name, info) in &header {
+            if let Some(shape) = info["shape"].as_array() {
+                shapes.insert(
+                    name.clone(),
+                    shape.iter().map(|d| d.as_u64().unwrap() as usize).collect(),
+                );
+            }
             if csf_part(name).is_some() {
                 let (buf, shape) = read(info);
                 io_bytes += buf.len();
@@ -409,7 +487,8 @@ fn csf_whole_checkpoint() {
             }
         }
     }
-    asm.finish().unwrap();
+    // Every decoded scale is the [n, k/16] its packed weight [n, k/2] needs.
+    asm.finish(|n| shapes.get(n).cloned()).unwrap();
     eprintln!(
         "{pairs} CSF pairs: {:.2} GiB read -> {:.2} GiB decoded, decode {:.2} s single-threaded \
          ({:.2} GiB/s); {mx_tensors} U8 weight_scale tensors, exponents {mx_lo}..={mx_hi}",
@@ -440,6 +519,9 @@ fn csf_layer_dump_matches_the_reference() {
         serde_json::from_slice(&std::fs::read(format!("{}.ref.json", dump.display())).unwrap())
             .unwrap();
     let mut asm = CsfAssembler::new();
+    // The dump holds the CSF pairs only: stand each weight in at the shape
+    // its decoded scale implies, so `finish` checks the pairing alone.
+    let mut weights: HashMap<String, Vec<usize>> = HashMap::new();
     let mut matched = 0;
     for (name, v) in &index {
         let shape: Vec<usize> = v[1]
@@ -462,10 +544,12 @@ fn csf_layer_dump_matches_the_reference() {
                 "{}",
                 d.name
             );
+            let w = d.name.strip_suffix("_scale").unwrap().to_string();
+            weights.insert(w, vec![d.shape[0], d.shape[1] * 8]);
             matched += 1;
         }
     }
-    asm.finish().unwrap();
+    asm.finish(|n| weights.get(n).cloned()).unwrap();
     assert!(
         want.is_empty(),
         "reference decoded {} pairs this did not",

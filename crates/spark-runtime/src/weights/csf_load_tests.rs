@@ -19,6 +19,11 @@ use std::path::{Path, PathBuf};
 const GATE: &str = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale";
 const DOWN: &str = "model.language_model.layers.0.mlp.experts.1.down_proj.weight_scale";
 const PLAIN: &str = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+const DOWN_W: &str = "model.language_model.layers.0.mlp.experts.1.down_proj.weight";
+/// The packed NVFP4 weights the decoded scales belong to: `[n, k/2]` for a
+/// `[n, k/16]` scale.
+const GATE_W_SHAPE: [usize; 2] = [640, 1280];
+const DOWN_W_SHAPE: [usize; 2] = [2560, 320];
 
 struct Dir(PathBuf);
 impl Dir {
@@ -81,6 +86,12 @@ fn write_shard(path: &Path, tensors: &[T<'_>]) {
 
 /// Two shards under `tensors/`, each CSF pair split across them.
 fn checkpoint(dir: &Path, with_gate_exceptions: bool) {
+    checkpoint_with(dir, with_gate_exceptions, GATE_W_SHAPE, &[]);
+}
+
+/// [`checkpoint`] with the gate weight at `gate_w` and `extra_b` added to
+/// shard b.
+fn checkpoint_with(dir: &Path, with_gate_exceptions: bool, gate_w: [usize; 2], extra_b: &[T<'_>]) {
     let gate_f = fixture("l0_e0_gate.fixed.bin");
     let gate_e = fixture("l0_e0_gate.exceptions.bin");
     let down_f = fixture("l0_e0_down.fixed.bin");
@@ -93,13 +104,17 @@ fn checkpoint(dir: &Path, with_gate_exceptions: bool) {
         &[
             (&gf, "U8", vec![40, 1296], gate_f),
             (&de, "U32", vec![down_e.len() / 4], down_e),
-            (PLAIN, "U8", vec![4, 2], vec![7; 8]),
+            (PLAIN, "U8", gate_w.to_vec(), vec![7; gate_w[0] * gate_w[1]]),
         ],
     );
-    let mut b: Vec<T<'_>> = vec![(&df, "U8", vec![160, 336], down_f)];
+    let mut b: Vec<T<'_>> = vec![
+        (&df, "U8", vec![160, 336], down_f),
+        (DOWN_W, "U8", DOWN_W_SHAPE.to_vec(), vec![9; 2560 * 320]),
+    ];
     if with_gate_exceptions {
         b.push((&ge, "U32", vec![gate_e.len() / 4], gate_e));
     }
+    b.extend(extra_b.iter().cloned());
     write_shard(&dir.join("tensors/b.safetensors"), &b);
     let mut map = serde_json::Map::new();
     for (n, s) in [
@@ -107,8 +122,12 @@ fn checkpoint(dir: &Path, with_gate_exceptions: bool) {
         (&de, "a"),
         (&PLAIN.to_string(), "a"),
         (&df, "b"),
+        (&DOWN_W.to_string(), "b"),
     ] {
         map.insert(n.clone(), format!("tensors/{s}.safetensors").into());
+    }
+    for (n, ..) in extra_b {
+        map.insert(n.to_string(), "tensors/b.safetensors".into());
     }
     if with_gate_exceptions {
         map.insert(ge.clone(), "tensors/b.safetensors".into());
@@ -140,7 +159,7 @@ fn check(store: &WeightStore, gpu: &MockGpuBackend, which: &str) {
         store.names().all(|n| nvfp4_csf::csf_part(n).is_none()),
         "{which}: a CSF stream reached the store"
     );
-    assert_eq!(store.len(), 3, "{which}");
+    assert_eq!(store.len(), 4, "{which}");
 }
 
 #[test]
@@ -165,7 +184,7 @@ fn both_loaders_decode_cross_shard_pairs_from_a_subdirectory_index() {
     ];
     assert_eq!(
         estimate_load_bytes(&shards, &|_| false).unwrap(),
-        640 * 160 + 2560 * 40 + 8
+        640 * 160 + 2560 * 40 + 640 * 1280 + 2560 * 320
     );
 }
 
@@ -203,4 +222,27 @@ fn ep_skips_both_halves_of_a_remote_pair() {
         .load(&dir.0, &gpu, 0)
         .unwrap();
     assert!(store.contains(DOWN) && !store.contains(GATE));
+}
+
+/// Both loaders, a load that must fail with `needle`.
+fn both_refuse(dir: &Path, needle: &str) {
+    let gpu = MockGpuBackend::new();
+    let e = format!(
+        "{:#}",
+        SafetensorsLoader::new().load(dir, &gpu, 0).err().unwrap()
+    );
+    assert!(e.contains(needle), "mmap: {e}");
+    let mut fast = FastSafetensorsLoader::new();
+    fast.try_direct_io = false;
+    let e = format!("{:#}", fast.load(dir, &gpu, 0).err().unwrap());
+    assert!(e.contains(needle), "fast: {e}");
+}
+
+/// A decoded scale that is not the `[n, k/16]` its weight needs fails the
+/// load, whichever shard the weight is in.
+#[test]
+fn a_scale_that_does_not_fit_its_weight_refuses_the_load() {
+    let dir = Dir::new("misfit");
+    checkpoint_with(&dir.0, true, [640, 1288], &[]);
+    both_refuse(&dir.0, "needs");
 }
