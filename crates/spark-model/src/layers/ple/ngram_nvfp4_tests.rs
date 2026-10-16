@@ -247,15 +247,7 @@ fn nvfp4_gather_matches_the_golden_through_pack_and_cache() {
     let k = g
         .kernel("embed_from_argmax", "batched_embed_nvfp4")
         .unwrap();
-    let mut cache = spark_storage::NgramRowCache::open_at(
-        &table.path,
-        table.base_offset,
-        None,
-        table.rows_total,
-        table.stride,
-        64,
-    )
-    .unwrap();
+    let mut cache = table.open_row_cache(64).unwrap();
     cache.set_nvfp4_global_scale(global).unwrap();
     check_packed_stride(cache.row_stride(), head_dim, false).unwrap();
 

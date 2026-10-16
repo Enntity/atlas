@@ -257,6 +257,12 @@ impl NgramRowCache {
         self.keepalive.as_ref().map_or(0, |k| k.reads())
     }
 
+    /// The backing file of a flat (non-segmented) table, so a caller can
+    /// check it is the file it validated (`ngram_pack::PackedTable`).
+    pub(crate) fn backing_file(&self) -> &File {
+        &self.file
+    }
+
     /// Device VA of the cache's row table — the `embed_table` argument of the
     /// gather kernels, which then index it by SLOT.
     /// Bytes per row, i.e. `head_dim * element_size`.

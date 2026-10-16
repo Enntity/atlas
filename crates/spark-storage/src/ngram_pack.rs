@@ -98,13 +98,92 @@ pub struct PackSpec<'a> {
     pub tag: &'a str,
 }
 
-/// A packed table on disk, ready for `NgramRowCache::open_at`.
+/// A packed table on disk, as [`open_or_pack`] validated it.
 #[derive(Debug, Clone)]
 pub struct PackedTable {
     pub path: PathBuf,
     pub base_offset: u64,
     pub rows_total: u64,
     pub stride: usize,
+    /// `(st_dev, st_ino)` of the file that passed validation.
+    file_id: (u64, u64),
+}
+
+impl PackedTable {
+    fn new(spec: &PackSpec<'_>, path: PathBuf, validated: &File) -> Result<Self> {
+        Ok(Self {
+            path,
+            base_offset: HEADER,
+            rows_total: spec.rows_total(),
+            stride: spec.stride,
+            file_id: file_id(validated)?,
+        })
+    }
+
+    /// Refuse `f` unless it is the very file [`open_or_pack`] validated: the
+    /// row cache opens the table again by path (with O_DIRECT), and a file
+    /// renamed over that path in between was never checked.
+    pub fn check_same_file(&self, f: &File) -> Result<()> {
+        let id = file_id(f)?;
+        ensure!(
+            id == self.file_id,
+            "ngram pack: {} was replaced after it was validated (inode {:?}, validated {:?})",
+            self.path.display(),
+            id,
+            self.file_id
+        );
+        Ok(())
+    }
+
+    /// The row cache over this table, opened on the validated file.
+    #[cfg(feature = "cuda")]
+    pub fn open_row_cache(&self, slots: usize) -> Result<crate::NgramRowCache> {
+        let cache = crate::NgramRowCache::open_at(
+            &self.path,
+            self.base_offset,
+            None,
+            self.rows_total,
+            self.stride,
+            slots,
+        )?;
+        self.check_same_file(cache.backing_file())?;
+        Ok(cache)
+    }
+}
+
+/// `(st_dev, st_ino)` of an open file (`(0, 0)` where there is no inode).
+fn file_id(f: &File) -> Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = f.metadata().context("ngram pack: fstat")?;
+        Ok((m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        Ok((0, 0))
+    }
+}
+
+/// `opts` with O_NOFOLLOW, so a symlink planted at the path fails the open
+/// (ELOOP) instead of redirecting it. For everything the packer creates or
+/// trusts in its directory; the SOURCES are followed (a Hugging Face snapshot
+/// is symlinks to blobs).
+fn nofollow(opts: &mut OpenOptions) -> &mut OpenOptions {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts
+}
+
+/// The packed file at `path`, opened for reading without following a link.
+fn open_packed(path: &Path) -> Result<File> {
+    nofollow(OpenOptions::new().read(true))
+        .open(path)
+        .with_context(|| format!("ngram pack: open {}", path.display()))
 }
 
 impl PackSpec<'_> {
@@ -259,25 +338,26 @@ pub fn interleave(planes: &[&[u8]], row_bytes: &[usize], stride: usize, out: &mu
 /// time can sit on a read-only mount: builds write a temp file and rename it,
 /// so the final name only ever holds a complete file. A build holds an
 /// exclusive lock on `<file>.lock`, so two processes on one host build once.
+/// Nothing in `dir` is opened through a symlink, and the returned table names
+/// the validated file by inode ([`PackedTable::check_same_file`]).
 pub fn open_or_pack(spec: &PackSpec<'_>, dir: &Path, verify: Verify) -> Result<PackedTable> {
     let name = spec.file_name()?;
     let path = dir.join(&name);
-    let table = PackedTable {
-        path: path.clone(),
-        base_offset: HEADER,
-        rows_total: spec.rows_total(),
-        stride: spec.stride,
+    let existing = |verify| -> Result<PackedTable> {
+        let f = open_packed(&path)?;
+        validate_file(spec, &f, verify)?;
+        PackedTable::new(spec, path.clone(), &f)
     };
-    if path.exists() && validate(spec, &path, verify).is_ok() {
+    if let Ok(table) = existing(verify) {
         return Ok(table);
     }
     std::fs::create_dir_all(dir)
         .with_context(|| format!("ngram pack: create {}", dir.display()))?;
     let _lock = DirLock::take(&dir.join(format!("{name}.lock")))?;
     // Re-check under the lock: another process may have just finished.
-    if path.exists() {
-        match validate(spec, &path, verify) {
-            Ok(()) => return Ok(table),
+    if std::fs::symlink_metadata(&path).is_ok() {
+        match existing(verify) {
+            Ok(table) => return Ok(table),
             Err(e) => tracing::warn!("ngram pack: {} is stale, rebuilding: {e:#}", path.display()),
         }
     }
@@ -300,8 +380,8 @@ pub fn open_or_pack(spec: &PackSpec<'_>, dir: &Path, verify: Verify) -> Result<P
     }
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("ngram pack: rename to {}", path.display()))?;
-    validate(spec, &path, Verify::Sample)
-        .context("ngram pack: freshly built file failed validation")?;
+    let table =
+        existing(Verify::Sample).context("ngram pack: freshly built file failed validation")?;
     tracing::info!(
         "ngram pack: built {} in {:.1}s",
         path.display(),
@@ -317,12 +397,10 @@ const CHUNK_ROWS: u64 = 262_144;
 
 /// Write the packed form of `spec` to `out_path`: rows read `io_rows` at a
 /// time, checksummed every `check_rows`, and the header LAST, so a file cut
-/// short anywhere fails the magic.
+/// short anywhere fails the magic. `out_path` must not exist: the file is
+/// created exclusively, so neither a planted file nor a symlink is written.
 fn pack(spec: &PackSpec<'_>, out_path: &Path, io_rows: u64, check_rows: u64) -> Result<()> {
-    let out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
+    let out = nofollow(OpenOptions::new().write(true).create_new(true))
         .open(out_path)
         .with_context(|| format!("ngram pack: create {}", out_path.display()))?;
     let identity = spec.identity()?;
@@ -493,8 +571,12 @@ fn read_header(f: &File) -> Result<Header> {
 /// one sampled row per shard against its sources, and the chunk checksums
 /// `verify` asks for.
 pub fn validate(spec: &PackSpec<'_>, path: &Path, verify: Verify) -> Result<()> {
-    let f = File::open(path).with_context(|| format!("ngram pack: open {}", path.display()))?;
-    let hdr = read_header(&f)?;
+    validate_file(spec, &open_packed(path)?, verify)
+}
+
+/// [`validate`] on an open file.
+fn validate_file(spec: &PackSpec<'_>, f: &File, verify: Verify) -> Result<()> {
+    let hdr = read_header(f)?;
     ensure!(
         hdr.identity == spec.identity()?.as_bytes(),
         "identity differs from the sources"
@@ -515,7 +597,7 @@ pub fn validate(spec: &PackSpec<'_>, path: &Path, verify: Verify) -> Result<()> 
     let mut exp = vec![0u8; spec.stride];
     for shard in 0..spec.shards() as u64 {
         let row = shard * spec.rows_per_shard + sample_row(shard, spec.rows_per_shard);
-        read_exact_at(&f, &mut got, packed_offset(row, spec.stride))?;
+        read_exact_at(f, &mut got, packed_offset(row, spec.stride))?;
         exp.fill(0);
         let mut at = 0;
         for (i, p) in spec.planes.iter().enumerate() {
@@ -536,7 +618,7 @@ pub fn validate(spec: &PackSpec<'_>, path: &Path, verify: Verify) -> Result<()> 
             rand::seq::index::sample(&mut rand::thread_rng(), n, SAMPLE_CHUNKS.min(n)).into_vec()
         }
     };
-    verify_chunks(&f, &hdr, rows_total, spec.stride, &which)
+    verify_chunks(f, &hdr, rows_total, spec.stride, &which)
 }
 
 /// Re-hash chunks `which` of the body and compare with the header's sums.
@@ -681,10 +763,7 @@ struct DirLock(#[allow(dead_code)] File);
 
 impl DirLock {
     fn take(path: &Path) -> Result<Self> {
-        let f = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
+        let f = nofollow(OpenOptions::new().create(true).truncate(false).write(true))
             .open(path)
             .with_context(|| format!("ngram pack: open lock {}", path.display()))?;
         #[cfg(unix)]

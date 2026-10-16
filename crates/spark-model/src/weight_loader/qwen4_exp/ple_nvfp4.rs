@@ -75,15 +75,9 @@ pub(super) fn open(
             dir.display()
         )
     })?;
-    let mut cache = spark_storage::NgramRowCache::open_at(
-        &table.path,
-        table.base_offset,
-        None,
-        table.rows_total,
-        table.stride,
-        slots,
-    )
-    .context("PLE: NVFP4 row cache")?;
+    let mut cache = table
+        .open_row_cache(slots)
+        .context("PLE: NVFP4 row cache")?;
     cache.set_nvfp4_global_scale(global)?;
     tracing::info!(
         "PLE n-gram table: NVFP4 (E2M1 + E4M3/16, global {global:.6e}), {} shards \

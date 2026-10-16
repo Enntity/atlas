@@ -514,3 +514,69 @@ fn verify_cost() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Nothing the packer opens for writing follows a symlink: a temp file, a
+/// lock or a packed file planted as a link to another file must never write
+/// through to that file.
+#[cfg(unix)]
+#[test]
+fn symlinks_are_never_followed() {
+    use std::os::unix::fs::symlink;
+    let f = fixture("links", 10);
+    let spec = f.spec();
+    let cache = f.dir.join("derived");
+    std::fs::create_dir_all(&cache).unwrap();
+    let victim = f.dir.join("victim");
+    std::fs::write(&victim, b"precious").unwrap();
+    let name = spec.file_name().unwrap();
+
+    // The temp file: pack() refuses a path that is a link.
+    let tmp = cache.join(format!("{name}.tmp1"));
+    symlink(&victim, &tmp).unwrap();
+    assert!(pack(&spec, &tmp, 7, 4).is_err());
+    std::fs::remove_file(&tmp).unwrap();
+
+    // The lock: refused, so the build is too.
+    let lock = cache.join(format!("{name}.lock"));
+    symlink(&victim, &lock).unwrap();
+    let e = open_or_pack(&spec, &cache, Verify::Full).unwrap_err();
+    assert!(format!("{e:#}").contains("lock"), "{e:#}");
+    std::fs::remove_file(&lock).unwrap();
+
+    // The packed file itself, linked to a VALID packed table elsewhere: not
+    // used through the link, but replaced by a regular file of its own.
+    let elsewhere = f.dir.join("elsewhere.bin");
+    pack(&spec, &elsewhere, 7, 4).unwrap();
+    let before = std::fs::read(&elsewhere).unwrap();
+    let path = cache.join(&name);
+    symlink(&elsewhere, &path).unwrap();
+    assert!(validate(&spec, &path, Verify::Full).is_err());
+    let t = open_or_pack(&spec, &cache, Verify::Full).unwrap();
+    assert!(!std::fs::symlink_metadata(&t.path).unwrap().is_symlink());
+    validate(&spec, &t.path, Verify::Full).unwrap();
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), before);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+/// The table `open_or_pack` returns names the file it VALIDATED, by inode,
+/// so a file swapped in under the same name between the check and the row
+/// cache's own open is refused rather than served.
+#[cfg(unix)]
+#[test]
+fn a_file_swapped_in_after_validation_is_refused() {
+    let f = fixture("swap", 10);
+    let spec = f.spec();
+    let cache = f.dir.join("derived");
+    let t = open_or_pack(&spec, &cache, Verify::Full).unwrap();
+    t.check_same_file(&File::open(&t.path).unwrap()).unwrap();
+    // Same bytes, new inode: what a concurrent rebuild's rename leaves.
+    let copy = cache.join("copy.bin");
+    std::fs::copy(&t.path, &copy).unwrap();
+    std::fs::rename(&copy, &t.path).unwrap();
+    let e = t
+        .check_same_file(&File::open(&t.path).unwrap())
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("replaced"), "{e:#}");
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
