@@ -20,7 +20,7 @@ The Rust test reads the two inputs, decodes them, and must be byte-identical
 
 THE REFERENCE
 -------------
-`decode_nvfp4_csf_scale` below is copied verbatim (minus logging) from vLLM
+`decode_nvfp4_csf_scale` below is copied verbatim (minus logging, plus a local `import torch`) from vLLM
 PR 60646, `vllm/model_executor/model_loader/csf_scales.py`, as carried by
 `eugr/spark-vllm-docker:docker/patches/qwen3.8/vllm/14-pr60646.patch`
 (upstream commit 00b5ad0712629374e6352e2b31de0460be0fdf17).
@@ -34,6 +34,17 @@ USAGE
     python3 scripts/nvfp4_csf_golden.py --check    # re-decode, compare to golden.json
 
 Needs `torch` (CPU is fine) and network access to huggingface.co.
+
+WHOLE-LAYER CHECK (against a local copy of the checkpoint)
+    # 1. where the checkpoint is (stdlib only): every CSF pair of one layer
+    python3 scripts/nvfp4_csf_golden.py --dump-layer 23 --ckpt <model dir> --out l23.csf
+    # 2. anywhere with torch: reference sha256 of every decoded matrix
+    python3 scripts/nvfp4_csf_golden.py --reference l23.csf      # -> l23.csf.ref.json
+    # 3. the Rust decoder over the same dump must match every hash
+    ATLAS_CSF_LAYER_DUMP=l23.csf cargo test -p spark-runtime --lib \
+        csf_layer_dump_matches_the_reference -- --ignored
+The dump is `<u64 LE json length><json index><raw tensor bytes>`, the index
+mapping each tensor name to `[dtype, shape, offset, length]`.
 """
 
 import argparse
@@ -44,7 +55,6 @@ import sys
 import urllib.request
 from pathlib import Path
 
-import torch
 
 REPO = "nvidia/Qwen3.8-Flash-Next-FP4-Local"
 REV = "b9ce18a6887e18c089fdea8509a33e63429a3300"
@@ -61,7 +71,9 @@ CASES = [
 
 
 # ---- vLLM reference (Apache-2.0, see module docstring) -----------------------
-def decode_nvfp4_csf_scale(fixed: torch.Tensor, exceptions: torch.Tensor) -> torch.Tensor:
+def decode_nvfp4_csf_scale(fixed, exceptions):
+    import torch
+
     """Rebuild one ``[rows, cols]`` float8_e4m3fn block-scale matrix."""
     if fixed.dtype != torch.uint8 or fixed.dim() != 2 or fixed.shape[1] % 16:
         raise ValueError(f"Invalid CSF fixed stream {fixed.dtype} {fixed.shape}")
@@ -114,15 +126,77 @@ def read_tensor(weight_map, name):
 
 
 def decode(fixed_bytes, fixed_shape, exc_bytes):
+    import torch
+
     fixed = torch.frombuffer(bytearray(fixed_bytes), dtype=torch.uint8).reshape(fixed_shape)
     exc = torch.frombuffer(bytearray(exc_bytes), dtype=torch.uint32)
     return decode_nvfp4_csf_scale(fixed, exc).view(torch.uint8).contiguous()
 
 
+def dump_layer(layer, ckpt, out):
+    """Every CSF pair of decoder layer `layer` from a local checkpoint."""
+    ckpt = Path(ckpt)
+    weight_map = json.loads((ckpt / "model.safetensors.index.json").read_text())["weight_map"]
+    pfx = f"model.language_model.layers.{layer}.mlp.experts."
+    names = sorted(n for n in weight_map if n.startswith(pfx) and ".nvfp4_csf_" in n)
+    index, blobs, off = {}, [], 0
+    headers = {}
+    for name in names:
+        shard = weight_map[name]
+        if shard not in headers:
+            with open(ckpt / shard, "rb") as f:
+                n = struct.unpack("<Q", f.read(8))[0]
+                headers[shard] = (8 + n, json.loads(f.read(n)))
+        base, header = headers[shard]
+        info = header[name]
+        a, b = info["data_offsets"]
+        with open(ckpt / shard, "rb") as f:
+            f.seek(base + a)
+            data = f.read(b - a)
+        index[name] = [info["dtype"], info["shape"], off, len(data)]
+        blobs.append(data)
+        off += len(data)
+    head = json.dumps(index).encode()
+    with open(out, "wb") as f:
+        f.write(struct.pack("<Q", len(head)))
+        f.write(head)
+        for blob in blobs:
+            f.write(blob)
+    print(f"{out}: {len(names)} tensors ({len(names) // 2} pairs), {off} bytes")
+
+
+def reference_hashes(dump):
+    """sha256 of the vLLM-reference decode of every pair in a dump."""
+    raw = Path(dump).read_bytes()
+    n = struct.unpack("<Q", raw[:8])[0]
+    index = json.loads(raw[8 : 8 + n])
+    data = raw[8 + n :]
+    out = {}
+    for name, (dtype, shape, off, length) in index.items():
+        if not name.endswith(".nvfp4_csf_fixed"):
+            continue
+        stem = name.removesuffix(".nvfp4_csf_fixed")
+        _, _, eoff, elen = index[f"{stem}.nvfp4_csf_exceptions"]
+        dec = decode(data[off : off + length], shape, data[eoff : eoff + elen])
+        out[stem] = hashlib.sha256(dec.numpy().tobytes()).hexdigest()
+    Path(f"{dump}.ref.json").write_text(json.dumps(out, indent=0, sort_keys=True) + "\n")
+    print(f"{dump}.ref.json: {len(out)} reference hashes")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="re-decode the fixtures on disk")
+    ap.add_argument("--dump-layer", type=int)
+    ap.add_argument("--ckpt")
+    ap.add_argument("--out")
+    ap.add_argument("--reference")
     args = ap.parse_args()
+    if args.dump_layer is not None:
+        dump_layer(args.dump_layer, args.ckpt, args.out)
+        return
+    if args.reference:
+        reference_hashes(args.reference)
+        return
 
     if args.check:
         golden = json.loads((OUT / "golden.json").read_text())
