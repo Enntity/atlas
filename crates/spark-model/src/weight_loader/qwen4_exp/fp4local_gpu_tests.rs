@@ -144,7 +144,7 @@ fn fp4local_gpu_first_layers_load_exactly() {
 
     // 3. The layers build, and their MXFP8 sources are released afterwards.
     let format = Qwen4ExpFormat::detect(&store, &config).unwrap();
-    assert!(format.is_fp4_local(), "{format:?}");
+    assert!(format.mxfp8_backbone, "{format:?}");
     let attn = config
         .layer_types
         .iter()

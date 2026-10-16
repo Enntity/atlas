@@ -9,13 +9,26 @@
 //! | FP8 / NVFP4 (old)  | BF16 (or block FP8)                         | plain E4M3           | BF16             | BF16 or FP8 128² |
 //! | **FP4-Local**      | **MXFP8** (E4M3 + UE8M0 per 32)             | **CSF** pairs        | **W4A16 NVFP4**  | **NVFP4**        |
 //!
-//! None of these needs its own arm. The CSF scales are decoded at upload
-//! (`spark_runtime::weights::nvfp4_csf`), every MXFP8 tensor goes through
-//! the exact MXFP8 -> BF16 expansion in `dense_auto`, the ViT NVFP4 linears
-//! are dequantized by `vision_dense_auto`, and the MTP experts load natively
-//! (`mtp.rs`). What lives here is the REPORT (one line saying which format
-//! loaded) and the release of each MXFP8 tensor's source bytes once every
-//! reader has read them.
+//! How each FP4-Local difference loads, and where:
+//!
+//! * CSF expert scales: decoded at upload, losslessly
+//!   (`spark_runtime::weights::nvfp4_csf`); the MoE never sees CSF.
+//! * MXFP8 GDN and QSA attention projections: the checkpoint's own bytes as
+//!   decode twins (`gdn_mxfp8`, `attn_mxfp8`; `ATLAS_QWEN4EXP_MXFP8_DECODE=0`
+//!   decodes BF16 instead) and their exact BF16 dequant for prefill.
+//! * MXFP8 QSA indexer `index_qk_proj` and ViT attention: the exact BF16
+//!   dequant (`dense_auto`).
+//! * MXFP8 shared expert: its exact BF16 dequant, REQUANTIZED to NVFP4 by
+//!   the shared MoE loader, as the BF16 releases' shared expert is. Not
+//!   exact, and kept as policy: the fused MoE kernels read NVFP4.
+//! * W4A16 NVFP4 ViT MLP and merger: expanded to BF16 (`vision_dense_auto`,
+//!   one rounding; see there).
+//! * NVFP4 MTP experts: loaded natively (`mtp.rs`).
+//! * F32 norms: rounded to BF16, RNE (`helpers::bf16_norm`).
+//!
+//! What lives here is the detection the loader branches on
+//! (`mxfp8_backbone`), one summary line, and the release of each MXFP8
+//! tensor's source bytes once every reader has read them.
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::{LayerType, ModelConfig};
@@ -121,19 +134,10 @@ pub struct Qwen4ExpFormat {
     /// MXFP8 backbone projections found (layer 0's GDN, the first attention
     /// layer's `q_proj`, layer 0's shared expert all probed).
     pub mxfp8_backbone: bool,
-    /// Routed-expert scales declared CSF in `quantized_layers`.
-    pub csf_expert_scales: bool,
-    /// The ViT MLP ships packed NVFP4 (W4A16) rather than BF16.
-    pub vision_mlp_nvfp4: bool,
-    /// The MTP block's routed experts ship per-expert NVFP4.
-    pub mtp_experts_nvfp4: bool,
-    /// Element type of the PLE n-gram table shards on disk.
-    pub ple_table: Option<WeightDtype>,
-    /// F32 norm tensors (`hc_norm`, PLE `norm_*`) that load rounded to BF16.
-    pub f32_norms: usize,
 }
 
 impl Qwen4ExpFormat {
+    /// Detect the format and log one summary line.
     pub fn detect(store: &WeightStore, config: &ModelConfig) -> Result<Self> {
         let l0 = config.layer_prefix(0);
         let first_attn = config
@@ -159,77 +163,39 @@ impl Qwen4ExpFormat {
                 probes.len()
             );
         }
-        let csf_expert_scales = config.quantization_config.as_ref().is_some_and(|q| {
-            q.quantized_layers
-                .iter()
-                .any(|(p, s)| p.contains(".mlp.experts") && s.weight_scale_encoding == "csf")
-        });
-        let dtype = |n: &str| store.get(n).ok().map(|t| t.dtype);
-        // `ple_layer_ids` is one-indexed: `[2]` lives at `layers.1.ple`.
-        let ple_table = config.ple_layer_ids.first().and_then(|&l| {
-            let lp = config.layer_prefix(l.saturating_sub(1));
-            let base = format!("{lp}.ple.ple_embedding.ngram_embedding");
-            store
-                .deferred(&format!("{base}.shard_0.weight"))
-                .map(|d| d.dtype)
-                .or_else(|| dtype(&format!("{base}.shard_0.weight")))
-        });
-        let f32_norms = store
-            .names()
-            .filter(|n| {
-                (n.ends_with(".hc_norm.weight") || n.contains(".ple.norm_"))
-                    && dtype(n) == Some(WeightDtype::FP32)
-            })
-            .count();
-        Ok(Self {
+        let format = Self {
             mxfp8_backbone: mxfp8 != 0,
-            csf_expert_scales,
-            vision_mlp_nvfp4: dtype("model.visual.blocks.0.mlp.linear_fc1.weight")
-                == Some(WeightDtype::UInt8),
-            mtp_experts_nvfp4: dtype("mtp.layers.0.mlp.experts.0.gate_proj.weight")
-                == Some(WeightDtype::UInt8),
-            ple_table,
-            f32_norms,
-        })
+        };
+        tracing::info!("qwen4_exp checkpoint format: {}", format.summary(store));
+        Ok(format)
     }
 
-    /// nvidia's FP4-Local release: MXFP8 backbone plus CSF expert scales.
-    pub fn is_fp4_local(&self) -> bool {
-        self.mxfp8_backbone && self.csf_expert_scales
-    }
-
-    pub fn log(&self) {
-        tracing::info!(
-            "qwen4_exp checkpoint format: {} — backbone {}, routed-expert scales {}, \
-             ViT MLP {}, MTP experts {}, PLE table {:?}, {} F32 norm(s) rounded to BF16 (RNE)",
-            if self.is_fp4_local() {
+    /// The release and what its backbone and ViT MLP load as. The CSF
+    /// decode, the MTP expert layout and the PLE table each log their own
+    /// line where they load.
+    fn summary(&self, store: &WeightStore) -> String {
+        let vit_nvfp4 = store
+            .get("model.visual.blocks.0.mlp.linear_fc1.weight")
+            .is_ok_and(|t| t.dtype == WeightDtype::UInt8);
+        format!(
+            "{}; backbone {}; ViT MLP {}",
+            if self.mxfp8_backbone {
                 "FP4-Local"
             } else {
                 "FP8/NVFP4 release"
             },
             if self.mxfp8_backbone {
-                "MXFP8 -> exact BF16 copies"
+                "MXFP8 (GDN/QSA decode twins + exact BF16 for prefill; indexer and ViT \
+                 attention exact BF16; shared expert BF16 requantized to NVFP4)"
             } else {
                 "BF16"
             },
-            if self.csf_expert_scales {
-                "CSF (decoded at upload)"
-            } else {
-                "plain E4M3"
-            },
-            if self.vision_mlp_nvfp4 {
+            if vit_nvfp4 {
                 "W4A16 NVFP4 -> BF16"
             } else {
                 "BF16"
             },
-            if self.mtp_experts_nvfp4 {
-                "native NVFP4"
-            } else {
-                "BF16/FP8 -> NVFP4"
-            },
-            self.ple_table,
-            self.f32_norms,
-        );
+        )
     }
 }
 

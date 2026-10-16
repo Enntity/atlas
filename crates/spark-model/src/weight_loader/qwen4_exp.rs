@@ -131,11 +131,12 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         let report = audit_namespace(store, config);
         report.log();
         report.ensure_loadable()?;
-        // Which release this is (FP8/NVFP4 vs FP4-Local), said once. The
-        // format needs no arm of its own — see `format.rs` — only the MXFP8
-        // source release after each layer below.
+        // Which release this is (FP8/NVFP4 vs FP4-Local), said once. An
+        // MXFP8 backbone adds the GDN and QSA decode twins (the `gdn` and
+        // `attn_mxfp8` arms below) and the per-layer release of its source
+        // bytes; everything else it ships loads through the shared paths
+        // (see `format.rs`).
         let format = Qwen4ExpFormat::detect(store, config)?;
-        format.log();
         let mut mxfp8_released = 0usize;
 
         let h = config.hidden_size;

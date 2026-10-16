@@ -139,13 +139,15 @@ fn audit_sees_the_whole_fp4_local_namespace() {
 
 #[test]
 fn detects_fp4_local() {
-    let f = Qwen4ExpFormat::detect(&build(uploaded()), &config()).unwrap();
-    assert!(f.is_fp4_local());
-    assert!(f.mxfp8_backbone && f.csf_expert_scales);
-    assert!(f.vision_mlp_nvfp4 && f.mtp_experts_nvfp4);
-    assert_eq!(f.ple_table, Some(WeightDtype::UInt8));
-    // 48 x 2 hc sites + the model mixer, plus norm_conv/key/query.
-    assert_eq!(f.f32_norms, 97 + 3);
+    let s = build(uploaded());
+    let f = Qwen4ExpFormat::detect(&s, &config()).unwrap();
+    assert!(f.mxfp8_backbone);
+    let line = f.summary(&s);
+    assert!(
+        line.starts_with("FP4-Local; backbone MXFP8")
+            && line.ends_with("ViT MLP W4A16 NVFP4 -> BF16"),
+        "{line}"
+    );
 }
 
 #[test]
@@ -162,9 +164,13 @@ fn the_old_release_is_not_fp4_local() {
     }
     let s = build(as_old_release(uploaded()));
     let f = Qwen4ExpFormat::detect(&s, &c).unwrap();
-    assert!(!f.is_fp4_local());
-    assert!(!f.mxfp8_backbone && !f.csf_expert_scales);
-    assert_eq!(f.f32_norms, 0);
+    assert!(!f.mxfp8_backbone);
+    // The ViT MLP stays W4A16 in this synthetic store (only the backbone and
+    // the norms were turned back into BF16).
+    assert!(
+        f.summary(&s)
+            .starts_with("FP8/NVFP4 release; backbone BF16;")
+    );
     audit_namespace(&s, &c).ensure_loadable().unwrap();
 }
 
