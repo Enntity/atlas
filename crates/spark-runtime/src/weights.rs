@@ -487,6 +487,7 @@ mod expert_filter_tests;
 #[cfg(test)]
 mod from_str_tests;
 mod name_utils;
+pub mod nvfp4_csf;
 mod side_files;
 mod store_edit;
 pub(crate) use name_utils::keeps_raw_f16;
