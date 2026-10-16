@@ -36,15 +36,8 @@ fn vision_dense_auto(
         // rounds that to BF16 (RNE). `scale_2` is an arbitrary f32, so no
         // BF16 can hold every product exactly; the error is at most about one
         // BF16 ulp per element. Exact would mean an NVFP4 linear in the
-        // tower, which it does not have.
-        WeightDtype::UInt8 => {
-            anyhow::ensure!(
-                w.shape.len() == 2,
-                "vision_dense_auto: packed NVFP4 {name} must be 2-D, got {:?}",
-                w.shape
-            );
-            crate::weight_map::dequant_nvfp4_to_bf16(store, prefix, w.shape[0], w.shape[1] * 2, gpu)
-        }
+        // tower, which it does not have. `dense_auto` is that expansion.
+        WeightDtype::UInt8 => dense_auto(store, &name, gpu),
         other => anyhow::bail!("vision_dense_auto: unsupported dtype {other:?} for {name}"),
     }
 }
