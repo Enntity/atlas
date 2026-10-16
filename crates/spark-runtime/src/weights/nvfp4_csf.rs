@@ -1,0 +1,293 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! Load-time decoder for CSF-compressed NVFP4 block scales.
+//!
+//! CSF checkpoints (`quantized_layers.*.weight_scale_encoding = "csf"`, codec
+//! `byte-window4-fixed-stream-u24-exceptions/1`) do not ship an NVFP4
+//! projection's E4M3 `weight_scale [n, k/16]`. They ship two tensors instead:
+//!
+//! * `<name>.nvfp4_csf_fixed` — U8 `[rows/16, 16 * (1 + cols/2)]`. Per 16-row
+//!   slab: one base byte per row, then each row's 4-bit codes, two per byte,
+//!   LOW nibble first. A scale byte is `base + code`.
+//! * `<name>.nvfp4_csf_exceptions` — U32, sorted words whose low 24 bits are a
+//!   flat `row * cols + col` position and whose high 8 bits REPLACE the scale
+//!   byte there (the bytes outside the row's 16-wide window).
+//!
+//! The decode is lossless: the output is the uncompressed checkpoint's E4M3
+//! bytes exactly, so every NVFP4 consumer reads `<name>` unchanged and never
+//! learns the checkpoint was compressed. That is why it lives here, at upload,
+//! rather than in any model loader: Qwen3.8-Flash-Next-FP4-Local's 73,728
+//! routed-expert scales use it, and so does the GLM CSF checkpoint.
+//!
+//! Format references (both read, neither copied — the arithmetic is the format):
+//! * vLLM PR 60646, `vllm/model_executor/model_loader/csf_scales.py`
+//!   (Apache-2.0), as carried by `eugr/spark-vllm-docker`'s
+//!   `docker/patches/qwen3.8/vllm/14-pr60646.patch`. Its decoder is the golden
+//!   reference in `scripts/nvfp4_csf_golden.py`.
+//! * flashinfer `flashinfer/experimental/b12x/_lib/quant/nvfp4_csf.py`
+//!   (Apache-2.0) — the GPU expander. Its `make_nvfp4_csf_batch` is where the
+//!   stricter checks below come from: exception positions must be unique,
+//!   sorted and in range, and the position field must be able to address the
+//!   whole matrix.
+//!
+//! Only the byte-window codec exists in checkpoints. flashinfer also has two
+//! resident-only codecs (`codec` 1/2, 8-row selector/mantissa planes) that are
+//! never serialized; a tensor named like a CSF part but shaped like neither is
+//! refused by the shape checks rather than guessed at. MXFP4 has no CSF form.
+
+use anyhow::{Context, Result, bail, ensure};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+/// Suffix of the fixed stream.
+pub const CSF_FIXED_SUFFIX: &str = ".nvfp4_csf_fixed";
+/// Suffix of the exception stream.
+pub const CSF_EXCEPTIONS_SUFFIX: &str = ".nvfp4_csf_exceptions";
+
+/// Row bases above this would carry into the next byte when a code is added
+/// (the reference packs four decoded bytes in one u32 add and relies on it).
+const MAX_BASE: u8 = 240;
+/// Rows per fixed-stream slab.
+const SLAB: usize = 16;
+/// The exception position field is 24 bits wide.
+const POSITION_BITS: u32 = 24;
+
+/// Which half of a CSF pair a tensor name is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsfPart {
+    Fixed,
+    Exceptions,
+}
+
+/// `Some((decoded_name, part))` when `name` is half of a CSF pair. The decoded
+/// name is the tensor the pair stands in for (`...weight_scale`).
+pub fn csf_part(name: &str) -> Option<(&str, CsfPart)> {
+    if let Some(base) = name.strip_suffix(CSF_FIXED_SUFFIX) {
+        Some((base, CsfPart::Fixed))
+    } else {
+        name.strip_suffix(CSF_EXCEPTIONS_SUFFIX)
+            .map(|base| (base, CsfPart::Exceptions))
+    }
+}
+
+/// The decoded size, in bytes, of a fixed stream of this shape — what the
+/// pair costs once uploaded. Used by the pre-flight estimate, which would
+/// otherwise count the 3.6 GB compressed and miss 3.9 GB of the 7.5 GB that
+/// lands on the device.
+pub fn decoded_len(fixed_shape: &[usize]) -> Option<usize> {
+    let (rows, cols) = geometry(fixed_shape).ok()?;
+    Some(rows * cols)
+}
+
+/// `(rows, cols)` of the decoded matrix, from the fixed stream's shape.
+fn geometry(fixed_shape: &[usize]) -> Result<(usize, usize)> {
+    ensure!(
+        fixed_shape.len() == 2,
+        "CSF fixed stream must be 2-D, got {fixed_shape:?}"
+    );
+    let (slabs, width) = (fixed_shape[0], fixed_shape[1]);
+    ensure!(
+        slabs > 0 && width % SLAB == 0 && width / SLAB >= 2,
+        "CSF fixed stream {fixed_shape:?} is not [rows/16, 16 * (1 + cols/2)]"
+    );
+    Ok((slabs * SLAB, (width / SLAB - 1) * 2))
+}
+
+/// Decode one CSF pair to the E4M3 `[rows, cols]` scale matrix, as raw bytes.
+///
+/// `exceptions` is the U32 stream's raw little-endian bytes. Every check that
+/// can fail does so loudly: a scale that decodes wrong produces an expert that
+/// runs and is wrong, which is the failure this codebase most wants to avoid.
+pub fn decode_nvfp4_csf(
+    fixed: &[u8],
+    fixed_shape: &[usize],
+    exceptions: &[u8],
+) -> Result<(Vec<u8>, [usize; 2])> {
+    let (rows, cols) = geometry(fixed_shape)?;
+    let width = fixed_shape[1];
+    ensure!(
+        fixed.len() == fixed_shape[0] * width,
+        "CSF fixed stream holds {} bytes but its shape {fixed_shape:?} needs {}",
+        fixed.len(),
+        fixed_shape[0] * width,
+    );
+    ensure!(
+        exceptions.len().is_multiple_of(4),
+        "CSF exception stream is {} bytes, not a whole number of u32 words",
+        exceptions.len()
+    );
+    let total = rows * cols;
+    ensure!(
+        total <= 1 << POSITION_BITS,
+        "CSF {rows}x{cols} matrix cannot be addressed by a {POSITION_BITS}-bit position"
+    );
+
+    let mut out = vec![0u8; total];
+    let half = cols / 2;
+    for (slab, src) in fixed.chunks_exact(width).enumerate() {
+        let (bases, codes) = src.split_at(SLAB);
+        for (r, (&base, row_codes)) in bases.iter().zip(codes.chunks_exact(half)).enumerate() {
+            ensure!(
+                base <= MAX_BASE,
+                "CSF row {} base {base:#04x} exceeds {MAX_BASE} — corrupt fixed stream",
+                slab * SLAB + r
+            );
+            let row = slab * SLAB + r;
+            let dst = &mut out[row * cols..(row + 1) * cols];
+            for (pair, &packed) in dst.chunks_exact_mut(2).zip(row_codes) {
+                pair[0] = base + (packed & 0x0F);
+                pair[1] = base + (packed >> 4);
+            }
+        }
+    }
+
+    let mut prev: Option<usize> = None;
+    for (i, w) in exceptions.chunks_exact(4).enumerate() {
+        let word = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+        let pos = (word & ((1 << POSITION_BITS) - 1)) as usize;
+        ensure!(
+            pos < total,
+            "CSF exception {i} addresses {pos}, past the {rows}x{cols} matrix"
+        );
+        ensure!(
+            prev.is_none_or(|p| pos > p),
+            "CSF exception {i} at {pos} is out of order (previous {prev:?}) — the \
+             stream must be sorted and unique"
+        );
+        prev = Some(pos);
+        out[pos] = (word >> POSITION_BITS) as u8;
+    }
+
+    // NVFP4 block scales are amax-derived, so non-negative and finite: an E4M3
+    // byte with the sign bit set or the 0x7F NaN code cannot come from a sound
+    // encoder. Checking costs one pass over bytes already in cache and catches
+    // a flipped high bit that every structural check above would let through.
+    if let Some(at) = out.iter().position(|&b| b >= 0x7F) {
+        bail!(
+            "CSF decoded scale {:#04x} at row {} col {} is negative or NaN — corrupt stream",
+            out[at],
+            at / cols,
+            at % cols
+        );
+    }
+    Ok((out, [rows, cols]))
+}
+
+/// One decoded `weight_scale`, ready to upload as FP8 E4M3.
+pub struct DecodedScale {
+    pub name: String,
+    pub shape: Vec<usize>,
+    pub bytes: Vec<u8>,
+}
+
+struct Part {
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+/// Pairs CSF halves as a loader streams tensors past it, in any order and
+/// across shards, and decodes each pair once both halves have arrived.
+///
+/// Every safetensors loader routes CSF parts here instead of uploading them,
+/// so the store only ever sees the decoded `weight_scale`, and the U32
+/// exception stream (a dtype the store does not carry) never reaches it.
+#[derive(Default)]
+pub struct CsfAssembler {
+    pending: HashMap<String, (Option<Part>, Option<Part>)>,
+    decoded: usize,
+    bytes_in: usize,
+    bytes_out: usize,
+    time: Duration,
+}
+
+impl CsfAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Hand over one CSF half. Returns the decoded scale when this completes a
+    /// pair, `None` while its partner is still to come.
+    pub fn offer(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        bytes: &[u8],
+    ) -> Result<Option<DecodedScale>> {
+        let (base, part) =
+            csf_part(name).with_context(|| format!("{name} is not a CSF stream tensor"))?;
+        let elem = match part {
+            CsfPart::Fixed => 1,
+            CsfPart::Exceptions => 4,
+        };
+        // The byte length against the header shape pins the dtype (U8 vs U32)
+        // without trusting the dtype string: a stream with the other width
+        // cannot satisfy both.
+        let numel: usize = shape.iter().product();
+        ensure!(
+            numel * elem == bytes.len(),
+            "{name}: {} bytes for shape {shape:?} — expected {} ({})",
+            bytes.len(),
+            numel * elem,
+            if elem == 1 { "U8" } else { "U32" },
+        );
+        let slot = self.pending.entry(base.to_string()).or_default();
+        let held = match part {
+            CsfPart::Fixed => &mut slot.0,
+            CsfPart::Exceptions => &mut slot.1,
+        };
+        ensure!(held.is_none(), "{name} appears twice");
+        *held = Some(Part {
+            shape: shape.to_vec(),
+            bytes: bytes.to_vec(),
+        });
+        if slot.0.is_none() || slot.1.is_none() {
+            return Ok(None);
+        }
+        let Some((Some(fixed), Some(exc))) = self.pending.remove(base) else {
+            unreachable!("both halves were just checked present")
+        };
+        let t = Instant::now();
+        let (out, [rows, cols]) = decode_nvfp4_csf(&fixed.bytes, &fixed.shape, &exc.bytes)
+            .with_context(|| format!("decoding CSF scale {base}"))?;
+        self.time += t.elapsed();
+        self.decoded += 1;
+        self.bytes_in += fixed.bytes.len() + exc.bytes.len();
+        self.bytes_out += out.len();
+        Ok(Some(DecodedScale {
+            name: base.to_string(),
+            shape: vec![rows, cols],
+            bytes: out,
+        }))
+    }
+
+    /// Refuse a load that left a half without its partner, and log what the
+    /// decode cost. A lone half means a scale the model will look for and not
+    /// find — or worse, find stale — so it is an error, not a warning.
+    pub fn finish(self) -> Result<()> {
+        if !self.pending.is_empty() {
+            let mut names: Vec<_> = self.pending.keys().take(4).cloned().collect();
+            names.sort();
+            bail!(
+                "{} CSF scale stream(s) without a partner, e.g. {names:?} — the \
+                 checkpoint is incomplete or a skip filter split a pair",
+                self.pending.len()
+            );
+        }
+        if self.decoded > 0 {
+            let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+            tracing::info!(
+                "Decoded {} CSF NVFP4 scale matrices: {:.2} GiB compressed -> {:.2} GiB E4M3 \
+                 in {:.2} s on the load thread",
+                self.decoded,
+                gib(self.bytes_in),
+                gib(self.bytes_out),
+                self.time.as_secs_f64(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "nvfp4_csf_tests.rs"]
+mod tests;
