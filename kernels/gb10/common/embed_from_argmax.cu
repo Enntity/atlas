@@ -123,3 +123,47 @@ extern "C" __global__ void batched_embed_fp8(
         dst[i] = __float2bfloat16(ngram_fp8_decode(src[i]) * scale);
     }
 }
+
+// NVFP4 (ModelOpt, group 16) table gather: each row is PACKED as
+//   [head_dim/2 B: E2M1 code pairs, LOW nibble = even element]
+//   [head_dim/16 B: E4M3 block scales, one per 16 elements]
+//   [zero pad up to row_stride]
+// — the layout `spark_storage::ngram_pack` writes for the Qwen3.8-Flash-Next-
+// FP4-Local PLE table, whose checkpoint keeps the codes and the scales in two
+// tensors. One global f32 (`weight_scale_2`) multiplies every row.
+//
+// value = (e2m1 * e4m3_scale) * global, in f32, then RNE to BF16: the order of
+// flashinfer's oracle (flashinfer/experimental/b12x/sequence/ple_embedding/
+// reference.py `_dequantize_selected_nvfp4`, Apache-2.0). e2m1 x e4m3 is exact
+// in f32 (at most 6 significant bits), so only the global multiply rounds;
+// `--fmad=false` (common KERNEL.toml) keeps the compiler from fusing anything.
+// The scale decode is `ngram_fp8_decode`, which maps E4M3's NaN to 0 where the
+// reference would propagate NaN — a valid checkpoint has no NaN scale.
+//
+// Grid: (num_rows, 1, 1)  Block: (256, 1, 1)
+extern "C" __global__ void batched_embed_nvfp4(
+    const unsigned int* __restrict__ token_ids,    // [num_rows] slot per row
+    const unsigned char* __restrict__ embed_table, // [slots, row_stride] packed
+    __nv_bfloat16* __restrict__ output,            // [num_rows, head_dim]
+    float global_scale,
+    unsigned int head_dim,
+    unsigned int row_stride
+) {
+    const unsigned int row = token_ids[blockIdx.x];
+    const unsigned char* src = embed_table + (unsigned long long)row * row_stride;
+    const unsigned char* scales = src + head_dim / 2;
+    __nv_bfloat16* dst = output + (unsigned long long)blockIdx.x * head_dim;
+    for (unsigned int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const unsigned int b = src[i >> 1];
+        const unsigned int code = (i & 1u) ? (b >> 4) : (b & 0xFu);
+        // E2M1: 0, 0.5, 1, 1.5, 2, 3, 4, 6; bit 3 is the sign. Code 8 is -0,
+        // as in flashinfer's Triton kernel and `atlas_core::numeric::FP4_E2M1`
+        // (the oracle's table says +0; no product can tell them apart).
+        const unsigned int mag = code & 7u;
+        float v = mag < 4u ? 0.5f * (float)mag
+                           : (float)(2u << ((mag - 4u) >> 1)) * ((mag & 1u) ? 1.5f : 1.0f);
+        if (code & 8u) v = -v;
+        const float s = ngram_fp8_decode(scales[i >> 4]);
+        dst[i] = __float2bfloat16((v * s) * global_scale);
+    }
+}

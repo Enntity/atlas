@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Segmented n-gram tables: shards scattered across one or MORE files, and
-//! the single-scalar FP8 dequant scale that RadixArk's Qwen3.8-Flash-Next
-//! conversion ships instead of a per-row scale file.
+//! Segmented n-gram tables: shards scattered across one or MORE files, the
+//! single-scalar FP8 dequant scale that RadixArk's Qwen3.8-Flash-Next
+//! conversion ships instead of a per-row scale file, and the NVFP4 global
+//! scale of the FP4-Local checkpoint.
 //!
 //! Split out of `ngram_cache.rs` to keep that file under the 500-LoC cap. A
 //! child module, so the cache's private fields are still reachable.
@@ -78,6 +79,9 @@ impl NgramRowCache {
                  a constant per-tensor scale would silently override it"
             );
         }
+        if self.nvfp4_global.is_some() {
+            bail!("NgramRowCache: the rows are NVFP4; an FP8 scale array would mis-decode them");
+        }
         let sbytes = self.slots * 4;
         let sblocks = sbytes.div_ceil(BLOCK);
         let arena = ExpertArena::new(1, sblocks as u32, BLOCK)
@@ -90,6 +94,29 @@ impl NgramRowCache {
         }
         self.scales = Some(ScaleCache { arena, file: None });
         Ok(())
+    }
+
+    /// Mark the rows as packed NVFP4 (E2M1 codes, then their E4M3 block
+    /// scales, in the row itself) and record the tensor's global f32 scale,
+    /// which the NVFP4 gather multiplies in after the block scale.
+    ///
+    /// Exclusive with a scale ARRAY: an NVFP4 row has no per-slot f32 to
+    /// look up, and leaving one installed would let the FP8 gather be picked
+    /// for bytes it cannot decode.
+    pub fn set_nvfp4_global_scale(&mut self, scale: f32) -> Result<()> {
+        if self.scales.is_some() {
+            bail!("NgramRowCache: an FP8 scale array is installed; NVFP4 rows carry their own");
+        }
+        if !(scale.is_finite() && scale > 0.0) {
+            bail!("NgramRowCache: NVFP4 global scale {scale} cannot dequantize anything");
+        }
+        self.nvfp4_global = Some(scale);
+        Ok(())
+    }
+
+    /// The NVFP4 global scale, `Some` exactly when the rows are packed NVFP4.
+    pub fn nvfp4_global_scale(&self) -> Option<f32> {
+        self.nvfp4_global
     }
 }
 

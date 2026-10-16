@@ -74,6 +74,9 @@ pub struct NgramRowCache {
     segments: Option<Segments>,
     /// Per-row scale file mirror (FP8 tables), `None` for BF16 tables.
     scales: Option<ScaleCache>,
+    /// NVFP4 rows (`set_nvfp4_global_scale`): each row carries its own block
+    /// scales, and this one f32 multiplies them all. `None` otherwise.
+    nvfp4_global: Option<f32>,
     row_stride: usize,
     slots: usize,
     rows_total: u64,
@@ -213,6 +216,7 @@ impl NgramRowCache {
             base_offset,
             segments: None,
             scales,
+            nvfp4_global: None,
             row_stride,
             slots,
             rows_total,
