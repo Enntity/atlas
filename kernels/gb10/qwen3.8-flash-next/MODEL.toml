@@ -477,14 +477,6 @@ hc_contract = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4'
 hc_post_moe_blend = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4's Sinkhorn mHC fusion. Not this model's mHC."
 hc_pre_from_raw_mix = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4's Sinkhorn mHC fusion. Not this model's mHC."
 
-[expected_absent.mxfp8_gemv]
-mxfp8_gemv_tc8 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 attention-projection twins (ATLAS_GLM_MLA_MXFP8, lossy opt-in). Not used here."
-mxfp8_gemv_tc16 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 twin. Not used here."
-mxfp8_gemv_tc32 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 twin. Not used here."
-mxfp8_gemv_tc8_grouped = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 grouped twin. Not used here."
-mxfp8_gemv_tc16_grouped = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 grouped twin. Not used here."
-mxfp8_quantize_bf16 = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; MXFP8 weight quantizer for the twins above. Not used here."
-
 [expected_absent.moe_nvfp4_mmq]
 atlas_moe_nvfp4_mmq64_gate_up = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; W4A4 MMQ MoE prefill tier. This target runs the W4A16 grouped GEMM."
 atlas_moe_nvfp4_mmq64_down = "GLM-5.3-Flash series probe, compiled only in glm-5.3-flash/nvfp4; same MMQ tier."
