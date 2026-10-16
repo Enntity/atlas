@@ -24,6 +24,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 
 use super::super::mxfp8::rows_gpu_tests::real::tensor;
 use super::super::mxfp8::rows_gpu_tests::{Rng, backend, upload};
+use super::gemm_gpu_tests::bench::time_ms;
 use super::tests::{quant_rows, tile_scales};
 use super::*;
 
@@ -245,26 +246,28 @@ fn hc_up_mix_mx_equals_hc_up_mix_then_quant() -> Result<()> {
         }
         let grid = [(h / 32) as u32, t.div_ceil(128) as u32, 1];
         let inv_hc = 1.0f32 / hc as f32;
-        // Reference: the plain kernel, then the standalone quant of its `y`.
-        KernelLaunch::new(gpu, plain)
-            .grid(grid)
-            .block([256, 1, 1])
-            .arg_ptr(low)
-            .arg_ptr(up_wt)
-            .arg_ptr(normed)
-            .arg_ptr(inj_pre)
-            .arg_ptr(y[0])
-            .arg_ptr(inj[0])
-            .arg_u32(t as u32)
-            .arg_u32(h as u32)
-            .arg_u32(rank as u32)
-            .arg_f32(inv_hc)
-            .launch(stream)?;
-        mxfp8_quant_act(
-            gpu, quant, y[0], h as u32, q[0], sf[0], t as u32, h as u32, stream,
-        )?;
-        // Fused, with and without the BF16 `y`.
-        for (i, y_out) in [(1usize, y[1]), (2, DevicePtr::NULL)] {
+        let run_plain = || {
+            KernelLaunch::new(gpu, plain)
+                .grid(grid)
+                .block([256, 1, 1])
+                .arg_ptr(low)
+                .arg_ptr(up_wt)
+                .arg_ptr(normed)
+                .arg_ptr(inj_pre)
+                .arg_ptr(y[0])
+                .arg_ptr(inj[0])
+                .arg_u32(t as u32)
+                .arg_u32(h as u32)
+                .arg_u32(rank as u32)
+                .arg_f32(inv_hc)
+                .launch(stream)
+        };
+        let run_quant = || {
+            mxfp8_quant_act(
+                gpu, quant, y[0], h as u32, q[0], sf[0], t as u32, h as u32, stream,
+            )
+        };
+        let run_fused = |i: usize, y_out: DevicePtr| {
             KernelLaunch::new(gpu, fused)
                 .grid(grid)
                 .block([256, 1, 1])
@@ -281,8 +284,14 @@ fn hc_up_mix_mx_equals_hc_up_mix_then_quant() -> Result<()> {
                 .arg_u32(rank as u32)
                 .arg_f32(inv_hc)
                 .arg_u32(mx_lt_inner_pad(h) as u32)
-                .launch(stream)?;
-        }
+                .launch(stream)
+        };
+        // Reference: the plain kernel, then the standalone quant of its `y`;
+        // then fused, with and without the BF16 `y`.
+        run_plain()?;
+        run_quant()?;
+        run_fused(1, y[1])?;
+        run_fused(2, DevicePtr::NULL)?;
         gpu.synchronize(stream)?;
         let same = |a: DevicePtr, b: DevicePtr, n: usize| -> Result<usize> {
             let (x, y) = (down(gpu, a, n)?, down(gpu, b, n)?);
@@ -298,6 +307,17 @@ fn hc_up_mix_mx_equals_hc_up_mix_then_quant() -> Result<()> {
         ];
         println!("hc_up_mix_mx T={t}: differing bytes {checks:?}");
         assert!(checks.iter().all(|c| c.1 == 0), "fused != plain + quant");
+        let ms = [
+            time_ms(gpu, 20, run_plain)?,
+            time_ms(gpu, 20, run_quant)?,
+            time_ms(gpu, 20, || run_fused(1, y[1]))?,
+            time_ms(gpu, 20, || run_fused(2, DevicePtr::NULL))?,
+        ];
+        println!(
+            "hc_up_mix_mx T={t}: plain {:.4} ms + quant {:.4} ms; fused {:.4} ms with the \
+             BF16 y, {:.4} ms without",
+            ms[0], ms[1], ms[2], ms[3]
+        );
         // And the reference quant is ModelOpt's rule on the plain `y`.
         let yb = down(gpu, y[0], t * h * 2)?;
         let yv: Vec<u16> = yb
