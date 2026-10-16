@@ -76,10 +76,15 @@ const MTP_LAYER_PREFIX: &str = "mtp.layers.0";
 enum MtpExpertLayout {
     /// RadixArk: fused `[E,2I,H]` + `[E,H,I]` BF16 tensors.
     StackedBf16,
-    /// nvidia: per-expert `experts.{e}.{gate,up,down}_proj.weight` +
-    /// `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
+    /// nvidia NVFP4 release: per-expert `experts.{e}.{gate,up,down}_proj.weight`
+    /// + `weight_scale_inv` (FP8_PB_WO, g=128) — declared by the pack's
     /// `quantized_layers` map entry `mtp.layers.0.mlp.experts`.
     PerExpertFp8BlockScaled,
+    /// nvidia FP4-Local: per-expert standard ModelOpt NVFP4 (`weight` U8
+    /// `[n, k/2]`, plain E4M3 `weight_scale`, F32 `weight_scale_2`; W4A16, so
+    /// no `input_scale`) — exactly the main layers' expert format, loaded the
+    /// same way with no conversion at all.
+    PerExpertNvfp4,
 }
 
 /// Detect the MTP expert storage layout from the store. `weight_scale_inv`
@@ -91,6 +96,10 @@ fn mtp_expert_layout(store: &WeightStore, mlp: &str) -> MtpExpertLayout {
     }
     if store.contains(&format!("{mlp}.experts.0.gate_proj.weight_scale_inv")) {
         return MtpExpertLayout::PerExpertFp8BlockScaled;
+    }
+    // `weight_scale_2` is the ModelOpt NVFP4 marker; the FP8 pack has none.
+    if store.contains(&format!("{mlp}.experts.0.gate_proj.weight_scale_2")) {
+        return MtpExpertLayout::PerExpertNvfp4;
     }
     // Default to the stacked path so its own error names what it expected.
     MtpExpertLayout::StackedBf16
@@ -231,6 +240,24 @@ fn build_mtp_moe(
                 }
             }
         }
+        // FP4-Local: the experts are already NVFP4 in the layout every main
+        // layer's experts use, so they go straight in. The old pack's arm
+        // above dequantizes FP8 and REQUANTIZES (lossy); this one converts
+        // nothing, so the drafter runs the checkpoint's own expert bytes.
+        MtpExpertLayout::PerExpertNvfp4 => {
+            for e in 0..n_experts {
+                let p = |name| format!("{mlp}.experts.{e}.{name}_proj");
+                let nvfp4 = |name| {
+                    crate::weight_map::quantized(store, &p(name), gpu)
+                        .with_context(|| format!("qwen4_exp MTP: NVFP4 expert {e} {name}_proj"))
+                };
+                experts.push(ExpertWeight {
+                    gate_proj: nvfp4("gate")?,
+                    up_proj: nvfp4("up")?,
+                    down_proj: nvfp4("down")?,
+                });
+            }
+        }
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
@@ -308,6 +335,7 @@ pub fn load_qwen4exp_mtp_module(
     let stream = gpu.default_stream();
     let free_before = gpu.free_memory().unwrap_or(0) as u64;
 
+    let layout = mtp_expert_layout(store, &format!("{MTP_LAYER_PREFIX}.mlp"));
     let ffn = build_mtp_moe(store, config, gpu)?;
 
     // Norm placeholders, exactly as the main layers get them: this model keeps
@@ -420,7 +448,7 @@ pub fn load_qwen4exp_mtp_module(
     let spent = free_before.saturating_sub(gpu.free_memory().unwrap_or(0) as u64);
     tracing::info!(
         "qwen4_exp MTP draft module loaded: 1 reused full-attention layer \
-         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE requantized from stacked BF16), \
+         (gated attn, dense — no QSA indexer + mHC + {}-expert MoE from {layout:?} experts), \
          shared embed/lm_head, own head mixer. Construction cost {:.2} GB.",
         config.num_experts,
         spent as f64 / 1e9,
@@ -474,6 +502,20 @@ mod tests {
         assert_eq!(
             mtp_expert_layout(&store, "mtp.layers.0.mlp"),
             MtpExpertLayout::PerExpertFp8BlockScaled
+        );
+    }
+
+    /// FP4-Local: per-expert `weight_scale_2` selects the native NVFP4 path.
+    #[test]
+    fn per_expert_scale_2_selects_nvfp4_layout() {
+        let store = store_with(&[
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight",
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale",
+            "mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_2",
+        ]);
+        assert_eq!(
+            mtp_expert_layout(&store, "mtp.layers.0.mlp"),
+            MtpExpertLayout::PerExpertNvfp4
         );
     }
 
