@@ -3,6 +3,7 @@
 pub(crate) mod attention_arms;
 pub(crate) mod linear_attn_arms;
 mod tq_plus_weight_rotation;
+pub(crate) use tq_plus_weight_rotation::weight_rotation_enabled;
 
 use anyhow::Result;
 use atlas_core::config::{LayerType, ModelConfig};

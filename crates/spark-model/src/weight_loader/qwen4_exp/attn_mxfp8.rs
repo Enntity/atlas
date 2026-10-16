@@ -31,6 +31,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::FfnComponent;
 use crate::tp_shard::TpAttentionDims;
 use crate::weight_loader::qwen35::load_layers::attention_arms::build_full_attention_nvfp4;
+use crate::weight_loader::qwen35::load_layers::weight_rotation_enabled;
 use crate::weight_map::{
     DenseWeight, Mxfp8Weight, Nvfp4Variant, RawMxfp8, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8,
 };
@@ -93,6 +94,7 @@ pub(super) fn build_full_attention(
     // The twins and the BF16 build below read the same raw bytes; the
     // loader's per-layer sweep (`format::release_mxfp8_sources`) frees them.
     let twins = if mxfp8_decode_requested() {
+        twins_allowed(weight_rotation_enabled())?;
         Some(twins(gpu, config, &raws, stream)?)
     } else {
         None
@@ -110,6 +112,18 @@ pub(super) fn build_full_attention(
             .install_dense_mxfp8(twins)?;
     }
     Ok(layer)
+}
+
+/// `TQ_PLUS_WEIGHT_ROTATION=1` rotates the BF16 build's Q/K/V in place after
+/// the dequant; the twins are the checkpoint's unrotated bytes, so decode and
+/// prefill would run two different sets of weights. Refused, not mixed.
+fn twins_allowed(rotation: bool) -> Result<()> {
+    ensure!(
+        !rotation,
+        "TQ_PLUS_WEIGHT_ROTATION=1 rotates the BF16 Q/K/V but not the MXFP8 decode \
+         twins; set ATLAS_QWEN4EXP_MXFP8_DECODE=0 to decode the (rotated) BF16 copies"
+    );
+    Ok(())
 }
 
 /// This rank's Q/K/V rows and O columns of the checkpoint tensors, with the
@@ -147,4 +161,14 @@ fn twins(
         rows(raws[2])?,
         (o, [on, ok]),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn twins_are_refused_beside_the_tq_weight_rotation() {
+        super::twins_allowed(false).unwrap();
+        let e = super::twins_allowed(true).unwrap_err().to_string();
+        assert!(e.contains("MXFP8_DECODE=0"), "{e}");
+    }
 }
