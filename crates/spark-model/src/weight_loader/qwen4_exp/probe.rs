@@ -84,8 +84,11 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         }
     }
 
+    // ONE-indexed (see `ple::load`): `[2]` is decoder layer 1, `layers.1.ple`.
+    // Reading `layer_prefix(l)` probed one layer late and reported 0 shards
+    // on every published checkpoint.
     for &l in &config.ple_layer_ids {
-        let lp = config.layer_prefix(l);
+        let lp = config.layer_prefix(l.saturating_sub(1));
         let base = format!("{lp}.ple.ple_embedding.ngram_embedding");
         let parts = if config.split_ngram_parts > 0 {
             config.split_ngram_parts

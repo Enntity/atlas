@@ -45,12 +45,12 @@ fn store(names: &[String], deferred: &[String]) -> WeightStore {
 }
 
 /// Two layers: GDN at 0, full attention + indexer at 1, PLE at decoder layer 1
-/// (`ple_layer_ids` is ONE-indexed, exactly as `audit_namespace` consumes it).
+/// (`ple_layer_ids` is ONE-indexed, so that is `[2]`, as the checkpoints say).
 fn config() -> ModelConfig {
     let mut c = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
     c.num_hidden_layers = 2;
     c.weight_prefix = "model.language_model".into();
-    c.ple_layer_ids = vec![1];
+    c.ple_layer_ids = vec![2];
     c.split_ngram_parts = 2;
     c
 }
