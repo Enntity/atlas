@@ -18,16 +18,16 @@ mod fp8_tensorwise;
 pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
 mod grouped;
 pub use fp8::{
-    fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_mx, fp8_gemm_act_weight_t_mx_candidate,
-    fp8_gemm_act_weight_t_rowwise,
+    fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_mx, fp8_gemm_act_weight_t_rowwise,
 };
 mod mx_algo;
 pub use grouped::bf16_grouped_gemm_act_weight_t;
+pub use mx_algo::fp8_gemm_mx_prepare;
+// The MXFP8 kernel choice's introspection, for tests and benches only.
 #[cfg(any(test, feature = "test-utils"))]
-pub use mx_algo::mx_per_bucket;
-pub use mx_algo::{
-    MX_CANDIDATES, fp8_gemm_mx_candidate_times, fp8_gemm_mx_prepare, mx_algo_description,
-};
+pub use fp8::fp8_gemm_act_weight_t_mx_candidate;
+#[cfg(any(test, feature = "test-utils"))]
+pub use mx_algo::{MX_CANDIDATES, fp8_gemm_mx_candidate_times, mx_algo_description, mx_per_bucket};
 mod mx_sweep;
 pub use mx_sweep::{MX_SWEEP, MxSweepShape};
 mod tf32;

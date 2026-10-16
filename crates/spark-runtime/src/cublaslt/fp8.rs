@@ -329,6 +329,7 @@ pub fn fp8_gemm_act_weight_t_mx(
 /// kernels only, as tuning does. `Ok(None)`: no such candidate, or it
 /// refuses the problem; nothing launched. `Some((description, in_order))`
 /// otherwise.
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_mx_candidate(
     act_fp8: u64,
