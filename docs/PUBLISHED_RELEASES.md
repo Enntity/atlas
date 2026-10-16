@@ -18,6 +18,8 @@ one pins an exact commit of this fork in `install/atlas-source.json`, and its
 | `main` | A mirror of Atlas-Inf `main`. |
 | `enntity/releases` | This index. Its source tree is an older snapshot (SparkGLM RC2, 2026-10-09); build from the product pins, not from this branch. |
 
+The default branch is `spark-shared`.
+
 `sparkglm` and `sparkqwen` always sit directly on `spark-shared`. A change
 both products need goes into `spark-shared` and both product branches are
 rebased onto it.
@@ -37,12 +39,12 @@ commits.
 
 | | SparkGLM | SparkQwen |
 |---|---|---|
-| Production pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261013-prefill` @ `fcf9735f` |
-| Release candidate (open product PR) | `sparkglm/atlas-20261015-vision` @ `16315004` ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261015-vision` @ `1954e759` ([sparkqwen#7](https://github.com/Enntity/sparkqwen/pull/7)) |
-| Shared layer of the candidate | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
-| Atlas-Inf base of the candidate | `7ffd183f` | same |
+| Product `main` pin (2026-10-15) | `sparkglm/atlas-20261015-vision` @ `16315004` ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261015-vision` @ `1954e759` ([sparkqwen#7](https://github.com/Enntity/sparkqwen/pull/7)) |
+| Shared layer | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
+| Atlas-Inf base | `7ffd183f` | same |
+| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261013-prefill` @ `fcf9735f` |
 
-The candidates are the current `sparkglm`, `sparkqwen` and `spark-shared`
-branch heads. Their measurements (text output, vision, fill, RigMark and a
+The pinned engines are the current `sparkglm`, `sparkqwen` and
+`spark-shared` branch heads. Their measurements (text output, vision, fill, RigMark and a
 same-prompt speed comparison against production) are in each product's
 `results/2026-10-15-shared-engine/`.
