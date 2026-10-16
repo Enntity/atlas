@@ -179,7 +179,7 @@ impl WeightLoader for SafetensorsLoader {
             weight_map.extend(extra_weights);
         }
 
-        csf.finish()?;
+        csf.finish(|n| super::loaded_shape(&weight_map, &deferred, n))?;
 
         let mut store = WeightStore::from_map(weight_map);
         for (name, d) in deferred {

@@ -351,7 +351,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut csf,
             )?;
         }
-        csf.finish()?;
+        csf.finish(|n| crate::weights::loaded_shape(&weights, &deferred, n))?;
 
         tracing::info!("Fast-loaded {} weight tensors", weights.len());
         let mut store = WeightStore::from_map(weights);
