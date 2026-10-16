@@ -231,8 +231,8 @@ pub(super) fn matmul(
     chk(st, "Matmul")
 }
 
-/// The algorithm for `p` (`m` rows of `n x k`): the cached pick of its
-/// bucket, tuned now on `ptrs` when there is none.
+/// The algorithm for `p` (`m` rows of `n x k`): the cached pick of its key,
+/// tuned now on `ptrs` when there is none or when it refuses `m` rows.
 pub(super) fn select(
     ctx: &Ctx,
     p: &Problem,
@@ -247,22 +247,59 @@ pub(super) fn select(
         .iter()
         .find(|e| e.0 == key)
         .map(|e| e.1);
-    if let Some(a) = cached {
-        anyhow::ensure!(
-            takes(ctx, p, &a),
-            "cuBLASLt MXFP8: the {n}x{k} kernel of the {}-row bucket (0: all) ({}) refuses \
-             {m} rows",
-            key.2,
+    match cached {
+        Some(a) if takes(ctx, p, &a) => return Ok(a),
+        // Only past what the key was prepared for (prepare tunes a shared
+        // key at its largest pass). Any in-order kernel serves a swept
+        // shape's bucket alike; a shared key's rows run the new kernel from
+        // here on.
+        Some(a) => tracing::warn!(
+            "cuBLASLt MXFP8 {n}x{k}: the kernel cached for {} ({}) refuses {m} rows; \
+             retuning it at {m} rows",
+            serves(key),
             description(&a)
-        );
-        return Ok(a);
+        ),
+        None => {}
     }
     let a = tune(ctx, p, [m, n, k], ptrs, stream)?;
-    let mut cache = CACHE.lock().unwrap();
-    if !cache.iter().any(|e| e.0 == key) {
-        cache.push((key, a));
+    Ok(store(&mut CACHE.lock().unwrap(), key, a, |c| {
+        takes(ctx, p, c)
+    }))
+}
+
+/// Cache `tuned` under `key` and return it, unless the entry already there
+/// (another thread tuned the same key meanwhile) also serves the problem:
+/// then that entry, so every caller of a key runs the one kernel it holds.
+fn store(
+    cache: &mut Vec<(Key, Algo)>,
+    key: Key,
+    tuned: Algo,
+    serves: impl Fn(&Algo) -> bool,
+) -> Algo {
+    match cache.iter_mut().find(|e| e.0 == key) {
+        Some(e) if serves(&e.1) => e.1,
+        Some(e) => {
+            e.1 = tuned;
+            tuned
+        }
+        None => {
+            cache.push((key, tuned));
+            tuned
+        }
     }
-    Ok(a)
+}
+
+/// What `key`'s kernel serves, for logs.
+fn serves(key: Key) -> String {
+    match key.2 {
+        0 => format!(
+            "every row count (one kernel: {}x{} is not swept on cuBLASLt {})",
+            key.0,
+            key.1,
+            super::version()
+        ),
+        b => format!("the {b}-row bucket"),
+    }
 }
 
 /// Milliseconds per launch of `algo` on `p` (median-free: one timed run of
@@ -325,16 +362,10 @@ fn tune(ctx: &Ctx, p: &Problem, [m, n, k]: [u32; 3], ptrs: [u64; 3], stream: u64
     let best = (0..fit.len())
         .min_by(|&i, &j| times[i].total_cmp(&times[j]))
         .expect("non-empty");
-    let rows = match key_here(n, k, m).2 {
-        0 => format!(
-            "every row count (not swept on cuBLASLt {}: one kernel)",
-            super::version()
-        ),
-        b => format!("the {b}-row bucket"),
-    };
     tracing::info!(
-        "cuBLASLt MXFP8 {n}x{k}, {rows}, tuned at {m} rows: {} at {:.3} ms \
+        "cuBLASLt MXFP8 {n}x{k}, {}, tuned at {m} rows: {} at {:.3} ms \
          ({} in-order of {offered} offered; the first ran {:.3} ms)",
+        serves(key_here(n, k, m)),
         description(&fit[best]),
         times[best],
         fit.len(),
@@ -406,11 +437,10 @@ pub fn fp8_gemm_mx_prepare(n: u32, k: u32, m_max: u32, stream: u64) -> Result<()
             }
         }
         let [act, act_sf, weight, weight_sf, out] = bufs;
-        let mut m = MIN_BUCKET;
-        while m <= top {
+        let per_bucket = super::mx_sweep::verified(super::version(), n, k);
+        for m in prepare_rows(per_bucket, top) {
             let p = Problem::with(m, n, k, Operands::Mxfp8 { weight_sf, act_sf })?;
             select(ctx, &p, [m, n, k], [weight, act, out], stream)?;
-            m *= 2;
         }
         // SAFETY: plain stream sync before the buffers are freed.
         unsafe { chk(cuStreamSynchronize(stream), "prepare sync") }
@@ -424,44 +454,18 @@ pub fn fp8_gemm_mx_prepare(n: u32, k: u32, m_max: u32, stream: u64) -> Result<()
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{bucket, key};
-
-    #[test]
-    fn rows_map_to_power_of_two_buckets_within_64_to_16384() {
-        assert_eq!(bucket(0), 64);
-        assert_eq!(bucket(1), 64);
-        assert_eq!(bucket(64), 64);
-        assert_eq!(bucket(65), 128);
-        assert_eq!(bucket(2048), 2048);
-        assert_eq!(bucket(2049), 4096);
-        assert_eq!(bucket(16384), 16384);
-        assert_eq!(bucket(16046), 16384);
-        assert_eq!(bucket(40000), 16384);
-        assert_eq!(bucket(u32::MAX), 16384);
+/// The row counts [`fp8_gemm_mx_prepare`] tunes at, up to the bucket `top`:
+/// every bucket when each has its own kernel, else `top` alone, so the one
+/// shared kernel is the largest pass's pick and takes every pass up to it.
+fn prepare_rows(per_bucket: bool, top: u32) -> Vec<u32> {
+    if !per_bucket {
+        return vec![top];
     }
-
-    #[test]
-    fn only_a_swept_shape_on_its_swept_cublaslt_gets_a_key_per_bucket() {
-        // Swept on 13.0.0 and 13.1.1: one key per bucket.
-        for v in [130000, 130101] {
-            assert_eq!(key(v, 8192, 2560, 1), (8192, 2560, 64));
-            assert_eq!(key(v, 8192, 2560, 100), (8192, 2560, 128));
-            assert_eq!(key(v, 2560, 3072, 16046), (2560, 3072, 16384));
-        }
-        // Another version, a shape not swept yet, one never swept: a
-        // single key for every row count.
-        for (v, n, k) in [
-            (130200, 8192, 2560),
-            (0, 6144, 2560),
-            (130000, 256, 2560),
-            (130101, 16384, 2560),
-            (130000, 320, 2560),
-        ] {
-            for m in [1, 64, 65, 2048, 16384, 40000] {
-                assert_eq!(key(v, n, k, m), (n, k, 0), "{v} {n}x{k} m={m}");
-            }
-        }
-    }
+    std::iter::successors(Some(MIN_BUCKET), |m| Some(m * 2))
+        .take_while(|&m| m <= top)
+        .collect()
 }
+
+#[cfg(test)]
+#[path = "mx_algo_tests.rs"]
+mod tests;

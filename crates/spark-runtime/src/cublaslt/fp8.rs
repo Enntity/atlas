@@ -291,9 +291,10 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
 ///   `[M, K/32]` (`kernels/gb10/common/mxfp8_act_quant.cuh`), `round_up(rows,
 ///   128) * round_up(K/32, 4)` bytes, columns past K/32 zero.
 ///
-/// `K % 32 == 0`. The kernel is the bucket's tuned in-order one
-/// (`mx_algo`): the first call of a `(N, K, row bucket)` times the
-/// candidates on these operands and synchronizes `stream` (or call
+/// `K % 32 == 0`. The kernel is a tuned in-order one (`mx_algo`), per row
+/// bucket for a shape the invariance sweep passed on this cuBLASLt, else one
+/// for every row count: the first call of a key (or one its kernel refuses)
+/// times the candidates on these operands and synchronizes `stream` (or call
 /// [`fp8_gemm_mx_prepare`](super::fp8_gemm_mx_prepare) at load).
 #[allow(clippy::too_many_arguments)]
 pub fn fp8_gemm_act_weight_t_mx(
