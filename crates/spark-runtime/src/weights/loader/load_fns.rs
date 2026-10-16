@@ -10,6 +10,7 @@ use std::path::Path;
 use super::super::{WeightDtype, WeightTensor, evict_page_cache, f16_to_bf16_bytes};
 use super::{SafetensorsIndex, check_oom_guard, estimate_has_fp8, estimate_load_bytes};
 use crate::gpu::{DevicePtr, GpuBackend};
+use crate::weights::nvfp4_csf::{CsfAssembler, csf_part};
 
 /// Upload one tensor's raw on-disk bytes to the store: F16→BF16 convert if
 /// needed, GPU-alloc (managed/UVM fallback on OOM), copy, insert. Shared by the
@@ -91,6 +92,43 @@ fn upload_one(
     Ok(())
 }
 
+/// [`upload_one`], except that a CSF-compressed NVFP4 scale half goes to the
+/// assembler, and the decoded E4M3 `weight_scale` is uploaded once its pair
+/// completes. Both halves are therefore never in the store.
+#[allow(clippy::too_many_arguments)]
+fn upload_or_assemble(
+    name: &str,
+    raw: &[u8],
+    st_dtype: safetensors::Dtype,
+    shape: Vec<usize>,
+    gpu: &dyn GpuBackend,
+    weights: &mut HashMap<String, WeightTensor>,
+    offload_logged: &mut bool,
+    csf: &mut CsfAssembler,
+) -> Result<()> {
+    if csf_part(name).is_none() {
+        return upload_one(name, raw, st_dtype, shape, gpu, weights, offload_logged);
+    }
+    let Some(scale) = csf.offer(name, &shape, raw)? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        !weights.contains_key(&scale.name),
+        "{} is in the checkpoint both plain and CSF-compressed",
+        scale.name
+    );
+    upload_one(
+        &scale.name,
+        &scale.bytes,
+        safetensors::Dtype::F8_E4M3,
+        scale.shape,
+        gpu,
+        weights,
+        offload_logged,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_sharded(
     model_dir: &Path,
     index_path: &Path,
@@ -99,6 +137,7 @@ pub(super) fn load_sharded(
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
     deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
+    csf: &mut CsfAssembler,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
         .with_context(|| format!("Failed to read {}", index_path.display()))?;
@@ -198,6 +237,7 @@ pub(super) fn load_sharded(
                 deferred,
                 &mut skipped,
                 &mut offload_logged,
+                csf,
             )?;
         }
         #[cfg(not(target_os = "windows"))]
@@ -229,7 +269,7 @@ pub(super) fn load_sharded(
                     continue;
                 }
                 let view = tensors.tensor(name)?;
-                upload_one(
+                upload_or_assemble(
                     name,
                     view.data(),
                     view.dtype(),
@@ -237,6 +277,7 @@ pub(super) fn load_sharded(
                     gpu,
                     &mut weights,
                     &mut offload_logged,
+                    csf,
                 )?;
             }
 
@@ -289,6 +330,7 @@ fn stream_shard_windows(
     deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
     skipped: &mut usize,
     offload_logged: &mut bool,
+    csf: &mut CsfAssembler,
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -360,7 +402,7 @@ fn stream_shard_windows(
             file.seek(SeekFrom::Start(data_base + begin as u64))?;
             file.read_exact(&mut staging[..len])
                 .with_context(|| format!("Failed to read tensor {name}"))?;
-            upload_one(
+            upload_or_assemble(
                 name,
                 &staging[..len],
                 info.dtype,
@@ -368,6 +410,7 @@ fn stream_shard_windows(
                 gpu,
                 weights,
                 offload_logged,
+                csf,
             )?;
         }
         Ok(())
@@ -381,6 +424,7 @@ pub(super) fn load_single(
     gpu: &dyn GpuBackend,
     oom_reserve_bytes: usize,
     skip_fn: &dyn Fn(&str) -> bool,
+    csf: &mut CsfAssembler,
 ) -> Result<HashMap<String, WeightTensor>> {
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
@@ -389,6 +433,20 @@ pub(super) fn load_single(
     let mut weights = HashMap::new();
     for (name, view) in tensors.tensors() {
         if skip_fn(&name) {
+            continue;
+        }
+        if csf_part(&name).is_some() {
+            let mut logged = false;
+            upload_or_assemble(
+                &name,
+                view.data(),
+                view.dtype(),
+                view.shape().to_vec(),
+                gpu,
+                &mut weights,
+                &mut logged,
+                csf,
+            )?;
             continue;
         }
         let shape: Vec<usize> = view.shape().to_vec();

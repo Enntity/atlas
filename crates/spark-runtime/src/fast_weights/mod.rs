@@ -246,6 +246,18 @@ impl WeightLoader for FastSafetensorsLoader {
         let total_shards = shard_files.len();
         let initial_free = gpu.free_memory()?;
         let mut offload_logged = false;
+        let mut csf = crate::weights::nvfp4_csf::CsfAssembler::new();
+
+        // Index entries grouped by the shard path they name, ONCE. The key is
+        // the index's own string (`tensors/model-00001-of-00021.safetensors`
+        // on FP4-Local, which keeps its shards in a subdirectory), matched
+        // against the shard's path relative to `model_dir`. Matching on the
+        // bare file name instead found nothing for such a checkpoint and
+        // silently loaded zero tensors from every shard.
+        let mut by_shard: HashMap<&str, Vec<String>> = HashMap::new();
+        for (t, s) in tensor_to_shard.iter().flatten() {
+            by_shard.entry(s.as_str()).or_default().push(t.clone());
+        }
 
         for (i, shard_path) in shard_files.iter().enumerate() {
             // When an index is present, only load the tensors it routes here;
@@ -254,11 +266,13 @@ impl WeightLoader for FastSafetensorsLoader {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|map| {
-                map.iter()
-                    .filter(|(_, s)| *s == shard_name)
-                    .map(|(t, _)| t.clone())
-                    .collect()
+            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|_| {
+                let rel = shard_path
+                    .strip_prefix(model_dir)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or(shard_name);
+                by_shard.remove(rel).unwrap_or_default()
             });
 
             tracing::info!(
@@ -285,6 +299,7 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
+                &mut csf,
             )?;
 
             let free_now = gpu.free_memory().unwrap_or(0);
@@ -333,8 +348,10 @@ impl WeightLoader for FastSafetensorsLoader {
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,
+                &mut csf,
             )?;
         }
+        csf.finish()?;
 
         tracing::info!("Fast-loaded {} weight tensors", weights.len());
         let mut store = WeightStore::from_map(weights);
