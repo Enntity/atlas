@@ -282,8 +282,9 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
 /// MXFP8 W8A8 `out[M,N] = act[M,K] @ weight[N,K]ᵀ` → BF16 (FP32 accumulate),
 /// both operands E4M3 with one UE8M0 scale per 32 K values
 /// (`CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0` on A and B; TN only on GB10).
-/// ~1.9× the BF16 path on FP4-Local's prefill projections (160–177 vs 80–95
-/// TFLOPS on GB10).
+/// GB10, FP4-Local's TP2 prefill shapes (`mxfp8_gemm_bench_gpu.rs` in
+/// spark-model, 2026-10-15): ~150-172 TFLOPS, against 57-60 for the BF16
+/// cuBLASLt heuristic on 13.0.0 (the runtime image's) and 80-94 on 13.1.1.
 ///
 /// Layouts (row-major, 16-byte aligned):
 /// * `weight_fp8` `[N, K]`, `act_fp8` `[M, K]` E4M3; `out` `[M, N]` BF16.
