@@ -72,6 +72,65 @@ pub fn mxfp8_gemv(
         .launch(stream)
 }
 
+/// Rows the widest plain tier (`mxfp8_gemv_tc32`) serves in one launch.
+pub const MXFP8_MAX_ROWS: usize = 32;
+
+/// [`mxfp8_gemv`] over any number of rows: `rows` rows of `input` (`[rows,
+/// k]`, contiguous) through twin `w` (`[n, k]`) into `output` (row `r` at
+/// `output + r * out_stride` elements), in launches of up to
+/// [`MXFP8_MAX_ROWS`] rows, each on
+/// [`mxfp8_kernel`]'s tier for its width (`row_major` holds
+/// `mxfp8_gemv_tc{8,16,32}`).
+///
+/// A row's output bytes do not depend on how many rows ride with it: every
+/// tier keeps each 8-row activation tile in its own MMA accumulators and sums
+/// the eight K-split warps in one fixed order (`mxfp8_tiled_test_gpu.rs`
+/// checks rows at `m` against the same rows at 32). So one copy can serve a
+/// 1-row decode and a k-row verify or multi-sequence batch and they agree bit
+/// for bit. Chunking past 32 rows keeps that; handing wide batches to a BF16
+/// GEMM instead would not.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_gemv_rows(
+    gpu: &dyn GpuBackend,
+    row_major: &[KernelHandle; 3],
+    w: &Mxfp8Weight,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    n: usize,
+    k: usize,
+    out_stride: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        out_stride >= n,
+        "mxfp8_gemv_rows: out_stride {out_stride} < n {n}"
+    );
+    for first in (0..rows).step_by(MXFP8_MAX_ROWS) {
+        let m = (rows - first).min(MXFP8_MAX_ROWS) as u32;
+        let kernel = mxfp8_kernel(gpu, w, row_major, m);
+        ensure!(
+            kernel.0 != 0,
+            "mxfp8_gemv_rows: no kernel for {m} rows (tiled={})",
+            w.tiled
+        );
+        mxfp8_gemv(
+            gpu,
+            kernel,
+            input.offset(first * k * 2),
+            w.data,
+            w.scales,
+            output.offset(first * out_stride * 2),
+            m,
+            n as u32,
+            k as u32,
+            out_stride as u32,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
 /// The plain tier for `m` rows: 0 (`tc8`, up to 8), 1 (`tc16`) or 2 (`tc32`).
 pub fn mxfp8_tier(m: u32) -> usize {
     match m {
