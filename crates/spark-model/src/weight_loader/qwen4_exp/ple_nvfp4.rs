@@ -19,12 +19,14 @@
 //! 26.8 GB checkpoint table, no extra memory. The checkpoint directory is not
 //! written; the packed copy goes to `ATLAS_PLE_PACKED_DIR`, defaulting to
 //! `atlas-ple/` under the Hugging Face hub cache, beside `atlas-ngram/` (the
-//! n-gram speculation table `serve_load` persists there).
+//! n-gram speculation table `serve_load` persists there). Every open re-hashes
+//! a random 1.3% of the packed file against its chunk checksums;
+//! `ATLAS_PLE_PACKED_VERIFY=full` re-hashes all of it.
 
 use anyhow::{Context, Result};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightStore};
-use spark_storage::ngram_pack::{PackSpec, Plane, open_or_pack};
+use spark_storage::ngram_pack::{PackSpec, Plane, Verify, open_or_pack};
 
 use crate::layers::ple::ngram_nvfp4::{code_bytes, packed_stride, scale_bytes};
 
@@ -65,7 +67,8 @@ pub(super) fn open(
         tag: "nvfp4g16",
     };
     let dir = packed_dir()?;
-    let table = open_or_pack(&spec, &dir).with_context(|| {
+    let verify = Verify::parse(std::env::var("ATLAS_PLE_PACKED_VERIFY").ok().as_deref());
+    let table = open_or_pack(&spec, &dir, verify).with_context(|| {
         format!(
             "PLE: packing the NVFP4 n-gram table into {} (set ATLAS_PLE_PACKED_DIR \
              to a writable directory with ~29 GB free)",

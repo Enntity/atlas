@@ -79,6 +79,18 @@ impl Fixture {
     }
 }
 
+/// Overwrite `path` in place (same inode) and restore its mtime.
+fn rewrite_keeping_mtime(path: &Path, bytes: &[u8]) {
+    let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
 fn expected_row(g: u64) -> Vec<u8> {
     let mut v: Vec<u8> = (0..5).map(|i| byte(0, g, i)).collect();
     v.extend((0..3).map(|i| byte(1, g, i)));
@@ -123,14 +135,14 @@ fn pack_reassembles_every_row_from_scattered_shards() {
     let f = fixture("rows", 10);
     let spec = f.spec();
     let out = f.dir.join("packed.bin");
-    pack(&spec, &out, 7).unwrap();
+    pack(&spec, &out, 7, 4).unwrap();
     let bytes = std::fs::read(&out).unwrap();
     assert_eq!(bytes.len() as u64, packed_offset(30, 16));
     for g in 0..30u64 {
         let at = packed_offset(g, 16) as usize;
         assert_eq!(&bytes[at..at + 16], expected_row(g).as_slice(), "row {g}");
     }
-    validate(&spec, &out).unwrap();
+    validate(&spec, &out, Verify::Full).unwrap();
     std::fs::remove_dir_all(&f.dir).unwrap();
 }
 
@@ -139,7 +151,7 @@ fn open_or_pack_reuses_a_valid_file_and_rebuilds_a_stale_one() {
     let f = fixture("reuse", 10);
     let spec = f.spec();
     let cache = f.dir.join("derived");
-    let t = open_or_pack(&spec, &cache).unwrap();
+    let t = open_or_pack(&spec, &cache, Verify::Full).unwrap();
     assert_eq!((t.base_offset, t.rows_total, t.stride), (HEADER, 30, 16));
     assert!(t.path.starts_with(&cache));
     assert!(
@@ -155,7 +167,7 @@ fn open_or_pack_reuses_a_valid_file_and_rebuilds_a_stale_one() {
     let mut bytes = std::fs::read(&t.path).unwrap();
     bytes[4000] = 0x5A;
     std::fs::write(&t.path, &bytes).unwrap();
-    let again = open_or_pack(&spec, &cache).unwrap();
+    let again = open_or_pack(&spec, &cache, Verify::Full).unwrap();
     assert_eq!(again.path, t.path);
     assert_eq!(std::fs::read(&t.path).unwrap()[4000], 0x5A);
 
@@ -166,20 +178,25 @@ fn open_or_pack_reuses_a_valid_file_and_rebuilds_a_stale_one() {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::remove_file(cache.join(format!("{}.lock", spec.file_name().unwrap())));
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let ro = open_or_pack(&spec, &cache);
+        let ro = open_or_pack(&spec, &cache, Verify::Full);
         std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(ro.unwrap().path, t.path);
     }
 
     // Same layout, new values: change a SAMPLED row (shard 0, row 0) in the
-    // source. Identity is unchanged (same names, lengths, offsets), so only
-    // the row spot-check can catch it — and it must, then rebuild.
+    // source and put its mtime back. Identity is unchanged (same names,
+    // lengths, offsets, mtimes, inodes), so only the row spot-check can catch
+    // it — and it must, then rebuild.
     let (a, off) = f.data[0].clone();
     let mut src = std::fs::read(&a).unwrap();
     src[off as usize] ^= 0xFF;
-    std::fs::write(&a, &src).unwrap();
-    assert!(validate(&spec, &t.path).is_err());
-    let rebuilt = open_or_pack(&spec, &cache).unwrap();
+    rewrite_keeping_mtime(&a, &src);
+    let e = validate(&spec, &t.path, Verify::Full).unwrap_err();
+    assert!(
+        format!("{e:#}").contains("does not match its sources"),
+        "{e:#}"
+    );
+    let rebuilt = open_or_pack(&spec, &cache, Verify::Full).unwrap();
     let bytes = std::fs::read(&rebuilt.path).unwrap();
     assert_eq!(bytes[HEADER as usize], byte(0, 0, 0) ^ 0xFF);
     assert_eq!(bytes[4000], 0, "rebuilt from scratch");
@@ -241,14 +258,14 @@ fn bad_specs_and_bad_files_are_refused() {
     // Truncated and wrong-magic files.
     let spec = f.spec();
     let out = f.dir.join("p.bin");
-    pack(&spec, &out, 64).unwrap();
+    pack(&spec, &out, 64, 4).unwrap();
     let full = std::fs::read(&out).unwrap();
     std::fs::write(&out, &full[..full.len() - 1]).unwrap();
-    assert!(validate(&spec, &out).is_err());
+    assert!(validate(&spec, &out, Verify::Full).is_err());
     let mut bad = full.clone();
     bad[0] = b'X';
     std::fs::write(&out, &bad).unwrap();
-    assert!(validate(&spec, &out).is_err());
+    assert!(validate(&spec, &out, Verify::Full).is_err());
     std::fs::remove_dir_all(&f.dir).unwrap();
 }
 
@@ -297,9 +314,12 @@ fn identity_of_the_real_table_fits() {
         tag: "nvfp4g16",
     };
     let id = spec.identity().unwrap();
-    println!("identity: {} bytes", id.len());
+    let chunks = spec.rows_total().div_ceil(spec.check_rows());
+    println!("identity: {} bytes, {chunks} chunk checksums", id.len());
     assert!(id.len() > 4096, "the case the 64 KiB header exists for");
-    assert!(16 + id.len() <= HEADER as usize);
+    assert_eq!(spec.check_rows(), CHUNK_ROWS, "one checksum per pack pass");
+    assert_eq!(chunks, 1221);
+    header_fits(id.len() as u64, chunks).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -312,24 +332,185 @@ fn a_corrupt_header_length_is_refused_and_rebuilt() {
     let f = fixture("hdrlen", 10);
     let spec = f.spec();
     let cache = f.dir.join("derived");
-    let t = open_or_pack(&spec, &cache).unwrap();
+    let t = open_or_pack(&spec, &cache, Verify::Full).unwrap();
     let good = std::fs::read(&t.path).unwrap();
-    for len in [
-        u64::MAX,
-        u64::MAX - 15,
-        u64::MAX / 2,
-        HEADER,
-        HEADER - 15,
-    ] {
+    for len in [u64::MAX, u64::MAX - 15, u64::MAX / 2, HEADER, HEADER - 15] {
         let mut bad = good.clone();
         bad[8..16].copy_from_slice(&len.to_le_bytes());
         std::fs::write(&t.path, &bad).unwrap();
-        let e = validate(&spec, &t.path).unwrap_err();
-        assert!(format!("{e:#}").contains("out of range"), "len {len}: {e:#}");
+        let e = validate(&spec, &t.path, Verify::Full).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("out of range"),
+            "len {len}: {e:#}"
+        );
         // `open_or_pack` treats it as stale and rebuilds a valid file.
-        let again = open_or_pack(&spec, &cache).unwrap();
+        let again = open_or_pack(&spec, &cache, Verify::Full).unwrap();
         assert_eq!(again.path, t.path);
-        validate(&spec, &t.path).unwrap();
+        validate(&spec, &t.path, Verify::Full).unwrap();
     }
     std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+/// A packed file damaged after it was written, in a row the per-shard spot
+/// check never reads, is caught by its chunk checksum: always under
+/// `Verify::Full`, and under `Verify::Sample` whenever the sample includes the
+/// chunk. `open_or_pack` then rebuilds it.
+#[test]
+fn a_damaged_unsampled_row_fails_its_chunk_checksum() {
+    let f = fixture("chunks", 10);
+    let spec = f.spec();
+    let cache = f.dir.join("derived");
+    let path = cache.join(spec.file_name().unwrap());
+    std::fs::create_dir_all(&cache).unwrap();
+    // 30 rows, 4 per chunk: 8 chunks, the last one short.
+    pack(&spec, &path, 7, 4).unwrap();
+    validate(&spec, &path, Verify::Full).unwrap();
+    // Row 13 (chunk 3) is no shard's spot-check row (0, 19, and shard 2's).
+    assert!((0..3).all(|s| s * 10 + sample_row(s, 10) != 13));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[packed_offset(13, 16) as usize + 2] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let e = validate(&spec, &path, Verify::Full).unwrap_err();
+    assert!(format!("{e:#}").contains("chunk 3"), "{e:#}");
+    let f2 = File::open(&path).unwrap();
+    let hdr = read_header(&f2).unwrap();
+    assert_eq!((hdr.check_rows, hdr.sums.len()), (4, 8));
+    // The chunks the sample would have to draw: the damaged one fails, the
+    // rest pass, so it is the checksum and not the spot check that caught it.
+    assert!(verify_chunks(&f2, &hdr, 30, 16, &[3]).is_err());
+    verify_chunks(&f2, &hdr, 30, 16, &[0, 1, 2, 4, 5, 6, 7]).unwrap();
+    drop(f2);
+
+    let t = open_or_pack(&spec, &cache, Verify::Full).unwrap();
+    assert_eq!(t.path, path);
+    let rebuilt = std::fs::read(&path).unwrap();
+    let at = packed_offset(13, 16) as usize;
+    assert_eq!(&rebuilt[at..at + 16], expected_row(13).as_slice());
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+/// A source rewritten in place with the same name and length is a new
+/// identity through its mtime alone, and is rebuilt under the SAME file name
+/// (the name depends on the layout only), leaving no stale copy behind.
+#[test]
+fn a_touched_source_is_a_new_identity_under_the_same_name() {
+    let f = fixture("touch", 10);
+    let spec = f.spec();
+    let cache = f.dir.join("derived");
+    let t = open_or_pack(&spec, &cache, Verify::Sample).unwrap();
+    let (id, name) = (spec.identity().unwrap(), spec.file_name().unwrap());
+    let (b, _) = &f.data[1];
+    let later =
+        std::fs::metadata(b).unwrap().modified().unwrap() + std::time::Duration::from_secs(5);
+    File::options()
+        .write(true)
+        .open(b)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    assert_ne!(spec.identity().unwrap(), id);
+    assert_eq!(spec.file_name().unwrap(), name);
+    let e = validate(&spec, &t.path, Verify::Sample).unwrap_err();
+    assert!(format!("{e:#}").contains("identity differs"), "{e:#}");
+    assert_eq!(
+        open_or_pack(&spec, &cache, Verify::Sample).unwrap().path,
+        t.path
+    );
+    validate(&spec, &t.path, Verify::Full).unwrap();
+    let bins = std::fs::read_dir(&cache)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".bin"))
+        .count();
+    assert_eq!(bins, 1);
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+/// Corrupt checksum geometry in the header is refused, never trusted.
+#[test]
+fn corrupt_checksum_geometry_is_refused() {
+    let f = fixture("geom", 10);
+    let spec = f.spec();
+    let out = f.dir.join("p.bin");
+    pack(&spec, &out, 64, 4).unwrap();
+    let good = std::fs::read(&out).unwrap();
+    for (at, value) in [
+        (24, u64::MAX),     // chunk count
+        (24, u64::MAX / 4), // chunk count that wraps when multiplied
+        (24, HEADER),       // more sums than the header holds
+        (24, 7),            // fits, but not ceil(30 / 4)
+        (16, 0),            // zero rows per chunk
+        (16, 5),            // rows per chunk that does not give 8 chunks
+    ] {
+        let mut bad = good.clone();
+        bad[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        std::fs::write(&out, &bad).unwrap();
+        assert!(
+            validate(&spec, &out, Verify::Full).is_err(),
+            "word @{at} = {value} accepted"
+        );
+    }
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}
+
+#[test]
+fn verify_mode_parses_leniently() {
+    assert_eq!(Verify::parse(Some("full")), Verify::Full);
+    for v in [None, Some(""), Some("1"), Some("FULL"), Some("bogus")] {
+        assert_eq!(Verify::parse(v), Verify::Sample, "{v:?}");
+    }
+}
+
+/// The cost of the default verify, at the NVFP4 table's real geometry
+/// (96-byte rows, 24 MiB chunks), on whatever disk `$TMPDIR` is: packs a
+/// 20-chunk (504 MB) single-plane table and times `Sample` (16 chunks) and
+/// `Full`. Not a unit test; run by hand:
+/// ```text
+/// cargo test -p spark-storage --release --lib verify_cost -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn verify_cost() {
+    let dir = std::env::temp_dir().join(format!("ngram_pack_cost_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("src.bin");
+    let rows = 20 * (CHECK_BYTES / 96);
+    let bytes: Vec<u8> = (0..rows * 90)
+        .map(|i| ((i * 2654435761) >> 13) as u8)
+        .collect();
+    std::fs::write(&src, &bytes).unwrap();
+    drop(bytes);
+    let shards = vec![(src, 0u64)];
+    let spec = PackSpec {
+        planes: vec![Plane {
+            shards: &shards,
+            row_bytes: 90,
+        }],
+        rows_per_shard: rows,
+        stride: 96,
+        tag: "cost",
+    };
+    let t = std::time::Instant::now();
+    let table = open_or_pack(&spec, &dir, Verify::Sample).unwrap();
+    println!("pack + sample verify: {:.2} s", t.elapsed().as_secs_f64());
+    for mode in [Verify::Sample, Verify::Full, Verify::Sample] {
+        let t = std::time::Instant::now();
+        validate(&spec, &table.path, mode).unwrap();
+        println!(
+            "{mode:?} verify of 20 chunks: {:.3} s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let mut h = crc32fast::Hasher::new();
+    let buf = vec![7u8; 256 << 20];
+    let t = std::time::Instant::now();
+    h.update(&buf);
+    let _ = h.finalize();
+    println!(
+        "crc32: {:.2} GB/s",
+        buf.len() as f64 / 1e9 / t.elapsed().as_secs_f64()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

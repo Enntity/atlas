@@ -174,7 +174,7 @@ fn global_scale_multiplies() {
 #[ignore]
 fn nvfp4_gather_matches_the_golden_through_pack_and_cache() {
     use spark_runtime::gpu::{DevicePtr, GpuBackend};
-    use spark_storage::ngram_pack::{PackSpec, Plane, open_or_pack};
+    use spark_storage::ngram_pack::{PackSpec, Plane, Verify, open_or_pack};
 
     let (head_dim, _, global, golden_rows) = golden();
     let (cb, sb) = (code_bytes(head_dim), scale_bytes(head_dim));
@@ -237,7 +237,7 @@ fn nvfp4_gather_matches_the_golden_through_pack_and_cache() {
         stride: packed_stride(head_dim),
         tag: "nvfp4g16",
     };
-    let table = open_or_pack(&spec, &dir.join("packed")).unwrap();
+    let table = open_or_pack(&spec, &dir.join("packed"), Verify::Full).unwrap();
 
     // CUDA first: the cache arena is pinned, GPU-addressable memory.
     let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4").unwrap();
