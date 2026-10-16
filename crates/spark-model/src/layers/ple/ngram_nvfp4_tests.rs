@@ -25,10 +25,14 @@ fn hex(s: &str) -> Vec<u8> {
 
 /// `(head_dim, rows_per_shard, global scale, rows)` from the fixture.
 pub(crate) fn golden() -> (usize, u64, f32, Vec<GoldenRow>) {
-    let v: serde_json::Value = serde_json::from_str(include_str!(concat!(
+    let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../bench/qwen4_exp/ple_nvfp4_fixtures.json"
-    )))
+    );
+    let v: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(path)
+            .expect("run bench/qwen4_exp/ple_nvfp4_golden.py to generate the fixture"),
+    )
     .expect("ple_nvfp4_fixtures.json");
     let rows = v["rows"]
         .as_array()
