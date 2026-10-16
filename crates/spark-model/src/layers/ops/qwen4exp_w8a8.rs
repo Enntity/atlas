@@ -14,8 +14,8 @@
 //! `index_qk_proj` (its kernels read BF16; N = 320 a rank), not the shared
 //! expert (NVFP4 on the fused MoE prefill kernels, as on the BF16 releases).
 //!
-//! GB10, TP2 per-rank shapes, cuBLASLt 13.0.0: ~150-172 TFLOPS against
-//! 57-60 for the BF16 GEMMs it replaces (`mxfp8_gemm_bench_gpu.rs`).
+//! Speed: `spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx` (its doc
+//! holds the measured numbers and their source).
 //!
 //! The activations come from the mHC collapse where it is the fused prefill
 //! arm (`hc_up_mix_bf16_nt_mx`, `ATLAS_QWEN4EXP_PREFILL_HC` at >= 1024 rows:
