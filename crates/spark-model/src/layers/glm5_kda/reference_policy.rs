@@ -136,8 +136,8 @@ impl Glm5KdaLayer {
         );
         // ATLAS_KDA_FLA_GRAPH=1 admits capture of the single-row decode
         // kernels (fixed per-sequence state pointers); multi-row stays eager.
-        let decode_graph_ok = tokens == 1
-            && std::env::var("ATLAS_KDA_FLA_GRAPH").as_deref() == Ok("1");
+        let decode_graph_ok =
+            tokens == 1 && std::env::var("ATLAS_KDA_FLA_GRAPH").as_deref() == Ok("1");
         ensure!(
             !ctx.graph_capture || decode_graph_ok,
             "KDA FLA core is not qualified for graph capture"
@@ -173,6 +173,141 @@ impl Glm5KdaLayer {
             bytes,
             stream,
         )
+    }
+
+    /// Speculative verify under the reference policy: each of the `tokens`
+    /// rows takes the same single-row decode kernel the serial decode uses
+    /// (conv + recurrence on the live state), and the state after row `t` is
+    /// snapshotted into intermediate `t` (h for all but the last row, conv
+    /// for every row) for the accepted-prefix commit / rollback. Row-for-row
+    /// the recurrence is the serial arithmetic; only the projections around
+    /// it see `tokens` rows. Records mode is not supported.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fla_verify_rows(
+        &self,
+        fla: &FlaReference,
+        packed: DevicePtr,
+        convolved: DevicePtr,
+        g1: DevicePtr,
+        beta: DevicePtr,
+        core_out: DevicePtr,
+        state: &mut SsmLayerState,
+        row0: usize,
+        tokens: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        ensure!(
+            state.kda_records.is_null(),
+            "ATLAS_KDA_FLA_REFERENCE=1 verify does not support --ssm-rollback-mode records"
+        );
+        ensure!(
+            !state.h_is_f16,
+            "KDA FLA core requires FP32 recurrent state"
+        );
+        ensure!(
+            !ctx.graph_capture,
+            "KDA FLA verify is not qualified for graph capture"
+        );
+        ensure!(
+            tokens >= 1
+                && state.h_state_intermediates.len() + 1 >= tokens
+                && state.conv_state_intermediates.len() >= tokens,
+            "GLM-5 KDA FLA verify needs K-1 h and K conv intermediates (h={}, conv={}, K={tokens})",
+            state.h_state_intermediates.len(),
+            state.conv_state_intermediates.len(),
+        );
+        let p = self.heads * self.dim;
+        let bf16 = 2usize;
+        let packed_row = 3 * p * bf16;
+        let gate_row = p * bf16;
+        let beta_row = self.heads * bf16;
+        // One conv + one recurrence launch for all rows when the snapshot
+        // slabs are contiguous (pool layout); same per-row arithmetic.
+        let contiguous = |ptrs: &[DevicePtr], n: usize, stride: usize| {
+            n == 0
+                || ptrs.first().is_some_and(|base| {
+                    !base.is_null()
+                        && ptrs[..n]
+                            .iter()
+                            .enumerate()
+                            .all(|(t, ptr)| ptr.0 == base.0 + (t * stride) as u64)
+                })
+        };
+        if std::env::var("ATLAS_GLM_EXL3_DFLASH_KDA_PER_ROW").as_deref() != Ok("1")
+            && contiguous(
+                &state.conv_state_intermediates,
+                tokens,
+                self.conv_state_bytes,
+            )
+            && contiguous(&state.h_state_intermediates, tokens - 1, self.h_state_bytes)
+        {
+            let io = KdaFlaIo {
+                qkv: packed.offset(row0 * packed_row),
+                raw_gate: g1.offset(row0 * gate_row),
+                raw_beta: beta.offset(row0 * beta_row),
+                conv_weight: self.weights.conv.weight,
+                a_log: self.weights.a_log.weight,
+                dt_bias: self.weights.dt_bias.weight,
+                conv_state: state.conv_state,
+                state: state.h_state,
+                conv_out: convolved.offset(row0 * packed_row),
+                output: core_out.offset(row0 * gate_row),
+                heads: self.heads as u32,
+                lower_bound: self.lower_bound,
+            };
+            let h_snaps = state
+                .h_state_intermediates
+                .first()
+                .copied()
+                .unwrap_or(DevicePtr::NULL);
+            if ops::kda_fla_verify_rows(
+                ctx.gpu,
+                &fla.kernels,
+                &io,
+                tokens as u32,
+                state.conv_state_intermediates[0],
+                self.conv_state_bytes,
+                h_snaps,
+                self.h_state_bytes,
+                stream,
+            )? {
+                return Ok(());
+            }
+        }
+        for t in 0..tokens {
+            let r = row0 + t;
+            let io = KdaFlaIo {
+                qkv: packed.offset(r * packed_row),
+                raw_gate: g1.offset(r * gate_row),
+                raw_beta: beta.offset(r * beta_row),
+                conv_weight: self.weights.conv.weight,
+                a_log: self.weights.a_log.weight,
+                dt_bias: self.weights.dt_bias.weight,
+                conv_state: state.conv_state,
+                state: state.h_state,
+                conv_out: convolved.offset(r * packed_row),
+                output: core_out.offset(r * gate_row),
+                heads: self.heads as u32,
+                lower_bound: self.lower_bound,
+            };
+            ops::kda_fla_decode(ctx.gpu, &fla.kernels, &io, stream)?;
+            if t + 1 < tokens {
+                ctx.gpu.copy_d2d_async(
+                    state.h_state,
+                    state.h_state_intermediates[t],
+                    self.h_state_bytes,
+                    stream,
+                )?;
+            }
+            ctx.gpu.copy_d2d_async(
+                state.conv_state,
+                state.conv_state_intermediates[t],
+                self.conv_state_bytes,
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn ensure_policy_off(&self, path: &str) -> Result<()> {

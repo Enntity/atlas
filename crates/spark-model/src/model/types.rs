@@ -74,6 +74,8 @@ pub struct TransformerModel {
     pub(super) lm_head_weight: DenseWeight,
     pub(super) exl3_moe_scratch: Option<crate::layers::glm5_exl3_ffn::MoeScratch>,
     pub(super) exl3_vocab_head: Option<super::glm_exl3_head::Glm5Exl3VocabHead>,
+    /// F4 phase 1 draft-only DFlash2 observer (`ATLAS_GLM_EXL3_DFLASH=1`).
+    pub(super) exl3_dflash: Option<Box<super::glm_exl3_dflash::Exl3DflashObserver>>,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// TRANSPOSED `[K/2, ldb]` twin of `lm_head_nvfp4` + its PADDED row stride.
     ///

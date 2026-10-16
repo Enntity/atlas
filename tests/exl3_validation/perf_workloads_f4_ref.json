@@ -1,0 +1,82 @@
+{
+ "schema_version": 1,
+ "note": "F4 tau-parity workload: the mindreader reference drafter-tune workload (tools/dt_workload.sh defaults at 140e71f/081213d: one user message 'Write a detailed 400 word essay about the history of bridges.', temperature 0, max_tokens 200, GLM chat template with its default open <think>). The 1024-token arm is the same prompt with more steps per request. ab_prose_long is copied verbatim from perf_workloads_ab.json.",
+ "prompt_classes": {
+  "reasoning-on": {
+   "task": "Write a detailed 400 word essay about the history of bridges.",
+   "paragraphs": [
+    "(unused: approx_input_tokens=1 keeps the prompt exactly the task)"
+   ],
+   "request_extra": {
+    "chat_template_kwargs": {
+     "enable_thinking": true
+    }
+   }
+  },
+  "reasoning-off": {
+   "task": "Write a detailed 400 word essay about the history of bridges.",
+   "paragraphs": [
+    "(unused: approx_input_tokens=1 keeps the prompt exactly the task)"
+   ],
+   "request_extra": {
+    "chat_template_kwargs": {
+     "enable_thinking": false
+    }
+   }
+  },
+  "prose": {
+   "task": "Using the notes below as background, write a detailed, essay-style explanation of how a modern GPU inference server turns a stream of user requests into generated text. Flow through the material in paragraphs, with no lists or headings.",
+   "paragraphs": [
+    "A decode step on a large language model is dominated by memory movement rather than arithmetic. Each generated token reads the full set of active weights from device memory, touches a single row of activations, and appends a small entry to the key-value cache. Because the arithmetic intensity of that work is low, the achievable rate is bounded by how quickly the device can stream weights, not by how many multiply-accumulate units happen to sit idle while the kernel runs.",
+    "The scheduler decides which requests share a step. Interactive serving wants the first token to arrive quickly, so the scheduler must balance admitting a new request and paying its prefill cost against keeping the running requests moving one token at a time. A conservative admission policy keeps decode latency stable but leaves the device underused; an aggressive one packs the batch but lets queueing delay creep into every request that arrives during a busy stretch.",
+    "The key-value cache is the memory-resident history of every active conversation. It grows with the sequence length, and its per-layer layout determines how much bandwidth each decode step consumes beyond the weights themselves. Paged layouts trade a small amount of indirection for the ability to admit and evict sequences without moving large contiguous blocks, which matters enormously once many conversations share the device.",
+    "Quantization shrinks the weights and the cache so that the same bandwidth carries more useful work per second. Lower bit widths buy throughput but cost accuracy at the margins, and the packing format interacts with the kernels that decode it: a format that the hardware can unpack in registers keeps the arithmetic pipeline fed, while a format that forces round trips through local memory can erase the bandwidth advantage entirely.",
+    "Streaming delivery is what the user actually experiences. As soon as the first token exists it can be sent, and each subsequent token follows as an event on an open connection. The client measures time to first token and the gaps between tokens, which reflect the server's queueing, the prefill pass, and the steady decode cadence respectively. A server that batches aggressively may look excellent on aggregate throughput while making every individual conversation feel sluggish.",
+    "Prefill and decode are different regimes wearing the same code path. Prefill processes many prompt tokens at once and is compute bound, so it can approach the device's peak arithmetic rate, while decode processes one token at a time per sequence and is bound by memory traffic. Treating them as one undifferentiated number hides the tradeoff: whatever time goes into prefill is time a waiting user feels before the first token appears.",
+    "Kernels are where the abstract plan becomes device work. Each layer reduces to a handful of matrix multiplications, an attention pass over the cache, and a collection of elementwise operations, and the dispatch overhead between them is pure loss when the kernels themselves are short. Overlapping copies with computation, fusing elementwise chains, and keeping the working set resident in fast memory are the quiet optimizations that separate a comfortable serving rate from an embarrassing one.",
+    "Measurement ties it all together. Without a fingerprint of the build, the checkpoint, the flags, the prompt class, and the sampling configuration, a timing number is just a rumour. Honest reports separate first-token latency from steady decode rate, keep prefill out of decode statistics, repeat runs enough times to see variance, and preserve the raw records so that a skeptical reader can recompute every claim from the evidence rather than trusting the prose."
+   ],
+   "request_extra": {
+    "reasoning_effort": "none"
+   }
+  }
+ },
+ "workloads": [
+  {
+   "name": "f4ref_bridges_200",
+   "prompt_class": "reasoning-on",
+   "approx_input_tokens": 1,
+   "max_tokens": 200,
+   "repeats": 3,
+   "temperature": 0.0,
+   "seed": 20261011
+  },
+  {
+   "name": "f4ref_bridges_1024",
+   "prompt_class": "reasoning-on",
+   "approx_input_tokens": 1,
+   "max_tokens": 1024,
+   "repeats": 3,
+   "temperature": 0.0,
+   "seed": 20261011
+  },
+  {
+   "name": "f4ref_bridges_nothink_1024",
+   "prompt_class": "reasoning-off",
+   "approx_input_tokens": 1,
+   "max_tokens": 1024,
+   "repeats": 3,
+   "temperature": 0.0,
+   "seed": 20261011
+  },
+  {
+   "name": "ab_prose_long",
+   "prompt_class": "prose",
+   "approx_input_tokens": 128,
+   "max_tokens": 1024,
+   "repeats": 3,
+   "temperature": 0.0,
+   "seed": 20261011
+  }
+ ]
+}

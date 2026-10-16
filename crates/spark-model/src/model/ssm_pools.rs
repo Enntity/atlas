@@ -66,7 +66,9 @@ impl SsmPools {
         let dflash_kgamma = super::dspark_pool::dflash_verify_rows(
             !config.dflash_capture_layers.is_empty(),
             num_drafts,
-        )?;
+        )?
+        // F4 EXL3 DFlash verify probe: K=gamma verify pools (0 when off).
+        .max(super::glm_exl3_dflash::verify_rows());
         // DFlash needs the SSM verify pools regardless of MTP weight presence
         // or lm_head quantization — its K=γ verify path checkpoints SSM state
         // for partial-accept rollback. Force `has_mtp` on whenever DFlash is

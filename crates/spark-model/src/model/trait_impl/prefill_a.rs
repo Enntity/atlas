@@ -443,6 +443,8 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // F4 draft-only observer (ATLAS_GLM_EXL3_DFLASH=1).
+            self.exl3_dflash_prefill_layer(seq, i, seq_len_start, proc_count, stream)?;
 
             // MLA diagnostic: dump per-layer hidden state norm (once per model).
             // Per-model latch (see `ModelStats::dumped`) rather than a static: an

@@ -92,6 +92,33 @@ impl Qwen3AttentionLayer {
                 ctx.gpu, input, weight, output, m, n, k, n, stream,
             );
         }
+        // F4 EXL3 speculative verify: the BF16 indexer projections (wk,
+        // kpool gate; N = 128) on <= 8 verify rows. dense_gemm_tc runs them
+        // on a 2-CTA grid (~0.6 ms each); the batch-M GEMV reads the weight
+        // once at bandwidth. Verify-only (numerics change within the lane),
+        // native EXL3 MLA only; ATLAS_GLM_EXL3_DFLASH_INDEXER_TC=1 keeps TC.
+        if m <= ops::DENSE_GEMV_BATCHM_MAX_M
+            && k.is_multiple_of(8)
+            && self.exl3_mla.is_some()
+            && spark_runtime::weights::exl3::native::in_verify_scope()
+            && std::env::var("ATLAS_GLM_EXL3_DFLASH_INDEXER_TC").as_deref() != Ok("1")
+        {
+            static GEMV: std::sync::OnceLock<spark_runtime::gpu::KernelHandle> =
+                std::sync::OnceLock::new();
+            let kernel = match GEMV.get() {
+                Some(k) => *k,
+                None => *GEMV.get_or_init(|| {
+                    ctx.gpu
+                        .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
+                        .unwrap_or(spark_runtime::gpu::KernelHandle(0))
+                }),
+            };
+            if kernel.0 != 0 {
+                return ops::dense_gemv_batchm(
+                    ctx.gpu, kernel, input, weight, output, m, n, k, n, stream,
+                );
+            }
+        }
         if use_cublas_mla_prefill(ctx.dispatch.cublas_gemm, m) {
             return ops::cublas_bf16_proj_dense(input, weight.weight, output, m, n, k, stream);
         }

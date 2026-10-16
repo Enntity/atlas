@@ -24,6 +24,7 @@ mod scratch;
 mod shared;
 pub use scratch::{MoeScratch, MoeScratchBorrow, MoeScratchGeometry};
 mod tables;
+pub mod verify_stats;
 pub use dense::NativeDenseFfn;
 pub use dense_policy::{NativeDenseActivation, NativeDenseFfnRole};
 pub use load::{load_glm5_exl3_ffn, load_glm5_exl3_ffn_with_scratch};

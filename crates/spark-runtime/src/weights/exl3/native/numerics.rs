@@ -58,6 +58,13 @@ fn verify_active() -> bool {
     VERIFY_ACTIVE.with(|v| v.get())
 }
 
+/// Whether the current thread is inside a [`verify_scope`] (a speculative
+/// verify forward). Callers use it to keep verify-only numerics choices out
+/// of prefill and serial decode.
+pub fn in_verify_scope() -> bool {
+    verify_active()
+}
+
 /// Profile slots: 0..4 are `row_profiles`, 4 is `verify_rows_5_8`.
 pub const EXL3_PROFILE_SLOTS: usize = 5;
 

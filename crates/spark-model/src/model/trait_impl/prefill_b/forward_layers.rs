@@ -307,6 +307,9 @@ impl TransformerModel {
                 proc_count,
                 stream,
             )?;
+            // F4 draft-only observer (ATLAS_GLM_EXL3_DFLASH=1): rows hold
+            // positions effective_seq_len_start.. .
+            self.exl3_dflash_prefill_layer(seq, i, effective_seq_len_start, proc_count, stream)?;
             // Riding owners' rows land in their stable hidden-save slots, as
             // after an owner-batched verify.
             if let Some((p, run)) = passengers.as_ref()

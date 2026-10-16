@@ -95,6 +95,35 @@ pub fn step_decode_only(
     // empirically as a 51s broadcast timeout on the worker followed by
     // stale comm data reads. See decode_a2.rs for the full rationale.
 
+    // F4 native EXL3 DFlash2 speculative lane (ATLAS_GLM_EXL3_DFLASH_SPEC=1):
+    // a greedy, processor-free single sequence verifies the drafter's
+    // proposal and emits accepted drafts + bonus. `None` from the model
+    // (lane off, drafter unhealthy, capacity) falls through to serial decode.
+    if n == 1 && exl3_spec_eligible(&active[0]) {
+        let a = &mut active[0];
+        match model.exl3_dflash_spec_step(a.last_token, &mut a.seq) {
+            Ok(Some(tokens)) => {
+                a.last_token_time = Instant::now();
+                for tok in tokens {
+                    emit_token(a, tok, None, sched);
+                    a.last_token = tok;
+                    if a.finished {
+                        break;
+                    }
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!("EXL3 DFlash speculative step: {e:#}");
+                for mut a in active.drain(..) {
+                    send_error(model, &mut a, &format!("{e:#}"));
+                }
+                return;
+            }
+        }
+    }
+
     // Decode, PREEMPTING on KV exhaustion instead of failing the whole batch.
     //
     // Sequences grow one block per `block_size` tokens as they decode; when
@@ -151,4 +180,23 @@ pub fn step_decode_only(
         adaptive_sampling,
         sched,
     );
+}
+
+/// The F4 EXL3 speculative lane emits raw verify argmaxes, so it only takes
+/// steps whose serial sampling would also be a plain argmax: greedy, no
+/// grammar, logprobs, penalties or bias, and no pending thinking-end /
+/// tool-call forcing. Everything else decodes serially.
+fn exl3_spec_eligible(a: &ActiveSeq) -> bool {
+    a.temperature == 0.0
+        && a.grammar_state.is_none()
+        && a.top_logprobs.is_none()
+        && a.repetition_penalty == 1.0
+        && a.presence_penalty == 0.0
+        && a.frequency_penalty == 0.0
+        && a.lz_penalty == 0.0
+        && a.dry_multiplier == 0.0
+        && a.logit_bias.is_empty()
+        && !a.force_end_thinking
+        && !a.think_just_ended
+        && !a.require_tool_call
 }

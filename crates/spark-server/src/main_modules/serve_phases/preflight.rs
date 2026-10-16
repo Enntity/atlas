@@ -174,10 +174,17 @@ pub(crate) fn preflight_reserve(
     let conv_state_bytes = config.ssm_conv_state_bytes();
     // `--dflash` allocates the same verify pools, sized by its γ-derived
     // draft count (see `build_model`), not the MTP `--num-drafts`.
-    let spec_on_pool =
-        args.speculative || args.dflash || args.self_speculative || args.ngram_speculative;
+    // F4 EXL3 DFlash verify probe: the observer's K=gamma verify pools (0 = off).
+    let exl3_verify_rows = spark_model::model::glm_exl3_dflash::verify_rows();
+    let spec_on_pool = args.speculative
+        || args.dflash
+        || args.self_speculative
+        || args.ngram_speculative
+        || exl3_verify_rows > 0;
     let pool_drafts = if args.dflash {
         super::build::checked_dflash_num_drafts(args.resolved_dflash_gamma())?
+    } else if exl3_verify_rows > 0 {
+        exl3_verify_rows - 1
     } else {
         args.resolved_num_drafts()
     };
@@ -219,7 +226,7 @@ pub(crate) fn preflight_reserve(
         spec_on_pool,
         pool_drafts,
         mtp_state_slots,
-        args.dflash,
+        args.dflash || exl3_verify_rows > 0,
         // Stage-3 f16-SIZED pool: mirrors `SsmStatePool::new`'s narrowing.
         // Unreachable today (ssm_h_fp16_preconditions refuses the mode
         // above), wired so preflight and allocator cannot diverge when the

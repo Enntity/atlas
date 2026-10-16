@@ -173,8 +173,10 @@ impl TransformerModel {
         // Rejected rows' K/V and per-token index entries are rewritten by the
         // next block, which re-finalizes the pools it touches. KDA layers keep
         // the verify path that snapshots per-row recurrent state.
+        // The native EXL3 DFlash observer (F4) verifies the same way.
         let glm_prefill_ctx = (self.config.model_type == "glm5_next"
-            && crate::speculative::glm_repair_policy::dflash_enabled()
+            && (crate::speculative::glm_repair_policy::dflash_enabled()
+                || self.exl3_dflash.is_some())
             && crate::speculative::glm_repair_policy::dflash_prefill_verify()
             && !hss_engaged
             && !use_graphs
@@ -350,6 +352,8 @@ impl TransformerModel {
                 }
                 self.trace_lightning_hidden_rows("k4", seq.seq_len, layer_idx, hidden, k, stream)?;
                 self.kgamma_dflash_capture(layer_idx, k, stream)?;
+                // F4 EXL3 observer: every verify row's drafter context.
+                self.exl3_dflash_verify_capture(layer_idx, k, stream)?;
                 if let Some(started) = layer_started {
                     self.gpu.synchronize(stream)?;
                     let elapsed = started.elapsed().as_micros();
@@ -397,7 +401,27 @@ impl TransformerModel {
             // LM head + argmax for K tokens, inside the graph (fixed scratch
             // addresses — graph-safe).
             let argmax_out = self.buffers.scratch();
-            if !self.glm_split_head_argmax(
+            // F4: the native EXL3 head has no dense weight; its vocab-sharded
+            // projection (+ TP gather) covers all k rows. Observer-only.
+            let exl3_head = self.exl3_dflash.is_some()
+                && self.project_exl3_vocab(normed, self.buffers.logits(), k, stream)?;
+            if exl3_head {
+                anyhow::ensure!(
+                    allow.is_none(),
+                    "masked verify is not wired for the native EXL3 vocab head"
+                );
+                let vocab = self.config.vocab_size;
+                for t in 0..k {
+                    ops::argmax_bf16(
+                        self.gpu.as_ref(),
+                        self.argmax_kernel,
+                        self.buffers.logits().offset(t * vocab * bf16),
+                        argmax_out.offset(t * 4),
+                        vocab as u32,
+                        stream,
+                    )?;
+                }
+            } else if !self.glm_split_head_argmax(
                 normed,
                 k,
                 argmax_out,

@@ -16,7 +16,8 @@ mod coop;
 mod numerics;
 pub use coop::{Exl3FusedCoop, coop_fused_input, coop_fused_output, coop_fused_qkv, coop_gemm};
 pub use numerics::{
-    EXL3_PROFILE_SLOTS, Exl3CooperativeProfile, Exl3LinearNumerics, VerifyScope, verify_scope,
+    EXL3_PROFILE_SLOTS, Exl3CooperativeProfile, Exl3LinearNumerics, VerifyScope, in_verify_scope,
+    verify_scope,
 };
 
 /// `ATLAS_EXL3_SPLIT_MMA=1` selects the slice-parallel EXL3 MMA kernels
@@ -317,7 +318,11 @@ impl Exl3LinearWorkspace {
                 .grid([plan.grid, 1, 1])
                 .block([plan.block, 1, 1])
                 .shared_mem(coop::COOP_SMEM_BYTES)
-                .arg_ptr(if fused.is_some() { input } else { self.buffers[0] })
+                .arg_ptr(if fused.is_some() {
+                    input
+                } else {
+                    self.buffers[0]
+                })
                 .arg_ptr(trellis)
                 .arg_ptr(self.buffers[1])
                 .arg_u32(rows)
@@ -371,7 +376,11 @@ impl Exl3LinearWorkspace {
             .arg_u32(self.k)
             .launch(self.stream)?;
         // The slice-parallel cooperative kernel covers 16 columns per block.
-        let columns_per_block = if self.numerics.is_some() && split_mma() { 16 } else { 128 };
+        let columns_per_block = if self.numerics.is_some() && split_mma() {
+            16
+        } else {
+            128
+        };
         let mut matmul = KernelLaunch::new(gpu, self.kernels[1])
             .grid([self.n.div_ceil(columns_per_block), rows, 1])
             .block([128, 1, 1])

@@ -69,6 +69,10 @@ impl TransformerModel {
         n: usize,
     ) -> Result<(bool, bool)> {
         self.validate_independent_decode(tokens, seqs)?;
+        if self.exl3_dflash.is_some() {
+            let slots: Vec<usize> = seqs.iter().map(|s| s.slot_idx).collect();
+            self.exl3_dflash_batched_decode(&slots);
+        }
         let independent_lane = crate::model::glm_independent::enabled(&self.config.model_type)?;
         let c4_lane = self.config.model_type == "glm5_next"
             && !independent_lane

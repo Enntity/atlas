@@ -52,6 +52,12 @@ const COOP_V3_BLOCK: u32 = 256;
 /// group slots by expert and stream each selected expert once for all its
 /// rows (`exl3_coop_moe8_multirow_b4_k32_n256`). Per-row values are those of
 /// the per-slot kernels (row-independent MMA, same partition).
+/// The grouped kernel's M tile holds 16 rows per expert group and poisons
+/// larger groups; at most 16 launch rows guarantees at most 16 routes per
+/// expert (top-k experts are distinct per row). Prefill chunks above this
+/// keep the per-slot path.
+const MULTIROW_MAX_ROWS: usize = 16;
+
 pub(super) fn coop_moe_multirow_min_rows() -> Option<usize> {
     static ON: OnceLock<Option<usize>> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -479,7 +485,10 @@ impl NativeMoeFfn {
             "EXL3 cooperative MoE slots exceed lock capacity"
         );
         if index == 2
-            && let Some(mr) = coop.multirow.as_ref().filter(|m| rows >= m.min_rows)
+            && let Some(mr) = coop
+                .multirow
+                .as_ref()
+                .filter(|m| rows >= m.min_rows && rows <= MULTIROW_MAX_ROWS)
         {
             // Down: the activation's F32 scratch (F16-representable) -> F16
             // in the down-output scratch (free until the down output
@@ -711,7 +720,11 @@ impl NativeMoeFfn {
         let (rows32, topk, experts) = (rows as u32, self.topk as u32, self.experts as u32);
         let xh = [self.buffers[7], self.buffers[5]];
         let yh = [self.buffers[8], self.buffers[8].offset(slots * n * 4)];
-        if let Some(mr) = coop.multirow.as_ref().filter(|m| rows >= m.min_rows) {
+        if let Some(mr) = coop
+            .multirow
+            .as_ref()
+            .filter(|m| rows >= m.min_rows && rows <= MULTIROW_MAX_ROWS)
+        {
             // Group this layer's slots by expert (reused by the down launch).
             KernelLaunch::new(gpu, mr.group)
                 .grid([1, 1, 1])

@@ -177,7 +177,11 @@ impl Model for TransformerModel {
     fn decode(&self, token: u32, seq: &mut SequenceState, _stream: u64) -> Result<DevicePtr> {
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
+        // F4 draft-only observer (no-op unless ATLAS_GLM_EXL3_DFLASH=1).
+        let position = seq.seq_len;
+        self.exl3_dflash_before_decode(token, seq)?;
         let logits = self.decode_dispatch(token, seq, _stream)?;
+        self.exl3_dflash_after_decode(seq.slot_idx, position);
         // The decode left this token's hidden stack in the shared DFlash
         // capture row; a sequence with a row of its own keeps it there.
         crate::layers::dflash_head::keep_own_capture(
@@ -344,7 +348,9 @@ impl Model for TransformerModel {
         self.bind_gpu_to_thread_dispatch()
     }
     fn alloc_sequence(&self) -> Result<SequenceState> {
-        self.alloc_sequence_dispatch()
+        let seq = self.alloc_sequence_dispatch()?;
+        self.exl3_dflash_on_alloc(&seq);
+        Ok(seq)
     }
     fn copy_logits_to_host(&self, logits_ptr: DevicePtr, dst: &mut [u8]) -> Result<()> {
         self.copy_logits_to_host_dispatch(logits_ptr, dst)
@@ -519,6 +525,7 @@ impl Model for TransformerModel {
         self.decode_marconi_checkpoint_dispatch(seq)
     }
     fn free_sequence(&self, seq: &mut SequenceState) -> Result<()> {
+        self.exl3_dflash_on_free(seq);
         self.free_sequence_dispatch(seq)
     }
     fn decode_verify_graphed(
@@ -1072,6 +1079,13 @@ impl Model for TransformerModel {
     }
     fn sync_secondary(&self) -> Result<()> {
         self.sync_secondary_dispatch()
+    }
+    fn exl3_dflash_spec_step(
+        &self,
+        last_token: u32,
+        seq: &mut SequenceState,
+    ) -> Result<Option<Vec<u32>>> {
+        self.exl3_dflash_spec_step_dispatch(last_token, seq)
     }
     fn commit_accepted_prefix(
         &self,

@@ -33,6 +33,9 @@ pub struct KdaFlaKernels {
     delta_h: KernelHandle,
     output: KernelHandle,
     recurrent_decode: KernelHandle,
+    /// Multi-row verify variants (0 when the module predates them).
+    conv_rows_snap: KernelHandle,
+    recurrent_rows_snap: KernelHandle,
 }
 
 impl KdaFlaKernels {
@@ -51,6 +54,8 @@ impl KdaFlaKernels {
             delta_h: k("kda_fla_delta_h")?,
             output: k("kda_fla_output")?,
             recurrent_decode: k("kda_fla_recurrent_decode")?,
+            conv_rows_snap: k("kda_fla_conv_rows_snap").unwrap_or(KernelHandle(0)),
+            recurrent_rows_snap: k("kda_fla_recurrent_decode_rows").unwrap_or(KernelHandle(0)),
         })
     }
 }
@@ -324,6 +329,62 @@ pub fn kda_fla_decode(
         .arg_ptr(io.output)
         .arg_u32(io.heads)
         .launch(stream)
+}
+
+/// Speculative verify of `rows` decode rows in two launches: the conv and
+/// recurrence of each row are those of [`kda_fla_decode`], with the conv
+/// window after every row written to `conv_snaps + t * conv_snap_stride`
+/// and the recurrent state after rows `0..rows-1` to
+/// `h_snaps + t * h_snap_stride` (strides in bytes, f32-aligned). Returns
+/// `false` (nothing launched) when the kernels are unavailable.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_fla_verify_rows(
+    gpu: &dyn GpuBackend,
+    k: &KdaFlaKernels,
+    io: &KdaFlaIo,
+    rows: u32,
+    conv_snaps: DevicePtr,
+    conv_snap_stride: usize,
+    h_snaps: DevicePtr,
+    h_snap_stride: usize,
+    stream: u64,
+) -> Result<bool> {
+    if k.conv_rows_snap.0 == 0 || k.recurrent_rows_snap.0 == 0 {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        conv_snap_stride.is_multiple_of(4) && h_snap_stride.is_multiple_of(4),
+        "KDA FLA verify snapshot strides must be f32-aligned"
+    );
+    let dim = 3 * io.heads * KDA_FLA_DIM as u32;
+    KernelLaunch::new(gpu, k.conv_rows_snap)
+        .grid([div_ceil(dim, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(io.conv_state)
+        .arg_ptr(io.qkv)
+        .arg_ptr(io.conv_weight)
+        .arg_ptr(io.conv_out)
+        .arg_u32(dim)
+        .arg_u32(rows)
+        .arg_ptr(conv_snaps)
+        .arg_u64((conv_snap_stride / 4) as u64)
+        .launch(stream)?;
+    KernelLaunch::new(gpu, k.recurrent_rows_snap)
+        .grid([KDA_FLA_DIM as u32 / 32, io.heads, 1])
+        .block([128, 1, 1])
+        .arg_ptr(io.conv_out)
+        .arg_ptr(io.raw_gate)
+        .arg_ptr(io.raw_beta)
+        .arg_ptr(io.a_log)
+        .arg_ptr(io.dt_bias)
+        .arg_ptr(io.state)
+        .arg_ptr(io.output)
+        .arg_u32(io.heads)
+        .arg_u32(rows)
+        .arg_ptr(h_snaps)
+        .arg_u64((h_snap_stride / 4) as u64)
+        .launch(stream)?;
+    Ok(true)
 }
 
 #[cfg(test)]

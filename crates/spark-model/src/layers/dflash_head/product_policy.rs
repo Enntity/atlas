@@ -315,6 +315,11 @@ pub struct DsparkStartupExecution {
     /// all-off set; generic heads keep legacy lenient semantics, parsed
     /// once. Hot paths must read these instead of the environment.
     pub diagnostics: DsparkDiagnostics,
+    /// Keep every drafter projection BF16: no load-time FP8 / MXFP8 /
+    /// NVFP4 twins regardless of the environment. Set by the native EXL3
+    /// draft-only observer so its acceptance is measured against the
+    /// reference's BF16 drafter.
+    pub bf16_weights_only: bool,
 }
 
 impl DsparkStartupExecution {
@@ -337,6 +342,7 @@ impl DsparkStartupExecution {
                 batch_parity: toggles.batch_parity_enabled,
                 ..DsparkDiagnostics::default()
             },
+            bf16_weights_only: false,
         }
     }
 
@@ -417,6 +423,7 @@ impl DsparkStartupExecution {
             debug_dump: one("ATLAS_DFLASH_DEBUG_DUMP"),
             graph_ineligible_diags,
             diagnostics: DsparkDiagnostics::from_env_lenient(),
+            bf16_weights_only: false,
         }
     }
 }

@@ -1417,6 +1417,19 @@ pub trait Model: Send + Sync {
         Ok(()) // No-op if no secondary stream.
     }
 
+    /// F4 native EXL3 DFlash2 speculative step (`ATLAS_GLM_EXL3_DFLASH_SPEC=1`)
+    /// for the pending `last_token`: verify the drafter's proposal, commit
+    /// the accepted prefix and return the emitted tokens (accepted drafts,
+    /// then the bonus, which stays pending). `None`: decode serially this
+    /// step. Default: never speculates.
+    fn exl3_dflash_spec_step(
+        &self,
+        _last_token: u32,
+        _seq: &mut SequenceState,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Item #2 (STree-style in-place verify commit): commit the surviving
     /// prefix of a verify pass directly onto the canonical `h_state` /
     /// `conv_state`. Full accept (`num_accepted == k`) is a no-op (the

@@ -722,6 +722,7 @@ impl TransformerModel {
             final_norm_identity,
             lm_head_weight,
             exl3_vocab_head: None,
+            exl3_dflash: None,
             exl3_moe_scratch: None,
             lm_head_nvfp4,
             lm_head_nvfp4_t,

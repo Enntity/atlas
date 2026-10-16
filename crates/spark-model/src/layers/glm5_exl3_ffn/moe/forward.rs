@@ -137,6 +137,16 @@ impl NativeMoeFfn {
                 .launch(self.stream)?;
             Ok(())
         })?;
+        if (2..=16).contains(&rows) && super::super::verify_stats::enabled() {
+            let mut raw = vec![0u8; rows * self.topk * 4];
+            gpu.synchronize(self.stream)?;
+            gpu.copy_d2h(self.buffers[1], &mut raw)?;
+            let ids: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            super::super::verify_stats::record(&ids, self.experts);
+        }
         // ATLAS_EXL3_SHARED_OVERLAP: fork the shared expert onto its side
         // stream now (after the router's cuBLAS work), join before buffers[6]
         // is read. Not under per-stage profiling (stage timings stay serial).
