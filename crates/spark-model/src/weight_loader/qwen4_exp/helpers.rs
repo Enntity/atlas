@@ -4,14 +4,42 @@
 //!
 //! Split out of `qwen4_exp.rs` for the file-size cap. The seam is a real one:
 //! none of these touches the loader's state or its trait impl — they are the
-//! three free functions the impl calls, and they are the only free functions
-//! in the file.
+//! free functions the impl and its submodules call.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
+use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::weight_map::DenseWeight;
+
+/// A norm weight as the BF16 the mHC and PLE kernels read.
+///
+/// The FP8 and NVFP4 releases ship these BF16 (passed through untouched). The
+/// FP4-Local release ships the 97 `hc_norm`s and the three PLE norms as F32
+/// ("original bytes preserved"), and every kernel that reads them takes
+/// `const __nv_bfloat16*` — the mHC ones across a dozen entry points, so F32
+/// is not a cheap change there — so they are ROUNDED here, to nearest even.
+///
+/// Round-to-nearest, not the truncation `dense_f32_safe` does: checked against
+/// the NVFP4 release's BF16 copies of the same tensors (layer 5 attn
+/// `hc_norm`, layer 1 `norm_key`, the model mixer's `hc_norm`), RNE of the
+/// F32 reproduces 97-99% of their elements and truncation 3-56%. (The rest
+/// differ by the retraining, not the rounding.)
+///
+/// Anything else is refused: `dense` would hand an F32 buffer to a BF16 read
+/// and the model would run on garbage.
+pub(super) fn bf16_norm(
+    store: &WeightStore,
+    name: &str,
+    gpu: &dyn GpuBackend,
+) -> Result<DenseWeight> {
+    match store.get(name)?.dtype {
+        WeightDtype::BF16 => crate::weight_map::dense(store, name),
+        WeightDtype::FP32 => crate::weight_map::dense_f32_as_bf16(store, name, gpu),
+        other => bail!("{name}: norm weight is {other:?}, expected BF16 or F32"),
+    }
+}
 
 /// A ones-filled `[n]` BF16 norm scale.
 ///

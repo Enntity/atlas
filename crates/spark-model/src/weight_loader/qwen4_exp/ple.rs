@@ -379,9 +379,10 @@ pub(super) fn load(
     let weights = PleWeights {
         key_proj: dense(store, &format!("{lp}.key_proj.weight"))?,
         value_proj: dense(store, &format!("{lp}.value_proj.weight"))?,
-        norm_key: dense(store, &format!("{lp}.norm_key.weight"))?,
-        norm_query: dense(store, &format!("{lp}.norm_query.weight"))?,
-        norm_conv: dense(store, &format!("{lp}.norm_conv.weight"))?,
+        // F32 on the FP4-Local release; rounded to BF16 (see `bf16_norm`).
+        norm_key: super::helpers::bf16_norm(store, &format!("{lp}.norm_key.weight"), gpu)?,
+        norm_query: super::helpers::bf16_norm(store, &format!("{lp}.norm_query.weight"), gpu)?,
+        norm_conv: super::helpers::bf16_norm(store, &format!("{lp}.norm_conv.weight"), gpu)?,
         conv1d: dense(store, &format!("{lp}.conv1d.weight"))?,
     };
 

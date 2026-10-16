@@ -127,8 +127,12 @@ fn load_site(
     let up_w = g("input_mix_weight_up")?;
     tr.apply(up_w)
         .with_context(|| format!("qwen4_exp mHC: transposing {prefix}.input_mix_weight_up"))?;
+    // F32 on the FP4-Local release; rounded to BF16 there (see `bf16_norm`).
+    let norm_w = super::helpers::bf16_norm(store, &format!("{prefix}.hc_norm.weight"), tr.gpu)
+        .with_context(|| format!("qwen4_exp mHC: {prefix}.hc_norm.weight"))?
+        .weight;
     Ok(HcLowRank {
-        norm_w: g("hc_norm")?,
+        norm_w,
         down_w: g("input_mix_weight_down")?,
         up_w,
         inject_w: if with_inject {
