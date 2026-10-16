@@ -25,7 +25,10 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
-        if self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)? {
+        // ATLAS_QWEN4EXP_PREFILL_W8A8 (`w8a8.rs`; no BF16 o_proj left after).
+        if self.w8a8_oproj(attn_out, o_out, [n, h, nq * hd], ctx, stream)?
+            || self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)?
+        {
             return Ok(o_out);
         }
         // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: BF16 at decode's weight values,

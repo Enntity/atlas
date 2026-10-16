@@ -57,7 +57,9 @@ impl Qwen3SsmLayer {
     /// window the peer needs first. Taken only on the dense BF16 arm, whose
     /// rows are independent (the tile kernel, or under the k-chain pin a
     /// cuBLASLt k-chain kernel with the same bytes per row at every row
-    /// count), so every byte is the unsplit GEMM + reduce-scatter's.
+    /// count), or the W8A8 arm (`w8a8.rs`, `out_proj_dense` then holds the
+    /// NULL slot; per-row quant and in-order kernels), so every byte is the
+    /// unsplit GEMM + reduce-scatter's.
     /// `Ok(false)`: not taken, nothing launched.
     pub(super) fn out_proj_reduce_scatter_piped(
         &self,
@@ -108,6 +110,12 @@ impl Qwen3SsmLayer {
         value_dim: usize,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_QWEN4EXP_PREFILL_W8A8 (`w8a8.rs`): ahead of every arm, as the
+        // BF16 copy the dense arm reads is gone.
+        let w8a8 = super::exact_rows::GdnProj::Out;
+        if self.w8a8_proj(ctx, w8a8, normed_out_buf, out_proj_buf, k as usize, stream)? {
+            return Ok(());
+        }
         let force_w8a8 = matches!(std::env::var("ATLAS_FP8_W8A8").ok().as_deref(), Some("1"));
         // PER-ROW FP8 from the checkpoint (`ATLAS_FP8_ROWWISE=1`), dequantised
         // once to BF16 — see the matching arm in `trait_prefill_proj.rs` for

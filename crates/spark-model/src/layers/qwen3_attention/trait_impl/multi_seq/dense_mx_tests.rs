@@ -68,31 +68,61 @@ fn o_rows_take_the_twin_and_a_wrong_shape_is_an_error() {
     let config = ModelConfig::qwen3_next_80b_nvfp4();
     let gpu = MockGpuBackend::new();
     let (mut layer, twins) = bf16_layer(&gpu, &config);
-    let o = layer.o_dense_bf16.unwrap();
     let (h, q_dim) = (
         config.hidden_size as u32,
         (config.num_attention_heads * config.head_dim) as u32,
     );
     let (a, c) = (DevicePtr(0x1000), DevicePtr(0x2000));
+    let rows = |l: &Qwen3AttentionLayer, w: &DenseWeight, k: u32| {
+        l.mx_rows(&gpu, a, w, c, 5, h, k, h as usize, 0)
+    };
     // No twins installed: the caller keeps its own arm.
-    assert!(
-        !layer
-            .mx_rows(&gpu, a, &o, c, 5, h, q_dim, h as usize, 0)
-            .unwrap()
-    );
+    assert!(!rows(&layer, layer.o_dense_bf16.as_ref().unwrap(), q_dim).unwrap());
     layer.install_dense_mxfp8(twins).unwrap();
     let before = gpu.launch_count();
+    assert!(rows(&layer, layer.o_dense_bf16.as_ref().unwrap(), q_dim).unwrap());
+    assert_eq!(gpu.launch_count(), before + 1);
+    assert!(rows(&layer, layer.o_dense_bf16.as_ref().unwrap(), q_dim / 2).is_err());
+    // A copy of the O weight is not the layer's O slot.
+    let copy = layer.o_dense_bf16.unwrap();
+    assert!(!rows(&layer, &copy, q_dim).unwrap());
+}
+
+#[test]
+fn twins_are_found_by_slot_once_the_bf16_copies_are_null() {
+    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    let gpu = MockGpuBackend::new();
+    let (mut layer, twins) = bf16_layer(&gpu, &config);
+    layer.install_dense_mxfp8(twins).unwrap();
+    // What `install_w8a8_prefill` leaves behind: every BF16 slot NULL.
+    for w in [
+        &mut layer.attn.q_proj,
+        &mut layer.attn.k_proj,
+        &mut layer.attn.v_proj,
+    ] {
+        w.weight = DevicePtr::NULL;
+    }
+    layer.o_dense_bf16.as_mut().unwrap().weight = DevicePtr::NULL;
+    let h = config.hidden_size as u32;
+    let kv = (config.num_key_value_heads * config.head_dim) as u32;
+    let q_dim = (config.num_attention_heads * config.head_dim) as u32;
+    let (a, c) = (DevicePtr(0x1000), DevicePtr(0x2000));
+    let o = layer.o_dense_bf16.as_ref().unwrap();
     assert!(
         layer
-            .mx_rows(&gpu, a, &o, c, 5, h, q_dim, h as usize, 0)
+            .mx_rows(&gpu, a, o, c, 3, h, q_dim, h as usize, 0)
             .unwrap()
     );
-    assert_eq!(gpu.launch_count(), before + 1);
+    let k = &layer.attn.k_proj;
     assert!(
         layer
-            .mx_rows(&gpu, a, &o, c, 5, h, q_dim / 2, h as usize, 0)
-            .is_err()
+            .mx_rows(&gpu, a, k, c, 3, kv, h, kv as usize, 0)
+            .unwrap()
     );
+    // V is its own slot, not K's twin again: same shape, other bytes.
+    let v = &layer.attn.v_proj;
+    assert_eq!(layer.mx_slot(v), Some(2));
+    assert_eq!(layer.mx_slot(k), Some(1));
 }
 
 #[test]

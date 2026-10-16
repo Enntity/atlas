@@ -86,6 +86,7 @@ mod hc;
 mod mtp;
 mod ple;
 mod probe;
+mod w8a8;
 
 pub use format::{Mxfp8Component, Qwen4ExpFormat};
 pub(crate) use gdn_fp8::GdnProjections;
@@ -137,7 +138,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // bytes; everything else it ships loads through the shared paths
         // (see `format.rs`).
         let format = Qwen4ExpFormat::detect(store, config)?;
-        let mut mxfp8_released = 0usize;
+        let (mut mxfp8_released, mut w8a8) = (0usize, w8a8::W8a8Load::default());
 
         let h = config.hidden_size;
         let variant = crate::weight_map::detect_nvfp4_variant(store, config);
@@ -386,6 +387,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             if let Some(p) = ple_layer {
                 attach::attach_ple(&mut layer, i, p)?;
             }
+            w8a8.install(&mut layer, format.mxfp8_backbone, config, gpu, stream)?;
             // Every reader of this layer's MXFP8 bytes is done: the GDN and
             // QSA decode twins, the exact BF16 dequants (prefill, the QSA
             // indexer's `index_qk_proj` in `attach_qsa` above), and the
@@ -405,13 +407,14 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         if let Some(tr) = up_tr.take() {
             tr.finish()?;
         }
+        w8a8.log(format.mxfp8_backbone);
         if format.mxfp8_backbone {
             tracing::info!(
-                "qwen4_exp: MXFP8 backbone loaded: GDN/QSA decode reads {}, prefill their \
-                 exact BF16 dequant; QSA indexer exact BF16; shared expert BF16 dequant \
-                 requantized to NVFP4 (the fused MoE kernels read NVFP4; the BF16 releases' \
-                 shared expert takes the same requantization). Released {:.2} GB of MXFP8 \
-                 source bytes",
+                "qwen4_exp: MXFP8 backbone loaded: GDN/QSA decode reads {}, prefill as \
+                 the ATLAS_QWEN4EXP_PREFILL_W8A8 line says; QSA indexer exact BF16; shared \
+                 expert BF16 dequant requantized to NVFP4 (the fused MoE kernels read \
+                 NVFP4; the BF16 releases' shared expert takes the same requantization). \
+                 Released {:.2} GB of MXFP8 source bytes",
                 if gdn == GdnProjections::Mxfp8Decode {
                     "the checkpoint's MXFP8 bytes"
                 } else {

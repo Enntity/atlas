@@ -7,8 +7,11 @@
 //! layers as MXFP8. Requantizing their BF16 dequant to NVFP4, the default
 //! for a BF16 checkpoint, would be a lossy round trip the checkpoint did not
 //! make, so the loader builds the exact BF16 copy (prefill) and installs the
-//! MXFP8 bytes here, keyed by the BF16 weight they stand for. Every dense
-//! decode site asks [`Qwen3AttentionLayer::dense_gemv_or_mx`] (one row) or
+//! MXFP8 bytes here, keyed by WHICH of the layer's BF16 slots they stand for
+//! (`attn.{q,k,v}_proj`, `o_dense_bf16`), not by its pointer: under
+//! `ATLAS_QWEN4EXP_PREFILL_W8A8` prefill reads these bytes too (`w8a8.rs`)
+//! and the BF16 copies are freed, their slots NULL. Every dense decode site
+//! asks [`Qwen3AttentionLayer::dense_gemv_or_mx`] (one row) or
 //! [`Qwen3AttentionLayer::mx_rows`] (rows) and gets the twin when one
 //! exists: serial decode (`attention_forward*`), the multi-sequence / verify
 //! Q/K/V (`multi_seq/qkv_mx.rs`, ahead of every other arm) and O
@@ -25,6 +28,20 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use super::Qwen3AttentionLayer;
 use crate::layers::ops;
 use crate::weight_map::{DenseWeight, Mxfp8Weight};
+
+/// The MXFP8 twins of Q, K, V and O (in that order, each with its `[n, k]`;
+/// empty without), and their W8A8 prefill operands (`w8a8.rs`).
+#[derive(Default)]
+pub(crate) struct DenseMx {
+    pub(super) twins: Vec<([usize; 2], Mxfp8Weight)>,
+    pub(super) w8a8: Option<super::w8a8::AttnW8a8>,
+}
+
+impl DenseMx {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.twins.is_empty()
+    }
+}
 
 impl Qwen3AttentionLayer {
     /// Install the MXFP8 twins of this layer's BF16 Q, K, V (`attn.*_proj`)
@@ -55,17 +72,25 @@ impl Qwen3AttentionLayer {
                 && self.o_weight.is_none(),
             "MXFP8 attention twins need the BF16 Q/K/V/O build (--attn-proj-dtype bf16 shape)"
         );
-        self.dense_mx = own
-            .into_iter()
-            .flatten()
-            .zip([q, k, v, o])
-            .map(|(w, (mx, nk))| (w, nk, mx))
-            .collect();
+        self.dense_mx.twins = [q, k, v, o].into_iter().map(|(mx, nk)| (nk, mx)).collect();
         Ok(())
     }
 
+    /// Which twin `w` stands for: the slot of the layer's own field it is
+    /// (Q, K, V, O), by address, since the BF16 pointer may be NULL by now.
+    pub(super) fn mx_slot(&self, w: &DenseWeight) -> Option<usize> {
+        let own = [
+            Some(&self.attn.q_proj),
+            Some(&self.attn.k_proj),
+            Some(&self.attn.v_proj),
+            self.o_dense_bf16.as_ref(),
+        ];
+        own.iter()
+            .position(|o| o.is_some_and(|o| std::ptr::eq(o, w)))
+    }
+
     fn mx_twin(&self, w: &DenseWeight, n: u32, k: u32) -> Result<Option<&Mxfp8Weight>> {
-        let Some((_, nk, mx)) = self.dense_mx.iter().find(|(p, ..)| *p == w.weight) else {
+        let Some((nk, mx)) = self.mx_slot(w).and_then(|i| self.dense_mx.twins.get(i)) else {
             return Ok(None);
         };
         ensure!(

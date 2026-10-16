@@ -15,7 +15,9 @@
 //!   (`spark_runtime::weights::nvfp4_csf`); the MoE never sees CSF.
 //! * MXFP8 GDN and QSA attention projections: the checkpoint's own bytes as
 //!   decode twins (`gdn_mxfp8`, `attn_mxfp8`; `ATLAS_QWEN4EXP_MXFP8_DECODE=0`
-//!   decodes BF16 instead) and their exact BF16 dequant for prefill.
+//!   decodes BF16 instead) and their exact BF16 dequant for prefill, which
+//!   `ATLAS_QWEN4EXP_PREFILL_W8A8` (`w8a8`) replaces with W8A8 GEMMs on the
+//!   twins, freeing it.
 //! * MXFP8 QSA indexer `index_qk_proj` and ViT attention: the exact BF16
 //!   dequant (`dense_auto`).
 //! * MXFP8 shared expert: its exact BF16 dequant, REQUANTIZED to NVFP4 by
@@ -185,8 +187,8 @@ impl Qwen4ExpFormat {
                 "FP8/NVFP4 release"
             },
             if self.mxfp8_backbone {
-                "MXFP8 (GDN/QSA decode twins + exact BF16 for prefill; indexer and ViT \
-                 attention exact BF16; shared expert BF16 requantized to NVFP4)"
+                "MXFP8 (GDN/QSA decode twins, prefill W8A8 on them or on their exact BF16; \
+                 indexer and ViT attention exact BF16; shared expert BF16 requantized to NVFP4)"
             } else {
                 "BF16"
             },

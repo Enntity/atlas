@@ -52,12 +52,14 @@ impl Qwen3AttentionLayer {
             };
         }
 
+        // ATLAS_QWEN4EXP_PREFILL_W8A8: one MXFP8 image for q, k and v.
+        let mx = self.w8a8_qkv_act(ctx, normed, n, stream)?;
         let qg_out = ctx.buffers.qkv_output();
         let t0 = std::time::Instant::now();
         self.cache_skip_one_proj(
             SkipProj::Q,
             normed,
-            normed_fp8,
+            (normed_fp8, mx),
             qg_out,
             n,
             q_proj_dim as u32,
@@ -80,7 +82,7 @@ impl Qwen3AttentionLayer {
         self.cache_skip_one_proj(
             SkipProj::K,
             normed,
-            normed_fp8,
+            (normed_fp8, mx),
             k_contiguous,
             n,
             nkv * hd,
@@ -103,7 +105,7 @@ impl Qwen3AttentionLayer {
         self.cache_skip_one_proj(
             SkipProj::V,
             normed,
-            normed_fp8,
+            (normed_fp8, mx),
             v_contiguous,
             n,
             nkv * hd,
@@ -129,7 +131,7 @@ impl Qwen3AttentionLayer {
         &self,
         proj: SkipProj,
         normed: DevicePtr,
-        normed_fp8: DevicePtr,
+        (normed_fp8, mx): (DevicePtr, Option<crate::layers::ops::MxAct>),
         out: DevicePtr,
         n: u32,
         out_dim: u32,
@@ -137,6 +139,9 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(act) = mx {
+            return self.w8a8_qkv(proj as usize, act, out, [n, out_dim], stream);
+        }
         // Per-projection weight bundle. Q now uses the transposed FP8 copy
         // whenever populated, matching K/V and the paged path — the strided
         // w8a16_gemm fallback is severely underperforming on some targets.

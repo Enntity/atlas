@@ -10,7 +10,9 @@
 //! FP8 option (`init_fp8.rs`, `ATLAS_QWEN4EXP_FP8_GDN=1`) minus its rounding:
 //! `mxfp8_gemv_tc*` turns each E4M3 byte times its power-of-two scale into
 //! the exact BF16 operand the dequantized copy holds, so the MXFP8 and BF16
-//! GEMVs differ only in FP32 summation order.
+//! GEMVs differ only in FP32 summation order. Under
+//! `ATLAS_QWEN4EXP_PREFILL_W8A8` (`w8a8.rs`) prefill reads these bytes too,
+//! as W8A8 GEMMs, and the BF16 copies are freed.
 //!
 //! Bytes: 1.03 a weight against BF16's 2. Per TP2 rank that is 29.5 MB a
 //! layer against 57.7 MB, ~1.0 GB less read per decode step over the 36 GDN
@@ -30,11 +32,14 @@ use super::exact_rows::GdnProj;
 use crate::layers::ops;
 use crate::weight_map::Mxfp8Weight;
 
-/// The two twins, their `[n, k]`, and the `mxfp8_gemv_tc{8,16,32}` tiers.
+/// The two twins, their `[n, k]`, the `mxfp8_gemv_tc{8,16,32}` tiers, and,
+/// under `ATLAS_QWEN4EXP_PREFILL_W8A8`, the prefill's W8A8 operands over the
+/// same bytes (`w8a8.rs`).
 pub(crate) struct GdnMxfp8 {
-    qkvz: (Mxfp8Weight, [usize; 2]),
-    out: (Mxfp8Weight, [usize; 2]),
+    pub(super) qkvz: (Mxfp8Weight, [usize; 2]),
+    pub(super) out: (Mxfp8Weight, [usize; 2]),
     tiers: [KernelHandle; 3],
+    pub(super) w8a8: Option<super::w8a8::GdnW8a8>,
 }
 
 impl Qwen3SsmLayer {
@@ -78,7 +83,12 @@ impl Qwen3SsmLayer {
             gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc16")?,
             gpu.kernel("mxfp8_gemv", "mxfp8_gemv_tc32")?,
         ];
-        self.gdn_mx = Some(GdnMxfp8 { qkvz, out, tiers });
+        self.gdn_mx = Some(GdnMxfp8 {
+            qkvz,
+            out,
+            tiers,
+            w8a8: None,
+        });
         Ok(())
     }
 

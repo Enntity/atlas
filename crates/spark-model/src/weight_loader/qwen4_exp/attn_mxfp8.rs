@@ -9,7 +9,8 @@
 //! requantizing their dequant to NVFP4 is a lossy round trip the checkpoint
 //! never made, so an MXFP8 layer always takes the arm's BF16 build (exact
 //! dequant, prefill), and with the switch on (the default) decode reads the
-//! checkpoint's bytes through `Qwen3AttentionLayer::install_dense_mxfp8`.
+//! checkpoint's bytes through `Qwen3AttentionLayer::install_dense_mxfp8`
+//! (and prefill too, as W8A8, under `ATLAS_QWEN4EXP_PREFILL_W8A8`: `w8a8.rs`).
 //! `=0` decodes the BF16 copy.
 //!
 //! Bytes per TP2 rank and layer: q 6144x2560, k/v 256x2560, o 2560x3072 =

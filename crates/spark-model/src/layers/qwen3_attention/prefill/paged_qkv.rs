@@ -10,7 +10,7 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
-use crate::layers::ops;
+use crate::layers::ops::{self, MxAct};
 
 /// Identifies which projection (Q/K/V) — selects the correct weight bank
 /// from `Qwen3AttentionLayer`.
@@ -79,6 +79,8 @@ impl Qwen3AttentionLayer {
                 Ok(a8)
             })
             .transpose()?;
+        // ATLAS_QWEN4EXP_PREFILL_W8A8: one MXFP8 image for q, k and v.
+        let mx = self.w8a8_qkv_act(ctx, normed, n, stream)?;
         let qg_out = ctx.buffers.qkv_output();
         self.prefill_one_proj(
             Proj::Q,
@@ -87,7 +89,7 @@ impl Qwen3AttentionLayer {
             n,
             q_proj_dim as u32,
             h,
-            (a4, a8),
+            (a4, a8, mx),
             ctx,
             stream,
         )?;
@@ -114,7 +116,7 @@ impl Qwen3AttentionLayer {
             n,
             nkv * hd,
             h,
-            (a4, a8),
+            (a4, a8, mx),
             ctx,
             stream,
         )?;
@@ -136,7 +138,7 @@ impl Qwen3AttentionLayer {
             n,
             nkv * hd,
             h,
-            (a4, a8),
+            (a4, a8, mx),
             ctx,
             stream,
         )?;
@@ -161,10 +163,17 @@ impl Qwen3AttentionLayer {
         n: u32,
         out_dim: u32,
         h: u32,
-        (a4, a8): (Option<(DevicePtr, DevicePtr)>, Option<DevicePtr>),
+        (a4, a8, mx): (
+            Option<(DevicePtr, DevicePtr)>,
+            Option<DevicePtr>,
+            Option<MxAct>,
+        ),
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(act) = mx {
+            return self.w8a8_qkv(proj as usize, act, out, [n, out_dim], stream);
+        }
         let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, label) = match proj {
             Proj::Q => (
                 self.q_fp8w_t.as_ref(),

@@ -121,9 +121,9 @@ pub struct Qwen3AttentionLayer {
     /// NVFP4 twins of the same projections (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY
     /// opt-in: ~half the MXFP8 bytes) on the W4A16 tensor-core tier.
     pub(crate) mla_q4: Vec<(DevicePtr, crate::weight_map::QuantizedWeight)>,
-    /// A checkpoint's own MXFP8 Q/K/V/O keyed by the BF16 dequant's pointer,
-    /// read by every dense decode arm instead of it (`dense_mx.rs`).
-    pub(crate) dense_mx: Vec<(DevicePtr, [usize; 2], crate::weight_map::Mxfp8Weight)>,
+    /// A checkpoint's own MXFP8 Q/K/V/O, read by every dense decode arm
+    /// instead of the BF16 copy, and their W8A8 prefill (`dense_mx.rs`).
+    pub(crate) dense_mx: super::dense_mx::DenseMx,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`

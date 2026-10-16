@@ -7,7 +7,8 @@
 //! and `out_proj` on all 36 GDN layers as MXFP8 (E4M3 + UE8M0 per 32 K
 //! values), where the NVFP4 release shipped BF16. The BF16 build
 //! (`dense_bf16_layer`) dequantizes them exactly and keeps that copy for
-//! prefill and as the parity reference; this adds the checkpoint's bytes,
+//! prefill (until `ATLAS_QWEN4EXP_PREFILL_W8A8`, `w8a8.rs`, replaces it with
+//! W8A8 GEMMs on the twins); this adds the checkpoint's bytes,
 //! sliced to the rank, as the decode copy (`Qwen3SsmLayer::
 //! install_mxfp8_decode`). No requantization anywhere, so decode stays the
 //! checkpoint's math: the MXFP8 GEMV and the BF16 one multiply identical

@@ -22,7 +22,7 @@ use crate::layers::ops;
 
 /// Which projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GdnProj {
+pub(crate) enum GdnProj {
     /// `in_proj_qkvz`: `[rows, hidden] -> [rows, qkvz]` (sequential layout).
     Qkvz,
     /// `out_proj`: `[rows, value_dim] -> [rows, hidden]`.

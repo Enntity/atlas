@@ -69,7 +69,7 @@ pub struct Qwen3SsmLayer {
     /// everywhere else, where the dispatch is unchanged.
     fp8w_decode_only: bool,
     /// The checkpoint's own MXFP8 QKVZ / out_proj (FP4-Local), read by every
-    /// decode arm; prefill keeps the BF16 copies. `init_mxfp8.rs`.
+    /// decode arm, and by prefill under `ATLAS_QWEN4EXP_PREFILL_W8A8`.
     gdn_mx: Option<init_mxfp8::GdnMxfp8>,
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
@@ -422,7 +422,7 @@ pub struct Qwen3SsmLayer {
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
 mod ckpt_capture;
 mod debug;
-mod exact_rows;
+pub(crate) mod exact_rows;
 mod fla_dispatch;
 mod gdn_defer;
 pub mod gdn_flags;
@@ -458,6 +458,7 @@ mod trait_prefill_phase1;
 mod trait_prefill_phase3;
 mod trait_prefill_proj;
 mod trait_prefill_recur;
+mod w8a8;
 
 pub use gdn_flags::{
     GdnFlags, gdn_fused_norm_enabled, ssm_batched_recurrent_enabled, ssm_h_dtype_bits,
