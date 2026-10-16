@@ -94,7 +94,8 @@ fn upload_one(
 
 /// [`upload_one`], except that a CSF-compressed NVFP4 scale half goes to the
 /// assembler, and the decoded E4M3 `weight_scale` is uploaded once its pair
-/// completes. Both halves are therefore never in the store.
+/// completes. Both halves are therefore never in the store. A plain tensor is
+/// reported to the assembler, which refuses a scale both plain and CSF.
 #[allow(clippy::too_many_arguments)]
 fn upload_or_assemble(
     name: &str,
@@ -107,16 +108,12 @@ fn upload_or_assemble(
     csf: &mut CsfAssembler,
 ) -> Result<()> {
     if csf_part(name).is_none() {
+        csf.note_plain(name)?;
         return upload_one(name, raw, st_dtype, shape, gpu, weights, offload_logged);
     }
     let Some(scale) = csf.offer(name, &shape, raw)? else {
         return Ok(());
     };
-    anyhow::ensure!(
-        !weights.contains_key(&scale.name),
-        "{} is in the checkpoint both plain and CSF-compressed",
-        scale.name
-    );
     upload_one(
         &scale.name,
         &scale.bytes,
@@ -449,6 +446,7 @@ pub(super) fn load_single(
             )?;
             continue;
         }
+        csf.note_plain(&name)?;
         let shape: Vec<usize> = view.shape().to_vec();
         // F16: convert to BF16 at load — see load_sharded above. EXL3 scale
         // vectors (`keeps_raw_f16`) keep their raw FP16 bytes.

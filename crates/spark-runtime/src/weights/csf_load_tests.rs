@@ -246,3 +246,22 @@ fn a_scale_that_does_not_fit_its_weight_refuses_the_load() {
     checkpoint_with(&dir.0, true, [640, 1288], &[]);
     both_refuse(&dir.0, "needs");
 }
+
+/// A plain `weight_scale` beside a CSF pair for the same name fails the
+/// load. The plain copy sits in shard b after the pair's fixed half, so the
+/// pair completes first: the order the loaders used to let through (they
+/// checked only a pair arriving after its plain twin). Either order is
+/// covered at the assembler level by
+/// `nvfp4_csf::tests::a_scale_both_plain_and_csf_is_refused_in_either_order`.
+#[test]
+fn a_scale_both_plain_and_csf_refuses_the_load() {
+    let dir = Dir::new("dup");
+    let plain = vec![0x38u8; 2560 * 40];
+    checkpoint_with(
+        &dir.0,
+        true,
+        GATE_W_SHAPE,
+        &[(DOWN, "F8_E4M3", vec![2560, 40], plain)],
+    );
+    both_refuse(&dir.0, "both plain and CSF");
+}
