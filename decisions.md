@@ -7,6 +7,32 @@ this file references them, it does not duplicate them. Newest first.
 Superseded entries are kept as one-line stubs marked **SUPERSEDED**, so the
 audit trail survives; their full text is in git history.
 
+## 2026-10-16 — Grouped multi-row FAT-routed MoE for prefill (major)
+
+- Choice: implement the audit's P0 as a **new, default-off** route
+  (`ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1`) instead of widening the existing
+  `ATLAS_EXL3_COOP_MOE_MULTIROW` kernel, because that kernel is reachable only
+  for `rows <= thin_capacity` and poisons `rows > 16` and `counts > thin_cap`.
+- Split: `exl3_moe_group_units` emits, per accumulation class, M-tile units of
+  at most 16 rows in the existing group layout. Thin units go to the existing
+  `exl3_coop_moe8_multirow_b4_k32_n256` (tile 32x256, 8 slices, F16-rounded
+  fold); fat units to the new `exl3_coop_moe_fat_multirow_b4_k16_n128` (tile
+  16x128, 1 slice, unrounded F32 fold). The M-tile chunking is the unit split,
+  so neither kernel needs a `rows > 16` poison.
+- Why one route for both classes: `exl3_moe_mul1_matmul_precision_mma` picks
+  fat vs thin **per expert count**, so a grouped prefill launch is usually a
+  mix; emitting only the one profile would change numerics for the other.
+- The grouped route is tried from `forward_local` for `rows > thin_capacity`
+  only; thin launches keep the existing per-slot/coop paths, and with the flag
+  off nothing is resolved or allocated.
+- Evidence: `tests/exl3_validation/coop_moe_bench/fat_multirow_bench.cu` — every
+  slot's F32 row byte-identical to `exl3_moe_mul1_matmul_precision_mma` over
+  three routing distributions (counts 1..9, 17..34, ~128), i.e. below and
+  above `thin_cap` and with groups spanning several M tiles; lock rows return
+  to zero. Measured at slots=1024/288 experts: gate|up 111 ms -> 5.5 ms
+  (20x), down 111 ms -> 5.5 ms (20x); all-fat 122 ms -> 2.0 ms (62x). In-model
+  A/B is owed by the owner of `perf/decode-vllm-parity-20261015`.
+
 ## 2026-10-15 — L1 fused-off result: observer verified, bisect blocked by tooling (major)
 
 - Result: `l1-fusedoff-f099-01` passed O1 (8/8 per engine) and O2 (layer-0/1

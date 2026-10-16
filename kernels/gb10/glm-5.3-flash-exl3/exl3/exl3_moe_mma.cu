@@ -54,3 +54,40 @@ extern "C" __global__ void exl3_moe_mul1_matmul_precision_mma(
         }
     }
 }
+
+// Slice-parallel variant (exl3_mma_split.cuh): same signature and guards,
+// bit-identical output. Grid(n/16,rows*topk,1), block(128,1,1).
+#include "exl3_mma_split.cuh"
+extern "C" __global__ void exl3_moe_mul1_matmul_precision_mma_split(
+    const float* __restrict__ xh, const int* __restrict__ ids,
+    const Exl3Expert* __restrict__ table, float* __restrict__ yh,
+    const unsigned int* __restrict__ counts,
+    unsigned int rows, unsigned int n, unsigned int k, unsigned int topk,
+    unsigned int experts, unsigned int thin_cap,
+    unsigned int tile_k, unsigned int tile_n, unsigned int slices,
+    unsigned int half_partial, unsigned int fat_tile_k, unsigned int fat_tile_n,
+    unsigned int fat_slices, unsigned int fat_half_partial) {
+    const unsigned int slot = blockIdx.y;
+    if (slot >= static_cast<unsigned long long>(rows) * topk) return;
+    const unsigned int block_n = blockIdx.x * 16u;
+    const unsigned long long output_row = static_cast<unsigned long long>(slot) * n;
+    const int expert = ids[slot];
+    if (expert < 0 || static_cast<unsigned int>(expert) >= experts
+        || tile_k != 32u || tile_n != 256u || slices != 8u || half_partial != 1u
+        || fat_tile_k != 16u || fat_tile_n != 128u || fat_slices != 1u
+        || fat_half_partial != 0u || k % 128u || n % 256u || thin_cap == 0u) {
+        if (threadIdx.x < 16u && block_n + threadIdx.x < n)
+            yh[output_row + block_n + threadIdx.x] = __int_as_float(0x7fc00000);
+        return;
+    }
+    const Exl3Expert descriptor = table[expert];
+    const unsigned int* packed = reinterpret_cast<const unsigned int*>(descriptor.trellis);
+    const unsigned long long input_row = static_cast<unsigned long long>(slot) * k;
+    const bool fat = counts[expert] > thin_cap;
+    if (fat)
+        exl3_split::block_columns<16u>(xh, packed, yh + output_row, input_row, block_n, n, k,
+            descriptor.bits, n, 0u, fat_tile_n, fat_slices, fat_half_partial);
+    else
+        exl3_split::block_columns<32u>(xh, packed, yh + output_row, input_row, block_n, n, k,
+            descriptor.bits, n, 0u, tile_n, slices, half_partial);
+}

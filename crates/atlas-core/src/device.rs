@@ -52,6 +52,7 @@ mod cuda_impl {
     impl AtlasDevice {
         /// Initialize an Atlas device on the given GPU ordinal.
         pub fn new(ordinal: usize) -> Result<Self> {
+            crate::cuda_host::apply_cuda_sched_env(ordinal);
             let ctx = CudaContext::new(ordinal).map_err(AtlasError::CudaDriver)?;
             Ok(Self { ctx, ordinal })
         }

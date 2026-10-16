@@ -134,8 +134,12 @@ impl Glm5KdaLayer {
             !state.h_is_f16,
             "KDA FLA core requires FP32 recurrent state"
         );
+        // ATLAS_KDA_FLA_GRAPH=1 admits capture of the single-row decode
+        // kernels (fixed per-sequence state pointers); multi-row stays eager.
+        let decode_graph_ok = tokens == 1
+            && std::env::var("ATLAS_KDA_FLA_GRAPH").as_deref() == Ok("1");
         ensure!(
-            !ctx.graph_capture,
+            !ctx.graph_capture || decode_graph_ok,
             "KDA FLA core is not qualified for graph capture"
         );
         let io = KdaFlaIo {

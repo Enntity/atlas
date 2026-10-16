@@ -212,6 +212,33 @@ pub trait GpuBackend: Send + Sync {
         self.launch(func, grid, block, shared_mem, stream, &mut params)
     }
 
+    /// Cooperative typed-args launch (`cuLaunchCooperativeKernel` on CUDA):
+    /// all CTAs are co-resident, as inter-CTA spin locks require. Backends
+    /// without cooperative launch return an error; callers fall back.
+    fn launch_cooperative_typed(
+        &self,
+        _func: KernelHandle,
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_mem: u32,
+        _stream: u64,
+        _args: &[KernelArg<'_>],
+    ) -> Result<()> {
+        anyhow::bail!("cooperative kernel launch is not supported by this GPU backend")
+    }
+
+    /// Resident CTAs per SM a cooperative launch of `func` gets with `block`
+    /// threads and `shared_mem` dynamic bytes (CUDA: sets the max-shared
+    /// carveout, then cuOccupancyMaxActiveBlocksPerMultiprocessor).
+    fn cooperative_blocks_per_sm(
+        &self,
+        _func: KernelHandle,
+        _block: u32,
+        _shared_mem: u32,
+    ) -> Result<u32> {
+        anyhow::bail!("occupancy query is not supported by this GPU backend")
+    }
+
     /// Whether `stream` is inside an active CUDA-graph capture. Telemetry
     /// taps MUST check this before any sync/D2H on a potentially-captured
     /// stream — those calls invalidate the capture (CUDA 901) and wedge the

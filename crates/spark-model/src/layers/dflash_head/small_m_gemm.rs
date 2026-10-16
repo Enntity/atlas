@@ -75,6 +75,32 @@ pub(super) fn small_m_arm(enabled: bool, batchm: bool, tc: bool, m: u32, k: u32)
     }
 }
 
+/// `ATLAS_DFLASH_BF16_TC=1` (drafter numerics only: affects acceptance, not
+/// output correctness): 2..=8 rows take the tensor-core BF16 tier instead of
+/// the batched GEMV, ~205 GB/s on every drafter shape vs 137-224 for the
+/// batched GEMV (drafter layers 9.4 vs 10.2 ms per step at 8 rows in the
+/// bench). Off by default.
+fn bf16_tc_small_rows() -> bool {
+    static BF16_TC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BF16_TC.get_or_init(|| std::env::var("ATLAS_DFLASH_BF16_TC").as_deref() == Ok("1"))
+}
+
+/// Pure decision: [`small_m_arm`]'s batch-M pick moved to the tensor-core
+/// tier for 2..=8 rows when `bf16_tc` (`ATLAS_DFLASH_BF16_TC=1`) and the
+/// 16-row tier is resolved and takes `k`.
+pub(super) fn bf16_tc_arm(arm: SmallMArm, bf16_tc: bool, tc16: bool, m: u32, k: u32) -> SmallMArm {
+    if arm == SmallMArm::BatchM
+        && bf16_tc
+        && tc16
+        && (2..=DENSE_GEMV_BATCHM_MAX_M).contains(&m)
+        && k.is_multiple_of(8)
+    {
+        SmallMArm::TensorCore
+    } else {
+        arm
+    }
+}
+
 /// Pure decision (kept for callers that only ask about the batch-M arm).
 pub(super) fn use_small_m_gemv(enabled: bool, handle_nonzero: bool, m: u32) -> bool {
     small_m_arm(enabled, handle_nonzero, false, m, 0) == SmallMArm::BatchM
@@ -96,13 +122,21 @@ impl BlockDiffusionDraftHead {
     ) -> Result<()> {
         ensure_bf16_present(w, m, n, k)?;
         let kernels = &self.kernels;
-        match small_m_arm(
+        let arm = small_m_arm(
             kernels.small_m_gemv,
             kernels.dense_gemv_batchm.0 != 0,
             kernels.dense_gemv_tc16.0 != 0 && kernels.dense_gemv_tc32.0 != 0,
             m,
             k,
-        ) {
+        );
+        let arm = bf16_tc_arm(
+            arm,
+            bf16_tc_small_rows(),
+            kernels.dense_gemv_tc16.0 != 0,
+            m,
+            k,
+        );
+        match arm {
             SmallMArm::BatchM => ops::dense_gemv_batchm(
                 gpu,
                 kernels.dense_gemv_batchm,
@@ -220,5 +254,17 @@ mod tests {
         assert_eq!(small_m_arm(false, true, true, 16, 4096), Pipelined);
         assert_eq!(small_m_arm(false, true, true, 8, 4096), Pipelined);
         assert_eq!(small_m_arm(true, true, true, 16, 4100), Pipelined);
+    }
+
+    #[test]
+    fn bf16_tc_moves_two_to_eight_batchm_rows_to_tensor_cores() {
+        use SmallMArm::*;
+        assert_eq!(bf16_tc_arm(BatchM, true, true, 8, 4096), TensorCore);
+        assert_eq!(bf16_tc_arm(BatchM, true, true, 2, 4096), TensorCore);
+        assert_eq!(bf16_tc_arm(BatchM, true, true, 1, 4096), BatchM);
+        assert_eq!(bf16_tc_arm(BatchM, false, true, 8, 4096), BatchM);
+        assert_eq!(bf16_tc_arm(BatchM, true, false, 8, 4096), BatchM);
+        assert_eq!(bf16_tc_arm(BatchM, true, true, 8, 4100), BatchM);
+        assert_eq!(bf16_tc_arm(Pipelined, true, true, 8, 4096), Pipelined);
     }
 }

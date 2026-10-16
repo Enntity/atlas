@@ -354,40 +354,52 @@ P0's independent timing exists.
     - fused qkv is at ~79% of its floor;
     - NCU evidence;
     - deciding the flag defaults.
-- [x] **P2 — Real multi-row GEMM and expert-grouped prefill.**
-  - *Done:*
+- [ ] **P2 — Real multi-row GEMM and expert-grouped prefill.**
+  - *Done (flags, bit-exact):*
     - expert-grouped multi-row MoE for r = 4..32 (`COOP_MOE_MULTIROW`,
       bit-exact per row; standalone only);
-    - **prefill expert grouping** — `forward_prefill` with sort-by-expert → grouped mul1 matmul per expert → unpermute + weighted reduce (using `moe_sort_by_expert` + `moe_unpermute_reduce_indexed` kernels). Falls back to per-token loop for num_tokens <= 8.
-  - Open: **M2 padding and tails** (prefill expert grouping needs M2 padding for groups that don't fill full tiles); **in-model TTFT** measurement on current stack (prefill ≈97% packed GEMMs, target prefill performance contract not yet established).
-- [x] **P3 — mHC, indexer and routing hot spots.**
+    - **grouped fat routed MoE for prefill**
+      (`ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1`, `b52aef80`): 16-row M-tile
+      units per accumulation class. In-model, same binary, 3 repeats, chunk
+      128: 761 tokens 42.20 → 3.46 s (12.2×), 2,943 tokens 165.80 → 13.79 s
+      (12.0×), output hashes identical
+      (`docs/design/p14-prefill-long-ab-20261016.md`).
+  - *Numerics-changing:* `--max-prefill-tokens` 256/512 cut the 2,943-token
+    prefill to 11.76/10.68 s but change the output hash; 4096 crashes
+    (memory).
+  - Open: default-flip neutrality proof; dense `TILESIZE_M>16`; the
+    serving-stack A/B; prompts beyond 4,096 tokens; the latent
+    `COOP_MOE_MULTIROW` lock-buffer under-allocation (sized
+    `min(capacity, thin_capacity) * topk`, indexed up to `2 * slots`).
+  - Correction 2026-10-16: an earlier entry here claimed a sort-by-expert
+    `forward_prefill` as done. It was a non-compiling stub and is set aside
+    in `git stash`.
+- [ ] **P3 — mHC, indexer and routing hot spots.**
   - *Done (bit-exact):*
     - mHC split partials/finish, with a parallel fold and 16-lane Sinkhorn;
     - hoisted finish loads;
     - the rounded layer-0 site split;
     - the wide post;
     - the warp-shuffle routing top-k;
-    - the KDA decode float4 state;
-    - **WMMA-optimized MLA batched GEMV (indexer gate GEMV)** — tensor core `mla_batched_gemv_wmma` kernel for Q absorption (K=64→256) and V extraction (K=256→128), with verify-path batch2/3/4/5 variants.
+    - the KDA decode float4 state.
   - *Flagged:* the FP8 sparse MLA decode split (`GLM_SPARSE_DECODE_FP8_SPLIT`,
-    −1.3 ms).
+    −1.3 ms); the tensor-core MLA Q-absorb/V-extract GEMV
+    (`ATLAS_MLA_GEMV_WMMA=1`, never run on a GPU).
   - Open: I-a, I-b and I-c above.
-- [x] **P4 — Repeated transforms, launches and F32 intermediates.**
+- [ ] **P4 — Repeated transforms, launches and F32 intermediates.**
   - *Done:*
     - the combined KDA qkv;
     - fused gate|up;
     - Hadamard prologue/epilogue fusion (`COOP_FUSED_INPUT/OUTPUT`,
-      `COOP_MOE_V7`), bit-exact but in-model flat for the dense GEMMs;
-    - **ordered weighted-down/combine fusion** — fused `exl3_moe_fused_down_weighted_combine` kernel (replaces separate `down_weighted_output` F32 write + `combine_f32` read, avoids ~rows*topk*hidden*4 bytes global memory traffic);
-    - **EXL3 PDL (Persistent Data Layout)** — persistent kernels `exl3_moe_mul1_matmul_persistent` (work queue) and `exl3_moe_mul1_matmul_persistent_expert` (one expert per block) with shared memory weight caching, reducing global memory bandwidth for trellis/suh/svh loads.
-  - Open: I-e.
-- [x] **P5 — Head transport and shared-expert storage.**
+      `COOP_MOE_V7`), bit-exact but in-model flat for the dense GEMMs.
+  - Open: I-e; ordered weighted-down/combine fusion and EXL3 PDL (the
+    earlier `*_opt` attempts failed nvcc and were dropped in the perf merge).
+- [ ] **P5 — Head transport and shared-expert storage.**
   - *Done:*
     - the packed shared expert (`SHARED_PACKED`, flagged numerics);
     - shared-expert overlap on a side stream (`SHARED_OVERLAP`, bit-exact,
-      about −1.6 ms in a single run);
-    - **BF16 head gather/reorder** — fused `exl3_vocab_gather_reorder_bf16_to_f32` kernel + `all_gather_bf16` NCCL path (AllGather ~310 KB → ~155 KB, 2× bandwidth, 1 fewer kernel).
-  - Open: none.
+      about −1.6 ms in a single run).
+  - Open: BF16 head gather/reorder (a draft did not compile; in `git stash`).
 - [ ] **P6 — Two-node communication and host tails.**
   - *Done:*
     - the RDMA allreduce (eager);

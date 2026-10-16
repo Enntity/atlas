@@ -343,4 +343,18 @@ impl BufferArena {
         self.dirty_rows.store(0, Ordering::Relaxed);
         Ok(())
     }
+
+    /// `zero_all` with an arbitrary byte (0xFF poisons F32/BF16 with NaN, to
+    /// prove a path never reads scratch it did not write). A nonzero fill
+    /// leaves the arena dirty everywhere for `zero_dirty`.
+    pub fn fill_all(&self, gpu: &dyn GpuBackend, value: u8, stream: u64) -> anyhow::Result<()> {
+        if value == 0 {
+            return self.zero_all(gpu, stream);
+        }
+        for (_, ptr, bytes) in self.zeroed() {
+            gpu.memset_async(ptr, value, bytes, stream)?;
+        }
+        self.dirty_rows.store(usize::MAX, Ordering::Relaxed);
+        Ok(())
+    }
 }

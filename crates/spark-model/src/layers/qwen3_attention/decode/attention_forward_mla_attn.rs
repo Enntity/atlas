@@ -328,6 +328,50 @@ impl Qwen3AttentionLayer {
             {
                 continue;
             }
+            // ATLAS_GLM_SPARSE_DECODE_FP8_SPLIT=1: run the fp8_g128 row through
+            // the verify owners' split kernel + merge (one CTA per K split
+            // instead of one CTA in total). Numerics-changing: the partial
+            // softmax sums merge in a different order than the single pass.
+            if self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128
+                && fp8_split_enabled()
+            {
+                // The dense fp8 index list sits at the head of expert_gate_out.
+                const INDEX_RESERVE: usize = 16384;
+                let splits = ops::sparse_split_count(1, GROUP, index_width);
+                let need = ops::sparse_split_scratch_bytes(splits, 1, GROUP, head_dim);
+                let avail = ctx
+                    .buffers
+                    .sizes()
+                    .expert_gate_out
+                    .saturating_sub(INDEX_RESERVE);
+                let split_scratch = scratch.offset(INDEX_RESERVE);
+                let disjoint = |p: DevicePtr, n: usize| {
+                    let (s0, s1) = (split_scratch.0, split_scratch.0 + need as u64);
+                    p.0 + n as u64 <= s0 || s1 <= p.0
+                };
+                if splits > 1
+                    && avail >= need
+                    && disjoint(a.query, group_bytes)
+                    && disjoint(a.output, group_bytes)
+                    && disjoint(indices, index_width as usize * 4)
+                    && disjoint(block_table, 4)
+                    && ops::try_glm_sparse_prefill_tc_split(
+                        ctx.gpu,
+                        &a,
+                        split_scratch,
+                        avail,
+                        stream,
+                    )?
+                {
+                    continue;
+                }
+                static DECLINED: std::sync::Once = std::sync::Once::new();
+                DECLINED.call_once(|| {
+                    tracing::warn!(
+                        "ATLAS_GLM_SPARSE_DECODE_FP8_SPLIT declined: splits={splits} need={need} avail={avail}"
+                    )
+                });
+            }
             if !ops::try_glm_sparse_decode_tc(ctx.gpu, &a, stream)? {
                 anyhow::ensure!(
                     group == 0,
@@ -338,4 +382,9 @@ impl Qwen3AttentionLayer {
         }
         Ok(true)
     }
+}
+
+fn fp8_split_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SPARSE_DECODE_FP8_SPLIT").as_deref() == Ok("1"))
 }

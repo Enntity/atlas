@@ -238,6 +238,10 @@ pub trait CommBackend: Send + Sync {
         // Default: no-op (single GPU or backends that don't need it)
     }
 
+    /// Kernel handles for the RDMA pair's kernel-side flags
+    /// (`atlas_flag_store_release`, `bf16_add_inplace_wait`); default no-op.
+    fn set_flag_kernels(&self, _store: u64, _add_wait: u64) {}
+
     /// Send tokens to a specific rank (for EP token dispatch).
     ///
     /// Sends `bytes` from `ptr` on this rank to `dest_rank`.

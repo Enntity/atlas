@@ -11,7 +11,9 @@ Decode rates come from perf_baseline's TPOT (prefill never leaks into them).
       --out $EV/perf-ab-20261015 [--env KEY=VALUE ...] [--workload decode_prose]
 """
 import argparse
+import gzip
 import json
+import os
 import shlex
 import socket
 import subprocess
@@ -21,8 +23,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-DESCRIPTORS = Path('/home/colum/Workspace/atlas-exl3-validation-20261010/'
-                   'statistical-gate-20261011/collector-only-profile')
+# ATLAS_BENCH_DESCRIPTORS selects an alternate collector-only profile directory
+# (same layout, different serve args) so serve-flag A/Bs need no code edits.
+DESCRIPTORS = Path(os.environ.get(
+    'ATLAS_BENCH_DESCRIPTORS',
+    '/home/colum/Workspace/atlas-exl3-validation-20261010/'
+    'statistical-gate-20261011/collector-only-profile'))
 DESCRIPTOR_IMAGE = 'atlas-exl3-validation:src-8b6b47f14d5b-rust1.97.1'
 OBSERVER_ENV = 'ATLAS_EXL3_LOGITS_DIR'
 HOSTS = {0: Path.home()/'.local/bin/spark0', 1: Path.home()/'.local/bin/spark1'}
@@ -31,15 +37,26 @@ MODEL = ('/root/.cache/huggingface/hub/models--MikeRoz--GLM-5.3-Flash-Uncensored
 SSH_TUNNEL = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-J', 'colum@192.168.1.50',
               '-N', '-L']
 
+# Bytes: a full container log is archived as-is below 1 MiB and gzipped above it.
+# NCCL_DEBUG=INFO transports emit far more than that, and the run directory is
+# copied off the Sparks wholesale, so the gz threshold keeps archives bounded.
+ARCHIVE_GZIP_THRESHOLD = 1024 * 1024
+# Seconds: pulling the full log can take minutes where the 400-line tail could not.
+ARCHIVE_LOG_TIMEOUT = 900
+
 
 def remote(rank, command, check=True, timeout=300):
-    result = subprocess.run([str(HOSTS[rank]), command], text=True, capture_output=True, timeout=timeout)
+    for attempt in range(4):  # ssh exit 255 = connection failure via the jump host; retry
+        result = subprocess.run([str(HOSTS[rank]), command], text=True, capture_output=True, timeout=timeout)
+        if result.returncode != 255:
+            break
+        time.sleep(5 * (attempt + 1))
     if check and result.returncode:
         raise RuntimeError(f'spark{rank}: {command}\n{result.stdout}\n{result.stderr}')
     return result.stdout
 
 
-def create_argv(rank, image, name, extra_env):
+def create_argv(rank, image, name, extra_env, binary=None, capture=None, cpuset=None):
     argv = json.loads((DESCRIPTORS/f'cand-rank{rank}-create-command.json').read_text())
     out, i = [], 0
     while i < len(argv):
@@ -59,6 +76,12 @@ def create_argv(rank, image, name, extra_env):
                 out[j+1] = item; break
         else:
             overrides += ['--env', item]
+    if cpuset:  # host CPUs 0-4,10-14 are isolcpus (no balancing); see gb10-fleet-facts
+        overrides += ['--cpuset-cpus', cpuset]
+    if binary:  # dev-built spark mounted over the image's binary (same runtime libs)
+        overrides += ['--volume', f'{binary}:/usr/local/bin/spark:ro']
+    if capture:  # per-step final-logit dumps for bit-identity checks
+        overrides += ['--env', f'{OBSERVER_ENV}=/tmp/capture', '--volume', f'{capture}/rank{rank}:/tmp/capture']
     out[at:at+1] = overrides + [image]
     return out
 
@@ -66,6 +89,24 @@ def create_argv(rank, image, name, extra_env):
 def free_port():
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0)); return s.getsockname()[1]
+
+
+def archive_container_log(rank, text, run_dir):
+    """Write rank's full container stdout+stderr into run_dir.
+
+    Additive to the 400-line tail the caller keeps in container-r{rank}.log:
+    the tail is what consumers read today, the archive carries the NCCL
+    init/transport lines that scroll past any tail (NCCL_DEBUG=INFO). Gzipped
+    above ARCHIVE_GZIP_THRESHOLD bytes. Returns the archive path.
+    """
+    path = Path(run_dir)/f'container-r{rank}.full.log'
+    if len(text.encode('utf-8', 'replace')) > ARCHIVE_GZIP_THRESHOLD:
+        path = path.with_name(path.name + '.gz')
+        with gzip.open(path, 'wt', encoding='utf-8', errors='replace', compresslevel=6) as fh:
+            fh.write(text)
+    else:
+        path.write_text(text, encoding='utf-8')
+    return path
 
 
 def main():
@@ -77,22 +118,31 @@ def main():
     ap.add_argument('--workload', action='append', default=None)
     ap.add_argument('--workloads', default=str(HERE/'perf_workloads_ab.json'))
     ap.add_argument('--health-timeout', type=float, default=1800)
+    ap.add_argument('--binary', help='host path of a spark binary present on both Sparks')
+    ap.add_argument('--cpuset', help='docker --cpuset-cpus for both ranks')
+    ap.add_argument('--capture', action='store_true', help='dump per-step logits under /home/colum/atlas-dev/capture/<run>')
     args = ap.parse_args()
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     run = Path(args.out)/f'{args.label}-{stamp}'
     run.mkdir(parents=True)
     names = {r: f'atlas-bench-{args.label}-{stamp.lower()}-r{r}' for r in (0, 1)}
-    argvs = {r: create_argv(r, args.image, names[r], args.env) for r in (0, 1)}
+    capture = f'/home/colum/atlas-dev/capture/{args.label}-{stamp}' if args.capture else None
+    argvs = {r: create_argv(r, args.image, names[r], args.env, args.binary, capture, args.cpuset) for r in (0, 1)}
     meta = {'label': args.label, 'image': args.image, 'env_overrides': args.env, 'argv': argvs,
+            'binary': args.binary, 'capture': capture,
             'utc': stamp, 'classification': 'unqualified-uninstrumented'}
     created, tunnel = [], None
     try:
         for r in (0, 1):
-            busy = remote(r, "docker ps --format '{{.Names}}' | grep -vx atlas-dev-builder; nvidia-smi --query-compute-apps=pid --format=csv,noheader", check=False).strip()
+            busy = remote(r, "docker ps --format '{{.Names}}' | grep -vxE 'atlas-dev-builder[0-9]*|atlas-spin'; nvidia-smi --query-compute-apps=pid --format=csv,noheader", check=False).strip()
             if busy:
                 raise RuntimeError(f'spark{r} not idle: {busy}')
         for r in (0, 1):
             meta[f'image_id_r{r}'] = remote(r, f'docker image inspect --format {{{{.Id}}}} {shlex.quote(args.image)}').strip()
+            if args.binary:
+                meta[f'binary_sha256_r{r}'] = remote(r, f'sha256sum {shlex.quote(args.binary)}').split()[0]
+            if capture:
+                remote(r, f'mkdir -p {capture}/rank{r}')
             remote(r, shlex.join(argvs[r])); created.append(r)
         for r in (0, 1):
             remote(r, f'docker start {names[r]}')
@@ -114,6 +164,9 @@ def main():
                 raise TimeoutError('health')
             time.sleep(5)
         meta['ready_utc'] = datetime.now(timezone.utc).isoformat()
+        if capture:
+            for r in (0, 1):
+                remote(r, f'touch {capture}/rank{r}/capture-enabled')
         cmd = [sys.executable, str(HERE/'perf_baseline.py'), '--endpoint', endpoint, '--model', MODEL,
                '--workloads', args.workloads, '--raw-out', str(run/'raw.jsonl'),
                '--summary-out', str(run/'summary.json'), '--initial-state', 'unknown',
@@ -131,6 +184,13 @@ def main():
         if tunnel:
             tunnel.terminate()
         for r in created:
+            # Archive before removal: docker logs dies with the container. A failed
+            # archive must not cost us the tail log or the teardown, hence the split.
+            try:
+                full = remote(r, f'docker logs {names[r]} 2>&1', check=False, timeout=ARCHIVE_LOG_TIMEOUT)
+                meta[f'log_archive_r{r}'] = str(archive_container_log(r, full, run))
+            except Exception as exc:  # archiving is additive; keep tearing down
+                meta[f'log_archive_error_r{r}'] = str(exc)
             try:
                 (run/f'container-r{r}.log').write_text(remote(r, f'docker logs --tail 400 {names[r]} 2>&1', check=False))
                 remote(r, f'docker rm -f {names[r]}', check=False)

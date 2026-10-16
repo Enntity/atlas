@@ -431,6 +431,7 @@ fn fixture_numerics(
                 half_partial: false,
             }),
         ],
+        verify_rows_5_8: None,
     })
 }
 

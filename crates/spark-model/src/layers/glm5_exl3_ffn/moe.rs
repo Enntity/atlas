@@ -6,6 +6,10 @@ use super::tables::ExpertTable;
 use super::*;
 use spark_runtime::weights::exl3::dense::{Exl3DenseDeviceTensor, Exl3DenseDtype};
 
+mod coop;
+mod coop_fat;
+mod overlap;
+pub(super) use overlap::{overlap_side_stream, shared_overlap};
 mod forward;
 mod policy;
 mod project;
@@ -39,6 +43,15 @@ pub struct NativeMoeFfn {
     drop_shared: bool,
     /// Gate control: BF16-round the running routed sum per expert.
     round_routed_accum: bool,
+    /// `ATLAS_EXL3_COOP_MOE=1` thin path; None keeps the existing kernels.
+    coop: Option<coop::CoopMoe>,
+    /// `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1` grouped prefill path; None keeps
+    /// the existing kernels.
+    coop_fat: Option<coop_fat::CoopFat>,
+    /// `ATLAS_EXL3_SHARED_OVERLAP=1`: the shared expert runs on its own side
+    /// stream (it was built bound to it), forked after the router and
+    /// joined before its output is consumed. None: same stream, in order.
+    overlap: Option<overlap::SharedOverlap>,
 }
 impl NativeMoeFfn {
     pub fn validate(&self, rows: usize, stream: u64, rank: usize, world: usize) -> Result<()> {
@@ -50,7 +63,12 @@ impl NativeMoeFfn {
                 && world == self.world,
             "EXL3 MoE lifetime/capacity/stream/topology mismatch"
         );
-        self.shared.validate(rows, stream, rank, world)?;
+        self.shared
+            .validate(rows, self.shared.stream, rank, world)?;
+        ensure!(
+            self.shared.stream == stream || self.overlap.is_some(),
+            "EXL3 shared expert stream differs without an overlap fork/join"
+        );
         self.scratch
             .validate(self.scratch.geometry(), rows, stream)?;
         ensure!(
@@ -79,6 +97,18 @@ impl<'a> ModelResource<dyn GpuBackend + 'a> for NativeMoeFfn {
         }
         if let Some(owner) = &mut self.owned_scratch {
             retain_error(&mut error, owner.release(gpu));
+        }
+        if let Some(coop) = self.coop.take() {
+            retain_error(&mut error, gpu.free(coop.locks));
+            if let Some(mr) = coop.multirow {
+                retain_error(&mut error, gpu.free(mr.groups));
+            }
+        }
+        if let Some(coop_fat) = self.coop_fat.take() {
+            retain_error(&mut error, coop_fat.release(gpu));
+        }
+        if let Some(overlap) = self.overlap.take() {
+            retain_error(&mut error, overlap.release(gpu));
         }
         finish(error)
     }

@@ -42,6 +42,66 @@ impl NativeDenseFfn {
         )
     }
 
+    /// ATLAS_EXL3_SHARED_PACKED=1 packed shared expert whose gate and up carry
+    /// the fused [gate | up] numerics (offsets 0 / n of logical 2n): up gets
+    /// its own workspace and gate|up one cooperative launch when available.
+    pub fn new_shared_packed(
+        gpu: &dyn GpuBackend,
+        weights: [Exl3DeviceShard; 3],
+        capacity: usize,
+        stream: u64,
+        activation: NativeDenseActivation,
+        numerics: [Exl3LinearNumerics; 3],
+    ) -> Result<Self> {
+        let [gate, up, down] = numerics;
+        let mut ffn = Self::setup(
+            gpu,
+            Box::new(weights),
+            capacity,
+            stream,
+            activation,
+            NativeDenseFfnRole::DensePacked,
+            Some([gate, down]),
+        )?;
+        let DenseProjections::Packed {
+            weights,
+            workspaces,
+            up_workspace,
+            fused_gate_up,
+        } = &mut ffn.projections
+        else {
+            unreachable!("setup builds packed projections")
+        };
+        let plan = weights[1].plan();
+        ensure!(
+            plan.bits() == up.bits,
+            "EXL3 shared up numerical bitrate mismatch"
+        );
+        let up_ws = match Exl3LinearWorkspace::new_with_numerics(
+            gpu,
+            plan.in_features(),
+            plan.out_features(),
+            capacity,
+            stream,
+            up,
+        ) {
+            Ok(ws) => ws,
+            Err(error) => {
+                let cleanup = ffn.release(gpu);
+                return Err(match cleanup {
+                    Ok(()) => error,
+                    Err(e) => error.context(format!("EXL3 shared FFN cleanup failed: {e:#}")),
+                });
+            }
+        };
+        *fused_gate_up = spark_runtime::weights::exl3::native::Exl3FusedCoop::resolve(
+            gpu,
+            &[(&workspaces[0], &weights[0]), (&up_ws, &weights[1])],
+        );
+        *up_workspace = Some(Box::new(up_ws));
+        Ok(ffn)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn setup(
         gpu: &dyn GpuBackend,
@@ -161,6 +221,8 @@ impl NativeDenseFfn {
                 projections: DenseProjections::Packed {
                     weights,
                     workspaces: Box::new([gate, down]),
+                    up_workspace: None,
+                    fused_gate_up: None,
                 },
                 activations,
                 merged_activation: DevicePtr::NULL,

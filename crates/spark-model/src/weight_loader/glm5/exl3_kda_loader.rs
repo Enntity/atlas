@@ -328,6 +328,10 @@ impl Glm5Exl3KdaResources {
                 }
             });
         }
+        // ATLAS_EXL3_COOP_FUSED_QKV=1: one launch for the fused q|k|v matrix.
+        if let [q, k, v, _] = projections.as_mut_slice() {
+            q.attach_fused_components(gpu, k, v);
+        }
         let mut projections = projections.into_iter();
         // Four successful pushes above are the only path to this conversion.
         Ok(Self {

@@ -40,6 +40,66 @@ fn lmhead_tgemm_enabled() -> bool {
     std::env::var("ATLAS_NO_LMHEAD_TGEMM").ok().as_deref() != Some("1")
 }
 
+/// Q5 (todo.md): whether this target's TP sums must stay on the pinned 2-rank
+/// send/recv all-reduce, which is armed solely by
+/// [`install_tp_add_kernel`].
+///
+/// True only for GLM-5.3 EXL3, i.e. the two signals the EXL3 checkpoint
+/// router itself requires (`model_type=glm5_next` plus `quant_method=exl3`,
+/// `crates/spark-runtime/src/weights/exl3/checkpoint.rs`). Every other family
+/// keeps the historical warn-and-degrade behaviour: their unpinned
+/// `ncclAllReduce` fallback only costs performance, whereas on EXL3 the NCCL
+/// tuner selects the reduction schedule per call and that reorders the
+/// accumulation, so run-to-run numerics stop being reproducible.
+///
+/// The caller is already gated on the live 2-rank communicator
+/// (`comm.world_size() == 2`); adding a second `tp_world_size` term here would
+/// only create a way to bypass the gate, so it is deliberately absent.
+fn glm53_exl3_pins_tp_reduce(config: &ModelConfig) -> bool {
+    config.model_type == "glm5_next"
+        && config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|q| q.quant_method == "exl3")
+}
+
+/// Install the `bf16_add_inplace` kernel that arms the 2-rank send/recv
+/// all-reduce — `CommBackend::all_reduce`/`all_reduce_async` only take the
+/// registered path when this kernel is set
+/// (`crates/spark-comm/src/nccl_backend/comm_impl.rs`).
+///
+/// Fail closed (PCND) on GLM-5.3 EXL3: a missing kernel there aborts startup
+/// instead of silently demoting every TP sum to an unpinned `ncclAllReduce`.
+/// Other families still log a warning and continue.
+fn install_tp_add_kernel(
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+    comm: &dyn spark_comm::CommBackend,
+) -> Result<()> {
+    match gpu.kernel("bf16_add", "bf16_add_inplace") {
+        Ok(kernel) => {
+            comm.set_add_kernel(kernel.0);
+            tracing::info!("TP all-reduce: pinned 2-rank send/recv path armed");
+            Ok(())
+        }
+        Err(e) if !glm53_exl3_pins_tp_reduce(config) => {
+            tracing::warn!("bf16_add_inplace kernel not found (send/recv disabled): {e}");
+            Ok(())
+        }
+        Err(e) => Err(e.context(
+            "bf16_add::bf16_add_inplace unavailable: GLM-5.3 EXL3 (model_type=glm5_next, \
+             quant_method=exl3) must run its TP=2 all-reduce on the registered send/recv path, \
+             and without this kernel every TP sum would silently fall back to an unpinned \
+             ncclAllReduce (crates/spark-comm/src/nccl_backend/comm_impl.rs). Rebuild the \
+             bf16_add kernel module for this (hw, model, quant) target.",
+        )),
+    }
+}
+
+#[cfg(test)]
+#[path = "impl_a1_tp_failclosed_tests.rs"]
+mod impl_a1_tp_failclosed_tests;
+
 impl TransformerModel {
     pub fn new(
         config: ModelConfig,
@@ -453,7 +513,9 @@ impl TransformerModel {
         // EP/TP: register the all-reduce target buffers with NCCL (caches the
         // IB/RoCE memory registration, enabling zero-copy user-buffer
         // collectives) and provide the bf16_add kernel for the 2-rank
-        // send/recv fast path.
+        // send/recv fast path — which GLM-5.3 EXL3 requires: a missing
+        // `bf16_add_inplace` there fails startup rather than demoting every
+        // TP sum to an unpinned `ncclAllReduce` (Q5, todo.md).
         //   - moe_output: EP MoE reduce + ALL GDN HeadParallel SSM out_proj
         //     reduces (decode `ssm_forward`, batched decode, multi-seq
         //     batched, prefill, prefill phase-3 all write out_proj into
@@ -476,12 +538,13 @@ impl TransformerModel {
                 Ok(_) => tracing::info!("Registered norm_output ({norm_bytes} B) with NCCL"),
                 Err(e) => tracing::warn!("ncclCommRegister norm_output failed (non-fatal): {e}"),
             }
-            match gpu.kernel("bf16_add", "bf16_add_inplace") {
-                Ok(k) => comm.set_add_kernel(k.0),
-                Err(e) => {
-                    tracing::warn!("bf16_add_inplace kernel not found (send/recv disabled): {e}")
-                }
+            if let (Ok(store), Ok(add_wait)) = (
+                gpu.kernel("bf16_add", "atlas_flag_store_release"),
+                gpu.kernel("bf16_add", "bf16_add_inplace_wait"),
+            ) {
+                comm.set_flag_kernels(store.0, add_wait.0);
             }
+            install_tp_add_kernel(&config, gpu.as_ref(), comm.as_ref())?;
             // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1); a
             // backend without them ignores the handle.
             if let Ok(k) = gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16") {

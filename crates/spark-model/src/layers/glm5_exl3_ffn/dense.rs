@@ -11,6 +11,11 @@ enum DenseProjections {
     Packed {
         weights: Box<[Exl3DeviceShard; 3]>,
         workspaces: Box<[Exl3LinearWorkspace; 2]>,
+        /// ATLAS_EXL3_SHARED_PACKED=1 shared expert: up's own workspace (its
+        /// numerics are the [gate | up] fused geometry at offset n) and the
+        /// one-launch gate|up cooperative GEMM. None for ordinary dense FFNs.
+        up_workspace: Option<Box<Exl3LinearWorkspace>>,
+        fused_gate_up: Option<spark_runtime::weights::exl3::native::Exl3FusedCoop>,
     },
     Reconstructed(super::shared::SharedBf16Weights),
 }
@@ -36,6 +41,30 @@ impl NativeDenseFfn {
     pub fn is_reconstructed(&self) -> bool {
         matches!(self.projections, DenseProjections::Reconstructed(_))
     }
+    /// ATLAS_EXL3_SHARED_PACKED=1 shared expert: gate and up as one
+    /// cooperative launch over the fused [gate | up] width, writing the same
+    /// BF16 activations the two separate launches write. `Ok(false)`: not
+    /// prepared or not applicable (the caller runs the separate launches).
+    fn fused_gate_up(&self, gpu: &dyn GpuBackend, input: DevicePtr, rows: usize) -> Result<bool> {
+        let DenseProjections::Packed {
+            weights,
+            workspaces,
+            up_workspace: Some(up),
+            fused_gate_up: Some(fused),
+        } = &self.projections
+        else {
+            return Ok(false);
+        };
+        fused.launch_bf16(
+            gpu,
+            &[
+                (&workspaces[0], &weights[0], self.activations[0]),
+                (&**up, &weights[1], self.activations[1]),
+            ],
+            input,
+            rows,
+        )
+    }
     fn project(
         &self,
         gpu: &dyn GpuBackend,
@@ -48,13 +77,18 @@ impl NativeDenseFfn {
             DenseProjections::Packed {
                 weights,
                 workspaces,
-            } => workspaces[usize::from(index == 2)].launch_bf16(
-                gpu,
-                &weights[index],
-                input,
-                output,
-                rows,
-            ),
+                up_workspace,
+                ..
+            } => match (index, up_workspace) {
+                (1, Some(up)) => up.launch_bf16(gpu, &weights[1], input, output, rows),
+                _ => workspaces[usize::from(index == 2)].launch_bf16(
+                    gpu,
+                    &weights[index],
+                    input,
+                    output,
+                    rows,
+                ),
+            },
             DenseProjections::Reconstructed(weights) => {
                 ensure!(
                     index == 0 || index == 2,
@@ -256,15 +290,26 @@ impl NativeDenseFfn {
             &[("input", Bf16, input, &h)],
             self.stream,
         )?;
-        timer.measure(
-            if self.is_reconstructed() {
-                "merged_gate_up_gemm_split"
-            } else {
-                "gate_projection"
-            },
-            || self.project(gpu, 0, input, self.activations[0], rows),
-        )?;
-        if !self.is_reconstructed() {
+        let fused_gate_up = matches!(
+            self.projections,
+            DenseProjections::Packed {
+                fused_gate_up: Some(_),
+                ..
+            }
+        ) && timer.measure("fused_gate_up_projection", || {
+            self.fused_gate_up(gpu, input, rows)
+        })?;
+        if !fused_gate_up {
+            timer.measure(
+                if self.is_reconstructed() {
+                    "merged_gate_up_gemm_split"
+                } else {
+                    "gate_projection"
+                },
+                || self.project(gpu, 0, input, self.activations[0], rows),
+            )?;
+        }
+        if !self.is_reconstructed() && !fused_gate_up {
             timer.measure("up_projection", || {
                 self.project(gpu, 1, input, self.activations[1], rows)
             })?;
@@ -327,11 +372,19 @@ impl<'a> ModelResource<dyn GpuBackend + 'a> for NativeDenseFfn {
             DenseProjections::Packed {
                 weights,
                 workspaces,
+                up_workspace,
+                fused_gate_up,
             } => {
+                if let Some(fused) = fused_gate_up {
+                    retain_error(&mut error, fused.release(gpu));
+                }
                 for w in weights.iter_mut() {
                     retain_error(&mut error, w.release(gpu));
                 }
                 for w in workspaces.iter_mut() {
+                    retain_error(&mut error, w.release(gpu));
+                }
+                if let Some(w) = up_workspace {
                     retain_error(&mut error, w.release(gpu));
                 }
             }

@@ -205,6 +205,42 @@ impl GpuBackend for AtlasCudaBackend {
         })
     }
 
+    fn launch_cooperative_typed(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        args: &[crate::gpu::KernelArg<'_>],
+    ) -> Result<()> {
+        let (storage, starts) = crate::gpu::pack_kernel_args(args);
+        let mut params: Vec<*mut c_void> = starts
+            .iter()
+            .map(|&i| &storage[i] as *const u64 as *mut c_void)
+            .collect();
+        let raw_func = RawCudaFunc(func.0 as *mut c_void);
+        let cfg = LaunchConfig {
+            grid_dim: (grid[0], grid[1], grid[2]),
+            block_dim: (block[0], block[1], block[2]),
+            shared_mem_bytes: shared_mem,
+        };
+        let registry = self.registry();
+        unsafe { registry.launch_cooperative_on_stream(raw_func, cfg, stream, &mut params) }
+            .map_err(|e| anyhow::anyhow!("Cooperative kernel launch failed: {e}"))
+    }
+
+    fn cooperative_blocks_per_sm(
+        &self,
+        func: KernelHandle,
+        block: u32,
+        shared_mem: u32,
+    ) -> Result<u32> {
+        self.registry()
+            .cooperative_blocks_per_sm(RawCudaFunc(func.0 as *mut c_void), block, shared_mem)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
     fn stream_is_capturing(&self, stream: u64) -> bool {
         // SCALE's libcuda does not export cuStreamIsCapturing; report
         // not-capturing there (gfx1151 telemetry taps then sample eagerly —

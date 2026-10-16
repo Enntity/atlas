@@ -43,9 +43,17 @@ impl NativeMoeFfn {
         self.output_hadamard(gpu, index, output, rows)
     }
     pub(super) fn matmul(&self, gpu: &dyn GpuBackend, index: usize, rows: usize) -> Result<()> {
+        if self.coop_matmul(gpu, index, rows)? {
+            return Ok(());
+        }
         let (rows, k, n, topk, experts, slots) = self.dimensions(index, rows);
+        let columns_per_block = if spark_runtime::weights::exl3::native::split_mma() {
+            16
+        } else {
+            128
+        };
         let mut launch = KernelLaunch::new(gpu, self.kernels[3])
-            .grid([n / 128, slots, 1])
+            .grid([n / columns_per_block, slots, 1])
             .block([128, 1, 1])
             .arg_ptr(self.buffers[7])
             .arg_ptr(self.buffers[1])

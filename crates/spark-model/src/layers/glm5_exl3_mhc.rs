@@ -87,7 +87,11 @@ impl MhcResidualPrecision {
 
 pub(crate) struct NativeExl3Mhc {
     pre: KernelHandle,
+    /// `ATLAS_EXL3_SPLIT_MHC=1`: (partials, finish, rounded partials) split of the pre site.
+    pre_split: Option<(KernelHandle, KernelHandle, KernelHandle)>,
     post: KernelHandle,
+    /// `ATLAS_EXL3_PAR_SMALL=1`: feature x row grid variant of `post`.
+    post_wide: Option<KernelHandle>,
     contract: KernelHandle,
     hidden: u32,
     iterations: u32,
@@ -139,7 +143,21 @@ impl NativeExl3Mhc {
         );
         Ok(Self {
             pre: gpu.kernel("exl3_mhc", "exl3_mhc_pre_norm")?,
+            pre_split: if std::env::var("ATLAS_EXL3_SPLIT_MHC").as_deref() == Ok("1") {
+                Some((
+                    gpu.kernel("exl3_mhc", "exl3_mhc_pre_partials")?,
+                    gpu.kernel("exl3_mhc", "exl3_mhc_pre_norm_split")?,
+                    gpu.kernel("exl3_mhc", "exl3_mhc_pre_partials_rounded")?,
+                ))
+            } else {
+                None
+            },
             post: gpu.kernel("exl3_mhc", "exl3_mhc_post_unrounded")?,
+            post_wide: if std::env::var("ATLAS_EXL3_PAR_SMALL").as_deref() == Ok("1") {
+                Some(gpu.kernel("exl3_mhc", "exl3_mhc_post_unrounded_wide")?)
+            } else {
+                None
+            },
             contract: gpu.kernel("exl3_mhc", "exl3_mhc_contract")?,
             hidden: hidden as u32,
             iterations: iterations as u32,
@@ -192,6 +210,70 @@ impl NativeExl3Mhc {
                 "native EXL3 mHC tensor bases must be distinct"
             );
         }
+        let rounded_splits = self
+            .numerical_policy
+            .rounded_splits(self.hidden as usize, rows)?;
+        // Rounded sites (layer-0 attention) run the same TF32 splits one warp
+        // per block for decode-sized batches; the finish folds them in the
+        // rounded branch's order.
+        let rounded_split = precision == MhcResidualPrecision::Rounded
+            && rows < 8
+            && self.hidden <= 4096
+            && 25 * rounded_splits * 4 <= self.hidden * 2;
+        if let (true, Some((partials, finish, partials_rounded))) = (
+            precision == MhcResidualPrecision::UnroundedPost || rounded_split,
+            self.pre_split,
+        ) {
+            let splits = if rounded_split {
+                KernelLaunch::new(gpu, partials_rounded)
+                    .grid([rounded_splits, rows as u32, 1])
+                    .block([32, 1, 1])
+                    .arg_ptr(buffers.highway)
+                    .arg_ptr(site.hc_fn)
+                    .arg_ptr(buffers.normed)
+                    .arg_u32(self.hidden)
+                    .arg_u32(rounded_splits)
+                    .launch(stream)?;
+                rounded_splits
+            } else {
+                // Same split count exl3_mhc_pre_norm derives from gridDim.x.
+                let splits: u32 = if rows < 8 && self.hidden <= 4096 { 8 } else { 4 };
+                ensure!(
+                    self.hidden.is_multiple_of(splits) && 25 * splits * 4 <= self.hidden * 2 && self.hidden <= 4096,
+                    "split mHC partials must fit the normed row"
+                );
+                KernelLaunch::new(gpu, partials)
+                    .grid([25, splits, rows as u32])
+                    .block([256, 1, 1])
+                    .arg_ptr(buffers.highway)
+                    .arg_ptr(site.hc_fn)
+                    .arg_ptr(buffers.normed)
+                    .arg_u32(self.hidden)
+                    .arg_u32(splits)
+                    .launch(stream)?;
+                splits
+            };
+            return KernelLaunch::new(gpu, finish)
+                .grid([rows as u32, 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(buffers.highway)
+                .arg_ptr(site.hc_fn)
+                .arg_ptr(site.hc_scale)
+                .arg_ptr(site.hc_base)
+                .arg_ptr(norm_weight)
+                .arg_ptr(buffers.normed)
+                .arg_ptr(buffers.post)
+                .arg_ptr(buffers.comb)
+                .arg_u32(self.hidden)
+                .arg_u32(self.iterations)
+                .arg_f32(self.rms_eps)
+                .arg_f32(self.rms_eps)
+                .arg_f32(self.hc_eps)
+                .arg_f32(self.post_multiplier)
+                .arg_u32(splits)
+                .arg_u32(rounded_splits)
+                .launch(stream);
+        }
         KernelLaunch::new(gpu, self.pre)
             .grid([rows as u32, 1, 1])
             .block([256, 1, 1])
@@ -210,10 +292,7 @@ impl NativeExl3Mhc {
             .arg_f32(self.hc_eps)
             .arg_f32(self.post_multiplier)
             .arg_u32(u32::from(precision == MhcResidualPrecision::UnroundedPost))
-            .arg_u32(
-                self.numerical_policy
-                    .rounded_splits(self.hidden as usize, rows)?,
-            )
+            .arg_u32(rounded_splits)
             .launch(stream)
     }
 
@@ -253,8 +332,12 @@ impl NativeExl3Mhc {
             output == highway || !pointers.contains(&output),
             "native EXL3 mHC post only permits highway aliasing"
         );
-        KernelLaunch::new(gpu, self.post)
-            .grid([rows as u32, 1, 1])
+        let (post_kernel, post_grid) = match self.post_wide {
+            Some(wide) => (wide, [self.hidden.div_ceil(256), rows as u32, 1]),
+            None => (self.post, [rows as u32, 1, 1]),
+        };
+        KernelLaunch::new(gpu, post_kernel)
+            .grid(post_grid)
             .block([256, 1, 1])
             .arg_ptr(block_output)
             .arg_ptr(highway)

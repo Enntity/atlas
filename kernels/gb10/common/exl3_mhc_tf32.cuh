@@ -6,16 +6,19 @@
 // All lanes supply the TF32 weight fragments. No residual writes are allowed
 // until every split has completed and the caller has synchronized the block.
 namespace exl3_mhc_tf32 {
-__device__ __forceinline__ void partials(
+// One warp's split. Quantity q (24 mixes, then the squared norm) of this
+// split lands at output[split * split_stride + q * quantity_stride].
+__device__ __forceinline__ void split_partial(
     const float* residual, const float* weight, float* output,
-    unsigned int width, unsigned int splits
+    unsigned int width, unsigned int splits, unsigned int split,
+    unsigned int split_stride, unsigned int quantity_stride
 ) {
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int group = lane / 4u;
     const unsigned int offset = lane & 3u;
     const unsigned int blocks = width / 64u;
     const unsigned int remainder = blocks % splits;
-    for (unsigned int split = threadIdx.x / 32u; split < splits; split += 8u) {
+    {
         const unsigned int count = blocks / splits + (split < remainder);
         const unsigned int start = (split * (blocks / splits) + min(split, remainder)) * 64u;
         float acc[3][4] = {};
@@ -39,14 +42,22 @@ __device__ __forceinline__ void partials(
         }
         for (unsigned int step = 2; step > 0; step >>= 1)
             square = __fadd_rn(square, __shfl_xor_sync(0xffffffffu, square, step));
-        if (lane == 0) output[split * 25u + 24u] = square;
+        if (lane == 0) output[split * split_stride + 24u * quantity_stride] = square;
         if (group == 0) {
             for (unsigned int tile = 0; tile < 3; ++tile) {
                 const unsigned int column = tile * 8u + offset * 2u;
-                output[split * 25u + column] = acc[tile][0];
-                output[split * 25u + column + 1u] = acc[tile][1];
+                output[split * split_stride + column * quantity_stride] = acc[tile][0];
+                output[split * split_stride + (column + 1u) * quantity_stride] = acc[tile][1];
             }
         }
     }
+}
+
+__device__ __forceinline__ void partials(
+    const float* residual, const float* weight, float* output,
+    unsigned int width, unsigned int splits
+) {
+    for (unsigned int split = threadIdx.x / 32u; split < splits; split += 8u)
+        split_partial(residual, weight, output, width, splits, split, 25u, 1u);
 }
 } // namespace exl3_mhc_tf32

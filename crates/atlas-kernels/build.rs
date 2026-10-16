@@ -530,8 +530,36 @@ fn main() {
         })
         .min(nvcc_invocations.max(1));
 
+    // Optional persistent content-addressed output cache (dev builds only):
+    // ATLAS_PTX_CACHE_DIR=<dir>. Key = include-closure digest of the source
+    // (atlas_closure: transitive quoted includes, by content) + arch + every
+    // flag + compiler id + the global nvcc env knobs. Unset = always compile.
+    let ptx_cache = std::env::var_os("ATLAS_PTX_CACHE_DIR").map(PathBuf::from);
+    println!("cargo:rerun-if-env-changed=ATLAS_PTX_CACHE_DIR");
+    let cache_compiler = compute_target.compiler_id().unwrap_or_default();
+    let cache_key = |job: &CompileJob| -> Option<String> {
+        let mut flags = job.extra_flags.clone();
+        for knob in ["ATLAS_EXTRA_NVCC_FLAGS", "ATLAS_KERNEL_NO_STRICT"] {
+            flags.push(format!("{knob}={}", std::env::var(knob).unwrap_or_default()));
+        }
+        let inputs = atlas_closure::ClosureInputs {
+            sources: vec![job.cu_file.clone()],
+            configs: vec![],
+            flags,
+            arch: job.arch.clone(),
+            compiler: cache_compiler.clone(),
+        };
+        atlas_closure::hash_with_report(workspace_root, &inputs)
+            .ok()
+            .filter(|closure| closure.unresolved.is_empty())
+            .map(|closure| closure.digest)
+    };
     if nvcc_invocations > 0 {
         let compute = &*compute_target;
+        let ptx_cache = &ptx_cache;
+        let cache_key = &cache_key;
+        let cache_served = std::sync::atomic::AtomicUsize::new(0);
+        let cache_served = &cache_served;
         let errors_mutex: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
 
@@ -547,6 +575,15 @@ fn main() {
                             break;
                         }
                         let job = &compile_jobs[i];
+                        let cached = ptx_cache
+                            .as_ref()
+                            .and_then(|dir| cache_key(job).map(|key| dir.join(key)));
+                        if let Some(entry) = &cached {
+                            if std::fs::copy(entry, &job.out_file).is_ok() {
+                                cache_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                continue;
+                            }
+                        }
                         if let Err(e) = compute.compile(
                             &job.cu_file,
                             &job.out_file,
@@ -554,12 +591,28 @@ fn main() {
                             &job.extra_flags,
                         ) {
                             errors_mutex.lock().unwrap().push(e);
+                        } else if let Some(entry) = &cached {
+                            // Write-then-rename so a concurrent reader never sees a partial file.
+                            let tmp = entry.with_extension(format!("tmp{i}"));
+                            if let Some(parent) = entry.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::copy(&job.out_file, &tmp).is_ok() {
+                                let _ = std::fs::rename(&tmp, entry);
+                            }
                         }
                     }
                 });
             }
         });
 
+        if ptx_cache.is_some() {
+            println!(
+                "cargo:warning=atlas-kernels: ATLAS_PTX_CACHE_DIR served {}/{} compile jobs",
+                cache_served.load(std::sync::atomic::Ordering::Relaxed),
+                nvcc_invocations
+            );
+        }
         let errors = errors_mutex.into_inner().unwrap();
         if !errors.is_empty() {
             panic!("Kernel compilation failed:\n{}", errors.join("\n"));

@@ -200,6 +200,7 @@ fn fixture_numerics() -> Exl3LinearNumerics {
             slices: 48,
             half_partial: false,
         }); 4],
+        verify_rows_5_8: None,
     }
 }
 

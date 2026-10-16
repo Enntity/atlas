@@ -137,37 +137,70 @@ impl NativeMoeFfn {
                 .launch(self.stream)?;
             Ok(())
         })?;
-        timer.measure("gate_projection", || {
-            self.project(gpu, 0, input, self.buffers[3], rows)
-        })?;
-        timer.measure("up_projection", || {
-            self.project(gpu, 1, input, self.buffers[4], rows)
-        })?;
-        diagnostics::capture(
-            &self.capture,
-            invocation,
-            gpu,
-            "gate_up",
-            &[
-                ("gate", F32, self.buffers[3], &midshape),
-                ("up", F32, self.buffers[4], &midshape),
-            ],
-            self.stream,
-        )?;
-        timer.measure("activation_down_hadamard", || self.activate_down(gpu, rows))?;
-        diagnostics::capture(
-            &self.capture,
-            invocation,
-            gpu,
-            "down_input_hadamard",
-            &[("xh", F32, self.buffers[7], &midshape)],
-            self.stream,
-        )?;
-        timer.measure("down_mma", || self.matmul(gpu, 2, rows))?;
-        timer.measure("weighted_down_hadamard", || {
-            self.output_hadamard(gpu, 2, self.buffers[5], rows)
-        })?;
-        if !self.drop_shared {
+        // ATLAS_EXL3_SHARED_OVERLAP: fork the shared expert onto its side
+        // stream now (after the router's cuBLAS work), join before buffers[6]
+        // is read. Not under per-stage profiling (stage timings stay serial).
+        let overlapped = self
+            .overlap
+            .as_ref()
+            .filter(|_| !enabled && !self.drop_shared);
+        if let Some(overlap) = overlapped {
+            overlap.fork(gpu, self.stream)?;
+            self.shared
+                .forward_local_profiled(gpu, input, self.buffers[6], rows, false)?;
+        }
+        // ATLAS_EXL3_COOP_MOE_FAT_MULTIROW: grouped multi-row routed chain for
+        // grouped-serve (prefill) launches (rows > thin_capacity): slots are
+        // grouped by expert into M-tile units and each unit streams its expert
+        // once, per-row bit-identical to the per-slot kernel.
+        let routed_fat = self.capture.is_none()
+            && timer.measure("routed_fat", || self.coop_routed_fat(gpu, input, rows))?;
+        // ATLAS_EXL3_COOP_MOE_V9: gate|up (fused input transform) + down with
+        // the gate/up output transforms, activation and down input transform
+        // fused into its staging; no intermediate diagnostics to capture.
+        let routed_fused = !routed_fat
+            && self.capture.is_none()
+            && timer.measure("routed_fused", || self.coop_routed_v9(gpu, input, rows))?;
+        if !routed_fat && !routed_fused {
+            let fused_gate_up =
+                timer.measure("gate_up_projection", || self.coop_gate_up(gpu, input, rows))?;
+            if !fused_gate_up {
+                timer.measure("gate_projection", || {
+                    self.project(gpu, 0, input, self.buffers[3], rows)
+                })?;
+                timer.measure("up_projection", || {
+                    self.project(gpu, 1, input, self.buffers[4], rows)
+                })?;
+            }
+            diagnostics::capture(
+                &self.capture,
+                invocation,
+                gpu,
+                "gate_up",
+                &[
+                    ("gate", F32, self.buffers[3], &midshape),
+                    ("up", F32, self.buffers[4], &midshape),
+                ],
+                self.stream,
+            )?;
+            timer.measure("activation_down_hadamard", || self.activate_down(gpu, rows))?;
+            diagnostics::capture(
+                &self.capture,
+                invocation,
+                gpu,
+                "down_input_hadamard",
+                &[("xh", F32, self.buffers[7], &midshape)],
+                self.stream,
+            )?;
+            timer.measure("down_mma", || self.matmul(gpu, 2, rows))?;
+            timer.measure("weighted_down_hadamard", || {
+                self.output_hadamard(gpu, 2, self.buffers[5], rows)
+            })?;
+        }
+        if let Some(overlap) = overlapped {
+            // Shared expert ran on the side stream; its output is read next.
+            overlap.join(gpu, self.stream)?;
+        } else if !self.drop_shared {
             self.shared
                 .forward_local_profiled(gpu, input, self.buffers[6], rows, enabled)?;
         }

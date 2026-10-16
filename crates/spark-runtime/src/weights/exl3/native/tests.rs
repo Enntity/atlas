@@ -114,6 +114,7 @@ fn cooperative_invalid_geometry_bits_and_flat_overflow_fail_before_gpu_work() {
         reference_min_rows: 3,
         reference_pad: true,
         row_profiles: [Some(geometry); 4],
+        verify_rows_5_8: None,
     };
     for invalid in [
         Exl3LinearNumerics { bits: 0, ..valid },
@@ -233,6 +234,7 @@ fn cooperative_profile_selects_explicit_padded_buckets_and_resolves_before_scrat
         reference_min_rows: 3,
         reference_pad: true,
         row_profiles: profiles,
+        verify_rows_5_8: None,
     };
     assert_eq!(numerical.profile_for_rows(1).unwrap().slices, 4);
     assert_eq!(numerical.profile_for_rows(5).unwrap().slices, 8);
@@ -294,6 +296,7 @@ fn cooperative_forward_checks_checkpoint_contract_and_preserves_empty_batches() 
             slices: 48,
             half_partial: false,
         }); 4],
+        verify_rows_5_8: None,
     };
     let gpu = MockGpuBackend::new();
     let mut shard = weight(&gpu, 128, 128);
@@ -351,6 +354,7 @@ fn absent_unreachable_bucket_is_explicit_but_capacity_requires_every_reachable_b
         reference_min_rows: 3,
         reference_pad: true,
         row_profiles: [None, Some(geometry), Some(geometry), Some(geometry)],
+        verify_rows_5_8: None,
     };
     let gpu = MockGpuBackend::new();
     let mut workspace =
@@ -379,4 +383,34 @@ fn absent_unreachable_bucket_is_explicit_but_capacity_requires_every_reachable_b
         .profile_for_rows(1)
         .is_err()
     );
+}
+
+#[test]
+fn verify_profile_applies_only_inside_a_verify_scope_and_only_to_5_8_rows() {
+    use super::{Exl3CooperativeProfile, Exl3LinearNumerics, verify_scope};
+    let p = |tile_k, tile_n| Exl3CooperativeProfile {
+        tile_k,
+        tile_n,
+        slices: 48,
+        half_partial: false,
+    };
+    let numerics = Exl3LinearNumerics {
+        logical_n: 4096,
+        logical_offset: 0,
+        bits: 6,
+        reference_min_rows: 3,
+        reference_pad: true,
+        row_profiles: [None, Some(p(16, 512)), Some(p(16, 512)), Some(p(32, 256))],
+        verify_rows_5_8: Some(p(32, 256)),
+    };
+    assert_eq!(numerics.profile_for_rows(6).unwrap(), p(16, 512));
+    {
+        let _scope = verify_scope();
+        assert_eq!(numerics.profile_for_rows(6).unwrap(), p(32, 256));
+        assert_eq!(numerics.profile_slot(8).unwrap(), 4);
+        assert_eq!(numerics.profile_for_rows(1).unwrap(), p(16, 512));
+        assert_eq!(numerics.profile_slot(4).unwrap(), 1);
+        assert_eq!(numerics.profile_slot(9).unwrap(), 3);
+    }
+    assert_eq!(numerics.profile_slot(6).unwrap(), 2);
 }

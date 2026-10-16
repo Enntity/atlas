@@ -37,6 +37,9 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // Speculative-verify forward: EXL3 launches in this scope may use the
+        // ATLAS_EXL3_VERIFY_PROFILES alternatives (prefill/serial never do).
+        let _verify_scope = spark_runtime::weights::exl3::native::verify_scope();
         let ban = seq.eos_ban;
         let ban_rows = ban.row_mask(seq.seq_len, k);
         if self.lightning_dspark_identity.policy().is_some()

@@ -59,14 +59,6 @@ impl RoutedPrecisionPolicy {
             u32::from(self.fat_half_partial),
         ]
     }
-
-    /// Whether to use cooperative MMA optimized kernels (shared weight cache,
-    /// fused hadamard transforms). Controlled by the precision policy to
-    /// allow A/B testing without config changes.
-    pub(super) fn cooperative_mma(self) -> bool {
-        // Enable for the reference profile (thin_capacity=32, tile_k=32, tile_n=256)
-        self.thin_capacity == 32 && self.tile_k == 32 && self.tile_n == 256 && self.slices == 8
-    }
 }
 #[cfg(test)]
 mod tests {

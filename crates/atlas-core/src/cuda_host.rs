@@ -74,6 +74,7 @@ static HOST: OnceLock<std::result::Result<Arc<CudaHost>, String>> = OnceLock::ne
 /// `kernel_blobs` argument.
 pub fn host(ordinal: usize) -> Result<Arc<CudaHost>> {
     let result = HOST.get_or_init(|| {
+        apply_cuda_sched_env(ordinal);
         let ctx = CudaContext::new(ordinal).map_err(|e| format!("{e}"))?;
         let stream = ctx.new_stream().map_err(|e| format!("{e}"))?;
         Ok(Arc::new(CudaHost {
@@ -119,4 +120,25 @@ pub fn release(registry: Arc<AtlasRegistry>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// `ATLAS_CUDA_SCHED=spin|yield|blocking` sets the primary-context scheduling
+/// flags before the context is retained (default: driver auto). Spin keeps the
+/// host thread polling instead of blocking in the driver during stream syncs.
+pub fn apply_cuda_sched_env(ordinal: usize) {
+    use cudarc::driver::sys;
+    let flags = match std::env::var("ATLAS_CUDA_SCHED").as_deref() {
+        Ok("spin") => sys::CUctx_flags::CU_CTX_SCHED_SPIN as u32,
+        Ok("yield") => sys::CUctx_flags::CU_CTX_SCHED_YIELD as u32,
+        Ok("blocking") => sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC as u32,
+        _ => return,
+    };
+    // SAFETY: plain driver calls on a valid ordinal before any context retain.
+    unsafe {
+        let _ = sys::cuInit(0);
+        let mut dev: sys::CUdevice = 0;
+        if sys::cuDeviceGet(&mut dev, ordinal as i32) == sys::CUresult::CUDA_SUCCESS {
+            let _ = sys::cuDevicePrimaryCtxSetFlags_v2(dev, flags);
+        }
+    }
 }

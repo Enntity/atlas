@@ -144,6 +144,24 @@
       "repeats": 3,
       "temperature": 0.0,
       "seed": 20261011
+    },
+    {
+      "name": "ab_prose_prefill_3k",
+      "prompt_class": "prose",
+      "approx_input_tokens": 4000,
+      "max_tokens": 16,
+      "repeats": 3,
+      "temperature": 0.0,
+      "seed": 20261011
+    },
+    {
+      "name": "ab_prose_long",
+      "prompt_class": "prose",
+      "approx_input_tokens": 128,
+      "max_tokens": 1024,
+      "repeats": 3,
+      "temperature": 0.0,
+      "seed": 20261011
     }
   ]
 }

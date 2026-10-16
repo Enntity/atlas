@@ -32,6 +32,10 @@ pub struct Glm5Exl3Projection {
     stream: u64,
     capacity: usize,
     active: bool,
+    /// `ATLAS_EXL3_COOP_FUSED_QKV=1`: on the first component of a fused
+    /// reference matrix, one launch for all components (see
+    /// `attach_fused_components`). None keeps per-component launches.
+    fused: Option<spark_runtime::weights::exl3::native::Exl3FusedCoop>,
 }
 
 impl Glm5Exl3Projection {
@@ -107,6 +111,7 @@ impl Glm5Exl3Projection {
                 stream,
                 capacity,
                 active: true,
+                fused: None,
             }),
             Err(error) => {
                 let cleanup = shard.release(gpu);
@@ -230,6 +235,56 @@ impl Glm5Exl3Projection {
         self.capacity
     }
 
+    /// Under `ATLAS_EXL3_COOP_FUSED_QKV=1`, prepare one cooperative launch
+    /// for `self | second | third`, the three equal-width output components
+    /// of one fused reference matrix (GLM KDA q|k|v). Unsupported geometry is
+    /// logged once and leaves the per-component launches in place.
+    pub fn attach_fused_components(&mut self, gpu: &dyn GpuBackend, second: &Self, third: &Self) {
+        use spark_runtime::weights::exl3::native::{Exl3FusedCoop, coop_fused_qkv};
+        if !coop_fused_qkv() || self.fused.is_some() {
+            return;
+        }
+        self.fused = Exl3FusedCoop::resolve(
+            gpu,
+            &[
+                (&self.workspace, &self.shard),
+                (&second.workspace, &second.shard),
+                (&third.workspace, &third.shard),
+            ],
+        );
+    }
+
+    /// One launch for `self | second | third` into three rank-local BF16
+    /// outputs, identical to three `launch_local_bf16` calls. `Ok(false)`:
+    /// not prepared or not applicable; the caller runs the separate launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fused_local_bf16(
+        &self,
+        gpu: &dyn GpuBackend,
+        second: &Self,
+        third: &Self,
+        input: DevicePtr,
+        outputs: [DevicePtr; 3],
+        rows: usize,
+    ) -> Result<bool> {
+        let Some(fused) = self.fused.as_ref() else {
+            return Ok(false);
+        };
+        for projection in [self, second, third] {
+            projection.validate_batch(rows)?;
+        }
+        fused.launch_bf16(
+            gpu,
+            &[
+                (&self.workspace, &self.shard, outputs[0]),
+                (&second.workspace, &second.shard, outputs[1]),
+                (&third.workspace, &third.shard, outputs[2]),
+            ],
+            input,
+            rows,
+        )
+    }
+
     pub fn shard(&self) -> &Exl3DeviceShard {
         &self.shard
     }
@@ -244,7 +299,11 @@ impl<'a> ModelResource<dyn GpuBackend + 'a> for Glm5Exl3Projection {
         // Always attempt both releases. Their resources retain failed handles
         // so a later teardown retry can free them.
         self.active = false;
-        let scratch = self.workspace.release(gpu);
+        let fused = match self.fused.as_mut() {
+            Some(fused) => fused.release(gpu),
+            None => Ok(()),
+        };
+        let scratch = self.workspace.release(gpu).and(fused);
         let weights = self.shard.release(gpu);
         match (scratch, weights) {
             (Ok(()), Ok(())) => Ok(()),

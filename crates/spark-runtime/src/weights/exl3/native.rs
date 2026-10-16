@@ -12,8 +12,28 @@ use crate::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use crate::kernel_args::KernelLaunch;
 
 use super::{HADAMARD_WIDTH, tp::Exl3DeviceShard};
+mod coop;
 mod numerics;
-pub use numerics::{Exl3CooperativeProfile, Exl3LinearNumerics};
+pub use coop::{Exl3FusedCoop, coop_fused_input, coop_fused_output, coop_fused_qkv, coop_gemm};
+pub use numerics::{
+    EXL3_PROFILE_SLOTS, Exl3CooperativeProfile, Exl3LinearNumerics, VerifyScope, verify_scope,
+};
+
+/// `ATLAS_EXL3_SPLIT_MMA=1` selects the slice-parallel EXL3 MMA kernels
+/// (`*_split`): same arithmetic and fold order, parallel split-K schedule.
+pub fn split_mma() -> bool {
+    static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SPLIT.get_or_init(|| std::env::var("ATLAS_EXL3_SPLIT_MMA").as_deref() == Ok("1"))
+}
+
+/// Kernel name for an EXL3 cooperative MMA entry point under `split_mma()`.
+pub fn split_mma_kernel(name: &'static str) -> &'static str {
+    match (split_mma(), name) {
+        (true, "exl3_mul1_matmul_mma") => "exl3_mul1_matmul_mma_split",
+        (true, "exl3_moe_mul1_matmul_precision_mma") => "exl3_moe_mul1_matmul_precision_mma_split",
+        _ => name,
+    }
+}
 
 /// Explicit rounding at the packed linear's input-transform boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +55,7 @@ impl Exl3InputPrecision {
 }
 
 /// Reusable activation scratch and resolved kernels, bound to one compute
-/// stream. All launches on this stream use that stream, so asynchronous
+/// stream. All launches on this workspace use that stream, so asynchronous
 /// stages cannot overwrite another stream's pending intermediate values.
 /// Callers must use the backend/device that owns the shard and workspace.
 pub struct Exl3LinearWorkspace {
@@ -46,7 +66,9 @@ pub struct Exl3LinearWorkspace {
     buffers: [DevicePtr; 2],
     kernels: [KernelHandle; 3],
     numerics: Option<Exl3LinearNumerics>,
-    fused: bool,
+    /// `ATLAS_EXL3_COOP_GEMM=1` path (numerics profiles only); None keeps the
+    /// existing kernels.
+    coop: Option<coop::CoopGemm>,
 }
 
 impl Exl3LinearWorkspace {
@@ -72,7 +94,7 @@ impl Exl3LinearWorkspace {
         stream: u64,
         input_precision: Exl3InputPrecision,
     ) -> Result<Self> {
-        Self::build(gpu, k, n, capacity, stream, input_precision, None, false)
+        Self::build(gpu, k, n, capacity, stream, input_precision, None)
     }
 
     /// Explicit cooperative arithmetic; unsupported geometry fails before GPU
@@ -94,28 +116,6 @@ impl Exl3LinearWorkspace {
             stream,
             Exl3InputPrecision::F16,
             Some(numerics),
-            false,
-        )
-    }
-
-    /// Fused kernel variant: single launch does input hadamard + matmul + output hadamard.
-    /// Eliminates intermediate global memory round-trips. Requires K <= 11136.
-    pub fn new_fused(
-        gpu: &dyn GpuBackend,
-        k: usize,
-        n: usize,
-        capacity: usize,
-        stream: u64,
-    ) -> Result<Self> {
-        Self::build(
-            gpu,
-            k,
-            n,
-            capacity,
-            stream,
-            Exl3InputPrecision::F16,
-            None,
-            true,
         )
     }
 
@@ -130,34 +130,23 @@ impl Exl3LinearWorkspace {
     ) -> Result<()> {
         numerics.validate(k, n, capacity)?;
         Self::dimensions(k, n, capacity)?;
-        Self::resolve_kernels(gpu, Exl3InputPrecision::F16, true, false).map(|_| ())
+        Self::resolve_kernels(gpu, Exl3InputPrecision::F16, true).map(|_| ())
     }
 
     fn resolve_kernels(
         gpu: &dyn GpuBackend,
         input_precision: Exl3InputPrecision,
         cooperative: bool,
-        fused: bool,
     ) -> Result<[KernelHandle; 3]> {
-        if fused {
-            // Fused kernel: single launch does input hadamard + matmul + output hadamard
-            // No intermediate scratch buffers needed for xh/yh
-            Ok([
-                gpu.kernel("exl3_linear_mma_opt", "exl3_fused_linear")?,
-                KernelHandle(0), // Not used in fused path
-                KernelHandle(0), // Not used in fused path
-            ])
-        } else {
-            Ok([
-                gpu.kernel("exl3", input_precision.kernel_name())?,
-                if cooperative {
-                    gpu.kernel("exl3_linear_mma", "exl3_mul1_matmul_mma")?
-                } else {
-                    gpu.kernel("exl3", "exl3_mul1_matmul")?
-                },
-                gpu.kernel("exl3", "exl3_output_hadamard")?,
-            ])
-        }
+        Ok([
+            gpu.kernel("exl3", input_precision.kernel_name())?,
+            if cooperative {
+                gpu.kernel("exl3_linear_mma", split_mma_kernel("exl3_mul1_matmul_mma"))?
+            } else {
+                gpu.kernel("exl3", "exl3_mul1_matmul")?
+            },
+            gpu.kernel("exl3", "exl3_output_hadamard")?,
+        ])
     }
 
     fn dimensions(k: usize, n: usize, capacity: usize) -> Result<[u32; 2]> {
@@ -184,33 +173,16 @@ impl Exl3LinearWorkspace {
         stream: u64,
         input_precision: Exl3InputPrecision,
         numerics: Option<Exl3LinearNumerics>,
-        fused: bool,
     ) -> Result<Self> {
         let [k_arg, n_arg] = Self::dimensions(k, n, capacity)?;
-
-        // Fused kernel doesn't need intermediate xh/yh scratch buffers
-        let (sizes, kernels) = if fused {
-            // Only need to verify shared memory constraints
-            if k > 11136 {
-                anyhow::bail!("EXL3 fused kernel requires K <= 11136 for shared memory limits");
-            }
-            // No scratch buffers needed for fused path
-            (
-                [0, 0],
-                Self::resolve_kernels(gpu, input_precision, numerics.is_some(), fused)?,
-            ) // sizes don't matter, won't allocate
-        } else {
-            let scratch_size = |width: usize| {
-                capacity
-                    .checked_mul(width)
-                    .and_then(|elements| elements.checked_mul(4))
-                    .context("EXL3 activation scratch size overflow")
-            };
-            let sizes = [scratch_size(k)?, scratch_size(n)?];
-            let kernels = Self::resolve_kernels(gpu, input_precision, numerics.is_some(), fused)?;
-            (sizes, kernels)
+        let scratch_size = |width: usize| {
+            capacity
+                .checked_mul(width)
+                .and_then(|elements| elements.checked_mul(4))
+                .context("EXL3 activation scratch size overflow")
         };
-
+        let sizes = [scratch_size(k)?, scratch_size(n)?];
+        let kernels = Self::resolve_kernels(gpu, input_precision, numerics.is_some())?;
         let mut result = Self {
             k: k_arg,
             n: n_arg,
@@ -219,22 +191,26 @@ impl Exl3LinearWorkspace {
             buffers: [DevicePtr::NULL; 2],
             kernels,
             numerics,
-            fused,
+            coop: None,
         };
-
-        if !fused {
-            for (slot, size) in sizes.into_iter().enumerate() {
-                match gpu.alloc(size) {
-                    Ok(ptr) => result.buffers[slot] = ptr,
-                    Err(error) => {
-                        let cleanup = result.release(gpu);
-                        return Err(match cleanup {
-                            Ok(()) => error,
-                            Err(cleanup) => error
-                                .context(format!("EXL3 scratch cleanup also failed: {cleanup:#}")),
-                        });
-                    }
+        let fail = |result: &mut Self, error: anyhow::Error| -> anyhow::Error {
+            match result.release(gpu) {
+                Ok(()) => error,
+                Err(cleanup) => {
+                    error.context(format!("EXL3 scratch cleanup also failed: {cleanup:#}"))
                 }
+            }
+        };
+        for (slot, size) in sizes.into_iter().enumerate() {
+            match gpu.alloc(size) {
+                Ok(ptr) => result.buffers[slot] = ptr,
+                Err(error) => return Err(fail(&mut result, error)),
+            }
+        }
+        if let Some(numerics) = numerics.filter(|_| coop::coop_gemm()) {
+            match coop::resolve(gpu, numerics, k, n, capacity) {
+                Ok(coop) => result.coop = coop,
+                Err(error) => return Err(fail(&mut result, error)),
             }
         }
         Ok(result)
@@ -251,11 +227,7 @@ impl Exl3LinearWorkspace {
         output: DevicePtr,
         rows: usize,
     ) -> Result<()> {
-        if self.fused {
-            self.launch_fused(gpu, shard, input, output, rows)
-        } else {
-            self.launch_output(gpu, shard, input, output, rows, self.kernels[2])
-        }
+        self.launch_output(gpu, shard, input, output, rows, self.kernels[2])
     }
 
     /// Native F32 vocabulary logits without intermediate BF16 rounding.
@@ -267,61 +239,8 @@ impl Exl3LinearWorkspace {
         output: DevicePtr,
         rows: usize,
     ) -> Result<()> {
-        if self.fused {
-            // Fused kernel doesn't support F32 output path yet
-            anyhow::bail!("EXL3 fused kernel does not support F32 output");
-        }
         let kernel = gpu.kernel("exl3", "exl3_output_hadamard_f32")?;
         self.launch_output(gpu, shard, input, output, rows, kernel)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn launch_fused(
-        &self,
-        gpu: &dyn GpuBackend,
-        shard: &Exl3DeviceShard,
-        input: DevicePtr,
-        output: DevicePtr,
-        rows: usize,
-    ) -> Result<()> {
-        ensure!(
-            rows <= self.capacity as usize,
-            "EXL3 batch exceeds workspace capacity"
-        );
-        ensure!(
-            shard.plan().in_features() == self.k as usize
-                && shard.plan().out_features() == self.n as usize,
-            "EXL3 shard dimensions do not match workspace"
-        );
-        if let Some(numerics) = self.numerics {
-            ensure!(
-                shard.plan().bits() == numerics.bits,
-                "EXL3 checkpoint bits differ from explicit numerical profile"
-            );
-        }
-        if rows == 0 {
-            return Ok(());
-        }
-        ensure!(
-            !input.is_null() && !output.is_null(),
-            "EXL3 activation buffers must be non-null"
-        );
-        let [trellis, input_scale, output_scale] = shard.buffers()?;
-        let rows = rows as u32;
-
-        KernelLaunch::new(gpu, self.kernels[0])
-            .grid([self.n.div_ceil(128), rows, 1])
-            .block([128, 1, 1])
-            .arg_ptr(input)
-            .arg_ptr(input_scale)
-            .arg_ptr(trellis)
-            .arg_ptr(output_scale)
-            .arg_ptr(output)
-            .arg_u32(rows)
-            .arg_u32(self.n)
-            .arg_u32(self.k)
-            .arg_u32(u32::from(shard.plan().bits()))
-            .launch(self.stream)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -369,7 +288,79 @@ impl Exl3LinearWorkspace {
             !self.buffers.contains(&input) && !self.buffers.contains(&output),
             "EXL3 activation buffers must not alias workspace scratch"
         );
+        let coop_plan = match (&self.coop, self.numerics) {
+            (Some(coop), Some(numerics)) => coop.plan(numerics.profile_slot(rows)?),
+            _ => None,
+        };
         let rows = rows as u32;
+        if let (Some(coop), Some(plan)) = (&self.coop, coop_plan) {
+            // ATLAS_EXL3_COOP_FUSED_INPUT: the transform runs in the GEMM's
+            // prologue from the raw BF16 input when the rows can be staged.
+            let fused = plan.fused.filter(|_| rows as usize <= plan.fused_rows);
+            // Fused output only for the BF16 output transform (not the F32 head).
+            let fused_out = plan
+                .fused_out
+                .filter(|_| fused.is_some() && output_kernel.0 == self.kernels[2].0);
+            if fused.is_none() {
+                // F16 activations reuse the F32 input scratch (half the bytes).
+                KernelLaunch::new(gpu, coop.input_kernel)
+                    .grid([self.k / 128, rows, 1])
+                    .block([128, 1, 1])
+                    .arg_ptr(input)
+                    .arg_ptr(input_scale)
+                    .arg_ptr(self.buffers[0])
+                    .arg_u32(rows)
+                    .arg_u32(self.k)
+                    .launch(self.stream)?;
+            }
+            let launch = KernelLaunch::new(gpu, fused_out.or(fused).unwrap_or(plan.kernel))
+                .grid([plan.grid, 1, 1])
+                .block([plan.block, 1, 1])
+                .shared_mem(coop::COOP_SMEM_BYTES)
+                .arg_ptr(if fused.is_some() { input } else { self.buffers[0] })
+                .arg_ptr(trellis)
+                .arg_ptr(self.buffers[1])
+                .arg_u32(rows)
+                .arg_u32(self.k)
+                .arg_u32(self.n)
+                .arg_ptr(coop.locks)
+                .arg_u32(plan.logical_tiles_n)
+                .arg_u32(plan.col_tile_offset)
+                .arg_u32(plan.slices)
+                .arg_u32(plan.slice_base);
+            let launched = if fused_out.is_some() {
+                launch
+                    .arg_ptr(input_scale)
+                    .arg_ptr(output)
+                    .arg_ptr(output_scale)
+            } else if fused.is_some() {
+                launch.arg_ptr(input_scale)
+            } else {
+                launch
+            }
+            .launch_cooperative(self.stream);
+            match launched {
+                // The fused-output GEMM already wrote the BF16 output.
+                Ok(()) if fused_out.is_some() => return Ok(()),
+                Ok(()) => {
+                    return KernelLaunch::new(gpu, output_kernel)
+                        .grid([self.n / 128, rows, 1])
+                        .block([128, 1, 1])
+                        .arg_ptr(self.buffers[1])
+                        .arg_ptr(output_scale)
+                        .arg_ptr(output)
+                        .arg_u32(rows)
+                        .arg_u32(self.n)
+                        .launch(self.stream);
+                }
+                // A rejected cooperative launch enqueues nothing; the existing
+                // path below rewrites the input scratch on the same stream.
+                Err(error) => {
+                    coop.disable();
+                    coop::fallback_note(format!("cooperative launch failed ({error:#})"));
+                }
+            }
+        }
         KernelLaunch::new(gpu, self.kernels[0])
             .grid([self.k / 128, rows, 1])
             .block([128, 1, 1])
@@ -379,8 +370,10 @@ impl Exl3LinearWorkspace {
             .arg_u32(rows)
             .arg_u32(self.k)
             .launch(self.stream)?;
+        // The slice-parallel cooperative kernel covers 16 columns per block.
+        let columns_per_block = if self.numerics.is_some() && split_mma() { 16 } else { 128 };
         let mut matmul = KernelLaunch::new(gpu, self.kernels[1])
-            .grid([self.n.div_ceil(128), rows, 1])
+            .grid([self.n.div_ceil(columns_per_block), rows, 1])
             .block([128, 1, 1])
             .arg_ptr(self.buffers[0])
             .arg_ptr(trellis)
@@ -414,7 +407,8 @@ impl<'a> ModelResource<dyn GpuBackend + 'a> for Exl3LinearWorkspace {
 
     fn release(&mut self, gpu: &(dyn GpuBackend + 'a)) -> Result<()> {
         let mut error = None;
-        for buffer in self.buffers.iter_mut().rev() {
+        let locks = self.coop.as_mut().map(|coop| &mut coop.locks);
+        for buffer in self.buffers.iter_mut().rev().chain(locks) {
             if buffer.is_null() {
                 continue;
             }

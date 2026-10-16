@@ -23,7 +23,43 @@ pub struct Exl3LinearNumerics {
     pub reference_pad: bool,
     /// None declares that bucket unavailable; it never selects a fallback.
     pub row_profiles: [Option<Exl3CooperativeProfile>; 4],
+    /// Speculative-verify alternative for the padded 5..8-row bucket
+    /// (`ATLAS_EXL3_VERIFY_PROFILES=1`), used only inside a [`verify_scope`]:
+    /// prefill chunks and serial decode keep `row_profiles`. None: no
+    /// alternative.
+    pub verify_rows_5_8: Option<Exl3CooperativeProfile>,
 }
+
+thread_local! {
+    static VERIFY_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current thread's forward as a speculative verify until dropped,
+/// so `verify_rows_5_8` profiles apply (launches recorded into a graph keep
+/// the choice made at capture time).
+pub struct VerifyScope {
+    previous: bool,
+}
+
+pub fn verify_scope() -> VerifyScope {
+    VerifyScope {
+        previous: VERIFY_ACTIVE.with(|v| v.replace(true)),
+    }
+}
+
+impl Drop for VerifyScope {
+    fn drop(&mut self) {
+        let previous = self.previous;
+        VERIFY_ACTIVE.with(|v| v.set(previous));
+    }
+}
+
+fn verify_active() -> bool {
+    VERIFY_ACTIVE.with(|v| v.get())
+}
+
+/// Profile slots: 0..4 are `row_profiles`, 4 is `verify_rows_5_8`.
+pub const EXL3_PROFILE_SLOTS: usize = 5;
 
 impl Exl3LinearNumerics {
     pub(super) fn validate(self, k: usize, physical_n: usize, capacity: usize) -> Result<()> {
@@ -53,7 +89,12 @@ impl Exl3LinearNumerics {
                 .is_some_and(|end| end <= self.logical_n),
             "EXL3 physical component exceeds logical reference width"
         );
-        for profile in self.row_profiles.into_iter().flatten() {
+        for profile in self
+            .row_profiles
+            .into_iter()
+            .chain([self.verify_rows_5_8])
+            .flatten()
+        {
             ensure!(
                 matches!(
                     (profile.tile_k, profile.tile_n),
@@ -86,6 +127,33 @@ impl Exl3LinearNumerics {
     }
 
     pub fn profile_for_rows(self, rows: usize) -> Result<Exl3CooperativeProfile> {
+        self.profile_at(self.profile_slot(rows)?)
+            .context("EXL3 selected row bucket has no explicit numerical profile")
+    }
+
+    /// The profile slot for `rows`: the padded-row bucket, or slot 4 (the
+    /// verify alternative) for the 5..8-row bucket inside a verify scope.
+    pub fn profile_slot(self, rows: usize) -> Result<usize> {
+        let bucket = self.bucket_for_rows(rows)?;
+        Ok(
+            if bucket == 2 && self.verify_rows_5_8.is_some() && verify_active() {
+                4
+            } else {
+                bucket
+            },
+        )
+    }
+
+    pub fn profile_at(self, slot: usize) -> Option<Exl3CooperativeProfile> {
+        match slot {
+            0..4 => self.row_profiles[slot],
+            4 => self.verify_rows_5_8,
+            _ => None,
+        }
+    }
+
+    /// Index into `row_profiles` for `rows` (after the reference padding).
+    pub fn bucket_for_rows(self, rows: usize) -> Result<usize> {
         ensure!(
             rows > 0 && (1..=128).contains(&self.reference_min_rows),
             "EXL3 profile lookup requires positive rows and explicit minimum"
@@ -95,14 +163,12 @@ impl Exl3LinearNumerics {
         } else {
             rows
         };
-        let index = match padded {
+        Ok(match padded {
             1..=2 => 0,
             3..=4 => 1,
             5..=8 => 2,
             _ => 3,
-        };
-        self.row_profiles[index]
-            .context("EXL3 selected row bucket has no explicit numerical profile")
+        })
     }
 
     pub(super) fn kernel_args(self, rows: usize) -> Result<[u32; 6]> {

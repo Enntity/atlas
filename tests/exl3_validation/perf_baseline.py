@@ -205,6 +205,7 @@ def stream_chat(endpoint, body, timeout):
     t0 = time.perf_counter()
     chunk_offsets = []
     token_offsets = []
+    output_text = []
     ttft = None
     first_output = None
     finish_reason = None
@@ -255,6 +256,9 @@ def stream_chat(endpoint, body, timeout):
                 has_output = bool(delta.get("content")
                                   or delta.get("reasoning_content")
                                   or delta.get("tool_calls"))
+                for key in ("reasoning_content", "content"):
+                    if isinstance(delta.get(key), str):
+                        output_text.append(key[0] + delta[key])
                 if has_output:
                     if first_output is None:
                         first_output = off
@@ -293,6 +297,8 @@ def stream_chat(endpoint, body, timeout):
             for i in range(len(token_offsets) - 1)]
     return {
         "error": error,
+        "output_sha256": hashlib.sha256("\x00".join(output_text).encode()).hexdigest() if error is None else None,
+        "output_head": "".join(t[1:] for t in output_text)[:400] if error is None else None,
         "wall_start_epoch": wall_start_epoch,
         "ttft_s": round6(ttft),
         "first_output_token_s": round6(first_output),
@@ -352,6 +358,8 @@ def run_one(endpoint, model, workload, class_doc, prompt, timeout,
         "e2e_s": res["e2e_s"],
         "usage": res["usage"],
         "finish_reason": res["finish_reason"],
+        "output_sha256": res.get("output_sha256"),
+        "output_head": res.get("output_head"),
         "error": res["error"],
     }
 

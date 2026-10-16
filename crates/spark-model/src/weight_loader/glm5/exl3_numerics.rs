@@ -37,7 +37,13 @@ pub fn glm53_tp2_packed_numerics(
         "Pinned GLM-5.3 packed numerical profile requires TP2; unsupported topology"
     );
     let geometry = (k, physical_n, logical_n, bits);
-    if geometry == (4096, 4096, 12288, 6) {
+    let shared_packed = std::env::var("ATLAS_EXL3_SHARED_PACKED").as_deref() == Ok("1");
+    if shared_packed && matches!(geometry, (4096, 1024, 2048, 5..=6)) {
+        ensure!(
+            [0, 1024].contains(&offset),
+            "Unsupported packed shared-expert gate|up component offset"
+        );
+    } else if geometry == (4096, 4096, 12288, 6) {
         ensure!(
             [0, 4096, 8192].contains(&offset),
             "Unsupported GLM-5.3 fused QKV component offset"
@@ -62,6 +68,21 @@ pub fn glm53_tp2_packed_numerics(
             [None, p(16, 512, 48), p(16, 512, 48), p(32, 128, 48)]
         }
         (4096, 512, 512, 6) => [None, p(32, 128, 20), p(32, 128, 16), p(32, 128, 16)],
+        // ATLAS_EXL3_SHARED_PACKED=1 only (numerics-changing): the shared expert's
+        // gate/up (K4096 -> N1024) and down (K1024 -> N4096) have no reference
+        // profile because the reference keeps them BF16. Untuned profiles.
+        (4096, 1024, 1024, 5..=6) | (1024, 4096, 4096, 5..=6)
+            if std::env::var("ATLAS_EXL3_SHARED_PACKED").as_deref() == Ok("1") =>
+        {
+            [None, p(32, 128, 48), p(32, 128, 48), p(32, 128, 48)]
+        }
+        // Shared gate|up as one fused [gate | up] matrix of logical width 2048
+        // (one cooperative launch, exl3_coop_gemm2): tile 32x128 gives 16
+        // column tiles x 128 k-tiles over 48 slices (~43 tiles per slice,
+        // ~3 slices per column), instead of 4 column tiles for 48 slices.
+        (4096, 1024, 2048, 5..=6) if shared_packed => {
+            [None, p(32, 128, 48), p(32, 128, 48), p(32, 128, 48)]
+        }
         (4096, 77440, 77440, GLM53_TP2_HEAD_BITS) => [
             p(32, 128, 48),
             p(32, 128, 48),
@@ -73,6 +94,22 @@ pub fn glm53_tp2_packed_numerics(
         ),
     };
     let head = geometry == (4096, 77440, 77440, GLM53_TP2_HEAD_BITS);
+    // ATLAS_EXL3_VERIFY_PROFILES=1 (speculative lane, numerics-changing for
+    // 5-8 row VERIFY launches only): the padded-rows 5..8 bucket's 16x512
+    // profile has a 32x256 alternative (~10-16 us faster per call at r = 5-8
+    // in the coop bench) that applies only inside a verify scope
+    // (spark_runtime::weights::exl3::native::verify_scope); prefill chunks
+    // and serial decode keep the reference profiles.
+    let verify_rows_5_8 = (std::env::var("ATLAS_EXL3_VERIFY_PROFILES").as_deref() == Ok("1"))
+        .then_some(row_profiles[2])
+        .flatten()
+        .filter(|p5| {
+            (p5.tile_k, p5.tile_n) == (16, 512)
+                && physical_n.is_multiple_of(256)
+                && logical_n.is_multiple_of(256)
+                && offset.is_multiple_of(256)
+        })
+        .and_then(|p5| p(32, 256, p5.slices));
     Ok(Exl3LinearNumerics {
         logical_n,
         logical_offset: offset,
@@ -80,6 +117,7 @@ pub fn glm53_tp2_packed_numerics(
         reference_min_rows: if head { 1 } else { 3 },
         reference_pad: !head,
         row_profiles,
+        verify_rows_5_8,
     })
 }
 

@@ -29,6 +29,10 @@ impl Glm5KdaLayer {
             && self.w4a16_gemv_batch5_qkv_k.0 != 0
             && verify_fused_qkv_enabled()
             && !crate::layers::canonical_verify::enabled();
+        if self.project_exl3_fused_qkv(normed, projected, m as usize, plane_bytes, ctx, stream)? {
+            profile::step(ctx, stream, profile_timer, "q_proj")?;
+            return Ok(());
+        }
         // Whether Q took the Lt FP8 route, leaving `normed` cast in scratch.
         let mut q_fp8 = false;
         if fused_qkv {
@@ -123,5 +127,51 @@ impl Glm5KdaLayer {
             }
         }
         Ok(())
+    }
+}
+
+impl Glm5KdaLayer {
+    /// `ATLAS_EXL3_COOP_FUSED_QKV=1`: q|k|v as one cooperative launch over
+    /// the fused reference matrix, writing the same three BF16 planes as the
+    /// separate EXL3 launches. `Ok(false)` leaves them to the caller.
+    fn project_exl3_fused_qkv(
+        &self,
+        normed: DevicePtr,
+        projected: DevicePtr,
+        tokens: usize,
+        plane_bytes: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let (Glm5Projection::Exl3(q), Glm5Projection::Exl3(k), Glm5Projection::Exl3(v)) = (
+            &self.weights.q_proj,
+            &self.weights.k_proj,
+            &self.weights.v_proj,
+        ) else {
+            return Ok(false);
+        };
+        let width = self.heads * self.dim;
+        for weight in [q, k, v] {
+            weight.validate_local_forward(
+                tokens,
+                self.hidden_size,
+                width,
+                stream,
+                ctx.config.tp_rank,
+                ctx.config.tp_world_size,
+            )?;
+        }
+        q.launch_fused_local_bf16(
+            ctx.gpu,
+            k,
+            v,
+            normed,
+            [
+                projected,
+                projected.offset(plane_bytes),
+                projected.offset(2 * plane_bytes),
+            ],
+            tokens,
+        )
     }
 }

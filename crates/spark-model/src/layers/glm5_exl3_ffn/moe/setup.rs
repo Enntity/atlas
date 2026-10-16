@@ -66,10 +66,17 @@ impl NativeMoeFfn {
                 "EXL3 MoE widths must be positive H128 multiples"
             );
             ensure!(
-                shared.is_reconstructed(),
+                shared.is_reconstructed()
+                    || std::env::var("ATLAS_EXL3_SHARED_PACKED").as_deref() == Ok("1"),
                 "native MoE shared experts require global BF16 reconstruction"
             );
-            shared.validate(capacity, stream, config.tp_rank, config.tp_world_size)?;
+            // The shared expert may be bound to the overlap side stream.
+            shared.validate(
+                capacity,
+                shared.stream,
+                config.tp_rank,
+                config.tp_world_size,
+            )?;
             ensure!(
                 shared.hidden == h,
                 "EXL3 shared/routed hidden size mismatch"
@@ -95,60 +102,28 @@ impl NativeMoeFfn {
             activation.validate()?;
             policy.validate()?;
             gpu.require_bf16_gemm_numerics(spark_runtime::gpu::Bf16GemmNumerics::CublasLt)?;
-
-            // Use optimized kernels when policy requests cooperative MMA
-            let use_opt = policy.cooperative_mma();
-
             let kernels = [
                 gpu.kernel("residual_add", "bf16_to_f32")?,
-                gpu.kernel("exl3_moe", "exl3_topk_sigmoid")?,
-                if use_opt {
-                    gpu.kernel(
-                        "exl3_moe_precision_opt",
-                        "exl3_moe_fused_input_hadamard_f16",
-                    )?
-                } else {
-                    gpu.kernel("exl3_moe_precision", "exl3_moe_input_hadamard_f16")?
-                },
-                if use_opt {
-                    gpu.kernel("exl3_moe_mma_opt", "exl3_moe_mul1_matmul_coop_mma")?
-                } else {
-                    gpu.kernel("exl3_moe_mma", "exl3_moe_mul1_matmul_precision_mma")?
-                },
-                if use_opt {
-                    gpu.kernel(
-                        "exl3_moe_precision_opt",
-                        "exl3_moe_fused_output_hadamard_precision",
-                    )?
-                } else {
-                    gpu.kernel("exl3_moe_precision", "exl3_moe_output_hadamard_precision")?
-                },
-                if use_opt {
-                    gpu.kernel("exl3_moe_precision_opt", "exl3_moe_fused_combine_f32")?
-                } else {
-                    gpu.kernel("exl3_moe_precision", "exl3_moe_combine_f32")?
-                },
-                if use_opt {
-                    gpu.kernel(
-                        "exl3_moe_precision_opt",
-                        "exl3_moe_fused_activate_down_hadamard",
-                    )?
-                } else {
-                    gpu.kernel("exl3_moe_precision", "exl3_moe_activate_down_hadamard")?
-                },
-                if use_opt {
-                    gpu.kernel("exl3_moe_precision_opt", "exl3_moe_route_counts")?
-                } else {
-                    gpu.kernel("exl3_moe_precision", "exl3_moe_route_counts")?
-                },
-                if use_opt {
-                    gpu.kernel(
-                        "exl3_moe_precision_opt",
-                        "exl3_moe_fused_down_weighted_output",
-                    )?
-                } else {
-                    gpu.kernel("exl3_moe_precision", "exl3_moe_down_weighted_output")?
-                },
+                gpu.kernel(
+                    "exl3_moe",
+                    if std::env::var("ATLAS_EXL3_PAR_SMALL").as_deref() == Ok("1") {
+                        "exl3_topk_sigmoid_par"
+                    } else {
+                        "exl3_topk_sigmoid"
+                    },
+                )?,
+                gpu.kernel("exl3_moe_precision", "exl3_moe_input_hadamard_f16")?,
+                gpu.kernel(
+                    "exl3_moe_mma",
+                    spark_runtime::weights::exl3::native::split_mma_kernel(
+                        "exl3_moe_mul1_matmul_precision_mma",
+                    ),
+                )?,
+                gpu.kernel("exl3_moe_precision", "exl3_moe_output_hadamard_precision")?,
+                gpu.kernel("exl3_moe_precision", "exl3_moe_combine_f32")?,
+                gpu.kernel("exl3_moe_precision", "exl3_moe_activate_down_hadamard")?,
+                gpu.kernel("exl3_moe_precision", "exl3_moe_route_counts")?,
+                gpu.kernel("exl3_moe_precision", "exl3_moe_down_weighted_output")?,
             ];
             let geometry = MoeScratchGeometry::new(config, capacity, stream)?;
             let borrowed = match &scratch {
@@ -163,33 +138,92 @@ impl NativeMoeFfn {
             Ok((kernels, intermediate))
         })();
         match setup {
-            Ok((kernels, intermediate)) => Ok(Self {
-                layer: None,
-                capture: None,
-                shared,
-                tables,
-                companions,
-                buffers,
-                scratch: scratch
-                    .unwrap_or_else(|| owned_scratch.as_ref().expect("scratch owner").borrow()),
-                owned_scratch,
-                kernels,
-                activation,
-                precision: policy,
-                hidden: config.hidden_size,
-                intermediate,
-                experts: config.num_experts,
-                topk: config.num_experts_per_tok,
-                normalize: config.norm_topk_prob,
-                scale: config.routed_scaling_factor as f32,
-                rank: config.tp_rank,
-                world: config.tp_world_size,
-                capacity,
-                stream,
-                active: true,
-                drop_shared: false,
-                round_routed_accum: false,
-            }),
+            Ok((kernels, intermediate)) => {
+                let overlap = if shared.stream != stream {
+                    match overlap::SharedOverlap::new(gpu, stream, shared.stream) {
+                        Ok(o) => Some(o),
+                        Err(error) => {
+                            let mut shared = shared;
+                            let mut cleanup = None;
+                            retain_error(&mut cleanup, shared.release(gpu));
+                            for t in &mut tables {
+                                retain_error(&mut cleanup, t.release(gpu));
+                            }
+                            for c in &mut companions {
+                                retain_error(&mut cleanup, c.release(gpu));
+                            }
+                            if let Some(owner) = &mut owned_scratch {
+                                retain_error(&mut cleanup, owner.release(gpu));
+                            }
+                            return Err(match cleanup {
+                                None => error,
+                                Some(e) => error.context(format!("EXL3 MoE cleanup failed: {e:#}")),
+                            });
+                        }
+                    }
+                } else {
+                    None
+                };
+                Ok(Self {
+                    overlap,
+                    coop: if coop::coop_moe()
+                        || coop::coop_moe_v2()
+                        || coop::coop_moe_v3()
+                        || coop::coop_moe_v6()
+                        || coop::coop_moe_v7()
+                    {
+                        coop::CoopMoe::resolve(
+                            gpu,
+                            &tables,
+                            config.hidden_size,
+                            intermediate,
+                            capacity,
+                            config.num_experts_per_tok,
+                            policy,
+                        )
+                    } else {
+                        None
+                    },
+                    coop_fat: coop_fat::coop_moe_fat_multirow()
+                        .then(|| {
+                            coop_fat::CoopFat::resolve(
+                                gpu,
+                                &tables,
+                                config.hidden_size,
+                                intermediate,
+                                capacity,
+                                config.num_experts_per_tok,
+                                policy,
+                            )
+                        })
+                        .flatten(),
+                    layer: None,
+                    capture: None,
+                    shared,
+                    tables,
+                    companions,
+                    buffers,
+                    scratch: scratch
+                        .unwrap_or_else(|| owned_scratch.as_ref().expect("scratch owner").borrow()),
+                    owned_scratch,
+                    kernels,
+                    activation,
+                    precision: policy,
+                    hidden: config.hidden_size,
+                    intermediate,
+                    experts: config.num_experts,
+                    topk: config.num_experts_per_tok,
+                    normalize: config.norm_topk_prob,
+                    scale: config.routed_scaling_factor as f32,
+                    rank: config.tp_rank,
+                    world: config.tp_world_size,
+                    capacity,
+                    stream,
+                    active: true,
+                    drop_shared: false,
+                    round_routed_accum: false,
+                })
+            }
             Err(error) => {
                 let mut cleanup = None;
                 retain_error(&mut cleanup, shared.release(gpu));

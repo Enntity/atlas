@@ -119,13 +119,20 @@ pub fn load_glm5_exl3_ffn_with_scratch(
             .is_some_and(|n| n <= 65535),
         "native EXL3 routed capacity must fit CUDA slot grid"
     );
+    // ATLAS_EXL3_SHARED_OVERLAP=1: bind the shared expert to the side stream
+    // (see moe/overlap.rs); NativeMoeFfn forks/joins it around the routed path.
+    let shared_stream = if moe::shared_overlap() {
+        moe::overlap_side_stream(gpu, stream)?
+    } else {
+        stream
+    };
     let shared = load_dense(
         checkpoint,
         config,
         &format!("{p}.shared_experts"),
         gpu,
         capacity,
-        stream,
+        shared_stream,
         dense_activation,
         NativeDenseFfnRole::SharedExperts,
         select,
@@ -234,7 +241,11 @@ fn load_dense(
     role: NativeDenseFfnRole,
     select: crate::weight_loader::glm5::exl3_numerics::Exl3NumericsSelector,
 ) -> Result<NativeDenseFfn> {
-    if role == NativeDenseFfnRole::SharedExperts {
+    // ATLAS_EXL3_SHARED_PACKED=1 (numerics-changing, flagged): keep the shared
+    // expert as packed EXL3 (coop GEMM path) instead of the BF16 reconstruction
+    // the reference uses; reads ~3x fewer weight bytes per token.
+    let shared_packed = std::env::var("ATLAS_EXL3_SHARED_PACKED").as_deref() == Ok("1");
+    if role == NativeDenseFfnRole::SharedExperts && !shared_packed {
         let weights =
             super::shared::SharedBf16Weights::load(checkpoint, prefix, config, gpu, stream)?;
         return NativeDenseFfn::from_shared(gpu, weights, capacity, stream, activation);
@@ -251,13 +262,26 @@ fn load_dense(
                         spec.out_features(),
                     )?;
                     let plan = spec.shard_plan(&view)?;
+                    // Packed shared expert: gate|up use the fused [gate | up]
+                    // geometry (logical 2n, offsets 0 / n) so one cooperative
+                    // launch covers both; per-component launches compute the
+                    // same partition.
+                    let fused_gate_up = shared_packed
+                        && role == NativeDenseFfnRole::SharedExperts
+                        && name != "down_proj";
+                    let (logical, offset) = if fused_gate_up {
+                        let n = plan.out_features();
+                        (2 * n, if name == "up_proj" { n } else { 0 })
+                    } else {
+                        (plan.out_features(), 0)
+                    };
                     let policy = select(
                         plan.world(),
                         plan.in_features(),
                         plan.out_features(),
                         plan.bits(),
-                        plan.out_features(),
-                        0,
+                        logical,
+                        offset,
                     )?;
                     spark_runtime::weights::exl3::native::Exl3LinearWorkspace::preflight_numerics(
                         gpu,
@@ -266,7 +290,7 @@ fn load_dense(
                         capacity,
                         policy,
                     )?;
-                    if name == "up_proj" {
+                    if name == "up_proj" && !fused_gate_up {
                         ensure!(
                             policies.first() == Some(&policy),
                             "EXL3 shared gate/up workspace requires identical numerical profiles"
@@ -292,6 +316,17 @@ fn load_dense(
     let shards = shards
         .try_into()
         .map_err(|_| anyhow::anyhow!("EXL3 FFN projection count mismatch"))?;
+    if policies[0] != policies[1] {
+        // Packed shared expert with fused [gate | up] numerics (see above).
+        return NativeDenseFfn::new_shared_packed(
+            gpu,
+            shards,
+            capacity,
+            stream,
+            activation,
+            [policies[0], policies[1], policies[2]],
+        );
+    }
     NativeDenseFfn::new_with_numerics(
         gpu,
         shards,

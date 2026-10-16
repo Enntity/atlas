@@ -242,6 +242,11 @@ impl CommBackend for NcclBackend {
         unsafe { nccl::nccl_mem_free(ptr as *mut c_void) }
     }
 
+    fn set_flag_kernels(&self, store: u64, add_wait: u64) {
+        self.flag_store_kernel.store(store, Ordering::Relaxed);
+        self.add_wait_kernel.store(add_wait, Ordering::Relaxed);
+    }
+
     fn set_add_kernel(&self, handle: u64) {
         self.add_kernel.store(handle, Ordering::Relaxed);
         tracing::info!(

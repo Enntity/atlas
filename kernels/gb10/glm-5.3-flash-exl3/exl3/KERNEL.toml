@@ -16,13 +16,11 @@ extra_nvcc_flags = ["--fmad=false"]
 # Unlisted .cu files use their file stem as the module name.
 [modules]
 exl3_linear_mma = "exl3_linear_mma"
-exl3_linear_mma_opt = "exl3_linear_mma_opt"
+exl3_coop_gemm = "exl3_coop_gemm"
 exl3_mhc = "exl3_mhc"
 exl3_moe = "exl3_moe"
 exl3_moe_mma = "exl3_moe_mma"
-exl3_moe_mma_opt = "exl3_moe_mma_opt"
 exl3_moe_precision = "exl3_moe_precision"
-exl3_moe_precision_opt = "exl3_moe_precision_opt"
 exl3_shared = "exl3_shared"
 # Mappings carried from the DeepSeek-V4 NVFP4 manifest this target inherited.
 e2m1_branchless = "e2m1"
