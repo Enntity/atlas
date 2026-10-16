@@ -91,6 +91,9 @@ pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
 pub use probe::audit_namespace;
 
 #[cfg(all(test, feature = "cuda"))]
+#[path = "qwen4_exp/fp4local_gpu_tests.rs"]
+mod fp4local_gpu_tests;
+#[cfg(all(test, feature = "cuda"))]
 mod shard_layout;
 #[cfg(all(test, feature = "cuda"))]
 pub use shard_layout::ple_shard_layout;
