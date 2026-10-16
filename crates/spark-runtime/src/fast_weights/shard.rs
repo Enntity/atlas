@@ -149,11 +149,6 @@ pub(super) fn load_shard_fast(
                      expert TP cannot serve this checkpoint",
                     scale.name
                 );
-                anyhow::ensure!(
-                    !out.contains_key(&scale.name),
-                    "{} is in the checkpoint both plain and CSF-compressed",
-                    scale.name
-                );
                 let ptr = upload(gpu, &scale.name, &scale.bytes, offload_logged)?;
                 out.insert(
                     scale.name,
@@ -166,6 +161,7 @@ pub(super) fn load_shard_fast(
             }
             continue;
         }
+        csf.note_plain(&meta.name)?;
         // F16 shards: convert bytes to BF16 before upload (same length,
         // different bit layout — meta.dtype is already staged as BF16).
         let converted: Vec<u8>;

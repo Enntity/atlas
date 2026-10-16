@@ -373,6 +373,43 @@ fn decoded_scales_are_checked_against_their_weights() {
     }
 }
 
+/// Plain and CSF copies of one scale are refused in either order (the
+/// loaders used to check only CSF-after-plain, and only within one map).
+#[test]
+fn a_scale_both_plain_and_csf_is_refused_in_either_order() {
+    let g = &golden()[0];
+    let name = "e.gate_proj.weight_scale";
+    let n = g.exceptions.len() / 4;
+    let offer_pair = |a: &mut CsfAssembler| -> Result<()> {
+        a.offer(
+            &format!("{name}{CSF_FIXED_SUFFIX}"),
+            &g.fixed_shape,
+            &g.fixed,
+        )?;
+        a.offer(
+            &format!("{name}{CSF_EXCEPTIONS_SUFFIX}"),
+            &[n],
+            &g.exceptions,
+        )?;
+        Ok(())
+    };
+    // Plain first, then the pair.
+    let mut a = CsfAssembler::new();
+    a.note_plain(name).unwrap();
+    let e = format!("{:#}", offer_pair(&mut a).unwrap_err());
+    assert!(e.contains("both plain and CSF"), "{e}");
+    // The pair first, then plain.
+    let mut a = CsfAssembler::new();
+    offer_pair(&mut a).unwrap();
+    let e = format!("{:#}", a.note_plain(name).unwrap_err());
+    assert!(e.contains("both plain and CSF"), "{e}");
+    // Unrelated plain tensors are fine either side of a pair.
+    let mut a = CsfAssembler::new();
+    a.note_plain("e.up_proj.weight_scale").unwrap();
+    offer_pair(&mut a).unwrap();
+    a.note_plain("e.gate_proj.weight").unwrap();
+}
+
 #[test]
 fn csf_part_names() {
     assert_eq!(

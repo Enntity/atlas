@@ -36,7 +36,7 @@
 //! refused by the shape checks rather than guessed at. MXFP4 has no CSF form.
 
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Suffix of the fixed stream.
@@ -225,11 +225,17 @@ struct Part {
 /// parts here instead of uploading them, so the store only ever sees the
 /// decoded `weight_scale`, and the U32 exception stream (a dtype the store
 /// does not carry) never reaches it.
+///
+/// It is also the one place that knows which scales came from a pair, so the
+/// loaders report every plain tensor too ([`Self::note_plain`]): a scale both
+/// plain and CSF-compressed is refused whichever arrives first.
 #[derive(Default)]
 pub struct CsfAssembler {
     pending: HashMap<String, (Option<Part>, Option<Part>)>,
     /// Every scale decoded so far, with its `[rows, cols]`.
     decoded: HashMap<String, [usize; 2]>,
+    /// Plain `.weight_scale` tensors the loader uploaded as they were.
+    plain_scales: HashSet<String>,
     bytes_in: usize,
     bytes_out: usize,
     time: Duration,
@@ -267,6 +273,10 @@ impl CsfAssembler {
             bytes.len(),
             if elem == 1 { "U8" } else { "U32" },
         );
+        ensure!(
+            !self.plain_scales.contains(base),
+            "{base} is in the checkpoint both plain and CSF-compressed"
+        );
         let slot = self.pending.entry(base.to_string()).or_default();
         let held = match part {
             CsfPart::Fixed => &mut slot.0,
@@ -295,6 +305,20 @@ impl CsfAssembler {
             shape: vec![rows, cols],
             bytes: out,
         }))
+    }
+
+    /// Report a tensor the loader uploaded as it was (not a CSF half).
+    /// Refuses a scale the assembler already decoded from a pair, and
+    /// remembers a plain `weight_scale` so a later pair for it is refused.
+    pub fn note_plain(&mut self, name: &str) -> Result<()> {
+        ensure!(
+            !self.decoded.contains_key(name),
+            "{name} is in the checkpoint both plain and CSF-compressed"
+        );
+        if name.ends_with(".weight_scale") {
+            self.plain_scales.insert(name.to_string());
+        }
+        Ok(())
     }
 
     /// Refuse a load that left a half without its partner, or decoded a scale
