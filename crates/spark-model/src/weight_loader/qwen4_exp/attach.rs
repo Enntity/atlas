@@ -35,10 +35,8 @@ pub(super) fn attach_qsa(
         // Already device-resident in the store; the indexer holds the
         // pointers (the store keeps the weights alive for the model's
         // lifetime, same as every other layer weight).
-        // The indexer kernels read these as BF16. FP4-Local ships
-        // `index_qk_proj` MXFP8: unless the checkpoint loader has replaced
-        // it with its BF16 dequant, refuse rather than score keys with E4M3
-        // bytes read as BF16.
+        // The indexer kernels read these norms as BF16: refuse any other
+        // dtype rather than score keys with bytes of the wrong format.
         let up = |name: &str| -> Result<spark_runtime::gpu::DevicePtr> {
             let t = store
                 .get(&format!("{lp}.self_attn.indexer.{name}"))
