@@ -248,15 +248,20 @@ impl WeightLoader for FastSafetensorsLoader {
         let mut offload_logged = false;
         let mut csf = crate::weights::nvfp4_csf::CsfAssembler::new();
 
-        // Index entries grouped by the shard path they name, ONCE. The key is
-        // the index's own string (`tensors/model-00001-of-00021.safetensors`
-        // on FP4-Local, which keeps its shards in a subdirectory), matched
-        // against the shard's path relative to `model_dir`. Matching on the
-        // bare file name instead found nothing for such a checkpoint and
-        // silently loaded zero tensors from every shard.
-        let mut by_shard: HashMap<&str, Vec<String>> = HashMap::new();
+        // Index entries grouped by the shard path they name, ONCE, keyed by
+        // `model_dir.join(<index string>)` — the very expression
+        // `resolve_shards` built `shard_files` from, so the lookup below is
+        // exact whatever the index spells (FP4-Local's
+        // `tensors/model-00001-of-00021.safetensors` keeps its shards in a
+        // subdirectory). Matching the index string to the bare FILE NAME
+        // instead found nothing for such a checkpoint and silently loaded
+        // zero tensors from every shard.
+        let mut by_shard: HashMap<PathBuf, Vec<String>> = HashMap::new();
         for (t, s) in tensor_to_shard.iter().flatten() {
-            by_shard.entry(s.as_str()).or_default().push(t.clone());
+            by_shard
+                .entry(model_dir.join(s))
+                .or_default()
+                .push(t.clone());
         }
 
         for (i, shard_path) in shard_files.iter().enumerate() {
@@ -266,14 +271,9 @@ impl WeightLoader for FastSafetensorsLoader {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            let tensor_filter: Option<Vec<String>> = tensor_to_shard.as_ref().map(|_| {
-                let rel = shard_path
-                    .strip_prefix(model_dir)
-                    .ok()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or(shard_name);
-                by_shard.remove(rel).unwrap_or_default()
-            });
+            let tensor_filter: Option<Vec<String>> = tensor_to_shard
+                .as_ref()
+                .map(|_| by_shard.remove(shard_path).unwrap_or_default());
 
             tracing::info!(
                 "Fast-loading shard {}/{}: {}{}",
