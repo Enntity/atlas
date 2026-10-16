@@ -302,3 +302,34 @@ fn identity_of_the_real_table_fits() {
     assert!(16 + id.len() <= HEADER as usize);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A corrupt or hostile header length must be refused, never trusted: on the
+/// old `16 + len` check a length near `u64::MAX` wrapped past the range test
+/// in a release build and `vec![0; len]` aborted the process, so a bad packed
+/// file crash-looped the server instead of being rebuilt.
+#[test]
+fn a_corrupt_header_length_is_refused_and_rebuilt() {
+    let f = fixture("hdrlen", 10);
+    let spec = f.spec();
+    let cache = f.dir.join("derived");
+    let t = open_or_pack(&spec, &cache).unwrap();
+    let good = std::fs::read(&t.path).unwrap();
+    for len in [
+        u64::MAX,
+        u64::MAX - 15,
+        u64::MAX / 2,
+        HEADER,
+        HEADER - 15,
+    ] {
+        let mut bad = good.clone();
+        bad[8..16].copy_from_slice(&len.to_le_bytes());
+        std::fs::write(&t.path, &bad).unwrap();
+        let e = validate(&spec, &t.path).unwrap_err();
+        assert!(format!("{e:#}").contains("out of range"), "len {len}: {e:#}");
+        // `open_or_pack` treats it as stale and rebuilds a valid file.
+        let again = open_or_pack(&spec, &cache).unwrap();
+        assert_eq!(again.path, t.path);
+        validate(&spec, &t.path).unwrap();
+    }
+    std::fs::remove_dir_all(&f.dir).unwrap();
+}

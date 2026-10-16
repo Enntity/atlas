@@ -311,12 +311,11 @@ pub fn validate(spec: &PackSpec<'_>, path: &Path) -> Result<()> {
     let mut head = [0u8; 16];
     read_exact_at(&f, &mut head, 0).context("ngram pack: read header")?;
     ensure!(&head[..8] == MAGIC, "bad magic");
-    let len = u64::from_le_bytes(head[8..16].try_into().unwrap()) as usize;
-    ensure!(
-        16 + len <= HEADER as usize,
-        "header length {len} out of range"
-    );
-    let mut id = vec![0u8; len];
+    // Bounded on the u64, with no addition: `16 + len` wrapped for a length
+    // near u64::MAX in a release build, passed, and `vec![0; len]` aborted.
+    let len = u64::from_le_bytes(head[8..16].try_into().unwrap());
+    ensure!(len <= HEADER - 16, "header length {len} out of range");
+    let mut id = vec![0u8; len as usize];
     read_exact_at(&f, &mut id, 16).context("ngram pack: read identity")?;
     ensure!(
         id == spec.identity()?.as_bytes(),
