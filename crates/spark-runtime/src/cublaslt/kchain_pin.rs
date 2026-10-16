@@ -33,8 +33,8 @@ pub(super) const RESULT_BYTES: usize = 96;
 
 const CONFIG_ID: u32 = 0;
 const CONFIG_TILE_ID: u32 = 1;
-pub(super) const CONFIG_SPLITK_NUM: u32 = 2;
-pub(super) const CONFIG_REDUCTION_SCHEME: u32 = 3;
+const CONFIG_SPLITK_NUM: u32 = 2;
+const CONFIG_REDUCTION_SCHEME: u32 = 3;
 /// The CUTLASS sm80 tensor-op GEMM.
 const ALGO_SM80: i32 = 21;
 /// 256x128, then 128x256.
@@ -95,11 +95,26 @@ pub(super) fn describe(algo: *const c_void) -> String {
     )
 }
 
+/// Whether a kernel with these `CUBLASLT_ALGO_CONFIG_SPLITK_NUM` and
+/// `_REDUCTION_SCHEME` values runs K in order in one pass: split-K 0 or 1
+/// (no split) and reduction 0 (none). Anything else, an unreadable value
+/// or a negative split-K included (the heuristic's MXFP8 split-K kernels
+/// report -2), is not.
+pub(super) fn unsplit(split_k: Option<i32>, reduction: Option<i32>) -> bool {
+    matches!(split_k, Some(0 | 1)) && reduction == Some(0)
+}
+
+/// [`unsplit`] of `algo`'s own attributes.
+pub(super) fn in_order(algo: *const c_void) -> bool {
+    unsplit(
+        attr(algo, CONFIG_SPLITK_NUM),
+        attr(algo, CONFIG_REDUCTION_SCHEME),
+    )
+}
+
 /// Algo 21 without split-K or a reduction: the in-order k-chain.
 fn kchain(algo: *const c_void) -> bool {
-    attr(algo, CONFIG_ID) == Some(ALGO_SM80)
-        && attr(algo, CONFIG_SPLITK_NUM).is_some_and(|s| s <= 1)
-        && attr(algo, CONFIG_REDUCTION_SCHEME) == Some(0)
+    attr(algo, CONFIG_ID) == Some(ALGO_SM80) && in_order(algo)
 }
 
 /// How `gemm_bf16_pick` chooses among the heuristic's results.
@@ -209,4 +224,27 @@ fn pick(results: &[u8], found: usize) -> usize {
             (0..found).find(|&i| kchain(at(i)) && attr(at(i), CONFIG_TILE_ID) == Some(tile))
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsplit;
+
+    #[test]
+    fn only_split_k_zero_or_one_without_a_reduction_is_in_order() {
+        assert!(unsplit(Some(0), Some(0)));
+        assert!(unsplit(Some(1), Some(0)));
+        for (split_k, reduction) in [
+            (Some(-2), Some(0)),
+            (Some(-1), Some(0)),
+            (Some(-2), Some(2)),
+            (Some(2), Some(0)),
+            (Some(1), Some(1)),
+            (Some(1), None),
+            (None, Some(0)),
+            (Some(i32::MIN), Some(0)),
+        ] {
+            assert!(!unsplit(split_k, reduction), "{split_k:?} {reduction:?}");
+        }
+    }
 }

@@ -32,7 +32,7 @@
 use std::sync::Mutex;
 
 use super::fixed_algo::{Operands, Problem, cublasLtMatmulAlgoCheck};
-use super::kchain_pin::{CONFIG_REDUCTION_SCHEME, CONFIG_SPLITK_NUM, RESULT_BYTES, attr, describe};
+use super::kchain_pin::{RESULT_BYTES, attr, describe};
 use super::*;
 
 /// Heuristic results asked for per selection.
@@ -156,9 +156,7 @@ pub(super) fn candidates(ctx: &Ctx, p: &Problem, in_order_only: bool) -> Result<
 
 /// No split-K and no reduction scheme (see the module docs).
 pub(super) fn in_order(algo: &Algo) -> bool {
-    let a = algo.as_ptr() as *const c_void;
-    attr(a, CONFIG_SPLITK_NUM).is_some_and(|s| s <= 1)
-        && attr(a, CONFIG_REDUCTION_SCHEME) == Some(0)
+    super::kchain_pin::in_order(algo.as_ptr() as *const c_void)
 }
 
 /// `id=.. tile=.. splitK=.. reduction=.. stages=.. swizzle=.. custom=..
