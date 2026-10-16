@@ -41,8 +41,15 @@ pub(super) fn attach_qsa(
                 .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?
                 .ptr)
         };
+        // The projection through `dense_auto`, not the raw store pointer:
+        // FP4-Local ships it MXFP8, and the indexer kernels read BF16. On the
+        // BF16 releases `dense_auto` returns the store's own buffer, as before.
+        let qk_name = format!("{lp}.self_attn.indexer.index_qk_proj.weight");
+        let index_qk = crate::weight_map::dense_auto(store, &qk_name, gpu)
+            .with_context(|| format!("qwen4_exp layer {i}: indexer {qk_name}"))?
+            .weight;
         let qsa = crate::layers::qsa::QsaIndexer::new(
-            up("index_qk_proj.weight")?,
+            index_qk,
             up("q_layernorm.weight")?,
             up("k_layernorm.weight")?,
             config.index_n_heads,

@@ -78,12 +78,14 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 // per-layer attach helpers.
 mod attach;
 mod ffn;
+mod format;
 mod gdn_fp8;
 mod hc;
 mod mtp;
 mod ple;
 mod probe;
 
+pub use format::{Mxfp8Component, Mxfp8Keep, Qwen4ExpFormat};
 pub(crate) use gdn_fp8::GdnProjections;
 pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
 pub use probe::audit_namespace;
@@ -123,6 +125,12 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         let report = audit_namespace(store, config);
         report.log();
         report.ensure_loadable()?;
+        // Which release this is (FP8/NVFP4 vs FP4-Local), said once. The
+        // format needs no arm of its own — see `format.rs` — only the MXFP8
+        // source release after each layer below.
+        let format = Qwen4ExpFormat::detect(store, config)?;
+        format.log();
+        let mut mxfp8_released = 0usize;
 
         let h = config.hidden_size;
         let variant = crate::weight_map::detect_nvfp4_variant(store, config);
@@ -365,11 +373,31 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             if let Some(p) = ple_layer {
                 attach::attach_ple(&mut layer, i, p)?;
             }
+            // Every MXFP8 projection of this layer now has its exact BF16 copy
+            // inside the layer; the checkpoint bytes are dead unless a
+            // component is kept for an MXFP8-native path (`Mxfp8Keep`).
+            if format.mxfp8_backbone {
+                mxfp8_released += format::release_mxfp8_sources(
+                    store,
+                    gpu,
+                    &lp,
+                    format::layer_components(config.layer_types[i]),
+                    format.keep,
+                )?;
+            }
             layers.push(layer);
             hc_bytes += f2.saturating_sub(free_now(gpu));
         }
         if let Some(tr) = up_tr.take() {
             tr.finish()?;
+        }
+        if format.mxfp8_backbone {
+            tracing::info!(
+                "qwen4_exp: MXFP8 backbone loaded as exact BF16 copies; released {:.2} GB \
+                 of MXFP8 source bytes (kept resident: {:?})",
+                mxfp8_released as f64 / 1e9,
+                format.keep,
+            );
         }
         tracing::info!(
             "qwen4_exp layer construction: MoE {:.2} GB ({:.1} MB/layer), \
@@ -471,11 +499,35 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     ) -> Result<Option<crate::layers::VisionEncoder>> {
         // The ViT tower IS the Qwen3-VL family shape the qwen35 loader
         // already reads: 27 blocks under `model.visual.*`, patch 16,
-        // spatial-merge 2, plain BF16 weights (no quant tensors under
-        // `visual` in this checkpoint), empty deepstack list. The
-        // qwen3.8-flash-next kernel target ships its own vision_encoder.cu
-        // shadow, so kernels resolve per-target as usual.
-        crate::weight_loader::qwen35::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
+        // spatial-merge 2, empty deepstack list. The FP8/NVFP4 releases ship
+        // it plain BF16; FP4-Local ships the attention MXFP8 and the MLP and
+        // merger W4A16 NVFP4, which `vision_dense_auto` expands to the same
+        // BF16 the tower runs on. The qwen3.8-flash-next kernel target ships
+        // its own vision_encoder.cu shadow, so kernels resolve per-target.
+        let ve = crate::weight_loader::qwen35::Qwen35WeightLoader
+            .load_vision_encoder(store, config, gpu)?;
+        // FP4-Local's ViT attention is MXFP8: the encoder now holds its exact
+        // BF16 copies, so the sources go unless `Mxfp8Keep` says vision.
+        if let (Some(_), Some(v)) = (&ve, &config.vision) {
+            let keep = Mxfp8Keep::from_env()?;
+            let mut released = 0;
+            for b in 0..v.depth {
+                released += format::release_mxfp8_sources(
+                    store,
+                    gpu,
+                    &format!("model.visual.blocks.{b}"),
+                    &[Mxfp8Component::Vision],
+                    keep,
+                )?;
+            }
+            if released > 0 {
+                tracing::info!(
+                    "qwen4_exp ViT: released {:.1} MB of MXFP8 attention source bytes",
+                    released as f64 / 1e6
+                );
+            }
+        }
+        Ok(ve)
     }
 
     fn load_mtp_weights(
