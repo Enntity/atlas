@@ -1,0 +1,29 @@
+{%- set bos_token = '<|endoftext|>' -%}
+{%- set eos_token = '<|im_end|>' -%}
+{%- set think_start = '<think>' -%}
+{%- set think_end = '</think>' -%}
+{%- set tool_start = '<tool_call>' -%}
+{%- set tool_end = '</tool_call>' -%}
+{%- set answer_start = '<answer>' -%}
+{%- set answer_end = '</answer>' -%}
+
+{# MiMo-V2.6-Flash-RL chat template — derived from deepseek_v4.jinja with
+   MiMo-V2 family adjustments (think/answer tags, tool format). #}
+
+{{- bos_token -}}
+{%- for message in messages %}
+{%- if message['role'] == 'system' %}
+{{- message['content'] }}
+{%- elif message['role'] == 'user' %}
+{{- message['content'] }}
+{%- elif message['role'] == 'assistant' %}
+{%- if message['content'] is not none %}
+{{- message['content'] }}
+{%- endif %}
+{%- if message['tool_calls'] %}
+{%- for tool_call in message['tool_calls'] %}
+{{- tool_start + tool_call['function']['name'] + '\n' + tool_call['function']['arguments'] | tojson + tool_end }}
+{%- endfor %}
+{%- endif %}
+{%- endif %}
+{%- endfor %}

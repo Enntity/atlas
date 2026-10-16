@@ -88,7 +88,7 @@ def main():
     created, tunnel = [], None
     try:
         for r in (0, 1):
-            busy = remote(r, 'docker ps -q; nvidia-smi --query-compute-apps=pid --format=csv,noheader').strip()
+            busy = remote(r, "docker ps --format '{{.Names}}' | grep -vx atlas-dev-builder; nvidia-smi --query-compute-apps=pid --format=csv,noheader", check=False).strip()
             if busy:
                 raise RuntimeError(f'spark{r} not idle: {busy}')
         for r in (0, 1):

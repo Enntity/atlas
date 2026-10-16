@@ -110,3 +110,6 @@ Constraints (provided):
 - File-size cap ≤500 LoC/file enforced by `.github/workflows/file-size-cap.yml`; crate split into lib/codec/block/bench modules accordingly.
 
 - External repo evaluation (13 repos, §7 of plan) is planned, not executed; each must supply explicit codec-id / pipeline declaration (PCND); no repo's default pipeline will be adopted implicitly.
+Assumption added to assumptions.md:
+- Prefill divergence above 2051 tokens is indexer-order (not arithmetic) per exl3-indexer-localization-result-20261015.md (216 rows, 38 differ, 0 different set). Fix = sort before expansion, not kernel replace.
+- FlashKDA adapter (research/flash-kda-prefill) is candidate only, not default; requires ATLAS_KDA_FLASH_PREFILL=1 + lib path. No dependency added.

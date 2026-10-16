@@ -151,50 +151,22 @@ branch; README there). The trace database for the current stack is at
 `spark0:/home/colum/p0-nsys-traces-20261015/p0-p6-20261015/rank{0,1}/*.sqlite`
 (rank 1 on spark1). Query it by piping a Python script over ssh.
 
-**Review / audit (CPU)**
-- [ ] **R-a. Arena-skip safety audit.**
-  `ATLAS_DECODE_ARENA_FILL=skip` (`model/trait_impl/decode_a.rs`)
-  passed a NaN-poison run on single-sequence decode only. Audit every
-  reader of the arena buffers listed in
-  `spark-runtime/src/buffers/accessors.rs::fill_all` on these paths:
-  multi-sequence decode, prefix-cache hit, MTP/DFlash verify and the
-  per-seq MLA fallback. Find any read-before-write or
-  accumulate-into-zero assumption. Output: a file:line list of hazards,
-  or "none found", plus a proposed poison test matrix.
-- [ ] **R-b. Perf-branch merge review.** Review
-  `git diff sparkglm/installable-20260924...perf/decode-vllm-parity-20261015`
-  for:
-  - every new env flag being default-off;
-  - no behaviour change with all flags unset;
-  - duplicated kernel files kept identical (`kernels/gb10/common/*` vs
-    `kernels/gb10/glm-5.3-flash-exl3/exl3/*`);
-  - `unsafe`/aliasing in the new Rust (`moe/overlap.rs`, MULTIROW dispatch);
-  - tests for the new host logic.
+**Review / audit (CPU)** — R-a…R-f all completed 2026-10-16 in the code-only
+fan-out and folded onto `perf/decode-vllm-parity-20261015`. Per-item evidence
+and report paths are under "Completed — evidence pointers" below. One-line
+status:
 
-  Output: a findings list with severities.
-- [ ] **R-c. Shared-expert overlap robustness.** `ATLAS_EXL3_SHARED_OVERLAP`
-  creates the side stream's BLAS handle lazily and relies on an eager
-  warmup before graph capture. Review `glm5_exl3_ffn/moe/overlap.rs` and
-  the capture path. Check the fork/join events against graph capture
-  rules, workspace aliasing per stream, and behaviour when capture starts
-  cold. Output: findings and a minimal fix if needed.
-- [ ] **R-d. mHC split thresholds at verify sizes.** The split mHC paths
-  (`glm5_exl3_mhc.rs::pre_norm`) engage for rows < 8 (unrounded: 8 splits;
-  rounded: rows < 8). An F4 verify with k=7 has r=8 rows and falls back to
-  the single-block kernels. Determine the thresholds and fold-order
-  constraints for r=8..16. Specify (no code needed) which split counts keep
-  the per-row numerics independent of r. Output: a short design note.
-- [ ] **R-e. Shared-HEAD build break triage.** `a04d27ff`/`4692fb8d`/
-  `72f9a788` (another session) add `exl3_moe_mma_opt`,
-  `exl3_moe_precision_opt` and `exl3_persistent_opt`. These fail nvcc, and
-  `cooperative_mma()` defaults them on for the reference profile with no
-  shared-memory size set. Reproduce the nvcc errors in the builder
-  container and list the minimal fixes. Recommend keep, fix or revert, and
-  confirm which flag keeps them off. Output: a report; do not push to the
-  shared branch.
-- [ ] **R-f. Bench log truncation.** `bench_tp2.py` keeps only the
-  container log tail, so NCCL init/transport lines (`NCCL_DEBUG=INFO`)
-  are lost. Make it archive the full logs, gzipped if large. CPU-testable.
+- **R-a** hazard inventory over the 18 `fill_all` buffers and the four
+  decode/verify/prefill entry points, plus a poison-test matrix. No GPU run.
+- **R-b** perf-merge review → **NEEDS FIXES FIRST, then requalification**
+  (5 CI gates red vs the merge base; one `#[test]` for ~13.6k new host lines).
+- **R-c** **real bug found and fixed**: a lazy per-stream cuBLAS handle and
+  32 MB workspace allocated inside a live graph capture (status 901), which
+  silently disabled graphs for the run.
+- **R-d** the `rows < 8` premise in this list was half wrong — see the report.
+- **R-e** `*_opt` nvcc errors reproduced; recommendation **revert**.
+  Owner decision still pending (see Housekeeping).
+- **R-f** full container logs archived, gzipped above 1 MiB.
 
 **Investigate (GPU microbench / trace queries)**
 - [ ] **I-a. mHC finish "sqsum" stage, ~6.3 µs unexplained.**
@@ -339,23 +311,20 @@ branch; README there). The trace database for the current stack is at
     yet. Q4 is also the quality gate for the numerics-changing perf flags
     and the F4 lane.
 
-- [ ] **Q5 — Atlas run-to-run determinism hardening.** The 2026-10-15 audit
+- [x] **Q5 — Atlas run-to-run determinism hardening.** The 2026-10-15 audit
   found neither reference hazard in Atlas (fixed-order MoE combine, ordered
   indexer top-k, commutative TP `__hadd`, consistent argmax ties). The perf
   work keeps that property: every new kernel uses a fixed fold order and no
   atomics, and outputs are deterministic over 3 repeats.
-  - [ ] **Pin the cuBLASLt router GEMM.** `crates/spark-runtime/src/cublaslt.rs:216-338`
-    runs `cublasLtMatmulAlgoGetHeuristic` on every call and takes the top
-    result with no reduction-scheme mask. The router output
-    (M ∈ {1..5, 128} × N=288 × K=4096) feeds top-k. Restrict the
-    preference to a deterministic reduction, cache the chosen algorithm per
-    shape, log it at first use, and add a repeat-bitwise test. Confirm the
-    mHC TF32 Lt callers (`hc_prefill.rs:81`, `glm_hc_prewarm.rs:209`) use
-    the same stream.
-  - [ ] **Fail closed on the TP all-reduce fallback.**
-    `model/impl_a1.rs:616-620` only warns when the `bf16_add_inplace`
-    lookup fails, then routes TP sums to an unpinned `ncclAllReduce`. Make
-    it a hard startup error for GLM-5.3 EXL3.
+  Both sub-items landed 2026-10-16 and are folded onto the perf branch
+  (see "Completed — evidence pointers"): the cuBLASLt router GEMM is pinned
+  per shape with the deterministic-reduction restriction behind the new
+  default-off `ATLAS_CUBLASLT_DETERMINISTIC_REDUCTION`, and the missing
+  `bf16_add_inplace` now fails GLM-5.3 EXL3 startup instead of warn-and-
+  continue. Still owed (GPU): the router repeat-bitwise proof, `#[ignore]`d,
+  to be run on a Spark under `flock /tmp/atlas-bench.lock`; and confirming the
+  mHC TF32 Lt callers pass the same stream (`glm_hc_prewarm.rs:209`,
+  `hc_prefill.rs:81`), which no fan-out lane could verify without a device.
 
 ### P — measure and optimize the native EXL3 path
 
@@ -526,8 +495,13 @@ in `q2-codepath-audit-20261012/comparison-report.md` §5, as corrected in
 - [ ] **Shared branch HEAD does not build.** Another session's `a04d27ff`,
   `4692fb8d` and `72f9a788` add `*_opt` kernels that fail nvcc, and
   `cooperative_mma()` defaults them on for the reference profile. The perf
-  branch reverts `a04d27ff` (`6a5110c2`). See follow-up R-e. Owner decision
-  needed before anyone builds the shared HEAD with `--no-cache`.
+  branch reverts `a04d27ff` (`6a5110c2`). R-e triaged this 2026-10-16
+  ([report](docs/design/re-opt-kernel-build-triage-20261016.md)): the three
+  modules fail nvcc with 8–38 errors each, a fourth (`exl3_linear_mma_opt`)
+  fails too, and `collect_cu_files()` compiles every `.cu` under
+  `kernels/gb10/common/` so no `KERNEL.toml` gate contains it. Recommendation:
+  **revert** — keep the perf-branch `6a5110c2` state. The owner decision is
+  STILL PENDING; do not build the shared HEAD with `--no-cache` until then.
 - [ ] **Spark disk cleanup, part 2 (paused for the operator).** Containers,
   superseded images and the build cache were removed 2026-10-15, with
   inspect data archived to `spark-cleanup-20261015/`. Not done:
@@ -539,11 +513,22 @@ in `q2-codepath-audit-20261012/comparison-report.md` §5, as corrected in
   Keep `gate-q2diag-20261011` (it carries the reference overlay),
   `~/.cache`, `glm53-kit-worker-home`, `spark-glm53`, `mindreader` and
   `/tmp`. Spark0 was at ~18 GB free.
-- [ ] Repo-health (unrelated to M1): `cargo fmt --check` under both the
-  pinned 1.93.1 and current stable rustfmt flags ~180 committed files.
-  Current-stable clippy errors sit in `cublaslt/grouped.rs`,
-  `weights/appended_skip_tests.rs` and `weights/exl3/dense_concat_tests.rs`.
-  `typos` shows 56 pre-existing findings. This needs its own cleanup PR.
+- [ ] Repo-health (unrelated to M1): the `typos` half is DONE — the fan-out
+  found 14 findings (not 56), all genuine misspellings in the two
+  byte-identical vendored `exllamav3_gemm_inner.cuh` copies, and fixed them
+  (`typos` exit 0; no `_typos.toml` exclusion needed). The three clippy files
+  named here were already repaired by ancestors `012ef692` and `99a38f28` —
+  `grouped.rs` carries `is_multiple_of(2)`, `appended_skip_tests.rs` carries
+  `std::slice::from_ref(&path)`, `dense_concat_tests.rs` carries a deliberate
+  `#[allow(clippy::single_range_in_vec_init)]`.
+  What is left is the **fmt drift**, which the operator explicitly excluded
+  from this fan-out (clippy+typos only): 13 `Diff in` sites in 8 files, all in
+  code the perf branch added (`atlas-kernels/build.rs:500`,
+  `spark-comm/src/nccl_backend.rs:455,474,481,490,550`,
+  `glm5_exl3_mhc.rs:237`, `glm_kda/reference_policy.rs:137`,
+  `attention_forward_mla_sparse.rs:107`, `decode_a.rs:498`,
+  `accessors.rs:363`, `exl3/native.rs:317,371`). `cargo fmt --all` is
+  mechanical and blocks CI (R-b blocker B1); it still needs its own PR.
 
 ## Completed — evidence pointers
 
@@ -638,6 +623,56 @@ continue.md). Do not delete these paths.
 - KV plan docs committed (`2a3b995b`).
 - GPU-iteration tooling (`image_cycle.py`, `g8g9_binding.py`, probe
   package).
+
+**Code-only fan-out, 2026-10-16** — nine isolated worktrees off
+`perf/decode-vllm-parity-20261015` @ `794e9400`, all folded onto the perf
+branch (`f8ecdfb4`…`6d4ab509`). Nothing pushed; nothing committed to the
+shared branch. Commands, run rules and the no-GPU constraint are in
+continue.md §0.
+- **Q5a — cuBLASLt router pin.** `crates/spark-runtime/src/cublaslt.rs`
+  (497 LoC) + new `cublaslt/router_pin_tests.rs`: per
+  `(shape, trans, dtype, compute)` pin table that runs the heuristic once and
+  logs it once, and the deterministic-reduction restriction behind the new
+  default-off `ATLAS_CUBLASLT_DETERMINISTIC_REDUCTION` (PCND: the restriction
+  can change the chosen algorithm, so it cannot be default-on). 5 CPU tests
+  pass on the folded branch; the repeat-bitwise proof is `#[ignore]`d and owed
+  on a Spark under the bench lock.
+- **Q5b — TP all-reduce fail-closed.** `model/impl_a1.rs` +
+  `impl_a1_tp_failclosed_tests.rs`: the missing `bf16_add_inplace` now fails
+  GLM-5.3 EXL3 startup instead of warn-and-continue through an unpinned
+  `ncclAllReduce`. 5 CPU tests pass.
+- **R-c — shared-expert overlap: a real bug, found and fixed**
+  (`glm5_exl3_ffn/moe/overlap.rs`, `e1e9487c`). The side stream's cuBLAS
+  handle and its 32 MB workspace were created lazily, and the fork event is
+  recorded on the capturing stream, so the allocation landed inside a live
+  capture → status 901 → `suppress_graphs` set permanently, i.e. graphs
+  silently off for the rest of the run. `prime_side_stream_blas()` now forces
+  both outside capture before the stream is published. 2 tests pass.
+- **R-f — bench log archive** (`bench_tp2.py` +
+  `test_bench_log_archive.py`): full container stdout/stderr archived as
+  `container-r{rank}.full.log`, gzipped above 1 MiB, recorded in `meta.json`.
+  Pure addition — the existing `--tail 400` output and everything already
+  reported are unchanged. 4 tests pass.
+- **repo-health.** All 14 `typos` findings fixed (`halfs`→`halves`,
+  `interm`→`interim`); the byte-identical `.cuh` pair stays byte-identical.
+  `typos` is exit 0. The three clippy files named in Housekeeping were already
+  repaired by ancestors `012ef692`/`99a38f28` — see the Housekeeping update.
+- **Reports.** R-a
+  [arena-skip hazard audit](docs/design/ra-arena-skip-hazard-audit-20261016.md);
+  R-b [perf-merge review](docs/design/rb-perf-merge-review-20261016.md) —
+  verdict **NEEDS FIXES FIRST, then requalification**;
+  R-d [mHC split thresholds](docs/design/rd-mhc-split-thresholds-verify-20261016.md)
+  — the `rows < 8` premise above was half wrong (the unrounded split pair runs
+  at every `rows` in 1..16; only the rounded layer-0 path is gated);
+  R-e [`*_opt` triage](docs/design/re-opt-kernel-build-triage-20261016.md) —
+  recommendation **revert**, owner decision pending.
+- **Mainline compile break found while folding.**
+  `sparkglm/installable-20260924` does not compile:
+  `atlas-core/src/load_progress.rs` (commit `7035710f`) calls `thread::sleep`
+  without importing `thread` and derives `Default` on a struct holding
+  `Instant`. Two-line fix committed as `6427bf6a` on branch
+  `fix/atlas-core-loadprogress-compile`, deliberately NOT folded onto the perf
+  branch. **Owner decision needed.**
 
 ## KV column-codec experiment — follow-ups (2026-10-13)
 

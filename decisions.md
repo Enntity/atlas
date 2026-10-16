@@ -561,3 +561,86 @@ selection and no discarding of reference rows: these still hold under v2.
 - D6 2026-08-13 load-progress logging: shared `atlas-core/src/load_progress.rs` (timer thread, `update()`, `tracing::info!`), env `ATLAS_LOAD_LOG_INTERVAL_SECS`, wired in server `serve_load.rs`, model `factory/build.rs`, storage `expert_pack.rs`. Reason: user requested info-level load-progress logging configurable per 5s; shared helper avoids duplication across 3 load paths. Status: done; deepest per-loader loop call-sites still need `update()` for file-level precision.
 
 D1 2026-10-15 done (config verified drowzeys=base, mimo_v2, 48-layer 9/39 fused_qkv). D2 2026-10-15 done (B=new loader mimo_v2.rs). D3 2026-10-15 deferred text-only. D4 2026-10-15 done (slug mimo-v2.6-flash-rl). D5 2026-10-15 partial (MoE reuse documented, attention kernel deferred).
+
+## 2026-10-16 prefill/MoE group — capture-diagnose then optimize (user ask)
+- Source ref: continue.md §9 (prefill ~18–19 tok/s, 128-token chunks, unoptimized); todo.md P (P2 grouping done; M2 padding / TTFT open).
+- Capture evidence base (user-selected): prefref/indexer snapshots from atlas-perf (`exl3-indexer-localization-result-20261015.md`; `research/flash-kda-prefill/`).
+- Component chosen: prefill / MoE grouping (`forward_prefill.rs`; `ep_prefill.rs`).
+- vLLM contract (`exl3-vllm-reference-contract.md` rev 2026-10-12, Luna subagent + parent) defines SM120 prefill as packed-cache, `fp8_ds_mla`, no dense-prefill bypass, head `pad=False`. Capture divergence localized below 2051 tokens removed; divergence above is indexer order (same pool set, permuted), not membership — so correctness fix = deterministic sort before expansion, not arithmetic change.
+- Optimization path (lazy / minimal): (a) sort selected pool IDs before sparse-MLA expansion to remove order-sensitive divergence; (b) close M2 padding + short-prefill (<8 tokens) fallbacks per todo P open items; (c) evaluate FlashKDA adapter (`research/flash-kda-prefill/`, 3.38–3.62x on H32/D128 2048–4100) only after (a) verified — no new runtime dependency by default.
+- No sources edited in this turn; only analysis + decision record (per ponytail / minimal-edit rule).
+
+## 2026-10-16 implementation — (A) indexer sort (commit 92d82a49)
+- Branch: followup/prefill-moe-group (worktree ../atlas-prefill-moe); parent perf/decode-vllm-parity-20261015 @ 794e9400.
+- Edit: crates/spark-model/src/layers/ops/glm_indexer_dynamic.rs (marker at topk_expand_dynamic → before sparse accumulation); docs/prefill-idx-sort-verify.md (protocol).
+- Capture-verify defined: label prefill-idx-sort-<n>, bench-lock flock /tmp/atlas-bench.lock, compare index buffer byte-id across 3 pairs x 2 ranks @ 2,052-token row; acceptance 0 diff.
+- No speed claim (measurement-discipline: ≥3 same-binary repeats required). No device-sort primitive yet — marker only; actual sort (thrust/gpu.sort) deferred to verification pass.
+- Not edited: shared perf branch; not committed to sparkglm/installable-20260924; not run on GPU (bench-lock not acquired this turn — needs scheduling with other agent).
+
+## 2026-10-16 verification attempt (commit 46393041) — NOT COMPLETE
+- Sort implemented (glm_sort_pool_indices). Before/after protocol defined (prefill-idx-sort-01/02/03).
+- GPU runs: BLOCKED — spark0 unreachable (ssh fail); bench-lock /tmp/atlas-bench.lock held by remote process; local host has no CUDA/nvcc.
+- Workload stop (serve_perf.py): ATTEMPTED — failed (host unreachable).
+- No fabricated results. Actual 3-repeat before/after comparison requires Spark execution under bench-lock; commands recorded in docs/prefill-idx-sort-verify-attempt.md.
+- Next: operator/agent with Spark access runs the 3 repeats; if pass, merge 46393041; if fail, revisit attribution (fused MoE / indexer per HSL result).
+
+## 2026-10-16 local cargo target cleanup (minor, operational)
+- Decision: removed `target/` for nominator and the five `atlas-pi-*` qualification worktrees (14.0 GB). Rule applied: delete only caches with no file written in >14 days. `atlas-perf/target` was explicitly protected — the 2026-10-16 fan-out agents compile into it. `atlas/target` (79 G), `atlas-f4/target`, `atlas-port/target`, `aibb`, `arc-dashboard` and `~/.cargo/registry` were left in place.
+- Reason: root fs was at 97% (35 G free), which blocks image builds and dev builds. Operator chose "stop here" rather than remove the 79 G main-repo cache, because `atlas-prefill-moe` has no target of its own and the live prefill agent is the likely user of it.
+- Reference: disk 35 G → 94 G free (97% → 90%). Status: done.
+
+## 2026-10-16 code-only fan-out, nine lanes (major)
+- Decision: fan out nine code-only lanes on isolated worktrees off `perf/decode-vllm-parity-20261015` @ `794e9400` (Q5a, Q5b, R-a…R-f, R-e, repo-health), each with its own branch and strict file ownership, then fold each onto the perf branch. Prefill/MoE/indexer excluded (another agent owns it). No GPU, no bench lock, nothing pushed, nothing on the shared branch.
+- Reason: operator asked to fan out; disk at 97% ruled out per-agent target copies, so all cargo builds shared `atlas-perf/target` (serialized on cargo's lock). Nine writers on one tree would be unsafe, so "same branch" was satisfied by one integration line (`perf/decode-vllm-parity-20261015`) with per-item branches merged by a single writer.
+- Landed: Q5a cublasLt router pin (`cublaslt.rs` 497 LoC + `router_pin_tests.rs`, 5 CPU tests), Q5b TP all-reduce fail-closed (`impl_a1.rs` + 5 tests), R-c overlap capture bug fixed (`e1e9487c`, lazy per-stream cuBLAS handle + 32 MB workspace allocated inside a live graph capture → status 901 → graphs silently off), R-f bench log archive (4 tests), repo-health typos (14 findings), and four reports (R-a, R-b, R-d, R-e).
+- Owed (GPU): router repeat-bitwise proof, R-c capture-propagation proof, R-a poison-test matrix runs, R-b's requalification of the perf→shared merge.
+- Reference: perf branch folds `f8ecdfb4`…`6d4ab509`; reports in `docs/design/{ra,rd,rb,re}-*20261016.md`, `docs/design/rc-overlap-robustness-20261016.md`. Status: folded; verification per item on the folded branch.
+
+## 2026-10-16 supervisor decisions for R-b (minor)
+- Decision 1 (`.licenserc.yaml` / `_typos.toml` for the vendored MIT exllamav3 tree): `.licenserc.yaml` is supervisor-owned and lands separately on the **perf line only** — the 12 `exllamav3_*.cuh` files do not exist on `sparkglm/installable-20260924`, so a mainline paths-ignore would be dead config. `_typos.toml` is owned by the repo-health lane; all 14 findings were real misspellings, so no exclusion was needed. Do NOT restamp the MIT headers.
+- Decision 2 (`ATLAS_EXL3_COOP_MOE_MULTIROW`): **C now** — keep default-off and add a `warn_once` ("unqualified in-model; speculative verify only"), with no in-model bit-identity measurement at merge time. **A owed** — confine the dispatch to verify rows, owned by the perf/F4 lane, because it is a behaviour change in a 990-LoC over-cap file needing a one-variable A/B with ≥3 repeats under `flock /tmp/atlas-bench.lock` (Sparks locked by a live server). B was rejected: it asserts an unmeasured path is fine.
+- Reason: R-b asked for two decisions outside its read-only ownership; both root-caused to pre-existing perf-line CI breakage rather than fan-out work.
+- Reference: `docs/design/rb-perf-merge-review-20261016.md` §9.2–§9.4. Status: recorded.
+
+## 2026-10-16 prefill: one kernel is 93.8% — target it, not the rest
+- Measured (p13trace2, ab_full flags, 1024-tok prefill, rank 0): `exl3_moe_mul1_matmul_precision_mma_split` 40.845 s / 93.8%; all other kernels sum to 2.6 s. Total GPU 43.44 s.
+- Baseline prefill rate (3 repeats, unprofiled, p13base): 761 tok -> 42.6/42.8/42.7 s; 108 tok -> 6.07 s => **17.8 tok/s**.
+- Dense packed linears already run the vendored coop GEMM (16-row M passes, `dq8` decode); `exl3_mul1_matmul_mma` did not execute. So the audit's dense M-tile and native-decode proposals are moot for prefill; keep them only as decode-path notes.
+- Decision: implement grouped multi-row routed-MoE for prefill (per-group thin/fat numerics, M-tile chunking, vendored inner with round_partial=false for fat) behind default-off `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW`. Expected ~8-14x on 93.8% of prefill.
+- Evidence: `prefill-investigation-20261016.md`, `p13-kernel-audit-exl3.md` (subagent dc8bd541), `p13trace2-20261016/.../nsys-stats.txt`.
+- Delegation: worker subagent on branch `followup/p13-fat-moe-multirow`; bit-identity gated; parent runs the model-level A/B.
+
+## 2026-10-16 prefill — VALIDATED: grouped fat-MoE multirow, 12.4x, bit-identical (major)
+- Commit `b52aef80` on `followup/p13-fat-moe-multirow`; flag `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1` (default off).
+- Same binary `spark.p13fat` (sha256 2287583360...c32e378), both nodes, bench lock, 3 repeats/workload.
+- 761-token prompt: 42.25-42.72 s (flag off) -> **3.427/3.410/3.422 s** (flag on) = **12.4x**.
+  108-token prompt: 6.07 s -> **0.541/0.637/0.540 s** = 11.2x. Prefill **17.8 -> 222 tok/s**.
+- `output_sha256` identical between flag-off and flag-on (`1c4328172e81`, `80b1eb5fadf8`) => bit-exact.
+- Engagement: flag-off logs the `fat (prefill) routed launch` fallback; flag-on logs none.
+- Ran under the 93.8%-of-prefill measurement in `prefill-investigation-20261016.md`; the target kernel
+  was `exl3_moe_mul1_matmul_precision_mma_split` (40.85 s of a 43.44 s prefill trace).
+- Next (follow-ups, not done): decide whether to default the flag on (needs the usual default-flip
+  neutrality proof on a fresh image); re-trace the new prefill to find the next bottleneck; fix the
+  latent `ATLAS_EXL3_COOP_MOE_MULTIROW` lock-buffer under-allocation noted by the worker.
+
+## 2026-10-16 prefill — final: 42.71 s -> 2.72 s (15.7x), bit-identical (major)
+- Kernel change `b52aef80` (`ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1`): 42.72 -> 3.42 s (12.4x),
+  hashes unchanged.
+- Serve-flag change (`--max-prefill-tokens 128 -> 512`, descriptor profile): 3.42 -> **2.72 s**
+  (1.26x). Combined **15.7x**, 17.8 -> **279 tok/s** on a 761-token prompt. Median of 3 repeats
+  each; all runs same binary `spark.p13fat` (sha256 2287583360...c32e378).
+- `--max-prefill-tokens 4096` crashes with `EP peer lost` (only 6.05 GB free after layer
+  construction): 512 is the ceiling under `--gpu-memory-utilization 0.84`. Raising it needs a
+  prefill-scratch memory plan.
+- Correctness: `output_sha256` equal flag-off vs flag-on, so both changes are speed-only.
+- Caveat recorded: the first chunk A/B was void (ab_full.sh resolves its repo root from `$0`, so it
+  used the fatmoe worktree's unpatched bench_tp2.py and kept chunk 128 in every arm); fixed and re-run.
+- Owed: same-hardware vLLM prefill measurement (`glm53-exl3-head`/`-worker`, env
+  `MAX_NUM_BATCHED_TOKENS=7168`); default-flip proof for the kernel flag; dense `TILESIZE_M>16`
+  (audit P1a) now that the MoE side is fixed.
+
+## 2026-10-16 prefill — long-prompt A/B and a correction (major)
+- Correction to the entry above: `--max-prefill-tokens 512` is **not** speed-only. Its output hash differs from chunk 128 (`07355bd7f0ef` vs `1c4328172e81` on the 761-token prompt; `e779a96788f1` vs `671ef63c142a` at 2,943 tokens). Chunk size changes per-expert row counts per launch, and so the thin/fat profile split. Treat it as a numerics-changing serve setting (label, qualify).
+- The kernel flag is confirmed at ~3k tokens. Same binary `spark.p13fat`, 3 repeats per arm, chunk 128: 2,943-token prompt 165.80 s → **13.79 s (12.0×)**, 761-token control 42.20 s → 3.46 s (12.2×). Hashes are identical across arms, so the flag is bit-exact. Engagement is confirmed from logs, and the server-side TTFT agrees with the client timer.
+- Chunk sweep, flag on, 2,943 tokens: 128 → 13.79 s, 256 → 11.76 s, 512 → 10.68 s, each with a different hash.
+- Evidence: `perf-ab-20261015/p14L-{off,on}-*`, `p14Lchunk{256,512}-*`; write-up `docs/design/p14-prefill-long-ab-20261016.md` on `followup/p13-fat-moe-multirow` @ `a27d0fb8`.

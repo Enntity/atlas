@@ -141,7 +141,7 @@
       "prompt_class": "prose",
       "approx_input_tokens": 1024,
       "max_tokens": 16,
-      "repeats": 1,
+      "repeats": 3,
       "temperature": 0.0,
       "seed": 20261011
     }
