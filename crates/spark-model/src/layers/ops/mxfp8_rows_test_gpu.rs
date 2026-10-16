@@ -81,17 +81,6 @@ fn f(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-/// OCP E4M3 (no infinities; 0x7f / 0xff are NaN and never generated).
-fn e4m3(b: u8) -> f32 {
-    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
-    let (e, m) = (i32::from((b >> 3) & 0xf), f32::from(b & 7));
-    sign * if e == 0 {
-        m / 8.0 * 2f32.powi(-6)
-    } else {
-        (1.0 + m / 8.0) * 2f32.powi(e - 7)
-    }
-}
-
 /// A synthetic MXFP8 weight `(values, scales)` and its exact BF16 dequant.
 fn weight(rng: &mut Rng, n: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<u16>) {
     let values: Vec<u8> = (0..n * k)
@@ -107,25 +96,11 @@ fn weight(rng: &mut Rng, n: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<u16>) {
     (values, scales, bf16)
 }
 
-/// The exact BF16 dequant of MXFP8 `[n, k]`: E4M3 x 2^(s - 127), asserted
-/// to round nothing.
+/// The exact BF16 dequant of MXFP8 `[n, k]`: the loader's own host
+/// reference (`weight_map::mxfp8_to_bf16_host`), which refuses any scale
+/// outside the range where E4M3 x 2^(s - 127) is exact in BF16.
 fn dequant(values: &[u8], scales: &[u8], k: usize) -> Vec<u16> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| {
-            let s = scales[(i / k) * (k / MXFP8_BLOCK) + (i % k) / MXFP8_BLOCK];
-            let v = e4m3(b) * 2f32.powi(i32::from(s) - 127);
-            let bits = (v.to_bits() >> 16) as u16;
-            assert_eq!(
-                f(bits),
-                v,
-                "E4M3 {b:#x} x 2^{} is not exact in BF16",
-                i32::from(s) - 127
-            );
-            bits
-        })
-        .collect()
+    crate::weight_map::mxfp8_to_bf16_host(values, scales, values.len() / k, k).unwrap()
 }
 
 fn bytes(v: &[u16]) -> Vec<u8> {

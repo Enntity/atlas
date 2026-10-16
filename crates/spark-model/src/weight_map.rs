@@ -47,6 +47,9 @@ mod quantized;
 mod ssm_qwen35;
 #[path = "weight_map/ssm_qwen35_more.rs"]
 mod ssm_qwen35_more;
+#[cfg(test)]
+#[path = "weight_map/test_checkpoint.rs"]
+pub(crate) mod test_checkpoint;
 
 #[cfg(test)]
 #[path = "weight_map/tests.rs"]

@@ -16,7 +16,6 @@
 //! to run without it. PLE is off because its NVFP4 n-gram table is another
 //! agent's port; layer 1 is the PLE host.
 
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use atlas_core::config::LayerType;
@@ -32,31 +31,9 @@ const LAYERS: usize = 4;
 
 /// One tensor's raw bytes and shape, straight from the shard on disk.
 fn read(dir: &Path, name: &str) -> (Vec<u8>, Vec<usize>) {
-    let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json")).unwrap())
-            .unwrap();
-    let shard = dir.join(index["weight_map"][name].as_str().unwrap());
-    let f = std::fs::File::open(shard).unwrap();
-    let mut len = [0u8; 8];
-    f.read_exact_at(&mut len, 0).unwrap();
-    let n = u64::from_le_bytes(len) as usize;
-    let mut h = vec![0u8; n];
-    f.read_exact_at(&mut h, 8).unwrap();
-    let header: serde_json::Value = serde_json::from_slice(&h).unwrap();
-    let info = &header[name];
-    let (a, b) = (
-        info["data_offsets"][0].as_u64().unwrap() as usize,
-        info["data_offsets"][1].as_u64().unwrap() as usize,
-    );
-    let mut buf = vec![0u8; b - a];
-    f.read_exact_at(&mut buf, (8 + n + a) as u64).unwrap();
-    let shape = info["shape"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|d| d.as_u64().unwrap() as usize)
-        .collect();
-    (buf, shape)
+    let (_, shape, bytes) = crate::weight_map::test_checkpoint::read_checkpoint_tensor(dir, name)
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    (bytes, shape)
 }
 
 fn d2h(g: &dyn GpuBackend, p: spark_runtime::gpu::DevicePtr, n: usize) -> Vec<u8> {
@@ -204,10 +181,10 @@ fn fp4local_gpu_vision_and_mtp_load() {
     config.max_batch_tokens = 2048;
 
     // The W4A16 ViT linears expand to the host reference of the kernel's
-    // documented arithmetic: bf16_rne(e2m1 * f32(e4m3 * scale_2)).
-    const E2M1: [f32; 16] = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
-    ];
+    // documented arithmetic: bf16_rne(e2m1 * f32(e4m3 * scale_2)). Not
+    // `atlas_core::numeric::nvfp4_dequant`, which multiplies in the other
+    // order ((e2m1 * e4m3) * scale_2) and so can round differently.
+    use atlas_core::numeric::FP4_E2M1;
     for stem in [
         "model.visual.blocks.0.mlp.linear_fc2",
         "model.visual.merger.linear_fc1",
@@ -223,7 +200,7 @@ fn fp4local_gpu_vision_and_mtp_load() {
                 let byte = w[r * k / 2 + c / 2];
                 let nib = if c % 2 == 1 { byte >> 4 } else { byte & 15 };
                 let scale = atlas_core::numeric::fp8_e4m3_to_f32(s[r * k / 16 + c / 16]) * s2;
-                atlas_core::numeric::f32_to_bf16(E2M1[nib as usize] * scale).to_le_bytes()
+                atlas_core::numeric::f32_to_bf16(FP4_E2M1[nib as usize] * scale).to_le_bytes()
             })
             .collect();
         let got = crate::weight_map::dequant_nvfp4_to_bf16(&store, stem, n, k, g).unwrap();
