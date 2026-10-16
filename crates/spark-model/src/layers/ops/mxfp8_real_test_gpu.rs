@@ -13,7 +13,7 @@ use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
 use crate::weight_map::{RawMxfp8, mxfp8_cols_twin, mxfp8_rows_twin};
 
 /// `(E4M3 [n, k], UE8M0 [n, k/32], n, k)` of checkpoint tensor `prefix`.
-fn tensor(dir: &str, prefix: &str) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
+pub(crate) fn tensor(dir: &str, prefix: &str) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
     let read = |name: &str| read_checkpoint_tensor(std::path::Path::new(dir), name);
     let (wd, ws, w) = read(&format!("{prefix}.weight"))?;
     let (sd, ss, s) = read(&format!("{prefix}.weight_scale"))?;

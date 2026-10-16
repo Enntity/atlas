@@ -40,10 +40,10 @@ const SHAPES: [(&str, usize, usize); 9] = [
     ("shared down", 2560, 640),
 ];
 
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -51,7 +51,7 @@ impl Rng {
     }
 }
 
-fn backend() -> Result<&'static AtlasCudaBackend> {
+pub(crate) fn backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
     if GPU.get().is_none() {
         let gpu =
@@ -63,7 +63,7 @@ fn backend() -> Result<&'static AtlasCudaBackend> {
     Ok(gpu)
 }
 
-fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
+pub(crate) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     let p = gpu.alloc(bytes.len().max(1))?;
     gpu.copy_h2d(bytes, p)?;
     Ok(p)
@@ -331,4 +331,4 @@ fn bench(name: &str, values: &[u8], scales: &[u8], bf16: &[u16], n: usize, k: us
 }
 
 #[path = "mxfp8_real_test_gpu.rs"]
-mod real;
+pub(crate) mod real;

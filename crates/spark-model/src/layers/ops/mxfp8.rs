@@ -342,4 +342,4 @@ mod tiled_gpu_tests;
 
 #[cfg(test)]
 #[path = "mxfp8_rows_test_gpu.rs"]
-mod rows_gpu_tests;
+pub(crate) mod rows_gpu_tests;
