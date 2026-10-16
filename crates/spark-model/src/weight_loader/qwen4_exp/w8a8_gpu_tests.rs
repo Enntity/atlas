@@ -354,8 +354,10 @@ fn w8a8_gpu_gdn_layer_prefill_tracks_bf16() {
 }
 
 /// What the W8A8 install adds to a TP2 rank's load: tuning the four
-/// distinct per-rank shapes' row buckets to 16384 rows (the production
-/// `--max-prefill-tokens`). No checkpoint needed.
+/// distinct per-rank shapes to 16384 rows (the production
+/// `--max-prefill-tokens`): every row bucket of a shape swept on this
+/// cuBLASLt, one kernel for the others (`cublaslt::MX_SWEEP`). No checkpoint
+/// needed.
 #[test]
 #[ignore]
 fn w8a8_gpu_tp2_tuning_time() {
