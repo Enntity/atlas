@@ -349,6 +349,29 @@ fn main() -> Result<()> {
         3 * kda.mx_bytes(),
     );
 
+    // Informational: the cuBLASLt MXFP8 W8A8 GEMM (row-invariant, NVIDIA's
+    // MXFP8 recipe: activations to E4M3 per 32) at decode / verify heights.
+    match ops::MxW8a8::from_twin(g, &kda.mx[0], [4096, 4096], 32, 0) {
+        Ok(w8a8) => {
+            let q = g.alloc(32 * 4096)?;
+            let sf = g.alloc(ops::mx_lt_scale_bytes(32, 4096))?;
+            let act = ops::MxAct { q, sf };
+            for m in ROWS {
+                let us = time(g, reps, 1, &|_| {
+                    ops::mx_quant_rows(g, nk.mx_quant, x, act, 0..m, 4096, 0)?;
+                    w8a8.gemm(act, outs[0], m, 0)
+                })?;
+                line(
+                    "q MXFP8 W8A8 cuBLASLt (1 copy, warm)",
+                    m,
+                    us,
+                    kda.mx_bytes(),
+                );
+            }
+        }
+        Err(e) => println!("  (W8A8 arm skipped: {e:#})"),
+    }
+
     println!("== MLA q_a + kv_a, q_b, o (per rank, 11 layers)");
     for m in ROWS {
         let cq = q_a.mx.len().min(kv_a.mx.len());
