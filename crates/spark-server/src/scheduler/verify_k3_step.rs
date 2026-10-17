@@ -104,7 +104,9 @@ fn k3_record_outcome(
     }
 }
 
-/// A K=3 verdict's re-propose from `token`, at the request's own depth.
+/// A K=3 verdict's re-propose from `token`: a copy in place of the head
+/// (`ATLAS_QWEN_COPY_DRAFTS`, `copy_drafts::mtp`), else the head at the
+/// request's own depth.
 fn k3_propose(
     model: &dyn Model,
     a: &mut ActiveSeq,
@@ -112,6 +114,9 @@ fn k3_propose(
     token: u32,
     num_drafts: usize,
 ) {
+    if crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+        return;
+    }
     let _mtp_grammar_mask = mtp_grammar_mask_for(a);
     match model.run_mtp_propose_multi(
         token,
@@ -243,7 +248,9 @@ pub fn step_verify_k3(
     } else {
         2
     };
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 2, num_accepted);
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(2, num_accepted, num_drafts, sched.levers.depth());
     }
@@ -373,7 +380,7 @@ pub fn step_verify_k3(
             tracing::error!("save_hidden_for_mtp(2): {e:#}");
             return;
         }
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 2, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 2) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         let t_propose = Instant::now();
@@ -390,7 +397,7 @@ pub fn step_verify_k3(
     } else if num_accepted == 1 {
         a.seq.seq_len -= 1;
         a.seq.tokens.pop();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2 (STree-style in-place K=3 verify commit). Partial accept
@@ -433,7 +440,7 @@ pub fn step_verify_k3(
         a.seq.seq_len -= 2;
         a.seq.tokens.pop();
         a.seq.tokens.pop();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2 (STree-style in-place K=3 verify commit). Partial accept

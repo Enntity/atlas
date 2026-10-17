@@ -59,8 +59,13 @@
 //! Each request's `Done:` line is followed by a `COPY DRAFTS` line with its
 //! copy rounds, drafts and accepted drafts, of the prompt and of the reply.
 //! They count the verifies that settle through `verify_dflash_tail` (the
-//! per-sequence and GLM owner-batched paths); the single-GPU batched eager
-//! verify drops confidences, the drafter's as well, and books neither.
+//! per-sequence and GLM owner-batched paths) and, on the MTP lane, every
+//! MTP verify ([`mtp::settle`]); the single-GPU batched eager DFlash verify
+//! drops confidences, the drafter's as well, and books neither.
+//!
+//! The MTP lane (`ATLAS_QWEN_COPY_DRAFTS=1`, qwen4_exp's exact lane only)
+//! uses the same index, proposal and knobs in place of the MTP head's
+//! propose rather than over its drafts: see [`mtp`].
 //!
 //! Prior art: the policy (match length, latest occurrence with a full
 //! continuation, copy over the drafter's block, the reply-match and
@@ -80,6 +85,8 @@ use std::sync::OnceLock;
 use super::ActiveSeq;
 use super::dflash_conf_width::{COPY_CONF, COPY_REPLY_CONF, is_copy};
 use super::dflash_width::MAX_DRAFTS;
+
+pub(super) mod mtp;
 
 /// Positions indexed at most: the 512K context limit (a longer context
 /// copies from its first 512K positions).
@@ -140,6 +147,13 @@ fn settings() -> Option<&'static Settings> {
     static S: OnceLock<Option<Settings>> = OnceLock::new();
     S.get_or_init(|| Settings::parse(|name| std::env::var(name).ok()))
         .as_ref()
+}
+
+/// The knobs whichever lane reads them (the MTP lane is switched by its
+/// lever, [`mtp`]).
+fn knobs() -> &'static Settings {
+    static S: OnceLock<Settings> = OnceLock::new();
+    S.get_or_init(|| Settings::knobs(|name| std::env::var(name).ok()))
 }
 
 /// A request's context: the committed tokens, then the pending one.
@@ -337,6 +351,9 @@ pub(crate) struct CopyState {
     offered: usize,
     /// The last settled copy round kept fewer than all of its drafts.
     missed: bool,
+    /// The copy confidence of the drafts the running MTP verify carries,
+    /// `None` when the head drafted them ([`mtp::begin_verify`]).
+    verifying: Option<f32>,
     /// Copy rounds, drafts and accepted drafts: of the prompt, of the reply.
     rounds: [u64; 2],
     drafted: [u64; 2],
@@ -347,7 +364,18 @@ impl CopyState {
     /// The state a preempted request resumes with: the index and counters are
     /// host-side and its context is unchanged, so only the offer is renewed.
     pub(super) fn resumed(self) -> Self {
-        Self { offered: 0, ..self }
+        Self {
+            offered: 0,
+            verifying: None,
+            ..self
+        }
+    }
+
+    /// Copy rounds, drafts and accepted drafts (of the prompt, of the
+    /// reply), and whether the last round missed.
+    #[cfg(test)]
+    pub(super) fn tally(&self) -> ([u64; 2], [u64; 2], [u64; 2], bool) {
+        (self.rounds, self.drafted, self.accepted, self.missed)
     }
 }
 
