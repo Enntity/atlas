@@ -3,8 +3,8 @@
 //! GPU tests (`#[ignore]`; a GB10, cuBLASLt with MXFP8 and a kernel target
 //! with `mxfp8_act_quant`) of `cublaslt::fp8_gemm_act_weight_t_mx` at the
 //! FP4-Local prefill shapes of `cublaslt::MX_SWEEP` (TP2 rank 0's cut and
-//! TP1; real weights with `ATLAS_FP4L_CKPT`, else random codes at the
-//! checkpoint's scale range):
+//! TP1; real weights with `ATLAS_FP4L_CKPT`, and for the GLM shape
+//! `ATLAS_GLM_FP4L_CKPT`, else random codes at the checkpoint's scale range):
 //!
 //! - against an f64 host reference on sampled outputs;
 //! - every cuBLASLt candidate (the unmasked heuristic list and the
@@ -72,6 +72,9 @@ fn cut(label: &str) -> Option<Cut> {
         "tp2 qsa k, v" => (&[("self_attn.k_proj", &[(0, 256)])], None, 3),
         "tp1 qsa k, v" => (&[("self_attn.k_proj", &[(0, 512)])], None, 3),
         "tp2 qsa o" | "tp1 qsa o" => (&[], Some(("self_attn.o_proj", 0)), 3),
+        // GLM-5.3-Flash-FP4-Local KDA layer 0, rank 0's q rows (k, v and the
+        // o columns share the shape).
+        "tp2 glm kda q, k, v, o" => (&[("self_attn.q_proj", &[(0, 4096)])], None, 0),
         _ => return None,
     })
 }
@@ -116,9 +119,16 @@ fn every_swept_shape_has_a_checkpoint_cut() {
 }
 
 /// Row-major `(E4M3 [n, k], UE8M0 [n, k/32])` for `s`: the checkpoint's cut
-/// with `ATLAS_FP4L_CKPT`, else random codes at the checkpoint's scale range.
+/// with `ATLAS_FP4L_CKPT` (Qwen3.8-Flash-Next-FP4-Local; a `glm` label reads
+/// `ATLAS_GLM_FP4L_CKPT`, GLM-5.3-Flash-FP4-Local), else random codes at the
+/// checkpoint's scale range.
 pub(super) fn weights(s: &Shape, rng: &mut Rng) -> Result<(Vec<u8>, Vec<u8>)> {
-    let Ok(dir) = std::env::var("ATLAS_FP4L_CKPT") else {
+    let env = if s.label.contains("glm") {
+        "ATLAS_GLM_FP4L_CKPT"
+    } else {
+        "ATLAS_FP4L_CKPT"
+    };
+    let Ok(dir) = std::env::var(env) else {
         let w = (0..s.n * s.k)
             .map(|_| match rng.next() as u8 {
                 b @ (0x7f | 0xff) => b - 1,
