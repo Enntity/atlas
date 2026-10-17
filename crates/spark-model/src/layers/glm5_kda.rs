@@ -49,6 +49,14 @@ pub(crate) fn kda_side_proj_lt_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_SIDE_PROJ_LT").ok().as_deref() == Some("1"))
 }
 
+/// `ATLAS_GLM_KDA_CONV_PLANES=1`: prefill convolves the projection's q / k /
+/// v planes in place instead of first copying them into packed rows
+/// (`kda_pack_qkv`); the same bytes.
+fn kda_conv_planes_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_CONV_PLANES").ok().as_deref() == Some("1"))
+}
+
 fn verify_batched_conv_snapshot_enabled() -> bool {
     std::env::var("ATLAS_GLM_K5_BATCHED_CONV_SNAPSHOT")
         .ok()
