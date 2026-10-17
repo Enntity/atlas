@@ -4,9 +4,14 @@
 
 use super::*;
 
+// `isolated` re-runs `<parent module>::<name>` with `--exact`; these tests live
+// one module down, so their names carry the `identity::` segment.
+
 #[test]
 fn actual_worker_prefill_entries_preserve_request_identity_in_forward_context() {
-    if isolated("actual_worker_prefill_entries_preserve_request_identity_in_forward_context") {
+    if isolated(
+        "identity::actual_worker_prefill_entries_preserve_request_identity_in_forward_context",
+    ) {
         return;
     }
     for entry in [Entry::Full, Entry::Chunk, Entry::TwoPhase] {
@@ -23,7 +28,7 @@ fn actual_worker_prefill_entries_preserve_request_identity_in_forward_context() 
 /// identity on the slot and its layer forward sees it.
 #[test]
 fn actual_worker_identity_then_f0_keeps_identity_through_layer_forward() {
-    if isolated("actual_worker_identity_then_f0_keeps_identity_through_layer_forward") {
+    if isolated("identity::actual_worker_identity_then_f0_keeps_identity_through_layer_forward") {
         return;
     }
     for v2 in [false, true] {
