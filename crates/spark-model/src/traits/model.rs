@@ -787,6 +787,30 @@ pub trait Model: Send + Sync {
         true
     }
 
+    /// Packed multi-prompt prefill (`ATLAS_GLM_PACKED_PREFILL`): whether
+    /// `prompt` (for adapter `adapter_id`) may be packed with other new
+    /// prompts. Decided on rank 0 only; the worker follows the packing.
+    fn packed_prefill_admits(&self, _prompt: &[u32], _adapter_id: u64) -> bool {
+        false
+    }
+
+    /// `(rows, prompts)` one packed prefill may hold.
+    fn packed_prefill_capacity(&self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    /// Prefill every `prompts[i]` (a whole new prompt) into the fresh
+    /// `seqs[i]` in one traversal (EP-coherent). Returns each prompt's
+    /// last-row logits; the caller normalizes and samples as after a
+    /// single-chunk prefill.
+    fn prefill_packed(
+        &self,
+        _prompts: &[&[u32]],
+        _seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<DevicePtr>> {
+        bail!("prefill_packed: unsupported by this model")
+    }
+
     /// Whether a prefill chunk of `chunk_len` rows of `prompt` may carry
     /// `owners` DFlash verify owners of `rows` rows each after its own rows.
     fn can_fuse_glm_prefill_verify(

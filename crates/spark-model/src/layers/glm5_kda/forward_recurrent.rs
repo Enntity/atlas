@@ -49,7 +49,7 @@ impl Glm5KdaLayer {
     /// `g1`/`beta` and the q|k|v `input` (`ops::kda_conv_prefill`'s packed
     /// rows or planes; prefill or single-row decode).
     #[allow(clippy::too_many_arguments)]
-    fn sequence_recurrent_rows(
+    pub(super) fn sequence_recurrent_rows(
         &self,
         input: (DevicePtr, bool),
         convolved: DevicePtr,

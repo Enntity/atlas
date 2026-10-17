@@ -14,6 +14,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 pub mod glm_long_owner;
+pub mod glm_packed;
 mod prefill_pieces;
 pub mod ssm_batch;
 pub use prefill_pieces::{

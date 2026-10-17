@@ -50,6 +50,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
     }
 
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        total: usize,
+        owners: &mut [crate::layer::glm_packed::GlmPackedOwner<'_>],
+        cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_glm_packed_mla(total, owners, cache, ctx, stream)
+    }
+
     fn uses_local_mla_prefill(&self) -> bool {
         // GLM-5 prefill (`prefill_attention_paged_glm_dense`) absorbs Q and
         // reads the complete paged latent + index history, exactly as chunk 1+

@@ -120,6 +120,21 @@ impl TransformerModel {
         proc_count: usize,
         stream: u64,
     ) -> Result<()> {
+        self.try_dflash_prefill_capture_layer_at(seq, layer_idx, chunk_start, proc_count, 0, stream)
+    }
+
+    /// [`Self::try_dflash_prefill_capture_layer`] for a pass whose rows sit
+    /// at arena row `row_base` (a packed prefill's prompt,
+    /// `glm_packed_prefill`): the same capture plan, read `row_base` rows on.
+    pub(super) fn try_dflash_prefill_capture_layer_at(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        layer_idx: usize,
+        chunk_start: usize,
+        proc_count: usize,
+        row_base: usize,
+        stream: u64,
+    ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
             return Ok(());
         }
@@ -179,7 +194,7 @@ impl TransformerModel {
             && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, sp_row0)
         {
             self.dflash_capture_rows(
-                row,
+                row_base + row,
                 1,
                 own_row.offset(slot_idx * h * bf16),
                 n_capture * h * bf16,
@@ -191,7 +206,7 @@ impl TransformerModel {
         };
         dstate.note_capture(&plan);
         self.dflash_capture_rows(
-            plan.src_row(&pass),
+            row_base + plan.src_row(&pass),
             plan.rows(),
             acc_base.offset(plan.dst_slot() * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,
