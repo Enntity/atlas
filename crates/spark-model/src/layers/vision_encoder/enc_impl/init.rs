@@ -126,11 +126,20 @@ impl VisionEncoder {
         let out_rows =
             crate::vision_limits::window_rows(p_max, spatial_merge_size, max_chunk_tokens);
         let buf_out = gpu.alloc(out_rows * out_hidden_size * 2)?;
-        tracing::info!(
-            "Vision output window {out_rows} rows ({:.0} MiB) for prefill chunks of up to \
-             {max_chunk_tokens} tokens",
-            (out_rows * out_hidden_size * 2) as f64 / (1024.0 * 1024.0)
-        );
+        let window_mib = (out_rows * out_hidden_size * 2) as f64 / (1024.0 * 1024.0);
+        if window_mib > 256.0 {
+            // Linear in the chunk: a large --max-prefill-tokens or
+            // ATLAS_MAX_BATCH_TOKENS buys this much more per rank.
+            tracing::warn!(
+                "Vision output window {out_rows} rows ({window_mib:.0} MiB per rank) for prefill \
+                 chunks of up to {max_chunk_tokens} tokens; a smaller chunk shrinks it"
+            );
+        } else {
+            tracing::info!(
+                "Vision output window {out_rows} rows ({window_mib:.0} MiB) for prefill chunks of \
+                 up to {max_chunk_tokens} tokens"
+            );
+        }
         let buf_pos_resampled = gpu.alloc(p_max * hidden_size * 2)?;
         let buf_rope_cos = gpu.alloc(p_max * head_dim * 2)?;
         let buf_rope_sin = gpu.alloc(p_max * head_dim * 2)?;
