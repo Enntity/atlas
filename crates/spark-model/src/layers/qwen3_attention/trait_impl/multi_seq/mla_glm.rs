@@ -151,6 +151,10 @@ impl Qwen3AttentionLayer {
                 }
                 n => anyhow::bail!("GLM MLA multi-sequence projection requires N=2..=5, got {n}"),
             }
+        } else if self.mla_native_gemv(
+            c.fwd.gpu, dense, input, output, c.n as u32, n_out, k, c.stream,
+        )? {
+            Ok(())
         } else {
             let kernel = if c.n == 5 && self.dense_gemv_batch5_k.0 != 0 {
                 self.dense_gemv_batch5_k

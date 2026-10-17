@@ -10,6 +10,7 @@ pub(crate) use fp4l::release_expanded;
 mod kda_mx;
 mod kda_side_pack;
 mod layers;
+mod mla_native;
 mod mla_twins;
 pub(crate) mod retirement;
 mod tp;

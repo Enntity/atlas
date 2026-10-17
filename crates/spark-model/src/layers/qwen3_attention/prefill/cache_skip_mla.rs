@@ -46,6 +46,10 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_GLM_FP4L_MLA_FP8: the checkpoint's FP8 block twin (`mla_native`).
+        if self.mla_native_rows(ctx, weight, input, output, m, n, k, stream)? {
+            return Ok(());
+        }
         // A packed prefill (`glm_packed_scope`): the BF16 GEMM at every row
         // count, which is row-invariant there; none of the short-batch twins.
         if crate::layers::glm_packed_scope::active() && ctx.dispatch.cublas_gemm {
