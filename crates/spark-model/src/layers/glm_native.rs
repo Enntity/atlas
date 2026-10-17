@@ -18,7 +18,8 @@
 //!
 //! Each switch is inert on a checkpoint that does not ship its group in that
 //! format (logged once by the loader). Values: `1` / `true` on, anything
-//! else off, like the loader's other flags.
+//! else off, like the loader's other flags; a group's own switch, when set,
+//! overrides the umbrella either way.
 
 /// Which layer groups load their checkpoint format natively.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,22 +39,43 @@ impl NativePolicy {
     pub const KDA_DECODE: &'static str = "ATLAS_GLM_FP4L_KDA_MXFP8_DECODE";
     pub const KDA_W8A8: &'static str = "ATLAS_GLM_FP4L_KDA_W8A8_PREFILL";
 
-    /// The policy from `get` (an environment lookup).
+    /// The policy from `get` (an environment lookup): each group's own switch
+    /// when it is set (`1` / `true` on, any other value off), else the
+    /// umbrella, so `ATLAS_GLM_FP4L_NATIVE=1 ATLAS_GLM_FP4L_KDA_W8A8_PREFILL=0`
+    /// is every group but KDA's W8A8 prefill.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        let on = |name: &str| get(name).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let all = on(Self::UMBRELLA);
+        let set = |name: &str| get(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let all = set(Self::UMBRELLA).unwrap_or(false);
+        let group = |name: &str| set(name).unwrap_or(all);
         Self {
-            mla_fp8: all || on(Self::MLA),
-            shared_fp8: all || on(Self::SHARED),
-            dense_mxfp8: all || on(Self::DENSE),
-            kda_decode: all || on(Self::KDA_DECODE),
-            kda_w8a8: all || on(Self::KDA_W8A8),
+            mla_fp8: group(Self::MLA),
+            shared_fp8: group(Self::SHARED),
+            dense_mxfp8: group(Self::DENSE),
+            kda_decode: group(Self::KDA_DECODE),
+            kda_w8a8: group(Self::KDA_W8A8),
         }
     }
 
-    /// The policy as this process's environment sets it.
+    /// The policy as this process's environment sets it; the resolved set is
+    /// logged once when any group is on.
     pub fn from_env() -> Self {
-        Self::from_lookup(|name| std::env::var(name).ok())
+        let p = Self::from_lookup(|name| std::env::var(name).ok());
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        if p.bits() != 0 {
+            LOGGED.call_once(|| {
+                tracing::info!(
+                    "FP4-Local native formats: MLA FP8 block {}, shared FP8 block {}, dense MXFP8 {}, \
+                     KDA MXFP8 decode {}, KDA W8A8 prefill {}; FP8 block prefill {:?}",
+                    p.mla_fp8,
+                    p.shared_fp8,
+                    p.dense_mxfp8,
+                    p.kda_decode,
+                    p.kda_w8a8,
+                    crate::layers::ops::Fp8bPrefill::from_env()
+                )
+            });
+        }
+        p
     }
 
     /// The groups as one word, for the ranks' startup agreement.
@@ -95,6 +117,20 @@ mod tests {
         let all = policy(&[(NativePolicy::UMBRELLA, "1")]);
         assert_eq!(all.bits(), 0b11111);
         assert_eq!(policy(&[(NativePolicy::UMBRELLA, "TRUE")]), all);
+    }
+
+    #[test]
+    fn an_explicit_switch_overrides_the_umbrella() {
+        let p = policy(&[(NativePolicy::UMBRELLA, "1"), (NativePolicy::KDA_W8A8, "0")]);
+        assert_eq!(p.bits(), 0b01111);
+        assert!(!p.kda_w8a8 && p.kda_decode && p.mla_fp8);
+        // Any set value other than 1 / true is off, as for the other flags.
+        assert_eq!(
+            policy(&[(NativePolicy::UMBRELLA, "1"), (NativePolicy::MLA, "no")]).bits(),
+            0b11110
+        );
+        // Without the umbrella an explicit 0 is just off.
+        assert_eq!(policy(&[(NativePolicy::SHARED, "0")]).bits(), 0);
     }
 
     #[test]
