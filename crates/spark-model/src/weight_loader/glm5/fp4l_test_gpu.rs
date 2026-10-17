@@ -349,10 +349,10 @@ fn mla_layer_3_builds_on_both_tp2_ranks() -> Result<()> {
             released == want,
             "rank {rank}: released {released} of {want} bytes"
         );
-        ensure!(
-            !store.was_reclaimed(&a("kv_b_proj.weight")),
-            "BF16 kv_b released"
-        );
+        // kv_b is BF16 in both releases: load_tp shards it and reclaims its
+        // source itself (as on the NVFP4 release), so `released` above, which
+        // counts only release_expanded's bytes, is what proves the FP8 sweep
+        // left BF16 alone.
         eprintln!("rank {rank}: MLA layer 3 built, {released} FP8 source bytes released");
     }
     Ok(())
