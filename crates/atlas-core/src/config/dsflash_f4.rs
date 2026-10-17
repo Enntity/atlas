@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 /// F4 feature flags per model profile (README: Nemotron + DSpark, Qwen + MTP).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DsflashF4Contract {
     /// DSpark drafter enabled (checkpoint declares `dspark_block_size > 0`).
     #[serde(default)]
@@ -28,6 +28,21 @@ pub struct DsflashF4Contract {
     /// Whether to bind the drafter to the same KV pool (true = shared).
     #[serde(default)]
     pub shared_kv_pool: bool,
+}
+
+/// Same values as the serde field defaults: a derived `Default` would zero
+/// `gamma`/`verify_k`/`draft_pool_max_seqs` and fail `check`.
+impl Default for DsflashF4Contract {
+    fn default() -> Self {
+        Self {
+            dspark_enabled: false,
+            mtp_enabled: false,
+            gamma: default_gamma(),
+            verify_k: default_k(),
+            draft_pool_max_seqs: default_pool(),
+            shared_kv_pool: false,
+        }
+    }
 }
 
 fn default_gamma() -> usize {
