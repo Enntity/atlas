@@ -104,12 +104,17 @@ struct Settings {
 }
 
 impl Settings {
-    /// Parse the knobs from `var` (an environment lookup); out-of-range
-    /// values take their defaults.
+    /// The knobs with DFlash2's copy drafts on, from `var` (an environment
+    /// lookup); `None` unless `ATLAS_DFLASH_COPY_DRAFTS=1`.
     fn parse(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
         if var("ATLAS_DFLASH_COPY_DRAFTS").as_deref() != Some("1") {
             return None;
         }
+        Some(Self::knobs(var))
+    }
+
+    /// Parse the knobs from `var`; out-of-range values take their defaults.
+    fn knobs(var: impl Fn(&str) -> Option<String>) -> Self {
         let num = |name: &str, default: usize, ok: &dyn Fn(usize) -> bool| {
             var(name)
                 .and_then(|v| v.trim().parse().ok())
@@ -120,14 +125,14 @@ impl Settings {
         let max = num("ATLAS_DFLASH_COPY_MAX", MAX_DRAFTS, &|v| {
             (1..=MAX_DRAFTS).contains(&v)
         });
-        Some(Self {
+        Self {
             match_len,
             max,
             reply_match: num("ATLAS_DFLASH_COPY_REPLY_MATCH", 0, &|v| {
                 v > match_len && v <= 64
             }),
             miss_max: num("ATLAS_DFLASH_COPY_MISS_MAX", 0, &|v| v <= max),
-        })
+        }
     }
 }
 
@@ -358,30 +363,14 @@ fn offer_with(a: &mut ActiveSeq, s: &Settings) {
     if a.grammar_state.is_some() || a.pending_drafts.is_empty() {
         return;
     }
-    let ctx = Context {
-        history: &a.seq.tokens,
-        pending: a.last_token,
-    };
+    let len = a.seq.tokens.len() + 1;
     let state = &mut a.spec_adapt.copy;
-    if state.offered == ctx.len() {
+    if state.offered == len {
         return;
     }
-    state.offered = ctx.len();
-    let mut k = s.max.min(a.pending_drafts.len());
-    if state.missed && s.miss_max > 0 {
-        k = k.min(s.miss_max);
-    }
-    let prompt = ctx.len().saturating_sub(a.output_tokens.len());
-    let index = state
-        .index
-        .get_or_insert_with(|| Index::new(s.match_len, prompt));
-    if let Some(at) = index.find(ctx, k, s.reply_match) {
-        let copy_conf = if index.in_reply(at) {
-            COPY_REPLY_CONF
-        } else {
-            COPY_CONF
-        };
-        let copy = copy_after(ctx, at, k);
+    state.offered = len;
+    let k = s.max.min(a.pending_drafts.len());
+    if let Some((copy, copy_conf)) = copy_for(a, s, k) {
         merge(
             &copy,
             copy_conf,
@@ -389,6 +378,31 @@ fn offer_with(a: &mut ActiveSeq, s: &Settings) {
             &mut a.pending_draft_conf,
         );
     }
+}
+
+/// The copy of `k` drafts `a`'s context holds (fewer after a miss, under
+/// the miss knob) and the confidence its drafts carry; none when its last
+/// `match` tokens never occurred before.
+fn copy_for(a: &mut ActiveSeq, s: &Settings, mut k: usize) -> Option<(Vec<u32>, f32)> {
+    let ctx = Context {
+        history: &a.seq.tokens,
+        pending: a.last_token,
+    };
+    let state = &mut a.spec_adapt.copy;
+    if state.missed && s.miss_max > 0 {
+        k = k.min(s.miss_max);
+    }
+    let prompt = ctx.len().saturating_sub(a.output_tokens.len());
+    let index = state
+        .index
+        .get_or_insert_with(|| Index::new(s.match_len, prompt));
+    let at = index.find(ctx, k, s.reply_match)?;
+    let copy_conf = if index.in_reply(at) {
+        COPY_REPLY_CONF
+    } else {
+        COPY_CONF
+    };
+    Some((copy_after(ctx, at, k), copy_conf))
 }
 
 /// After `a`'s pending drafts were cut, cut a copy's confidences with them.
