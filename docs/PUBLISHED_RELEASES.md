@@ -39,10 +39,10 @@ commits.
 
 | | SparkGLM | SparkQwen |
 |---|---|---|
-| Product `main` pin | `sparkglm/atlas-20261015-vision` @ `16315004`, 2026-10-15 ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f`, 2026-10-16 ([sparkqwen#11](https://github.com/Enntity/sparkqwen/pull/11)) |
+| Product `main` pin | `sparkglm/atlas-20261015-vision` @ `16315004`, 2026-10-15 ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261017-vision` @ `92dd5435`, 2026-10-17 ([sparkqwen#12](https://github.com/Enntity/sparkqwen/pull/12)) |
 | Shared layer | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
 | Atlas-Inf base | `7ffd183f` | same |
-| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261016-fp4local` @ `9f64bf6b` |
+| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f` |
 
 The pinned engines are the current `sparkglm`, `sparkqwen` and
 `spark-shared` branch heads. Their measurements (text output, vision, fill, RigMark and a
@@ -59,4 +59,11 @@ rows for the prompt and every verified token, queues a long prompt's first
 prefill chunk behind the prefills in flight, and carries the W8A8 review
 hardening; its model-independent scheduler commits are marked `shared:` and
 sit in the `sparkqwen` layer until the shared layer moves. Measurements in
-SparkQwen's `results/2026-10-16-drafter/`.
+SparkQwen's `results/2026-10-16-drafter/`. SparkQwen's vision admission release
+(`sparkqwen/atlas-20261017-vision`, [sparkqwen#10](https://github.com/Enntity/sparkqwen/issues/10))
+sizes the Qwen encoder's output window to one prefill chunk's images, admits
+image requests from their headers under per-request and in-flight row limits
+(400 / 503 with `Retry-After`), bounds decode memory and fixes warm
+multi-chunk prompts splicing a cached image's rows; text output is unchanged.
+Its commits are mostly `shared:` and keep GLM's admitted sizes; they sit in
+the `sparkqwen` layer too. Measurements in SparkQwen's `results/2026-10-17-vision/`.
