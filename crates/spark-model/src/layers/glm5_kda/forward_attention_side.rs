@@ -318,10 +318,17 @@ impl Glm5KdaLayer {
     ) -> Result<bool> {
         let w = &self.weights;
         let row = self.hidden_size * 2;
-        if !crate::layers::kda_side_proj_lt_enabled()
-            || w.f_a_proj.weight != w.b_proj.weight.offset(self.heads * row)
+        if !crate::layers::kda_side_proj_lt_enabled() {
+            return Ok(false);
+        }
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        let report = |what: &str| {
+            REPORTED.call_once(|| tracing::info!("ATLAS_GLM_KDA_SIDE_PROJ_LT: {what} ({m} rows)"))
+        };
+        if w.f_a_proj.weight != w.b_proj.weight.offset(self.heads * row)
             || w.g_a_proj.weight != w.f_a_proj.weight.offset(self.dim * row)
         {
+            report("b / f_a / g_a are not packed; the pipelined triple runs");
             return Ok(false);
         }
         let scratch = ctx.buffers.ssm_deinterleaved();
@@ -329,7 +336,7 @@ impl Glm5KdaLayer {
             m as usize * (self.heads + 2 * self.dim) * 2 <= ctx.buffers.sizes().ssm_deinterleaved,
             "GLM KDA packed side projections: {m} rows overflow the staging scratch"
         );
-        ops::dense_gemm_packed_triple_n(
+        let ran = ops::dense_gemm_packed_triple_n(
             ctx.gpu,
             normed,
             w.b_proj.weight,
@@ -339,6 +346,12 @@ impl Glm5KdaLayer {
             [self.heads as u32, self.dim as u32],
             self.hidden_size as u32,
             stream,
-        )
+        )?;
+        report(if ran {
+            "packed CUTLASS GEMM"
+        } else {
+            "CUTLASS declined the packed GEMM; the pipelined triple runs"
+        });
+        Ok(ran)
     }
 }

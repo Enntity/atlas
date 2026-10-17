@@ -318,8 +318,8 @@ pub fn dense_gemm_pipelined_triple_n(
 /// Large-M twin of [`dense_gemm_pipelined_triple_n`] for the three weights
 /// stored back to back (`packed` is `[first_n + 2 * other_n, k]`,
 /// `ATLAS_GLM_KDA_SIDE_PROJ_LT`): one CUTLASS GEMM reads the activation once
-/// into `scratch` (`[m, first_n + 2 * other_n]`), then three pitched copies
-/// land the planes. Each output is the same k16 MMA chain as the pipelined
+/// into `scratch` (`[m, first_n + 2 * other_n]`), then `kda_split_side_proj`
+/// (or, without it, three pitched copies) lands the planes. Each output is the same k16 MMA chain as the pipelined
 /// kernel's ([`super::bf16_gemm_pipelined_twin`]), so the planes are the
 /// triple's bytes at any `m`. `Ok(false)`: CUTLASS rejected the shape and
 /// nothing was launched.
@@ -339,14 +339,31 @@ pub fn dense_gemm_packed_triple_n(
     if !super::bf16_gemm_pipelined_twin(input, packed.0, scratch, [m, n, k], stream)? {
         return Ok(false);
     }
-    split_columns(
-        gpu,
-        scratch,
-        outputs,
-        m,
-        [first_n, other_n, other_n],
-        stream,
-    )?;
+    let split = gpu.op_cache().kernel(gpu, "kda", "kda_split_side_proj");
+    match split {
+        Ok(kernel) if first_n.is_multiple_of(8) && other_n.is_multiple_of(8) => {
+            let (c0, c1) = (first_n / 8, other_n / 8);
+            KernelLaunch::new(gpu, kernel)
+                .grid([div_ceil(m * (c0 + 2 * c1), 256), 1, 1])
+                .block([256, 1, 1])
+                .arg_ptr(scratch)
+                .arg_ptr(outputs[0])
+                .arg_ptr(outputs[1])
+                .arg_ptr(outputs[2])
+                .arg_u32(m)
+                .arg_u32(c0)
+                .arg_u32(c1)
+                .launch(stream)?;
+        }
+        _ => split_columns(
+            gpu,
+            scratch,
+            outputs,
+            m,
+            [first_n, other_n, other_n],
+            stream,
+        )?,
+    }
     Ok(true)
 }
 
