@@ -838,6 +838,9 @@ pub(crate) fn load_model(
     let model_name = serve_phases::resolve_model_name(&args, &config_json, &model_dir);
 
     let scheduler_model = model;
+    // Read before the scheduler takes the model: the API's admission check
+    // needs the encoder's output window (`spark_model::vision_limits`).
+    let vision_window_rows = scheduler_model.vision_window_rows();
     let scheduler_eos = eos_tokens;
     // EP gate. v1 single-sequence worker protocol required max_batch_size=1
     // because each cmd targeted one slot and the head's per-token broadcast
@@ -1264,6 +1267,14 @@ pub(crate) fn load_model(
         ),
         vision_config: config.vision.clone(),
         vision_max_pixels,
+        vision_limits: config.vision.as_ref().map(|_| {
+            spark_model::vision_limits::VisionRowLimits::resolve(
+                vision_window_rows,
+                max_batch_tokens,
+                args.vision_max_request_rows,
+                args.max_seq_len,
+            )
+        }),
         remote_image_policy,
         video_ffmpeg,
         video_fps: args.video_fps,

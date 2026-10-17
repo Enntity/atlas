@@ -917,6 +917,22 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     pub vision_max_pixels: usize,
 
+    /// Vision tokens (merged patches, one prompt placeholder each) one request
+    /// may carry across all its images and videos. A request over it, or one
+    /// whose prefill chunks could not encode their images (see
+    /// `spark_model::vision_limits`), is refused at admission with a 400
+    /// naming the counts, instead of failing in prefill where clients retry.
+    ///
+    /// The engine encodes each prefill chunk's images separately, so this is
+    /// not an encoder limit; it bounds host memory. Rank 0 holds a request's
+    /// preprocessed pixels (f32) from admission until its prefill ends: 24 KiB
+    /// per vision token on the Qwen tower, so the default 32768 (8 images of
+    /// 2048x2048, or 32 of 1024x1024) is 768 MiB per request, held by every
+    /// prefilling and queued request. The context (`--max-seq-len`) bounds it
+    /// too. 0 = the context alone.
+    #[arg(long, default_value_t = 32_768)]
+    pub vision_max_request_rows: usize,
+
     /// Fetch `image_url` parts that carry an http(s) URL, instead of
     /// rejecting them.
     ///

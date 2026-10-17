@@ -52,6 +52,7 @@ fn state(dir: &std::path::Path) -> AppState {
         rotation_tx: None,
         vision_config: None,
         vision_max_pixels: None,
+        vision_limits: None,
         remote_image_policy: Default::default(),
         video_ffmpeg: Default::default(),
         video_fps: 1.0,

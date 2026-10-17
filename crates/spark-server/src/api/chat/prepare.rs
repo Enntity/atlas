@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::ir::ChatRequest;
 
-use super::{msg_entry, template, thinking};
+use super::{msg_entry, template, thinking, vision_admit};
 
 // Opt-in per-request phase timing for the chat request path
 // (`ATLAS_CHAT_PHASE_TIMING=1`, strict `== "1"`).
@@ -124,6 +124,9 @@ pub(crate) fn prepare_chat_prompt(
         &state.chat,
         state.tokenizer.uses_deepseek_v4_encoding(),
     )?;
+    // A request the engine cannot serve is refused here, with a 400, rather
+    // than failing at prefill start where clients retry it forever.
+    vision_admit::check(state.vision_limits.as_ref(), &image_pad_counts)?;
     // A call that keeps returning the same result gets a notice on its
     // latest result and one turn of deeper thinking, instead of having
     // `<tool_call>` masked (see `loop_detect::check_loops`).

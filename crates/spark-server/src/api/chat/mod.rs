@@ -31,6 +31,7 @@ pub(crate) mod remote_image;
 mod sampling_setup;
 mod template;
 mod thinking;
+mod vision_admit;
 
 use crate::main_modules::model_host::CurrentModel;
 use axum::extract::State;

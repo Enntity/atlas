@@ -1174,6 +1174,14 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// Merged vision rows one encode may write: the encoder output window
+    /// (`VisionEncoder::output_rows`), which one prefill chunk's items must
+    /// fit. The API admits only requests whose every chunk fits
+    /// (`crate::vision_limits`). Default: 0 (no vision encoder).
+    fn vision_window_rows(&self) -> usize {
+        0
+    }
+
     /// `prepare_vision_embed` for a request whose chunk 0 goes through
     /// `prefill_chunk`: a model that prefix-caches vision prompts may stage
     /// the images on `seq` and encode, inside the chunk-0 prefix lookup, only
