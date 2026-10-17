@@ -105,6 +105,11 @@ fn a_run_extends_only_contiguously_in_one_layout() {
     assert_eq!(run.map(|r| (r.window_start, r.lo)), Some((14, 22)));
 }
 
+/// A store of `slots` windows at the simulation's shape.
+pub(super) fn store(gpu: &dyn GpuBackend, slots: usize) -> WarmCtxStore {
+    WarmCtxStore::reserve(gpu, slots, W, SLOT).unwrap()
+}
+
 fn head(mode: WarmCtx) -> BlockDiffusionDraftHead {
     let mut head = zero_head();
     head.target_layer_ids = vec![0, 1];
@@ -248,7 +253,7 @@ pub(super) fn window(
         .collect()
 }
 
-fn exact(win: &[(usize, Option<usize>)]) -> bool {
+pub(super) fn exact(win: &[(usize, Option<usize>)]) -> bool {
     win.iter().all(|&(label, row)| row == Some(label))
 }
 
@@ -259,7 +264,7 @@ fn a_cold_multi_chunk_window_is_exact_off_legacy() {
     for prompt in [W + 1, CHUNK + 3, CHUNK + 18, 3 * CHUNK + 7] {
         for mode in MODES {
             let gpu = MockGpuBackend::new();
-            let store = WarmCtxStore::new(4);
+            let store = store(&gpu, 4);
             let toks = tokens(prompt, 1);
             let mut state = prefill(&gpu, &store, mode, &toks, Turn::cold(prompt));
             let win = window(&gpu, &mut state);
@@ -281,7 +286,7 @@ fn a_warm_turn_window_matches_its_cold_prefill_under_restore() {
         let toks = tokens(second, 2);
         let cold = {
             let gpu = MockGpuBackend::new();
-            let store = WarmCtxStore::new(4);
+            let store = store(&gpu, 4);
             window(
                 &gpu,
                 &mut prefill(&gpu, &store, WarmCtx::Exact, &toks, Turn::cold(second)),
@@ -289,7 +294,7 @@ fn a_warm_turn_window_matches_its_cold_prefill_under_restore() {
         };
         for mode in MODES {
             let gpu = MockGpuBackend::new();
-            let store = WarmCtxStore::new(4);
+            let store = store(&gpu, 4);
             let turn1 = Turn::cold(first);
             prefill(&gpu, &store, mode, &toks, turn1);
             assert_eq!(store.len(), mode.restores() as usize, "{mode:?}");
@@ -318,7 +323,7 @@ fn a_warm_turn_window_matches_its_cold_prefill_under_restore() {
 fn a_restore_without_its_entry_seeds_the_window() {
     for slots in [0, 1, 4] {
         let gpu = MockGpuBackend::new();
-        let store = WarmCtxStore::new(slots);
+        let store = store(&gpu, slots);
         let (a, b) = (tokens(60, 3), tokens(60, 4));
         prefill(&gpu, &store, WarmCtx::Restore, &a, Turn::cold(40));
         // Same positions, other tokens: the content key differs. Its own
@@ -342,7 +347,7 @@ fn a_restore_without_its_entry_seeds_the_window() {
 #[test]
 fn a_shorter_next_prompt_takes_the_rows_the_entry_holds() {
     let gpu = MockGpuBackend::new();
-    let store = WarmCtxStore::new(4);
+    let store = store(&gpu, 4);
     let toks = tokens(64, 5);
     // Window [44, 60); its tail cut 52 stores [44, 52).
     let turn1 = Turn::cold(60);
@@ -364,7 +369,7 @@ fn a_shorter_next_prompt_takes_the_rows_the_entry_holds() {
 #[test]
 fn a_branch_checkpoint_below_the_window_stores_its_own_tail() {
     let gpu = MockGpuBackend::new();
-    let store = WarmCtxStore::new(4);
+    let store = store(&gpu, 4);
     let toks = tokens(120, 6);
     let turn = Turn {
         branch_at: Some(40),
@@ -397,7 +402,7 @@ fn a_branch_checkpoint_below_the_window_stores_its_own_tail() {
 #[test]
 fn an_entry_never_spans_a_hole() {
     let gpu = MockGpuBackend::new();
-    let store = WarmCtxStore::new(4);
+    let store = store(&gpu, 4);
     let toks = tokens(64, 7);
     // Passes [0, 4) and [4, 12); rank 0 keeps rows 2.. and 8.. of them.
     let turn = Turn {
@@ -419,7 +424,7 @@ fn an_entry_never_spans_a_hole() {
 #[test]
 fn the_store_replaces_equal_keys_and_evicts_the_least_recent() {
     let gpu = MockGpuBackend::new();
-    let store = WarmCtxStore::new(2);
+    let store = store(&gpu, 2);
     for conversation in [10, 11, 10, 12] {
         prefill(
             &gpu,

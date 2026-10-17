@@ -16,8 +16,8 @@ use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::gpu::GpuBackend;
 
 use super::WarmCtx;
-use super::warm_ctx_store::{WarmCtxStore, store_key};
-use super::warm_ctx_tests::{Turn, W, prefill, tokens, window};
+use super::warm_ctx_store::{StoreRefs, WarmCtxStore, store_key};
+use super::warm_ctx_tests::{Turn, W, prefill, store, tokens, window};
 
 fn cuda() -> Result<AtlasCudaBackend> {
     AtlasCudaBackend::new(0, &[]).context("CUDA backend")
@@ -29,7 +29,7 @@ fn a_warm_turn_window_matches_its_cold_prefill_on_the_device() -> Result<()> {
     let gpu = cuda()?;
     for (first, second) in [(40, 44), (40, 41), (70, 75), (90, 120), (9, 13)] {
         let toks = tokens(second, 2);
-        let store = WarmCtxStore::new(4);
+        let store = store(&gpu, 4);
         let cold = window(
             &gpu,
             &mut prefill(&gpu, &store, WarmCtx::Exact, &toks, Turn::cold(second)),
@@ -63,16 +63,19 @@ fn the_store_round_trips_glm_windows_on_the_device() -> Result<()> {
     let acc = gpu.alloc(WINDOW * ROW)?;
     let out = gpu.alloc(WINDOW * ROW)?;
     gpu.copy_h2d(&rows, acc)?;
-    let store = WarmCtxStore::new(2);
+    let store = WarmCtxStore::reserve(gpu, 2, WINDOW, ROW)?;
     // A tail checkpoint 24 rows under a 45,000-token prompt end: the window
     // [42952, 45000) holds real rows [42952, 44976).
     let (ws, cut) = (42_952usize, 44_976usize);
     let key = store_key(0, &vec![7u32; cut]);
     let src = acc.offset(0);
-    anyhow::ensure!(store.save(gpu, key, src, ws, cut, ROW, WINDOW, stream)?);
+    let saved = store.save(gpu, key, StoreRefs::default(), src, ws, cut, ROW, stream)?;
+    anyhow::ensure!(saved.is_some());
     // The next turn (45,600 tokens) wants [43552, 44976).
     let want = 43_552usize;
-    let lo = store.restore(gpu, key, cut, want, ROW, out, stream)?;
+    let lo = store
+        .restore(gpu, key, cut, want, ROW, out, stream)?
+        .map(|r| r.0);
     anyhow::ensure!(lo == Some(want), "{lo:?}");
     gpu.synchronize(stream)?;
     let mut got = vec![0u8; (cut - want) * ROW];

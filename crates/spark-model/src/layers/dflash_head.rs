@@ -429,6 +429,8 @@ pub struct DflashProposerState {
     pub ctx_floor: usize,
     /// The accumulator rows this prefill wrote or restored (`warm_ctx`).
     pub(crate) ctx_run: Option<warm_ctx::CtxRun>,
+    /// The store windows this prefill wrote and restored from (`warm_ctx`).
+    pub(crate) ctx_store: warm_ctx_store::StoreRefs,
 }
 
 impl DflashProposerState {
@@ -787,10 +789,13 @@ mod first_append;
 pub use first_append::FirstAppend;
 pub mod warm_ctx;
 pub use warm_ctx::WarmCtx;
+mod warm_ctx_seq;
 pub(crate) mod warm_ctx_store;
-pub use warm_ctx_store::WarmCtxStore;
+pub use warm_ctx_store::{WarmCtxStore, store_bytes as warm_ctx_store_bytes};
 #[cfg(test)]
 mod warm_ctx_gpu_tests;
+#[cfg(test)]
+mod warm_ctx_store_tests;
 #[cfg(test)]
 mod warm_ctx_tests;
 pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
@@ -1190,6 +1195,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
             warm_ctx: self.startup.diagnostics.warm_ctx,
             ctx_floor: 0,
             ctx_run: None,
+            ctx_store: Default::default(),
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.
@@ -1455,6 +1461,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.own_capture = false;
         dstate.end_floor = 0;
         (dstate.ctx_floor, dstate.ctx_run) = (0, None);
+        dstate.ctx_store = Default::default();
         Ok(())
     }
 }

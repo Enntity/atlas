@@ -12,6 +12,15 @@ use crate::layers::DflashProposerState;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
+    /// Install the store `build_model` reserved before sizing the KV pool.
+    pub(crate) fn set_dflash_warm_store(
+        &mut self,
+        store: crate::layers::dflash_head::WarmCtxStore,
+    ) {
+        self.dflash_warm_store.free(self.gpu.as_ref());
+        self.dflash_warm_store = store;
+    }
+
     /// This rank's DFlash proposer state of `seq`, when it owns the drafter
     /// context (rank 0 of a multi-rank world).
     fn dflash_ctx_owner(

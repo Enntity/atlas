@@ -35,15 +35,15 @@
 //!
 //! The store is rank-0 only (the accumulator is) and adds no collective, so
 //! ranks need not agree on it; the target's restore depth is agreed as
-//! before. What it stores, per entry: up to `max_ctx_len` rows of
-//! `capture layers x hidden x BF16` (GLM-5.3-Flash with DFlash2: 5 x 4096 x 2
-//! = 40 KiB a row, 80 MiB for a full 2048-row window) in one device slab of
-//! `ATLAS_DFLASH_WARM_CTX_SLOTS` windows (default 8, 640 MiB on GLM),
-//! allocated on the first save, evicted least recently used. It is written
-//! when a prefill saves an SSM checkpoint at the end of a pass (the tail
-//! split, a branch point, the prompt leaf), from the rows the accumulator
-//! holds up to that position; it is read when a later prefill restores the
-//! target at exactly that position. A branch checkpoint below the prompt's
+//! before. What it stores, per prefill: one window of up to `max_ctx_len`
+//! rows of `capture layers x hidden x BF16` (GLM-5.3-Flash with DFlash2:
+//! 5 x 4096 x 2 = 40 KiB a row, 80 MiB for a full 2048-row window) in a
+//! device slab of `ATLAS_DFLASH_WARM_CTX_SLOTS` windows (default 8, 640 MiB
+//! on GLM) reserved before the KV pool is sized. Every SSM checkpoint the
+//! prefill saves at the end of a pass (the tail split, a branch point, the
+//! prompt leaf) keys the sub-range of that window ending there; a later
+//! prefill that restores the target at exactly that position reads it
+//! (`warm_ctx_store` docs: eviction, keys, ordering). A branch checkpoint below the prompt's
 //! own window would find nothing in the accumulator, so under `restore` the
 //! pass that ends there captures its last rows against its own end first
 //! (the window's rows all come later and overwrite them).
@@ -112,7 +112,7 @@ impl WarmCtx {
     }
 
     /// The rows under the restore point come back from the store.
-    pub(crate) fn restores(self) -> bool {
+    pub fn restores(self) -> bool {
         self == Self::Restore
     }
 }

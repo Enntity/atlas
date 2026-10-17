@@ -1,20 +1,44 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The `ATLAS_DFLASH_WARM_CTX=restore` store (`warm_ctx` module docs): drafter
-//! windows saved with prefill checkpoints, keyed by prefix content, and the
-//! sequence-side save/restore.
+//! The `ATLAS_DFLASH_WARM_CTX=restore` store (`warm_ctx` module docs).
+//!
+//! The slab holds `slots` windows of `window_rows` accumulator rows. A
+//! prefill writes ONE window: its first checkpoint save copies the rows that
+//! end there, each later checkpoint of the same prefill (the tail cut, the
+//! tail block, the prompt leaf) appends only the rows past the previous one,
+//! and every checkpoint registers a key that names the sub-range
+//! `[window.lo, end)` it covers. So a slot is a conversation turn, not a
+//! checkpoint. A window is evicted least recently used, with its keys; the
+//! window a prefill restored from is demoted to the next victim once that
+//! prefill has stored its own (the new window covers the conversation's next
+//! turn; the old one only serves a branch back to an earlier turn).
+//!
+//! Keys are content keys: SHA-256 of the adapter and the prefix-cache key
+//! tokens `[0, end)`. The rows at positions under `end` are a function of
+//! exactly those tokens, as the KV radix's blocks are. The scheduler's
+//! `session_hash` is not part of the key: it is derived from the prompt's
+//! first 1024 tokens (`session_manager::compute_session_hash`), not a tenant
+//! salt, and only gates restores of TAIL SSM snapshots, whose state bleeds
+//! past the exact prefix; these rows never do.
+//!
+//! The slab is allocated by `build_model` before the KV pool is sized
+//! ([`WarmCtxStore::for_build`]), so its bytes come out of the KV budget
+//! instead of unified memory the budget already promised. Every copy into
+//! or out of a window waits on the window's event and records it, so a
+//! save and a restore on different streams are ordered on every path.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
-use super::DflashProposerState;
-use super::warm_ctx::{CapturePlan, CtxRun, store_slots_from_env};
+use super::warm_ctx::{WarmCtx, store_slots_from_env};
 
-/// Content key of a store entry: the token prefix `[0, end)` a checkpoint
-/// covers (the prefix cache's key tokens) and the adapter. A collision-free
-/// digest, so equal keys mean equal prefixes.
+/// Content key of a checkpoint: the token prefix `[0, end)` it covers (the
+/// prefix cache's key tokens) and the adapter. A collision-free digest, so
+/// equal keys mean equal prefixes.
 pub(crate) type StoreKey = [u8; 32];
 
 pub(crate) fn store_key(adapter_id: u64, key_tokens: &[u32]) -> StoreKey {
@@ -32,159 +56,313 @@ pub(crate) fn store_key(adapter_id: u64, key_tokens: &[u32]) -> StoreKey {
     h.finalize().into()
 }
 
+/// Bytes of a slab of `slots` windows: the startup reservation.
+pub fn store_bytes(slots: usize, window_rows: usize, row_bytes: usize) -> Option<usize> {
+    slots.checked_mul(window_rows)?.checked_mul(row_bytes)
+}
+
+/// A window a prefill wrote or restored from; stale once its slot is reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowRef {
+    slot: usize,
+    generation: u64,
+}
+
+/// A sequence's store handles for its current prefill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StoreRefs {
+    /// The window this prefill writes (later checkpoints extend it).
+    pub own: Option<WindowRef>,
+    /// The window it restored from (demoted once `own` exists).
+    pub src: Option<WindowRef>,
+}
+
 #[derive(Debug, Clone, Copy)]
-struct Entry {
-    key: StoreKey,
-    /// Positions `[lo, hi)`; row 0 of the entry's window is `lo`.
+struct Window {
+    /// Positions `[lo, hi)`; row 0 of the slot is position `lo`.
     lo: usize,
     hi: usize,
+    generation: u64,
     used: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyRef {
+    win: WindowRef,
+    end: usize,
 }
 
 #[derive(Default)]
 struct StoreInner {
     slab: Option<DevicePtr>,
-    /// Bytes of one row and rows of one window, fixed by the first save.
     row_bytes: usize,
     window_rows: usize,
-    entries: Vec<Option<Entry>>,
+    windows: Vec<Option<Window>>,
+    /// One event per slot (0 = the backend has none: copies sync instead).
+    events: Vec<u64>,
+    keys: HashMap<StoreKey, KeyRef>,
     tick: u64,
-    /// The slab allocation failed: the store stays off.
-    failed: bool,
+    generation: u64,
+}
+
+impl StoreInner {
+    fn window(&self, r: WindowRef) -> Option<Window> {
+        self.windows
+            .get(r.slot)
+            .copied()
+            .flatten()
+            .filter(|w| w.generation == r.generation)
+    }
+
+    /// The live key `key`: its window and end.
+    fn key(&self, key: &StoreKey) -> Option<(WindowRef, Window, usize)> {
+        let k = self.keys.get(key)?;
+        Some((k.win, self.window(k.win)?, k.end))
+    }
+
+    fn touch(&mut self, slot: usize) {
+        self.tick += 1;
+        if let Some(w) = self.windows[slot].as_mut() {
+            w.used = self.tick;
+        }
+    }
+
+    /// A free slot, else the window `prefer` names (the one this prefill
+    /// restored from: its conversation moves on to the new window), else the
+    /// least recently used one; emptied with its keys.
+    fn take_slot(&mut self, prefer: Option<WindowRef>) -> usize {
+        let prefer = prefer.filter(|&r| self.window(r).is_some()).map(|r| r.slot);
+        let slot = self
+            .windows
+            .iter()
+            .position(Option::is_none)
+            .or(prefer)
+            .unwrap_or_else(|| {
+                (0..self.windows.len())
+                    .min_by_key(|&i| self.windows[i].map_or(0, |w| w.used))
+                    .unwrap_or(0)
+            });
+        self.windows[slot] = None;
+        self.keys.retain(|_, k| k.win.slot != slot);
+        slot
+    }
+
+    /// `rows` rows from `src` into `slot` from its row `row0`, ordered after
+    /// every earlier copy touching the slot, on any stream.
+    fn copy_in(
+        &self,
+        gpu: &dyn GpuBackend,
+        slot: usize,
+        row0: usize,
+        src: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        let dst = self.slot_row(slot, row0);
+        self.ordered(gpu, slot, stream, || {
+            gpu.copy_d2d_async(src, dst, rows * self.row_bytes, stream)
+        })
+    }
+
+    fn slot_row(&self, slot: usize, row: usize) -> DevicePtr {
+        let slab = self.slab.expect("a live window has a slab");
+        slab.offset((slot * self.window_rows + row) * self.row_bytes)
+    }
+
+    fn ordered(
+        &self,
+        gpu: &dyn GpuBackend,
+        slot: usize,
+        stream: u64,
+        copy: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let event = self.events[slot];
+        if event != 0 {
+            gpu.stream_wait_event(stream, event)?;
+        }
+        copy()?;
+        if event != 0 {
+            gpu.record_event(event, stream)
+        } else {
+            gpu.synchronize(stream)
+        }
+    }
 }
 
 /// Device-resident drafter windows keyed by prefix content (module docs).
 pub struct WarmCtxStore {
-    capacity: usize,
     inner: Mutex<StoreInner>,
 }
 
 impl WarmCtxStore {
-    pub fn new(capacity: usize) -> Self {
+    /// No store (every mode but `restore`, worker ranks, non-DFlash models).
+    pub fn disabled() -> Self {
         Self {
-            capacity,
             inner: Mutex::new(StoreInner::default()),
         }
     }
 
-    pub fn from_env() -> Result<Self> {
-        Ok(Self::new(store_slots_from_env()?))
+    /// A slab of `slots` windows, allocated now.
+    pub fn reserve(
+        gpu: &dyn GpuBackend,
+        slots: usize,
+        window_rows: usize,
+        row_bytes: usize,
+    ) -> Result<Self> {
+        let bytes = store_bytes(slots, window_rows, row_bytes)
+            .ok_or_else(|| anyhow::anyhow!("DFlash warm ctx store size overflows"))?;
+        if bytes == 0 {
+            return Ok(Self::disabled());
+        }
+        let slab = gpu.alloc(bytes)?;
+        let events = (0..slots)
+            .map(|_| gpu.create_event())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            inner: Mutex::new(StoreInner {
+                slab: Some(slab),
+                row_bytes,
+                window_rows,
+                windows: vec![None; slots],
+                events,
+                ..StoreInner::default()
+            }),
+        })
     }
 
-    /// Entries currently held (tests, logs).
+    /// `build_model`, before the KV pool is sized: the slab when this rank
+    /// owns the drafter context and `ATLAS_DFLASH_WARM_CTX=restore` (only
+    /// then is `ATLAS_DFLASH_WARM_CTX_SLOTS` read); otherwise nothing.
+    pub fn for_build(
+        gpu: &dyn GpuBackend,
+        capture_layers: usize,
+        hidden_size: usize,
+        ctx_window: Option<usize>,
+        rank0: bool,
+    ) -> Result<Self> {
+        if capture_layers == 0 || !rank0 || !WarmCtx::from_env()?.restores() {
+            return Ok(Self::disabled());
+        }
+        let slots = store_slots_from_env()?;
+        let (window_rows, row_bytes) = (ctx_window.unwrap_or(0), capture_layers * hidden_size * 2);
+        let mib = store_bytes(slots, window_rows, row_bytes).unwrap_or(usize::MAX) >> 20;
+        match Self::reserve(gpu, slots, window_rows, row_bytes) {
+            Ok(store) => {
+                tracing::info!(
+                    "Reserved before KV sizing: DFlash warm ctx store {mib} MiB \
+                     ({slots} windows x {window_rows} rows x {row_bytes} B, \
+                     ATLAS_DFLASH_WARM_CTX=restore)"
+                );
+                Ok(store)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "DFlash warm ctx: reserving the {mib} MiB store failed ({error}); \
+                     warm turns fall back to the seeded window"
+                );
+                Ok(Self::disabled())
+            }
+        }
+    }
+
+    /// Windows currently held (tests, logs).
     pub fn len(&self) -> usize {
-        self.inner.lock().entries.iter().flatten().count()
+        self.inner.lock().windows.iter().flatten().count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Release the slab (model teardown).
+    /// Release the slab and the events (model teardown).
     pub fn free(&self, gpu: &dyn GpuBackend) {
         let mut inner = self.inner.lock();
+        for event in inner.events.drain(..).filter(|&e| e != 0) {
+            let _ = gpu.destroy_event(event);
+        }
         if let Some(slab) = inner.slab.take()
             && let Err(error) = gpu.free(slab)
         {
             tracing::warn!("DFlash warm ctx: freeing the store slab failed ({error})");
         }
-        inner.entries.clear();
+        inner.windows.clear();
+        inner.keys.clear();
     }
 
-    /// Store rows `[lo, hi)` (at most a window) read from `src` under `key`.
-    /// Replaces an entry with the same key, else takes a free or the least
-    /// recently used window. `Ok(false)` = not stored (store off, or a shape
-    /// the slab was not sized for).
+    /// Store the checkpoint `key` = rows `[lo, end)`, read from `src_lo`
+    /// (the accumulator row of position `lo`). `refs.own` is the window this
+    /// prefill already wrote: when it starts at `lo` and ends at or under
+    /// `end` only the new rows are copied into it. A new window takes a free
+    /// slot, else `refs.src`'s, else the least recently used. Returns the
+    /// window that now holds the rows (`refs.own` unchanged when the key
+    /// already names a window with at least these rows, `None` when nothing
+    /// was stored).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn save(
         &self,
         gpu: &dyn GpuBackend,
         key: StoreKey,
-        src: DevicePtr,
+        refs: StoreRefs,
+        src_lo: DevicePtr,
         lo: usize,
-        hi: usize,
+        end: usize,
         row_bytes: usize,
-        window_rows: usize,
         stream: u64,
-    ) -> Result<bool> {
-        if self.capacity == 0 || lo >= hi || hi - lo > window_rows || row_bytes == 0 {
-            return Ok(false);
-        }
+    ) -> Result<Option<WindowRef>> {
         let mut inner = self.inner.lock();
-        if inner.failed {
-            return Ok(false);
+        if inner.slab.is_none()
+            || row_bytes != inner.row_bytes
+            || lo >= end
+            || end - lo > inner.window_rows
+        {
+            return Ok(None);
         }
-        let slab = match inner.slab {
-            Some(slab) => {
-                if (inner.row_bytes, inner.window_rows) != (row_bytes, window_rows) {
-                    return Ok(false);
+        // An equal key keeps the window with more rows (the smaller lo): a
+        // seed-fallback turn must not shrink a full entry.
+        if let Some((win, w, _)) = inner.key(&key)
+            && w.lo <= lo
+        {
+            inner.touch(win.slot);
+            return Ok(refs.own);
+        }
+        let win = match refs.own.and_then(|r| inner.window(r).map(|w| (r, w))) {
+            Some((r, w)) if w.lo == lo && w.hi <= end => {
+                let skip = w.hi - lo;
+                if end > w.hi {
+                    let src = src_lo.offset(skip * row_bytes);
+                    inner.copy_in(gpu, r.slot, skip, src, end - w.hi, stream)?;
                 }
-                slab
+                if let Some(w) = inner.windows[r.slot].as_mut() {
+                    w.hi = end;
+                }
+                r
             }
-            None => {
-                let bytes = self.capacity * window_rows * row_bytes;
-                match gpu.alloc(bytes) {
-                    Ok(slab) => {
-                        tracing::info!(
-                            "DFlash warm ctx: store of {} windows x {window_rows} rows x \
-                             {row_bytes} B = {} MiB",
-                            self.capacity,
-                            bytes >> 20
-                        );
-                        inner.slab = Some(slab);
-                        inner.row_bytes = row_bytes;
-                        inner.window_rows = window_rows;
-                        inner.entries = vec![None; self.capacity];
-                        slab
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            "DFlash warm ctx: allocating the {} MiB store failed ({error}); \
-                             warm turns fall back to the seeded window",
-                            bytes >> 20
-                        );
-                        inner.failed = true;
-                        return Ok(false);
-                    }
-                }
+            _ => {
+                let slot = inner.take_slot(refs.src);
+                inner.generation += 1;
+                let r = WindowRef {
+                    slot,
+                    generation: inner.generation,
+                };
+                inner.copy_in(gpu, slot, 0, src_lo, end - lo, stream)?;
+                inner.windows[slot] = Some(Window {
+                    lo,
+                    hi: end,
+                    generation: r.generation,
+                    used: 0,
+                });
+                r
             }
         };
-        inner.tick += 1;
-        let tick = inner.tick;
-        let slot = inner
-            .entries
-            .iter()
-            .position(|e| e.is_some_and(|e| e.key == key))
-            .or_else(|| inner.entries.iter().position(Option::is_none))
-            .unwrap_or_else(|| {
-                (0..inner.entries.len())
-                    .min_by_key(|&i| inner.entries[i].map_or(0, |e| e.used))
-                    .unwrap_or(0)
-            });
-        // Unregistered until the copy is enqueued: a failed enqueue must not
-        // leave the previous entry naming a half-written window.
-        inner.entries[slot] = None;
-        let window_bytes = window_rows * row_bytes;
-        gpu.copy_d2d_async(
-            src,
-            slab.offset(slot * window_bytes),
-            (hi - lo) * row_bytes,
-            stream,
-        )?;
-        inner.entries[slot] = Some(Entry {
-            key,
-            lo,
-            hi,
-            used: tick,
-        });
-        Self::order_slab_reuse(gpu, stream)?;
-        Ok(true)
+        inner.keys.insert(key, KeyRef { win, end });
+        inner.touch(win.slot);
+        Ok(Some(win))
     }
 
-    /// Copy the stored rows `[max(lo, want_lo), end)` of the entry for `key`
-    /// that ends at `end` to `dst` (rows of `row_bytes`). Returns that first
-    /// position (`end` when the entry holds nothing at or above `want_lo`),
-    /// or `None` on a miss.
+    /// Copy the rows `[max(lo, want_lo), end)` of the checkpoint `key` (which
+    /// must end at `end`) to `dst`. Returns that first position (`end` when
+    /// the window holds nothing at or above `want_lo`) and the window, or
+    /// `None` on a miss.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         &self,
@@ -195,137 +373,33 @@ impl WarmCtxStore {
         row_bytes: usize,
         dst: DevicePtr,
         stream: u64,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<(usize, WindowRef)>> {
         let mut inner = self.inner.lock();
-        let Some(slab) = inner.slab.filter(|_| inner.row_bytes == row_bytes) else {
-            return Ok(None);
-        };
-        let Some(slot) = inner
-            .entries
-            .iter()
-            .position(|e| e.is_some_and(|e| e.key == key && e.hi == end))
+        let Some((win, w, key_end)) = inner.key(&key).filter(|_| inner.row_bytes == row_bytes)
         else {
             return Ok(None);
         };
-        inner.tick += 1;
-        let tick = inner.tick;
-        let window_bytes = inner.window_rows * row_bytes;
-        let entry = inner.entries[slot].as_mut().expect("found above");
-        entry.used = tick;
-        let entry_lo = entry.lo;
-        let lo = entry_lo.max(want_lo).min(end);
+        if key_end != end {
+            return Ok(None);
+        }
+        inner.touch(win.slot);
+        let lo = w.lo.max(want_lo).min(end);
         if lo < end {
-            let src = slab.offset(slot * window_bytes + (lo - entry_lo) * row_bytes);
-            gpu.copy_d2d_async(src, dst, (end - lo) * row_bytes, stream)?;
-            Self::order_slab_reuse(gpu, stream)?;
+            let src = inner.slot_row(win.slot, lo - w.lo);
+            inner.ordered(gpu, win.slot, stream, || {
+                gpu.copy_d2d_async(src, dst, (end - lo) * row_bytes, stream)
+            })?;
         }
-        Ok(Some(lo))
+        Ok(Some((lo, win)))
     }
 
-    /// A slab window may be refilled from another prefill stream next time;
-    /// copies off the default stream finish before the lock is released.
-    /// (Multi-rank worlds prefill on the default stream: no sync there.)
-    fn order_slab_reuse(gpu: &dyn GpuBackend, stream: u64) -> Result<()> {
-        if stream != gpu.default_stream() {
-            gpu.synchronize(stream)?;
+    /// Make `r` the next eviction victim (its keys stay valid until then).
+    pub(crate) fn demote(&self, r: WindowRef) {
+        let mut inner = self.inner.lock();
+        if inner.window(r).is_some()
+            && let Some(w) = inner.windows[r.slot].as_mut()
+        {
+            w.used = 0;
         }
-        Ok(())
-    }
-}
-
-impl DflashProposerState {
-    /// Record a prefill capture of positions `[plan.first, plan.end)`.
-    pub(crate) fn note_capture(&mut self, plan: &CapturePlan) {
-        CtxRun::note(&mut self.ctx_run, plan.window_start, plan.first, plan.end);
-    }
-
-    /// Chunk 0 of a prefill, after the prefix lookup: the target's state was
-    /// restored at `skip` (0 = computes from the start) of a
-    /// `prompt_len`-token prompt. Sets where the window may start and, under
-    /// `restore`, copies the stored rows under `skip` into the accumulator.
-    /// `key_tokens` are the prompt's prefix-cache key tokens (`None`: the
-    /// prompt has no key, so nothing can have been stored for it).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn begin_warm_ctx(
-        &mut self,
-        store: &WarmCtxStore,
-        adapter_id: u64,
-        key_tokens: Option<&[u32]>,
-        skip: usize,
-        prompt_len: usize,
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<()> {
-        self.ctx_floor = 0;
-        self.ctx_run = None;
-        if !self.warm_ctx.seeds() || skip == 0 {
-            return Ok(());
-        }
-        self.ctx_floor = skip;
-        let want_lo = prompt_len.max(skip).saturating_sub(self.max_ctx_len);
-        if !self.warm_ctx.restores() || want_lo >= skip || self.ctx_hidden_acc.0 == 0 {
-            return Ok(());
-        }
-        let restored = match key_tokens.and_then(|t| t.get(..skip)) {
-            Some(prefix) => {
-                let key = store_key(adapter_id, prefix);
-                let (acc, row) = (self.ctx_hidden_acc, self.ctx_slot_bytes);
-                store.restore(gpu, key, skip, want_lo, row, acc, stream)?
-            }
-            None => None,
-        };
-        match restored {
-            Some(lo) => {
-                self.ctx_floor = lo;
-                // The window now starts at `lo` (>= want_lo), slot 0.
-                CtxRun::note(&mut self.ctx_run, lo, lo, skip);
-                tracing::info!(
-                    "DFlash warm ctx: restored {} rows [{lo}, {skip}) under a {prompt_len}-token \
-                     prompt ({} wanted from {want_lo})",
-                    skip - lo,
-                    skip - want_lo,
-                );
-            }
-            None => tracing::info!(
-                "DFlash warm ctx: no stored rows at {skip}; window seeded from there \
-                 ({} rows short)",
-                skip - want_lo
-            ),
-        }
-        Ok(())
-    }
-
-    /// A prefill checkpoint was saved at the end of `prefix` (its
-    /// prefix-cache key tokens): store the accumulator's real rows that end
-    /// there. `Ok(false)` when there are none or the store declines.
-    pub(crate) fn save_warm_ctx(
-        &self,
-        store: &WarmCtxStore,
-        adapter_id: u64,
-        prefix: &[u32],
-        gpu: &dyn GpuBackend,
-        stream: u64,
-    ) -> Result<bool> {
-        let end = prefix.len();
-        if !self.warm_ctx.restores() || self.ctx_hidden_acc.0 == 0 {
-            return Ok(false);
-        }
-        let Some(run) = CtxRun::rows_to(self.ctx_run, end) else {
-            return Ok(false);
-        };
-        let key = store_key(adapter_id, prefix);
-        let src = self
-            .ctx_hidden_acc
-            .offset((run.lo - run.window_start) * self.ctx_slot_bytes);
-        store.save(
-            gpu,
-            key,
-            src,
-            run.lo,
-            end,
-            self.ctx_slot_bytes,
-            self.max_ctx_len,
-            stream,
-        )
     }
 }
