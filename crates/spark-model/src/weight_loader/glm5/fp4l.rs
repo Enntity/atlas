@@ -36,7 +36,7 @@
 use anyhow::{Context, Result, bail};
 use atlas_core::config::LayerType;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::weights::{WeightDtype, WeightStore};
+use spark_runtime::weights::{WeightDtype, WeightStore, WeightTensor};
 
 use crate::weight_map::DenseWeight;
 
@@ -119,6 +119,32 @@ pub(super) fn norm_bf16(
         WeightDtype::FP32 => crate::weight_map::dense_f32_as_bf16(store, name, gpu),
         other => bail!("{name}: norm weight is {other:?}, expected BF16 or F32"),
     }
+}
+
+/// The BF16 `lm_head` every GLM head path reads (`[vocab_rows, hidden]`): the
+/// store's own tensor on the NVFP4 release, the exact expansion of FP4-Local's
+/// MXFP8 otherwise. Anything else is refused: the head used to be read as
+/// BF16 whatever its dtype. The MXFP8 source stays until the split verify
+/// head has taken its shard of the checkpoint's bytes
+/// (`model::prepare_glm_head_mxfp8`); the factory releases it right after.
+pub(super) fn lm_head_bf16(store: &WeightStore, gpu: &dyn GpuBackend) -> Result<WeightTensor> {
+    const NAME: &str = "lm_head.weight";
+    let t = store.get(NAME).context("GLM-5: missing lm_head.weight")?;
+    let ptr = match t.dtype {
+        WeightDtype::BF16 => t.ptr,
+        WeightDtype::FP8E4M3 if crate::weight_map::mxfp8_geometry(store, "lm_head")?.is_some() => {
+            crate::weight_map::dense_auto(store, NAME, gpu)?.weight
+        }
+        other => bail!(
+            "GLM-5 {NAME} is {other:?} {:?}; expected BF16 or MXFP8",
+            t.shape
+        ),
+    };
+    Ok(WeightTensor {
+        ptr,
+        shape: t.shape.clone(),
+        dtype: WeightDtype::BF16,
+    })
 }
 
 #[cfg(test)]

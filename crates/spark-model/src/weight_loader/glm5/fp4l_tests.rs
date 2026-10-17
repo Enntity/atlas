@@ -309,3 +309,72 @@ fn null_store_pointers_never_alias_a_mock_allocation() {
         assert!(seen.insert(ptr.0), "{name}");
     }
 }
+
+/// `lm_head.weight` of `dtype` `[64, 64]` plus an optional scale.
+fn head_store(
+    gpu: &MockGpuBackend,
+    dtype: WeightDtype,
+    scale: Option<(WeightDtype, Vec<usize>)>,
+) -> WeightStore {
+    let mut map = HashMap::new();
+    map.insert(
+        "lm_head.weight".to_string(),
+        WeightTensor {
+            ptr: gpu.alloc(64 * 64 * 2).unwrap(),
+            shape: vec![64, 64],
+            dtype,
+        },
+    );
+    if let Some((dtype, shape)) = scale {
+        let n: usize = shape.iter().product();
+        let ptr = gpu.alloc(n * dtype.byte_size()).unwrap();
+        gpu.copy_h2d(&vec![127u8; n * dtype.byte_size()], ptr)
+            .unwrap();
+        map.insert(
+            "lm_head.weight_scale".to_string(),
+            WeightTensor { ptr, shape, dtype },
+        );
+    }
+    WeightStore::from_map(map)
+}
+
+/// The head was read as BF16 whatever its dtype; now BF16 is the store's
+/// tensor, MXFP8 its exact expansion (source kept for the split head's
+/// shard), and anything else is refused.
+#[test]
+fn lm_head_is_bf16_or_expanded_mxfp8_and_nothing_else() {
+    let gpu = MockGpuBackend::new();
+    let store = head_store(&gpu, WeightDtype::BF16, None);
+    let head = lm_head_bf16(&store, &gpu).unwrap();
+    assert_eq!(head.ptr, store.get("lm_head.weight").unwrap().ptr);
+
+    let gpu = MockGpuBackend::new();
+    let store = head_store(
+        &gpu,
+        WeightDtype::FP8E4M3,
+        Some((WeightDtype::UInt8, vec![64, 2])),
+    );
+    let head = lm_head_bf16(&store, &gpu).unwrap();
+    assert_ne!(head.ptr, store.get("lm_head.weight").unwrap().ptr);
+    assert_eq!(
+        (head.dtype, head.shape.as_slice()),
+        (WeightDtype::BF16, &[64, 64][..])
+    );
+    assert_eq!(gpu.launch_count(), 1, "one exact MXFP8 -> BF16 expansion");
+    assert!(!store.was_reclaimed("lm_head.weight"));
+
+    for (dtype, scale) in [
+        (
+            WeightDtype::UInt8,
+            Some((WeightDtype::FP8E4M3, vec![64, 4])),
+        ),
+        (WeightDtype::FP8E4M3, Some((WeightDtype::FP32, vec![1]))),
+        (WeightDtype::FP8E4M3, None),
+        (WeightDtype::FP32, None),
+    ] {
+        let gpu = MockGpuBackend::new();
+        let store = head_store(&gpu, dtype, scale.clone());
+        assert!(lm_head_bf16(&store, &gpu).is_err(), "{dtype:?} {scale:?}");
+        assert_eq!(gpu.launch_count(), 0);
+    }
+}
