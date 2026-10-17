@@ -422,6 +422,13 @@ pub struct DflashProposerState {
     /// `max_ctx_len`, holding this sequence's latest own capture (its last
     /// prefilled position, then each single-sequence decode).
     pub own_row: Option<DevicePtr>,
+    /// `ATLAS_DFLASH_WARM_CTX`, frozen from the head at allocation.
+    pub warm_ctx: WarmCtx,
+    /// Lowest prompt position the prefill window may start at: the first
+    /// position this prefill computes or restored (`warm_ctx`); 0 = none.
+    pub ctx_floor: usize,
+    /// The accumulator rows this prefill wrote or restored (`warm_ctx`).
+    pub(crate) ctx_run: Option<warm_ctx::CtxRun>,
 }
 
 impl DflashProposerState {
@@ -778,6 +785,12 @@ pub use lifecycle::{
 };
 mod first_append;
 pub use first_append::FirstAppend;
+pub mod warm_ctx;
+pub use warm_ctx::WarmCtx;
+pub(crate) mod warm_ctx_store;
+pub use warm_ctx_store::WarmCtxStore;
+#[cfg(test)]
+mod warm_ctx_tests;
 pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
 #[cfg(test)]
 mod first_append_own_tests;
@@ -1172,6 +1185,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             own_capture: false,
             own_row_at: None,
             own_row: own.then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
+            warm_ctx: self.startup.diagnostics.warm_ctx,
+            ctx_floor: 0,
+            ctx_run: None,
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.
@@ -1436,6 +1452,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         (dstate.first_append_at, dstate.own_row_at) = (None, None);
         dstate.own_capture = false;
         dstate.end_floor = 0;
+        (dstate.ctx_floor, dstate.ctx_run) = (0, None);
         Ok(())
     }
 }

@@ -96,6 +96,8 @@ pub(crate) fn load_model(
     // (the head that freezes the value is built last, on the head rank only).
     if args.dflash {
         spark_model::layers::dflash_head::FirstAppend::from_env()?;
+        spark_model::layers::dflash_head::WarmCtx::from_env()?;
+        spark_model::layers::dflash_head::warm_ctx::store_slots_from_env()?;
     }
     // 0. Resolve model directory from HF ID or path
     spark_runtime::progress::phase(1, "model resolve");

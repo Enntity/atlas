@@ -150,18 +150,28 @@ impl TransformerModel {
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
         let own_row = dstate.own_row;
-        // The accumulator holds the LAST `max_ctx` prompt positions (the
-        // drafter's context window), not the first: slot 0 is position
-        // `window_start`. Earlier rows of this chunk are dropped.
-        let end = chunk_start + proc_count;
-        let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
-        let mut first = window_start.max(chunk_start);
         // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
         // upper half, compacted at row 0) in the highway.
         let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
-        first = first.max(chunk_start + sp_row0);
+        // The accumulator holds the LAST `max_ctx_len` prompt positions (the
+        // drafter's context window), not the first: slot 0 is position
+        // `window_start`. Earlier rows of this chunk are dropped. Where the
+        // window is anchored is `ATLAS_DFLASH_WARM_CTX` (`warm_ctx`).
+        let pass = crate::layers::dflash_head::warm_ctx::Pass {
+            tokens_len: seq.tokens.len(),
+            prompt_len: seq.prompt_len,
+            start: chunk_start,
+            rows: proc_count,
+            sp_row0,
+            branch_at: seq.pc_branch_at,
+        };
+        let plan = crate::layers::dflash_head::warm_ctx::capture_plan(
+            dstate.warm_ctx,
+            dstate.max_ctx_len,
+            dstate.ctx_floor,
+            &pass,
+        );
         // Non-legacy `ATLAS_DFLASH_FIRST_APPEND`: keep this pass's last row —
         // after the final chunk, the last prompt position — in the sequence's
         // own spare row, whatever the window below keeps.
@@ -176,13 +186,14 @@ impl TransformerModel {
                 stream,
             )?;
         }
-        if first >= end {
+        let Some(plan) = plan else {
             return Ok(());
-        }
+        };
+        dstate.note_capture(&plan);
         self.dflash_capture_rows(
-            first - chunk_start - sp_row0,
-            end - first,
-            acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
+            plan.src_row(&pass),
+            plan.rows(),
+            acc_base.offset(plan.dst_slot() * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,
             stream,
         )

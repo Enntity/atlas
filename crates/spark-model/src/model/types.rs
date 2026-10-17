@@ -324,6 +324,9 @@ pub struct TransformerModel {
     pub(super) dflash_hidden_save_rows: usize,
     /// How many sequences the capture buffer is strided for (1 = C=1 layout).
     pub(super) dflash_hidden_save_nseq: usize,
+    /// `ATLAS_DFLASH_WARM_CTX=restore`: drafter windows saved with prefill
+    /// checkpoints (rank 0; the slab is allocated on the first save).
+    pub(super) dflash_warm_store: crate::layers::dflash_head::WarmCtxStore,
     /// Cached CUDA graphs for K=2 verification, **keyed by `seq.slot_idx`**.
     /// Same rationale as `decode_graph`: the captured graph has SSM
     /// h_state/conv_state pointers baked in as kernel arguments, so replay for

@@ -419,6 +419,7 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
+                    self.dflash_warm_save(seq, &key, stream)?;
                 } else {
                     // A placeholder the content key does not cover (an
                     // image-tainted snapshot under a colliding key), or HSS

@@ -211,6 +211,9 @@ impl TransformerModel {
             self.prefix_cache
                 .mark_branch_snapshot(&boundary_key, seq.adapter_id);
         }
+        // ATLAS_DFLASH_WARM_CTX=restore: the drafter rows up to this
+        // checkpoint, for the prefill that restores it.
+        self.dflash_warm_save(seq, &boundary_key, stream)?;
         tracing::info!(
             "Intermediate SSM checkpoint saved at token {} (snapshot_id {}, block {})",
             end_token,
