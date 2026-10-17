@@ -278,17 +278,36 @@ fn srpt_orders_queued_first_chunks_by_tokens_left() {
         "the 4-token tail first"
     );
 
+    // A short newcomer queued ahead of a long remainder: 18 tokens take two
+    // chunks, so it queues, and SRPT puts its 18 ahead of the 24 left.
     let model = multi_rank();
     let mut t = Tick::new(&model, true, true);
     let (a, _ra) = request(40);
-    let (c, _rc) = request(3);
+    let (c, _rc) = request(18);
     t.admit(vec![a]);
     t.admit(vec![c]);
-    assert_eq!(t.queue(), vec![(3, 0, Some(3)), (40, 16, None)]);
+    assert_eq!(t.queue(), vec![(18, 0, Some(16)), (40, 16, None)]);
     t.step();
-    assert_eq!(wire(&model), vec![CHUNK, 16, 0, 40, CHUNK, 3, 0, 3]);
-    assert_eq!(t.active.len(), 1, "the 3-token prompt decodes");
-    assert_eq!(t.queue(), vec![(40, 16, None)]);
+    assert_eq!(wire(&model), vec![CHUNK, 16, 0, 40, CHUNK, 16, 0, 18]);
+}
+
+/// A prompt that fits one chunk runs it at admission behind a long prefill
+/// in flight, lever on or off, SRPT on or off: queued, it would wait for
+/// every remaining chunk of the long prompt.
+#[test]
+fn a_one_chunk_prompt_runs_at_admission_behind_a_long_prefill() {
+    for srpt in [false, true] {
+        let model = multi_rank();
+        let mut t = Tick::new(&model, true, srpt);
+        let (a, _ra) = request(200);
+        let (c, _rc) = request(3);
+        t.admit(vec![a]);
+        t.admit(vec![c]);
+        assert_eq!(t.active.len(), 1, "the 3-token prompt decodes at once");
+        assert_eq!(t.queue(), vec![(200, 16, None)]);
+        assert_eq!(wire(&model), vec![CHUNK, 16, 0, 200, CHUNK, 3, 0, 3]);
+        assert_eq!(chunks(&model), vec![(0, 16), (0, 3)]);
+    }
 }
 
 /// A queued request whose caller left frees its slot on every rank, and the

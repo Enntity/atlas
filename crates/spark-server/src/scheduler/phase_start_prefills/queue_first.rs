@@ -29,14 +29,18 @@
 //! deferrals and the multi-prompt prefill of short prompts keep precedence.
 //! Image prompts keep the inline chunk, which encodes their pixels, as do
 //! beam searches, which run whole at admission. A prompt admitted with
-//! nothing in flight runs its first chunk at admission as before.
+//! nothing in flight runs its first chunk at admission as before, and so
+//! does one that fits a single chunk: it finishes there, while queued it
+//! would wait behind every remaining chunk of a long prompt in flight (tens
+//! of seconds behind a ~200K-token prefill with FIFO order).
 
 use super::FirstChunk;
 
 /// What a new request does with its first chunk. `defer`: a batched step
 /// (co-dispatch, VARLEN, always-mixed fuse, multi-prompt prefill) takes it;
 /// `queue_lever`: `ATLAS_PREFILL_QUEUE_FIRST_CHUNK`; `in_flight`: a prefill is
-/// in `prefilling` ahead of it, admitted this tick or before.
+/// in `prefilling` ahead of it, admitted this tick or before; `one_chunk`:
+/// the whole prompt fits its first chunk.
 pub(super) fn first_chunk(
     defer: bool,
     queue_lever: bool,
@@ -44,10 +48,11 @@ pub(super) fn first_chunk(
     in_flight: bool,
     vision: bool,
     beams: bool,
+    one_chunk: bool,
 ) -> FirstChunk {
     if defer {
         FirstChunk::Defer
-    } else if queue_lever && multi_rank && in_flight && !vision && !beams {
+    } else if queue_lever && multi_rank && in_flight && !vision && !beams && !one_chunk {
         FirstChunk::Queue
     } else {
         FirstChunk::Inline
@@ -58,10 +63,24 @@ pub(super) fn first_chunk(
 mod tests {
     use super::*;
 
-    /// (defer, lever, multi-rank, in flight, vision, beams)
+    /// (defer, lever, multi-rank, in flight, vision, beams), a prompt longer
+    /// than one chunk.
     fn decide(flags: (bool, bool, bool, bool, bool, bool)) -> FirstChunk {
         let (defer, lever, ep, in_flight, vision, beams) = flags;
-        first_chunk(defer, lever, ep, in_flight, vision, beams)
+        first_chunk(defer, lever, ep, in_flight, vision, beams, false)
+    }
+
+    #[test]
+    fn a_prompt_that_fits_one_chunk_runs_at_admission() {
+        assert_eq!(
+            first_chunk(false, true, true, true, false, false, true),
+            FirstChunk::Inline
+        );
+        // A deferral still takes it.
+        assert_eq!(
+            first_chunk(true, true, true, true, false, false, true),
+            FirstChunk::Defer
+        );
     }
 
     #[test]

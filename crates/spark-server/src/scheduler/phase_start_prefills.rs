@@ -274,16 +274,6 @@ pub(super) fn start_new_requests(
             let defer = want_codispatch
                 || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels())
                 || (multi_burst && multi_eligible(&req));
-            // ATLAS_PREFILL_QUEUE_FIRST_CHUNK: behind a prefill in flight,
-            // wait for the chunk's turn (`queue_first`).
-            let first_chunk = queue_first::first_chunk(
-                defer,
-                sched.levers.prefill_queue_first_chunk,
-                model.is_ep(),
-                !prefilling.is_empty(),
-                req.has_image_pixels(),
-                req.num_beams() > 1,
-            );
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -304,6 +294,20 @@ pub(super) fn start_new_requests(
                 max_batch_tokens,
                 active.is_empty() && prefilling.is_empty(),
                 glm_c4_sparse,
+            );
+            // ATLAS_PREFILL_QUEUE_FIRST_CHUNK: behind a prefill in flight, a
+            // prompt longer than one chunk waits for its turn (`queue_first`);
+            // `start_chunked_prefill`'s first chunk is the whole prompt
+            // exactly when it fits `budget` (the granule rounding only cuts a
+            // chunk short of the prompt's end).
+            let first_chunk = queue_first::first_chunk(
+                defer,
+                sched.levers.prefill_queue_first_chunk,
+                model.is_ep(),
+                !prefilling.is_empty(),
+                req.has_image_pixels(),
+                req.num_beams() > 1,
+                req.prompt_len() <= budget,
             );
             match start_chunked_prefill(
                 sched,
