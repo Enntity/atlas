@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_tp2  # noqa: E402
 
 IMAGE = 'atlas-exl3-validation:src-4ee96c12b44c-rust1.97.1'
-BINARY = '/home/colum/atlas-serve/spark.5e1674ba'  # perf 9ffdb3dd stack, frozen copy
+BINARY = '/home/colum/atlas-serve/spark.main-34d94f34'  # merged main 34d94f34, frozen copy
 NAMES = {0: 'glm53-exl3-perf-0', 1: 'glm53-exl3-perf-1'}
 HOLD = Path('/tmp/atlas-serve.hold')
 LOCK = '/tmp/atlas-bench.lock'
@@ -38,7 +38,9 @@ EXACT = ['ATLAS_EXL3_SPLIT_MMA=1', 'ATLAS_EXL3_SPLIT_MHC=1', 'ATLAS_RDMA_ALLREDU
          'ATLAS_EXL3_COOP_GEMM=1', 'ATLAS_EXL3_COOP_MOE=1', 'ATLAS_EXL3_COOP_FUSED_QKV=1',
          'ATLAS_EXL3_PAR_SMALL=1', 'ATLAS_EXL3_COOP_MOE_V2=1', 'ATLAS_EXL3_COOP_MOE_V3=1',
          'ATLAS_EXL3_COOP_MOE_V6=1', 'ATLAS_EXL3_COOP_MOE_V7=1', 'ATLAS_EXL3_SHARED_OVERLAP=1',
-         'ATLAS_DECODE_ARENA_FILL=skip']
+         'ATLAS_DECODE_ARENA_FILL=skip',
+         # Grouped fat routed MoE for prefill: ~12x TTFT, output-identical (m1-srv-*).
+         'ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1']
 FLAGGED = ['ATLAS_EXL3_SHARED_PACKED=1', 'ATLAS_GLM_SPARSE_DECODE_FP8_SPLIT=1']
 
 

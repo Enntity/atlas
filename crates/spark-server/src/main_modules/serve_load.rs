@@ -765,6 +765,7 @@ pub(crate) fn load_model(
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let progress = atlas_core::load_progress::LoadProgress::new(total_weight_bytes, load_interval);
+    progress.update(0, "model_load_start");
 
     let model = serve_phases::build_model(
         &args,
@@ -784,9 +785,8 @@ pub(crate) fn load_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        Some(progress),
     )?;
-    progress.update(total_weight_bytes, "build_model_done");
-    drop(progress);
 
     // Kernel load audit + the fail-closed boot gate. Every lookup is eager, so
     // by here the audit holds this model's COMPLETE lookup set — see

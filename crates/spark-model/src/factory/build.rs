@@ -70,6 +70,8 @@ pub fn build_model(
     // NLLB / M2M-100 PEFT LoRA adapter directory (`--lora-adapter` for an
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
+    // Load-progress handle owned by the caller; `None` = no progress logging.
+    progress: Option<atlas_core::load_progress::LoadProgress>,
 ) -> Result<Box<dyn Model>> {
     // Review finding m3: a set C2 norm-substitution knob on a model whose
     // load path does not engage it would be silently ignored — refuse before
@@ -298,15 +300,15 @@ pub fn build_model(
         );
         loader.load_layers(&store, &config, gpu.as_ref(), &attn_layer_dtypes)?
     };
-    // Layer-load progress logging: timer reports layer construction.
-    let load_interval: u64 = std::env::var("ATLAS_LOAD_LOG_INTERVAL_SECS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-    let layer_progress = atlas_core::load_progress::LoadProgress::new(0, load_interval);
-    layer_progress.update(0, "layer_load_start");
+    // Layer-load progress: use the caller's progress handle if provided.
+    if let Some(ref p) = progress {
+        p.update(0, "layer_load_start");
+    }
     // (Progress updates during layer construction could be added at sub-loop
     // level inside loader.load_layers; timer reports every interval.)
-    layer_progress.update(0, "layer_load_done");
-    drop(layer_progress);
+    if let Some(ref p) = progress {
+        p.update(0, "layer_load_done");
+    }
     let free_after_layers = gpu.free_memory().unwrap_or(0);
     tracing::info!(
         "Layer construction: {:.2} GB consumed ({:.2} GB free -> {:.2} GB free) \
@@ -1205,5 +1207,8 @@ pub fn build_model(
         model.attach_exl3_dflash(parts)?;
     }
     model.adopt_weight_store(store);
+    if let Some(ref p) = progress {
+        p.update(0, "build_model_done");
+    }
     Ok(Box::new(model))
 }

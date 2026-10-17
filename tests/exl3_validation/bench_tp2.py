@@ -14,6 +14,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -119,9 +120,15 @@ def main():
     ap.add_argument('--workloads', default=str(HERE/'perf_workloads_ab.json'))
     ap.add_argument('--health-timeout', type=float, default=1800)
     ap.add_argument('--binary', help='host path of a spark binary present on both Sparks')
+    ap.add_argument('--binary-source-commit',
+                    help='source commit of the mounted binary, required with --binary')
     ap.add_argument('--cpuset', help='docker --cpuset-cpus for both ranks')
     ap.add_argument('--capture', action='store_true', help='dump per-step logits under /home/colum/atlas-dev/capture/<run>')
     args = ap.parse_args()
+    if bool(args.binary) != bool(args.binary_source_commit):
+        ap.error('--binary and --binary-source-commit must be supplied together')
+    if args.binary_source_commit and not re.fullmatch(r'[0-9a-fA-F]{7,40}', args.binary_source_commit):
+        ap.error('--binary-source-commit must be a 7-40 character hexadecimal commit ID')
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     run = Path(args.out)/f'{args.label}-{stamp}'
     run.mkdir(parents=True)
@@ -129,7 +136,8 @@ def main():
     capture = f'/home/colum/atlas-dev/capture/{args.label}-{stamp}' if args.capture else None
     argvs = {r: create_argv(r, args.image, names[r], args.env, args.binary, capture, args.cpuset) for r in (0, 1)}
     meta = {'label': args.label, 'image': args.image, 'env_overrides': args.env, 'argv': argvs,
-            'binary': args.binary, 'capture': capture,
+            'binary': args.binary, 'binary_source_commit': args.binary_source_commit,
+            'capture': capture,
             'utc': stamp, 'classification': 'unqualified-uninstrumented'}
     created, tunnel = [], None
     try:
@@ -141,6 +149,11 @@ def main():
             meta[f'image_id_r{r}'] = remote(r, f'docker image inspect --format {{{{.Id}}}} {shlex.quote(args.image)}').strip()
             if args.binary:
                 meta[f'binary_sha256_r{r}'] = remote(r, f'sha256sum {shlex.quote(args.binary)}').split()[0]
+        if meta['image_id_r0'] != meta['image_id_r1']:
+            raise RuntimeError('rank image IDs differ; refusing an unmatched benchmark')
+        if args.binary and meta['binary_sha256_r0'] != meta['binary_sha256_r1']:
+            raise RuntimeError('rank binary hashes differ; refusing an unmatched benchmark')
+        for r in (0, 1):
             if capture:
                 remote(r, f'mkdir -p {capture}/rank{r}')
             remote(r, shlex.join(argvs[r])); created.append(r)
@@ -174,7 +187,11 @@ def main():
         for w in args.workload or []:
             cmd += ['--workload', w]
         (run/'fingerprint.json').write_text(json.dumps({
-            'image_id': meta['image_id_r0'], 'source_commit': args.image, 'serve_flags': argvs[0],
+            'image_id': meta['image_id_r0'], 'source_commit': args.binary_source_commit,
+            'binary': args.binary,
+            'binary_sha256_r0': meta.get('binary_sha256_r0'),
+            'binary_sha256_r1': meta.get('binary_sha256_r1'),
+            'serve_flags': argvs[0],
             'environment': args.env, 'hosts': ['spark0', 'spark1'],
             'checkpoint_revision': 'dda99c7e935920fa6e235ce410e6f806e1c02720'}))
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -198,7 +215,8 @@ def main():
                 meta[f'teardown_error_r{r}'] = str(exc)
         (run/'meta.json').write_text(json.dumps(meta, indent=2) + '\n')
     print(run)
+    return result.returncode
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

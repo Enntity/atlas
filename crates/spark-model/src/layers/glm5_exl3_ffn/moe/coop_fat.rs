@@ -26,6 +26,10 @@ use super::*;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(test)]
+#[path = "coop_fat_tests.rs"]
+mod tests;
+
 /// `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1`.
 pub(super) fn coop_moe_fat_multirow() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -119,6 +123,16 @@ impl CoopFat {
         // Both tile widths divide the projections, so no unit straddles a tile.
         if !hidden.is_multiple_of(256) || !intermediate.is_multiple_of(256) {
             warn_fat("projection widths are not multiples of tile_n 256");
+            return None;
+        }
+        // MoeScratchGeometry::sizes allocates one F32 matmul-output region
+        // of max(hidden, intermediate) elements per slot. Gate and up share
+        // that region, so both intermediate-width outputs must fit together.
+        if intermediate
+            .checked_mul(2)
+            .is_none_or(|width| width > hidden.max(intermediate))
+        {
+            warn_fat("grouped gate/up outputs exceed the matmul scratch width");
             return None;
         }
         if !tables

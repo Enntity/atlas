@@ -113,3 +113,19 @@ Constraints (provided):
 Assumption added to assumptions.md:
 - Prefill divergence above 2051 tokens is indexer-order (not arithmetic) per exl3-indexer-localization-result-20261015.md (216 rows, 38 differ, 0 different set). Fix = sort before expansion, not kernel replace.
 - FlashKDA adapter (research/flash-kda-prefill) is candidate only, not default; requires ATLAS_KDA_FLASH_PREFILL=1 + lib path. No dependency added.
+
+## 2026-10-16 campaign assumptions (parent session)
+- Operator grants: F4 lane ownership + Spark/GPU control for the campaign
+  ("stop and leave down"); builder2 + `~/atlas-dev2` are in use (campaign
+  binary backed up as `spark.main-172ce45a`). The port agent's builder3,
+  routed-MoE kernel lane and the paused Spark cleanup are still NOT ours.
+- All campaign numbers are single-harness (`perf_baseline` TPOT), n=3/arm,
+  same session, one variable per A/B → "observed under fingerprint F"
+  claims (run dirs hold `fingerprint.json`/`meta.json`); no cross-harness
+  validation yet.
+- F4 arms carry `COOP_MOE_MULTIROW` in both serial and spec arms (inert at
+  1 serial row) so the spec lane is the only variable.
+- DFLASH flags are the diagnostic A/B class; every new surface
+  (`_VERIFY_GRAPH`, `_KDA_PER_ROW`, `GDN_WY3_REWRITE`,
+  `EXL3_BF16_VOCAB_GATHER`, `MLA_GEMV_WMMA`) is default-off pending its
+  GPU proof.

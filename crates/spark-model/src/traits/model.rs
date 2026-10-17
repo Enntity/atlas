@@ -34,7 +34,7 @@
 use anyhow::{Result, bail};
 use spark_runtime::gpu::DevicePtr;
 
-use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState};
+use super::{MixedBatchResult, MixedForwardResult, PrefillSlice, SequenceState, ThinkBudgetState};
 
 /// One beam-search request for a translation model (NLLB). Carries the resolved
 /// per-request parameters the scheduler stamps onto the sequence; the model runs
@@ -1422,10 +1422,19 @@ pub trait Model: Send + Sync {
     /// the accepted prefix and return the emitted tokens (accepted drafts,
     /// then the bonus, which stays pending). `None`: decode serially this
     /// step. Default: never speculates.
+    ///
+    /// `budget` is the sequence's thinking-budget accounting at dispatch
+    /// time. The commit must never emit a token the serial governor would
+    /// have replaced with `</think>` (`forced_think_end::ForcedThinkEndInjector`):
+    /// it truncates the committed prefix at the last plain-argmax emission
+    /// (`ThinkBudgetState::processor_free_emission_len`), leaving governed
+    /// thinking/tool boundary picks to the caller's canonical serial pipeline.
+    /// A boundary in row zero restores target state and returns `None`.
     fn exl3_dflash_spec_step(
         &self,
         _last_token: u32,
         _seq: &mut SequenceState,
+        _budget: &ThinkBudgetState,
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }

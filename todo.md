@@ -6,9 +6,10 @@ is duplicated here. Q2 diagnostic sequencing detail lives in
 [docs/plans/q2-norm-causality-plan.md](docs/plans/q2-norm-causality-plan.md);
 decisions in [decisions.md](decisions.md); experiment results in
 [q2-diagnostic.md](q2-diagnostic.md). Decode-performance results live in the
-decode ledger, `docs/design/decode-vllm-parity-ledger-20261015.md` on the
-local, unpushed branch `perf/decode-vllm-parity-20261015` (worktree
-`../atlas-perf`). Evidence paths are
+decode ledger, `docs/design/decode-vllm-parity-ledger-20261015.md`. Since
+2026-10-16 the perf, prefill, F4 and coop-port branches are merged into
+`sparkglm/installable-20260924` (the main branch); the old `perf/*` and
+`followup/*` worktrees are historical. Evidence paths are
 relative to the durable root `/home/colum/Workspace/atlas-exl3-validation-20261010`.
 
 Completed items are removed from the active lists below. Their evidence is
@@ -55,7 +56,7 @@ Rules that apply throughout:
 |---|---|---|---|
 | **M1 — Numerical qualification** (critical path) | Q2, closing Q1 | Fresh image passes gate v2 with all controls on both ranks | **Blocked at reference verifiability; diagnostics remain** |
 | M2 — Behavior and quality | Q3, Q4 | Behavior receipts pass; Q4 thresholds met on the qualified profile | Q3 partial; Q4 harness only |
-| M3 — Performance | P0 → P1–P6 | Baseline + targets recorded; optimizations meet them without regressing M1/M2 | **Decode 0.663 → 0.0457 s/token, bit-exact** (~21.9 tok/s; dev branch, unqualified, preliminary; ledger). Numerics-changing flag stack: 0.0425 s/token |
+| M3 — Performance | P0 → P1–P6 | Baseline + targets recorded; optimizations meet them without regressing M1/M2 | **Observed decode 0.0457 s/token on `ab_prose_long`** (unqualified, preliminary, single-harness; `p8C`/`p8C2` in ledger). Historical 0.663 used a different workload and lacks a hash; no endpoint bit-exact A/B is established. Numerics-changing flag stack: 0.0425 s/token |
 | M4 — Serving features | F1–F4 | Each feature qualified independently | F1 graphs used by the perf stack (unqualified); F4 phase 2 in progress |
 | M5 — Release | R1, R2 | Qualified image + regression gate | Not started |
 
@@ -81,6 +82,47 @@ Rules that apply throughout:
 
 ## Now
 
+### Review fixes in the working tree (2026-10-16)
+
+- Implemented: F4 structural-token boundaries now defer to serial processing,
+  with pre-verify state restoration when the first pick needs a processor;
+  budget truncation is replicated to both ranks. Confidence-governed and
+  unlimited thinking use serial decoding conservatively.
+- Implemented: grouped fat-MoE rejects scratch geometries that cannot hold
+  both gate/up projections; side-stream classic-cuBLAS resources are primed
+  before graph capture, with transactional temporary-buffer cleanup.
+- Implemented: benchmark failures propagate after teardown; mounted-binary
+  build commits and both binary hashes are fingerprinted; mismatched ranks
+  fail before launch. Wrapper callers require explicit build provenance.
+- Corrected: the historical short-output baseline and later long-output
+  results are separate observations, not an endpoint bit-exact A/B.
+- CPU evidence: 30 Python benchmark tests pass; model MoE tests 23/23 and
+  budget policy tests 16/16 pass. Full model suite: 1696 passed, 2 ignored,
+  with the pre-existing S-b sync-count test failure (26 expected, 28 actual).
+- Live GPU correctness passed on frozen source `50126e46`, identical binary
+  `3a88201c…` on both Sparks: 12 zero-prefix restores, 711 rejected-tail
+  checks per rank across boundary/budget arms, six JSON/SSE probes, and
+  checker-off output/token-trace identity (n=3/workload). Budget 63 fired
+  mid-step in 3/3; budget 64 was the step-boundary control. Details and
+  fingerprints: continue.md "Review corrections" and
+  `$EV/review-gpu-20261017/validation-summary.json`.
+- Scope: live structural positive is `</think>`; raw `<think>` reentry mask
+  is unit-tested only. Fingerprints cover KDA/conv, not all auxiliary state.
+  All 27 selected scheduler/grammar tests passed in the CUDA runtime
+  (10 decode-step regressions, 3 scalar/tool boundary tests, 14 grammar
+  state tests). Both ranks must be rebuilt together for the shared
+  trait/wire change. The live negative control returned HTTP 400 three
+  times and propagated child/wrapper exit 3 after successful teardown.
+- Fresh timings (n=3, full fingerprints and independent server timing in
+  continue.md): exact-stack long prose output matches the old binary at
+  approximately 21.8 tok/s. Fat-MoE on/off preserves output and reduces
+  first-output median 42.64 → 3.45 s on the 761-token prompt.
+- F4 under restored default processors: serial→k=3 tok/s is 21.33→18.32,
+  20.97→22.57, 21.31→25.62, 20.70→23.64 on the four reference workloads.
+  The short thinking case regresses; F4 remains open. Follow-up: avoid
+  discarded observer proposals during serial thinking without losing the
+  drafter context needed after thinking. Exact per-stage cost is unmeasured.
+
 ### A. M1 causality (open)
 
 Inspect both hosts before new GPU work (continue.md "Before any GPU work").
@@ -105,18 +147,20 @@ Inspect both hosts before new GPU work (continue.md "Before any GPU work").
 - [ ] **G-fallbacks**, in the plan's order (G2, G3, G4, G1, G5, G6/G7), each
   preceded by its G8/G9 binding. See "M1 diagnostic backlog" below.
 
-### B. Decode performance and F4 (active; branch `perf/decode-vllm-parity-20261015`)
+### B. Decode performance and F4 (active; merged into main 2026-10-16)
 
 Worktrees, builders and scripts are in continue.md §8. Agents may hold these
 items: check `ListAgents` and the ledger before starting.
 
-- [ ] **F4 phase 2: make speculation beat serial everywhere.** The lane is
-  on branch `perf/f4-dflash2-exl3` at `172d18e7`; status is in
+- [ ] **F4 phase 2: make speculation beat serial everywhere.** The lane
+  (`perf/f4-dflash2-exl3` @ `172d18e7`) is merged into main; status is in
   `docs/design/f4-phase1-dflash2-exl3.md` §"Phase 2 status at the
   2026-10-16 stop", which has the env recipes.
-  - It works end to end. Exit criteria (a)–(c) hold: emitted tokens are the
-    verify-row argmax, runs are deterministic, and rollback is exact. (d)
-    divergence from serial is reported: bridges_200 1.00, the others low.
+  - Historical raw-argmax lane: criteria (a)–(c) were recorded as passing;
+    (d) divergence from serial was bridges_200 1.00, the others low.
+    The review fix now uses verify argmax only for processor-free prefixes;
+    structural/governed tokens resume canonical serial selection. Fresh
+    boundary/budget receipts are above; historical timings remain historical.
   - Best k=7 result with the NVFP4 drafter
     (`ATLAS_GLM_EXL3_DFLASH_DRAFTER_WEIGHTS=nvfp4`), MULTIROW and the
     indexer verify GEMV fix (`f4k7-idx-20261016T051530Z`): 24.2 / 21.3 /
@@ -124,19 +168,64 @@ items: check `ListAgents` and the ledger before starting.
     ab_prose_long. Serial on the same kernels is ~21.
   - A k=7 step is ~145 ms: routed MoE 52.6 ms (37 unique experts, ~36 ms
     floor), drafter 15.6 ms, ~15 ms eager idle, KDA snapshot copies 4.9 ms.
-  - [ ] Verify graphs keyed by r (recovers the ~15 ms idle).
-  - [ ] A k=3/5 sweep: fewer unique experts makes verify cheaper.
-  - [ ] GPU-check `fe02685e` (one-launch multi-row KDA verify) bit-exact
-    against `ATLAS_GLM_EXL3_DFLASH_KDA_PER_ROW=1`, then time it.
-  - [ ] Port the multirow ≤16-rows cap (`b030781f`) to
-    `perf/exl3-coop-gemm-port`. Above 16 rows per expert in prefill the
-    kernel poisons rows and output degenerates.
-  - [ ] Enforce the thinking budget on speculative steps; C>1.
-- [ ] **Merge plan to the shared branch.** The perf branch reverts the
-  unbuildable `*_opt` kernels (`6a5110c2`, see Housekeeping) and adds many
-  default-off flags.
-  - Review the merge for: default behaviour byte-identical with all flags
-    off, no new mandatory env, CPU tests green, and a no-cache build.
+  - [ ] Verify graphs keyed by r (recovers the ~15 ms idle). **Code done
+    on `f4/verify-graphs-by-r` @ `9b05883d`…`698cd569`; GPU-validated
+    2026-10-16** (`f4c-vg2-*` runs): whole-body capture first FAILED the
+    hash gate (replay of the MLA multi-row prefill region — dynamic host
+    inputs); fixed by REGION capture (KDA forwards + tail captured, MLA
+    segments + hooks eager). Gate now PASSES: hashes byte-identical
+    on/off on all 4 workloads (3/3), rollback 45/45, both ranks clean.
+    Engagement proven (`F4_VERIFY_GRAPH`: 35 captured regions of 46, 11
+    eager MLA, ~2450 replays/request). Observed speedup 2.2–2.8% at k=3
+    (n=3/arm). Owed: nsys idle quantification; in-model hash-parity proof
+    before ever folding the MLA region into capture.
+  - [x] **k sweep done 2026-10-16** (`f4c-{serial,k7,k5,k3}-*`, n=3 each,
+    same session, one binary, one variable): **k=3 is best everywhere** —
+    30.4 / 28.1 / 26.2 / 25.4 tok/s on bridges_200 / bridges_1024 /
+    nothink_1024 / ab_prose_long vs serial 21.5 / 21.1 / 21.3 / 20.8
+    (1.22–1.42×). Accept grows weakly with k (tokens/step 2.26 at k=3 →
+    2.58 at k=7) while verify cost explodes (37 unique experts at k=7);
+    k=7 is slower than serial on nothink_1024. k=2/k=4 fine sweep +
+    `ATLAS_EXL3_VERIFY_PROFILES` A/B in flight (`f4c-{k2,k4,k7-vp}-*`).
+  - [x] **`fe02685e` GPU-checked bit-exact 2026-10-16** (`f4c-smoke1-*`
+    vs `f4c-kdaperrow1-*`): one-launch multi-row KDA verify vs
+    `ATLAS_GLM_EXL3_DFLASH_KDA_PER_ROW=1` — output hash `140b56e3ecb9`
+    identical 3/3 on both paths; rollback checks 62/62 state+argmax
+    identical; both ranks' `DFLASH_ACCEPT` lines identical; τ 2.82 plausible.
+  - [x] The multirow ≤16-rows cap (`b030781f`) and the coop-gemm port
+    are both on main since the 2026-10-16 merge.
+  - [ ] Enforce the thinking budget on speculative steps; C>1. **Code done
+    on `f4/thinking-budget` @ `b3efd501`…`91e25b06`** (commit-side
+    truncation mirroring serial-governor semantics exactly, EP-wired rank
+    symmetry; CPU tests green). **GPU-validated 2026-10-16**
+    (`f4c-bgt-*` runs): inert when the boundary lands on a step end (B=64
+    byte-identical to unpatched), fires when it lands mid-step (B=63:
+    `DFLASH_THINKBUDGET fired=1 dropped=1`, stream changes vs unpatched),
+    rank parity (both ranks fired identically), rollback 86/86,
+    reasoning_tokens 67 ≤ budget+65 in all arms. Owed (Q3-class, live
+    server): `behavior_protocol.py` budget cases, the CUDA-gated grammar
+    tests, C>1 smoke. Drafting AT C>1 remains a separate feature.
+- [ ] **Post-merge requalification.** Merged 2026-10-16 (merge commits
+  `883fc2b8` p13/perf, then coop-port, F4 and prefill-moe-group; fixes
+  `4e7d0767`, `c2a74e6e`, `34d94f34`). Conflicts were resolved in favour of the perf
+  line, so the unbuildable `*_opt` kernels and their dispatch are gone.
+  - Done: GLM-target release build with nvcc at `34d94f34` (234 kernels,
+    `ATLAS_TARGET_MODEL=glm-5.3-flash-exl3 ATLAS_TARGET_QUANT=exl3`, binary
+    sha256 `99d8655a…`, on spark1 at `~/atlas-merge/target/spark.merge-48ec71b1`);
+    CPU tests pass except the pre-existing failures S-a/S-b; the all-targets
+    build fails only on the pre-existing S-e.
+  - Done: in-model re-baseline (`tests/exl3_validation/m1_rebaseline_ab.sh`,
+    runs `m1-*-20261016T17*`/`T18*`, 3 repeats each, same session). The
+    merged binary reproduces every hash of the last measured binary
+    (`80b1eb5fadf8` decode, `1c4328172e81` prefill; flagged stack
+    `564e84bc1f25`/`00fc1b2b6bd0`). Decode is 45.84 vs 45.80 ms/token (old
+    binary), and flagged-stack decode is 42.6 ms/token. The fat-MoE prefill
+    flag stays 12× and output-identical on the flagged stack. The server
+    now runs this binary (continue.md §9).
+  - Owed: a no-cache image and the R-b CI blockers
+    (`docs/design/rb-perf-merge-review-20261016.md`) — B1 fmt fixed on
+    `followup/repo-health-fmt` @ `7b4ead9e`, B2 SPDX fixed on
+    `followup/ci-spdx-vendor` @ `2a14494b` (merge pending).
   - Then decide which bit-exact flags become defaults. Each one needs its
     own neutrality proof on a fresh image.
 
@@ -144,10 +233,13 @@ items: check `ListAgents` and the ledger before starting.
 
 Each item is self-contained, with scope, files and an acceptance check. The
 "CPU" items need no GPU; "GPU" items must take `/tmp/atlas-bench.lock`.
-Unless stated otherwise, work on a new branch off
-`perf/decode-vllm-parity-20261015` and do not commit to the shared branch.
-Standalone harnesses are in `tests/exl3_validation/microbench/` (perf
-branch; README there). The trace database for the current stack is at
+Unless stated otherwise, work in your own worktree on a new branch off
+`sparkglm/installable-20260924` (`git worktree add ../atlas-<item> -b
+followup/<item> sparkglm/installable-20260924`), commit only to that branch,
+and leave merging to the operator. Do not push. Standalone harnesses are in
+`tests/exl3_validation/microbench/` (README there). `ab_full.sh` resolves
+its repo root from `$0`, so it runs the `bench_tp2.py`/workloads of the
+worktree you call it from. The trace database for the current stack is at
 `spark0:/home/colum/p0-nsys-traces-20261015/p0-p6-20261015/rank{0,1}/*.sqlite`
 (rank 1 on spark1). Query it by piping a Python script over ssh.
 
@@ -165,8 +257,153 @@ status:
   silently disabled graphs for the run.
 - **R-d** the `rows < 8` premise in this list was half wrong — see the report.
 - **R-e** `*_opt` nvcc errors reproduced; recommendation **revert**.
-  Owner decision still pending (see Housekeeping).
+  The merge adopted that recommendation and removed the broken drafts.
 - **R-f** full container logs archived, gzipped above 1 MiB.
+
+**Small code work (ready to pick up, 2026-10-16).** Local checks:
+`ATLAS_SKIP_BUILD=1 ATLAS_NO_RDMA=1 cargo +stable test -p <crate>
+--no-default-features --lib`; add `CUDARC_CUDA_VERSION=13000` for
+`cargo +stable check -p spark-server`. A real kernel build needs nvcc: the
+spark1 builders, or a throwaway `nvidia/cuda:13.0.0-devel-ubuntu24.04`
+container with `libibverbs-dev librdmacm-dev pkg-config` installed (the
+plain image lacks them). Never build into `~/atlas-dev*/bin`.
+
+- [x] **S-a (CPU). Failing test `atlas-core
+  config::dsflash_f4::tests::f4_contract_default_ok`** — panics with
+  `draft_pool_max_seqs > 0` at `crates/atlas-core/src/config/dsflash_f4.rs:70`
+  (fails on the pre-merge perf line too). Decide whether the default or the
+  test is wrong; fix. Accept: `-p atlas-core --no-default-features --lib`
+  green. **DONE on `followup/sa-f4-contract-test` @ `57d268fd`+`35cb3a7d`,
+  reviewed**: the validation was wrong (0 = legal "no pool" for an inert
+  contract; `ensure!` now scoped to enabled contracts) AND review found
+  `check_f4_contract` had zero production call sites — now wired into
+  `validate_config` (fail-fast is no longer decorative). atlas-core 181/0.
+- [x] **S-b (CPU). Failing test `spark-model
+  layers::glm5_exl3_ffn::tests::actual_component_prefill_has_one_tp_sum_and_preflight_rejects_missing_comm`**
+  (fails on the pre-merge perf line too). Find the expectation that drifted;
+  fix test or code with a reason. Accept: `-p spark-model
+  --no-default-features --lib` green. **DONE on `followup/sb-prefill-test-drift`
+  @ `c2ced4a3`, reviewed**: expectation drifted (V2 probe stage → 14 stages
+  = 28 syncs; 26→28, assert kept exact). spark-model 1674/0.
+- [x] **S-c (CPU). Dead `glm_sort_pool_indices`**
+  (`crates/spark-model/src/layers/ops/glm_indexer_dynamic.rs`, from
+  `followup/prefill-moe-group`): never called, no kernel behind it. Atlas's
+  indexer top-k is already ordered (Q5 audit), so the sort targeted a
+  reference-only hazard. Delete it and the `docs/prefill-idx-sort-verify*`
+  notes, or give it a real kernel behind a default-off flag. Accept: build
+  plus tests green. **DONE on `followup/sc-delete-glm-sort-pool` @
+  `6f3f6592`+`d11ebda3`, reviewed**: pure deletion (35 lines, zero callers
+  proven); decision log annotated after removal.
+- [x] **S-d (CPU). `ATLAS_EXL3_COOP_MOE_MULTIROW` lock-buffer
+  under-allocation.** Sized `min(capacity, thin_capacity) * topk` rows but
+  indexed `projection * n_groups + group` (up to `2 * slots`); can run out
+  of range when nearly every slot draws a distinct expert. `CoopFat`
+  already allocates `2 * slots`. Accept: a size unit test. **DONE on
+  `followup/sd-multirow-lock-buffer` @ `3d10f85d`, reviewed**: sizing now
+  derives from the write bound via `coop_lock_rows` (SSOT; red-first tests).
+  Reviewer note: today's live OOB window was narrower than stated (old
+  sizing byte-sufficient only via an unrelated resolve coupling) — the
+  contract fix removes the trap either way. GPU proof owed (MULTIROW
+  standalone + in-model under the lock).
+- [x] **S-e (CPU). All-targets kernel build is broken (pre-existing).** With
+  no `ATLAS_TARGET_MODEL` set, `build.rs` compiles every model's kernels, and
+  the symlinked `nvfp4/w4a16_gemm.cu` copies (laguna, minimax, mistral,
+  nemotron×3, qwen3-vl, step3p7 → `deepseek-v4-flash/nvfp4/`) fail with
+  `glm_shared_m16.cuh: No such file or directory`, because nvcc resolves the
+  include next to the symlink. The GLM builders set
+  `ATLAS_TARGET_MODEL=glm-5.3-flash-exl3 ATLAS_TARGET_QUANT=exl3` and never
+  see it. Fix: an `-I` for the symlink target dir in `build.rs`, or include by
+  a path that resolves from every model dir. Accept: the all-targets
+  `cargo build --release -p spark-server` passes nvcc. **DONE on
+  `followup/se-alltargets-include-fix` @ `c824cc03`+`f40ad0e9`, reviewed**:
+  `-I<link-target dir>` in build machinery (SSOT); all 26 `w4a16_gemm.cu`
+  copies verified and the full all-targets release build is green in a
+  container (5m21s, 29 targets, 6133 PTX).
+- [x] **S-f (CPU). Salvage drafts from branch
+  `wip/broken-set-aside-20261016`** (does not compile or fails nvcc; based
+  on pre-merge main). One item per branch, each behind a default-off flag.
+  **ALL DONE 2026-10-16, reviewed (one blocker found+fixed)**:
+  - Tensor-core MLA batched GEMV → **`followup/sf-mla-wmma-gemv` @
+    `c1be30aa`+`814df013`**: kernel body rewritten on `mma.sync m16n8k16`
+    (the draft had OOB fragment loads/stores — CWE-125/787 — so the named
+    shape fix alone would have shipped memory errors); exact
+    `mla_batched_gemv` V-extract fallback kept; everything behind
+    `ATLAS_MLA_GEMV_WMMA`. Numerics-unproven: TC GEMV cannot be bit-exact
+    vs the scalar path — acceptance bar is an operator decision. The
+    batch2..5 handles are registered but undispatched (wiring or removal =
+    follow-up).
+  - GDN wy3 decode rewrite → **`followup/sf-gdn-wy3` @ `c19a1629`…
+    `1dec16d5`** behind `ATLAS_GDN_WY3_REWRITE=1`. Review found and fixed
+    a BLOCKER (base twins applied token updates to the original H instead
+    of the chained state) + a divergent-barrier hazard (now barrier-free);
+    source-contract tests pin both. GPU compare vs today's kernels on a
+    GDN model owed before any default change.
+  - BF16 vocab-head gather → **`followup/sf-bf16-vocab-gather` @
+    `00d4b288`+`9f6e859e`+`13906b42`** behind
+    `ATLAS_EXL3_BF16_VOCAB_GATHER=1`; review fixes: SingleGpu no-op
+    override dropped (fall-through fail-fast), size arithmetic hoisted
+    pre-submit. GPU `output_sha256` proof owed (expected bit-exact).
+  - Persistent-graph async argmax → **not implemented**; design note on
+    `followup/sf-async-argmax-designnote` @ `74d0efe9` (hazards, safe-design
+    requirements tied to I-d, flag/rollback plan).
+  - MiMo-V2.6 loader → triage on the same branch @ `ed5ba81a`:
+    **recommendation DEFER** (missing required loader methods, dead type
+    paths; needs a full model-integration plan). Operator decision.
+  - The GLM MoE `forward_prefill` stub is obsolete (superseded by
+    `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW`): do not salvage.
+- [x] **S-g (CPU). Dead `*_opt` remnants check.** After the merge, grep
+  for references to the dropped `*_opt` kernels (`exl3_moe_mma_opt`,
+  `exl3_moe_precision_opt`, `exl3_persistent_opt`, `exl3_linear_mma_opt`) in
+  docs, scripts and `KERNEL.toml` files, and remove stale ones. Accept: no
+  dangling module names (`gpu.kernel("<module>", …)` must name a module that
+  exists). **DONE 2026-10-16 (verification-only, zero commits)**: zero
+  stale `*_opt` references anywhere (the merge dropped all registrations);
+  every `gpu.kernel(...)` call site resolves. The R-e report
+  (`docs/design/re-opt-kernel-build-triage-20261016.md`) is load-bearing
+  history — kept. Non-`*_opt` drift found and recorded under Follow-ups.
+- [x] **S-h (CPU). `cargo fmt --all`** (see Housekeeping, repo-health).
+  **DONE on `followup/repo-health-fmt` @ `7b4ead9e`, reviewed**: 10 files,
+  formatting-only (302 diff lines token-reviewed — zero semantic change).
+
+**Discovered follow-ups (2026-10-16 fan-out + review; not yet owned)**
+- clippy (deny-warnings) is red on main beyond the named B4/B5:
+  `clippy::collapsible_if` `atlas-kernels/build.rs` ~:544,
+  `redundant_pattern_matching` atlas-core, plus deny errors at
+  `mtp_head/batch_caps.rs:169` and `glm5_exl3_ffn/dense.rs:10`.
+- Two pre-existing `atlas-kernels` test failures: `argmax_tiebreak_contract::
+  every_cuda_argmax_reduction_matches_last_index_greedy_contract` (14 vs 11)
+  and `module_compile_flags::actual_exl3_model_declares_only_its_mhc_override`
+  (MODEL.toml lacks `build.module_nvcc_flags`).
+- KERNEL.toml drift: 83 dangling `[modules]` entries (strix 41+37+1,
+  longcat-flash-lite 5) whose `.cu` exists elsewhere; `build.rs`
+  `validate_modules` silently ignores dangling keys — candidate validation
+  (build.rs is shared surface; coordinate with the S-e lane).
+- `crates/atlas-core/src/config/tests/tests_b.rs` is orphaned (no
+  `mod tests_b;`) — its tests never compile or run.
+- SPDX gate hardening: `check_spdx.py` fnmatch `*` crosses `/`, so the new
+  `exllamav3_*` ignores would also swallow a future nested/AGPL file with
+  that prefix — pin the 12 filenames or anchor ignores by parent dir.
+- `sd-multirow`: thread `GATE_UP_PROJECTIONS` into the launch-site
+  literals (`coop.rs`/`coop_fat.rs` still pass bare `2`).
+- File-size debt: `glm5_kda/upstream.rs` 557 LoC (grew from 542),
+  `coop.rs` 1003 LoC, `decode_a.rs`/`glm5_exl3_mhc.rs` over cap after fmt;
+  file-size-cap gate +5 vs base from the perf merge.
+- HIP vendor mirror may share the symlinked-include gap (S-e follow-up).
+- typos: 9 findings in tracked docs (mostly the `nothink` workload name and
+  quoted `halfs`/`interm`) — fix or register `_typos.toml` words.
+- Legacy `SingleGpuBackend::all_gather`/`all_reduce_scatter` no-op
+  overrides share the uninit-recv caveat the BF16 review caught.
+
+**Operator decisions pending**
+- L1 lead (c): candidate FP32 highway vs pinned BF16 reference capture —
+  L1 collections now fail closed at the dtype guard by design; needs a
+  registered correction (reference re-pin vs candidate cast).
+- `ATLAS_MLA_GEMV_WMMA` GPU acceptance bar: TC GEMV cannot be bit-exact
+  vs the scalar path (accumulation order) — tolerance vs accepted-hash
+  protocol before any qualification.
+- MiMo-V2.6 loader: implement or defer (triage recommends DEFER).
+- Strict-PCND `f4_draft_pool_max_seqs` (require the JSON key rather than
+  the serde default 4) — recommendation only, in decisions.md.
 
 **Investigate (GPU microbench / trace queries)**
 - [ ] **I-a. mHC finish "sqsum" stage, ~6.3 µs unexplained.**
@@ -175,14 +412,41 @@ status:
   LDS/FFMA. Dropping the residual writeback (v4) saves only ~1 µs. Find the
   cause (use `sudo -n /usr/local/cuda/bin/ncu` on the spark1 host, under
   the lock) and propose a bit-exact fix. Worth ≤0.5 ms/token.
+  **Investigated 2026-10-16** (`Ia-*` runs, report
+  `ia-ib-ic-20261016/HANDOFF.md`, branch `followup/ia-ib-ic-microbench` @
+  `b93e5b10`+`dcddbc06`): cause NOT YET DETERMINED — three hypotheses
+  falsified with counter/probe evidence (bank conflicts only 0.6-0.7 µs,
+  guard instructions 0.25 µs, writeback 0.3-0.4 µs; ncu: lg_throttle +
+  barrier stalls dominate a globally stall-bound kernel; stage-marker
+  method ±0.3-1 µs unreliable). Bit-exact fix landed (16-byte loads,
+  9/9 byte-identical): ≈0.05-0.08 ms/token (preliminary, microbench-only;
+  in-model hash check owed). Residual ~5.4 µs/call (≈0.48 ms/token) open.
 - [ ] **I-b. KDA recurrent decode: 32 µs vs a ~15 µs roofline**, for 4 MB
   of state read and written per call, 34 calls/token. Try the
   `[V,K]` layout or overlapped load/compute in `microbench/kda_decode`.
   The update order per value row must stay identical. Worth ≤0.6
   ms/token.
+  **Investigated 2026-10-16** (`Ib-*` runs, report
+  `ia-ib-ic-20261016/HANDOFF-Ib.md`, commit `04cc8c9d`): CAUSE FOUND —
+  DRAM traffic amplification (float4-pair stores write each state sector
+  twice → 1.55× logical traffic; 130 GB/s on logical bytes, 195 GB/s on
+  actual). The `[V,K]` layout is bit-exact (under transpose) and
+  −9.24 µs/call (−27.8%, n=3 same-process A/B) → ≈0.31 ms/token projected
+  in-model. PRODUCTION LAYOUT FLIP NOT APPLIED — cross-cutting (all KDA
+  state readers/writers incl. `_rows`/snaps/prefill must transpose
+  together): **operator decision**.
 - [ ] **I-c. `exl3_mhc_pre_partials`: 12 µs vs a ~8 µs floor** (1.5 MB of
   `fn` weights per call, 89 calls/token). Bit-exact only: the per-thread
   loop and `projection_reduce` order are fixed.
+  **Investigated 2026-10-16** (`Ic-*` runs, report
+  `ia-ib-ic-20261016/HANDOFF-Ic.md`, commit `bc37b864`): clean negative —
+  cause NOT YET DETERMINED, two hypotheses falsified with counter evidence
+  (no I-b-style load-side traffic amplification; SASS-verified prefetch
+  variant is FLAT, +0.14 µs). Production kernel left UNCHANGED (the
+  variant would cost ≈0.01 ms/token). Gap (12.53 vs 8 µs floor) ≈0.40
+  ms/token open; in-model graph-captured calls may already sit closer to
+  the floor — re-measure before budgeting. Needs PC-sampling ncu build
+  (this one lacks it — same limit that bounded I-a).
 - [ ] **I-d. Decode graph launch cost.** `cuGraphLaunch` of the decode
   graph takes ~1.7 ms of host time, and the first kernel started ~480 µs
   in, behind the arena memsets now removed by `skip`. Re-measure the
@@ -191,20 +455,60 @@ status:
   `cuGraphUpload`/instantiate flags. Output: the remaining gap, and
   whether async next-step launch (token read from device) is worth
   building.
+  **Investigated 2026-10-16** (`ia-ib-ic-20261016/HANDOFF-Id.md`, trace
+  analysis, no commits): gap decomposed — 562 µs p50 turnaround = 486 µs
+  arena memsets (87%; already removed by `DECODE_ARENA_FILL=skip`) +
+  ~68 µs in-graph front gaps (I-e class) + 8 µs scheduling. Nodes/step
+  2,234 kernels + 34 memset nodes (pre-skip); `cuGraphInstantiateWithFlags`
+  flags=0; NO `cuGraphUpload` anywhere. cuGraphLaunch host span p50
+  1.73 ms but enqueued a FULL STEP early (host busy 3.7%) → **async
+  next-step launch NOT worth building** (it already exists; upper bound
+  0.16% of a step). Fresh arena-skip confirmation trace `I-d-skip1`
+  queued behind the bench lock (predicted residual ~76 µs/token).
 - [ ] **I-e. In-graph dependency gaps.** There are ~150 gaps of ~5 µs per
   token (~0.8 ms) at `exl3_output_hadamard → ncclDevKernel_SendRecv`,
   `→ Kernel2` (cuBLASLt) and `splitKreduce → dense_gemv_bf16`. Identify
   the cross-stream/event edges that cause them, and say whether they can
   be removed safely.
+  **Investigated 2026-10-16** (`ia-ib-ic-20261016/HANDOFF-Ie.md`, trace
+  analysis, no commits): all classes mapped to the four-hop exchange in
+  `comm_impl.rs` (:124-125/:57-95). B (213 µs/token) is the arena-memset
+  node — already reclaimed by `DECODE_ARENA_FILL=skip`, not a sync edge.
+  A+D (414 µs/token, 90/step = one per exchange) = compute→comm
+  cross-stream event hops; C+E (253 µs/token) = redundant return-edge
+  crossings (edge satisfied 253 µs early). Addressable sync overhead
+  ≈0.67 ms/token (1.4%). Cheapest: run the exchange on the compute stream
+  (the `try_rdma_all_reduce` pattern, comm_impl.rs:52-55). All proposals
+  are sync-structure only (bit-exact by construction) but change
+  comm/compute overlap for prefill/verify → **owner decision**.
 - [ ] **I-f. NCCL SendRecv latency.** 90 exchanges/token of 8 KB;
   p10 15 µs, p50 25 µs on both ranks, ~2.7 ms/token in total. With full
   logs (R-f), confirm the transport (GDR vs host bounce) and protocol, then
   A/B `NCCL_PROTO`/GDR knobs. No code change.
+  **Investigated 2026-10-17** (`ia-ib-ic-20261016/HANDOFF-If.md`, `If-*`
+  runs): TRANSPORT CONFIRMED — 8-KB SendRecv goes over IB verbs on RoCE
+  (`rocep1s0f0`, GID 3) with **host bounce, no GDR** (`NCCL_CUMEM_ENABLE=0`
+  explicit in the container descriptor). Knob A/B (n=3/arm, hashes
+  identical `140b56e3ecb9`): base 0.04686 / LL 0.04716 / LL128 0.04701 /
+  GDR_LEVEL=0 0.04676 / **GDR ON 0.04681** — ALL FLAT within noise.
+  Verdict: the ~25 µs/exchange is structural (the I-e event hops), not
+  knob-tunable; **no NCCL config change**; the lever is I-e's
+  on-compute-stream exchange (owner decision).
 - [ ] **I-g. Remaining cuBLAS calls on the decode path.** Router `gemvx`
   (16 µs × 42), `Kernel2`/cutlass wmma (17 µs × 34) and `splitKreduce`.
   Find what each computes, its bytes and its roofline. Replacing any of
   them changes numerics (flag-only), so the output is a costed list. This
   overlaps Q5 (pinning the cuBLASLt router).
+  **Investigated 2026-10-17** (`ia-ib-ic-20261016/HANDOFF-Ig.md`, trace+code
+  analysis, no commits): costed list done. Router GEMM (`moe/forward.rs:
+  78-80`) 16.44 µs × 42 = 0.69 ms/token at **~105% of the DRAM roofline**
+  (4.50 MiB weights/call, 189 MiB/token) — only lever is fewer bytes:
+  FP8/INT8 router ≈ +0.35 ms/token (strong numerics flag: top-k can
+  change). Q5 pinning restated: ≤35 µs/token headroom (the call is at the
+  roofline). Kernel2+splitKreduce = one split-K GEMM, 0.673 ms/token at
+  78-100% roofline → standalone port rejected (≤0.15 ms/token).
+  `mla_batched_gemv`+`dense_gemv_bf16` (2.0 ms/token, repo-own) are
+  bigger than any cuBLAS item here — separate byte-audit candidate.
 
 **Numerics characterization (GPU, flagged stack)**
 - [ ] **N-a. Divergence report for each numerics-changing flag.** Flags:
@@ -342,8 +646,19 @@ P0's independent timing exists.
     - ≥3 matched uninstrumented repeats with **independent** timing
       (stream timestamps or nsys cadence, measurement rule 7), since
       `perf_baseline.py` TPOT is so far the only timer;
-    - prefill/TTFT at short and near-limit lengths on the current stack;
-    - the recorded targets.
+    - prefill/TTFT at short and near-limit lengths on the current stack
+      — **DONE 2026-10-16** (`f4c-p0-prefill{,-fat}-*`, n=3): current
+      stack (FAT_MULTIROW) 108 tok → 0.56 s, 761 → 3.47 s, 2,943 → 13.9 s
+      TTFT (~215 tok/s prefill); without FAT_MULTIROW the same prompts
+      take 6.1 / 42.6 / 161.9 s (~18 tok/s) — the flag is the 12× lever;
+    - the recorded targets — **RECORDED 2026-10-17**: decode on
+      `ab_prose_long` (the contract workload) must sit in the reference
+      band ~25-35 tok/s — **met at k=3** (25.4 serial-comparable stack,
+      26.0 with region verify graphs; 31.3 on bridges_200); prefill target
+      ≥200 tok/s — **met** (215 tok/s with FAT_MULTIROW; 18 tok/s
+      without, so the flag is part of the contract). Promoted candidate
+      stack: F4 k=3 + region verify graphs + FAT_MULTIROW, still
+      UNQUALIFIED pending Q2/Q3/Q4.
 - [ ] **P1 — Packed decoder and decode occupancy.**
   - *Done (flags, bit-exact):*
     - slice-parallel MMA (`SPLIT_MMA`);
@@ -383,8 +698,7 @@ P0's independent timing exists.
     - the warp-shuffle routing top-k;
     - the KDA decode float4 state.
   - *Flagged:* the FP8 sparse MLA decode split (`GLM_SPARSE_DECODE_FP8_SPLIT`,
-    −1.3 ms); the tensor-core MLA Q-absorb/V-extract GEMV
-    (`ATLAS_MLA_GEMV_WMMA=1`, never run on a GPU).
+    −1.3 ms). The tensor-core MLA GEMV draft fails nvcc (S-f).
   - Open: I-a, I-b and I-c above.
 - [ ] **P4 — Repeated transforms, launches and F32 intermediates.**
   - *Done:*
@@ -504,7 +818,10 @@ in `q2-codepath-audit-20261012/comparison-report.md` §5, as corrected in
 
 ## Housekeeping
 
-- [ ] **Shared branch HEAD does not build.** Another session's `a04d27ff`,
+- [x] **Shared branch HEAD does not build** — resolved 2026-10-16 by the
+  merge: conflicts taken from the perf line (the R-e "revert"
+  recommendation, operator decision), plus `fix/atlas-core-loadprogress-compile`
+  and the `load_progress` cfg-gate fix `c2a74e6e`. Original note: another session's `a04d27ff`,
   `4692fb8d` and `72f9a788` add `*_opt` kernels that fail nvcc, and
   `cooperative_mma()` defaults them on for the reference profile. The perf
   branch reverts `a04d27ff` (`6a5110c2`). R-e triaged this 2026-10-16
@@ -512,8 +829,8 @@ in `q2-codepath-audit-20261012/comparison-report.md` §5, as corrected in
   modules fail nvcc with 8–38 errors each, a fourth (`exl3_linear_mma_opt`)
   fails too, and `collect_cu_files()` compiles every `.cu` under
   `kernels/gb10/common/` so no `KERNEL.toml` gate contains it. Recommendation:
-  **revert** — keep the perf-branch `6a5110c2` state. The owner decision is
-  STILL PENDING; do not build the shared HEAD with `--no-cache` until then.
+  **revert** — the merge adopted the perf-branch `6a5110c2` state.
+  This old build blocker is resolved; fresh-image qualification remains owed.
 - [ ] **Spark disk cleanup, part 2 (paused for the operator).** Containers,
   superseded images and the build cache were removed 2026-10-15, with
   inspect data archived to `spark-cleanup-20261015/`. Not done:
@@ -599,7 +916,10 @@ continue.md). Do not delete these paths.
 **P / F (perf branch `perf/decode-vllm-parity-20261015`; ledger has run IDs)**
 - P0 Nsight attribution ([record](docs/design/p0-attribution-20261015.md),
   `p0-trace-20261015/`).
-- Decode exact path 0.663 → 0.0457 s/token, in order:
+- Decode optimization history (two workload series, not one endpoint A/B):
+  historical `ab_prose_decode` baseline 0.663 s/token has no output hash;
+  `ab_prose_long` later observed 0.0457 s/token (`p8C`/`p8C2`, preliminary,
+  single-harness). The individual changes and their scoped identity checks, in order:
   - split MMA/mHC (`8fe98293`);
   - RDMA allreduce;
   - cpuset 15-19 (`37f8c010`);
@@ -677,14 +997,14 @@ continue.md §0.
   — the `rows < 8` premise above was half wrong (the unrounded split pair runs
   at every `rows` in 1..16; only the rounded layer-0 path is gated);
   R-e [`*_opt` triage](docs/design/re-opt-kernel-build-triage-20261016.md) —
-  recommendation **revert**, owner decision pending.
+  recommendation **revert**, adopted by the mainline merge.
 - **Mainline compile break found while folding.**
   `sparkglm/installable-20260924` does not compile:
   `atlas-core/src/load_progress.rs` (commit `7035710f`) calls `thread::sleep`
   without importing `thread` and derives `Default` on a struct holding
   `Instant`. Two-line fix committed as `6427bf6a` on branch
   `fix/atlas-core-loadprogress-compile`, deliberately NOT folded onto the perf
-  branch. **Owner decision needed.**
+  branch at the time; the fix is now integrated through the mainline merge.
 
 ## KV column-codec experiment — follow-ups (2026-10-13)
 

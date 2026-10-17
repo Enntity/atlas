@@ -16,8 +16,7 @@ duplicate it.
 5. The `AGENTS.md`/`CONTRIBUTING.md` rules and the measurement-discipline
    skill before any numerical claim.
 6. For performance or F4 work: §8 below, then the decode ledger
-   `docs/design/decode-vllm-parity-ledger-20261015.md` on the local branch
-   `perf/decode-vllm-parity-20261015` (worktree `../atlas-perf`).
+   `docs/design/decode-vllm-parity-ledger-20261015.md` in this checkout.
 
 The latest review and its disposition table are in
 [CODE_REVIEW_2026-10-12.md](CODE_REVIEW_2026-10-12.md). Superseded narrative
@@ -26,22 +25,21 @@ is in git history.
 ## 0. Start here — follow-up workers
 
 You were probably given one item from todo.md "Follow-up and review areas"
-(R-a…R-f, I-a…I-g, N-a). Read that item, this section and §8. Nothing else
+(S-a…S-h, I-a…I-g, N-a). Read that item, this section and §8. Nothing else
 is required.
 
 **Where to work.**
-- All performance code lives on the local, unpushed branch
-  `perf/decode-vllm-parity-20261015`, in worktree
-  `/home/colum/Workspace/RustroverProjects/atlas-perf`. The microbenchmarks
-  (`tests/exl3_validation/microbench/`) and the decode ledger
-  (`docs/design/decode-vllm-parity-ledger-20261015.md`) exist only there.
+- Since 2026-10-16 all performance, prefill, F4 and coop-port work is merged
+  into `sparkglm/installable-20260924` (the main branch); the ledger
+  (`docs/design/decode-vllm-parity-ledger-20261015.md`) and microbenchmarks
+  (`tests/exl3_validation/microbench/`) are on it. The `perf/*` worktrees
+  are historical.
 - Make your own worktree on a new branch:
-  `git -C ../atlas-perf worktree add ../atlas-<item> -b followup/<item>
-  perf/decode-vllm-parity-20261015`.
-- Do not commit to `sparkglm/installable-20260924` (the shared branch, with
-  other sessions' uncommitted files in its tree). Do not commit to the three
-  `perf/*` branches, do not push anything, and do not rebase others'
-  branches.
+  `git worktree add ../atlas-<item> -b followup/<item>
+  sparkglm/installable-20260924`. Commit only to that branch; the operator
+  merges. Do not push, and do not rebase others' branches.
+- Small, self-contained code items are listed in todo.md "Small code work"
+  (S-a…S-h).
 
 **Do not touch** (owned by running agents or the operator):
 - the builder containers `atlas-dev-builder`, `-builder2` and `-builder3`,
@@ -87,7 +85,7 @@ E=(--env ATLAS_EXL3_COOP_MOE_V2=1 --env ATLAS_EXL3_COOP_MOE_V3=1 --env ATLAS_EXL
    --env ATLAS_EXL3_COOP_MOE_V7=1 --env ATLAS_EXL3_SHARED_OVERLAP=1 --env ATLAS_DECODE_ARENA_FILL=skip
    --env ATLAS_NO_DECODE_GRAPHS=0 --env ATLAS_NO_DECODE_GRAPHS_MULTISEQ=0 --env ATLAS_DEBUG_NO_GRAPH=0
    --env ATLAS_EP_GRAPHS=1 --env ATLAS_KDA_FLA_GRAPH=1 --workload ab_prose_long)
-bash tests/exl3_validation/ab_full.sh <item>-<label> /home/colum/atlas-dev/bin/spark "${E[@]}"
+ATLAS_BENCH_BINARY_SOURCE_COMMIT=<actual-binary-build-commit> bash tests/exl3_validation/ab_full.sh <item>-<label> /home/colum/atlas-dev/bin/spark "${E[@]}"
 # prints: tpot p50, the 3 output hashes, and the run dir
 ```
 
@@ -116,6 +114,113 @@ bash tests/exl3_validation/ab_full.sh <item>-<label> /home/colum/atlas-dev/bin/s
 
   Do not edit todo.md or continue.md; the operator merges results.
 
+## Review corrections (2026-10-16)
+
+The post-review working tree separates the historical short-output baseline
+from the later long-output series; the endpoints do not establish a
+bit-exact speedup. The benchmark runner now propagates measurement failures,
+requires the actual build commit for mounted binaries, records both rank
+hashes, and rejects mismatched rank images/binaries before launch.
+`ab_full.sh` accepts that build commit through
+`ATLAS_BENCH_BINARY_SOURCE_COMMIT` or `--binary-source-commit`; the two-binary
+`m1_rebaseline_ab.sh` requires `OLD_SOURCE_COMMIT` and `NEW_SOURCE_COMMIT`
+separately. A current checkout commit is not proof of an older binary's build.
+
+Live review validation (2026-10-17 UTC): frozen source `50126e4666a46bcbe4bf4ab9db626937231eb15f`
+(base `172ce45a`), binary SHA256
+`3a88201c66b1433f750bf8bd267d919837e33c4b72c63b70541fbd346a6c0baa`
+on both Sparks. Fresh native release build: 234/234 kernels compiled, zero
+kernel cache hits; isolated builder, existing runtime image. This validates
+the frozen review snapshot, excluding concurrent load-progress edits.
+Evidence: `$EV/review-gpu-20261017/validation-summary.json` and its run dirs
+(`$EV=/home/colum/Workspace/atlas-exl3-validation-20261010`).
+Local CUDA link failures do not imply live validation is unavailable: check
+`~/.local/bin/spark0` and `spark1` before declaring a GPU blocker. Preflight
+workload fixtures before expensive model loading. The first boundary
+attempt (`review-boundary-20261017T024433Z`) aborted before requests because
+of an invalid prompt class; its failed receipt is retained separately and
+none of its data is used. The v2 fixtures passed loader preflight.
+
+The TP=2/EP=1 GLM-5.3 Flash EXL3 correctness slice passed:
+- `review2-boundary-*`: 12 zero-prefix structural-boundary restores and
+  366 rejected-tail checks per rank; KDA/conv fingerprints and next argmax
+  matched. Six full JSON/SSE protocol probes passed.
+- `review2-budget-*`: all three budget-63 repeats kept one/dropped one at
+  count 62; budget 64 reached a step boundary without truncation. All 345
+  rejected-tail checks per rank matched. Reasoning counts were 75 in both
+  cases, within the serial governor's budget+65 deferral bound.
+- Both checker-off controls matched diagnostic hashes and generated token
+  traces across three repeats per workload. Diagnostics disabled watchdogs
+  deliberately so thinking speculation engaged.
+
+All 27 selected scheduler/grammar tests passed in the CUDA runtime after
+an isolated release-test build: ten decode-step regression tests, three
+scalar/tool-boundary tests, and fourteen grammar state tests. The live
+failure-control arm (`review-rejected-request-20261017T033936Z`) produced
+three HTTP 400 errors and propagated child/wrapper exit 3 after teardown.
+Full build/test logs and nonzero test-count receipts are in the evidence
+root. The inference campaign and selected test campaign are complete:
+63 successful benchmark requests, six protocol probes, and all 27 selected
+tests passed. Our benchmark containers were removed and our isolated
+builder stopped; pre-existing builders were left untouched. Postflight
+rank 1 telemetry still reported 96% utilization at 6 W with no visible
+compute process; this is preserved in `postflight-r1-detail.txt`, not used
+to reinterpret any timing.
+
+Live structural probes exercised `</think>`, not special `<think>` reentry;
+that mask case remains unit-tested only. State fingerprints cover KDA/conv,
+not every auxiliary tensor. Ordinary confidence-governed and unlimited
+thinking conservatively use serial selection. Processor-free accepted
+prefixes use verify-row argmax; structural/governed emissions resume the
+canonical serial processors. Historical raw-argmax F4 receipts therefore
+do not establish output identity for this hybrid path.
+
+Fresh diagnostics-off timings (same checkpoint revision
+`dda99c7e935920fa6e235ce410e6f806e1c02720`, TP=2/EP=1, `fp8_g128`,
+max sequence 4096, prefill chunk 128, one sequence, cpuset 15-19, greedy,
+seed 20261011; complete argv/requests/hashes in each run's fingerprint):
+
+- Exact-stack binary A/B: `review-old-exact-20261017T022246Z` vs
+  `review-new-exact-20261017T023010Z`, n=3/workload. Long prose (108 actual
+  prompt tokens, 989 completion tokens) client medians 21.8056 vs 21.8236
+  tok/s; independent server medians 21.7754 vs 21.8005. Output hashes match
+  across builds and repeats. These observations do not establish a speedup.
+- Fat-MoE one-variable ablation on the new binary:
+  `review-new-fat-off-20261017T023733Z` vs the new-exact arm above. The
+  761-token prompt's first-output median fell 42.6378 → 3.4518 s (12.35×);
+  server TTFT independently fell 42.6299 → 3.4385 s. All n=3 outputs match.
+  This fresh result covers 761 tokens, not the historical 2943-token case.
+- F4 serial/k=3: `review-serial-20261017T031744Z` vs
+  `review-k3-20261017T032848Z`, n=3/workload, default watchdogs enabled,
+  historical F4 recipe (separate from the fat-MoE recipe above):
+
+  | Workload | Serial tok/s | k=3 tok/s | Ratio |
+  |---|---:|---:|---:|
+  | bridges_200 | 21.33 | 18.32 | 0.86× |
+  | bridges_1024 | 20.97 | 22.57 | 1.08× |
+  | bridges_nothink_1024 | 21.31 | 25.62 | 1.20× |
+  | ab_prose_long | 20.70 | 23.64 | 1.14× |
+
+  These are client decode medians; server timing agrees within 0.96% for
+  every request. All outputs are 3/3 deterministic. Only bridges_200
+  matches serial's hash; longer speculative outputs remain numerically
+  different. Both ranks have 12 successful CUDA graph captures, no failure
+  receipts, and matching final speculative counters. Committed speculative
+  steps/emissions per request were respectively 4/13, 224/523, 225/501,
+  and 434/957. Draft acceptance telemetry alone is not engagement.
+
+The short thinking arm is slower: the restored confidence gate selects
+serial thinking, while the existing observer still proposes drafts in
+`exl3_dflash_before_decode`. Avoiding that discarded work is a follow-up;
+its exact stage cost was not measured here. F4's "beat serial everywhere"
+criterion remains unmet. Historical 30.4/28.1/26.2/25.4 tok/s receipts do not
+carry forward to this restored processor policy.
+
+Older GPU receipts describe their recorded builds only. The registered Q2
+qualification and fresh release-image qualification remain open. This was
+a fresh native build in an isolated builder with a mounted binary, not a
+newly qualified release image.
+
 ## 1. Status at a glance (2026-10-16)
 
 | Area | Status | Pointer |
@@ -125,15 +230,15 @@ bash tests/exl3_validation/ab_full.sh <item>-<label> /home/colum/atlas-dev/bin/s
 | Dominant cause of divergence | **Unproven.** C2 mixed. L1 reference observer now verifiable (2026-10-15, O1/O2 pass). The registered bisect produced no attribution because of two capture/binding defects; every pairable layer-1 stage differs (descriptive) | [L1 fused-off result](docs/design/l1-fusedoff-observer-result-20261015.md), todo "Now" §4 |
 | API behavior (Q3) | Partial: focused live slice 15/15 on `ee5eaf0f` | todo Q3 |
 | Task quality (Q4) | Harness only; no live run | todo Q4 |
-| Performance (P0–P6) | Unqualified dev branch. Decode on `ab_prose_long` (128 in / 1024 out, graphs): **0.663 → 0.0457 s/token bit-exact** (~21.9 tok/s; two 3-repeat runs, 0.04574 / 0.04573), and **0.0425** with the numerics-changing flags. vLLM's DFlash ~25–35 tok/s needs F4. No P0 contract or targets yet | §8, decode ledger, todo "Now B" |
-| Speculative decoding (F4) | Phase 2 works end to end. At k=7, NVFP4 drafter, multirow MoE and the indexer fix, it measures 24.2 / 21.3 / 18.2 / 20.4 tok/s on bridges_200 / bridges_1024 / nothink_1024 / ab_prose_long, against ~21 serial on the same kernels. Deterministic; rollback verified exact. Verify-row numerics diverge from serial (labelled). A k=7 step costs ~145 ms: routed MoE 52.6, drafter 15.6, ~15 idle (eager verify). Next: verify graphs, smaller k, KDA one-launch verify (`fe02685e`, untested on GPU) | `perf/f4-dflash2-exl3` @ `172d18e7`, `docs/design/f4-phase1-dflash2-exl3.md` |
+| Performance (P0–P6) | Unqualified dev branch. Preliminary, single-harness observation on `ab_prose_long` (128 in / 1024 requested out, graphs): **0.0457 s/token** (`p8C-20261016T004247Z`, `p8C2-20261016T014550Z`, three repeats each with matching output hashes). The historical 0.663 s/token baseline used `ab_prose_decode` and has no output hash; these endpoints are separate workload series, not a bit-exact A/B. The numerics-changing stack separately observed **0.0425 s/token** (`p8flagged-20261016T021707Z`). vLLM's DFlash ~25–35 tok/s needs F4. No P0 contract or targets yet | §8, decode ledger, todo "Now B" |
+| Speculative decoding (F4) | **k sweep complete 2026-10-16 evening** (campaign binary = merged main `172ce45a`, `f4c-*` runs): **k=3 best — 30.4 / 28.1 / 26.2 / 25.4 tok/s** on bridges_200 / bridges_1024 / nothink_1024 / ab_prose_long vs serial 21.5 / 21.1 / 21.3 / 20.8 (1.22–1.42×, n=3, one variable). k=7 loses to serial on nothink_1024; `VERIFY_PROFILES` flat-to-worse at k=7 (off). `fe02685e` KDA one-launch verify **GPU-checked bit-exact** (hash `140b56e3ecb9`, rollback 62/62). Code landed on branches: verify graphs keyed by `(slot, r)` (`f4/verify-graphs-by-r` @ `9b05883d`), thinking-budget enforcement (`f4/thinking-budget` @ `b3efd501`…) — both have branch-local GPU validation recorded below; those receipts do not validate later edits | todo "Now B", `docs/design/f4-phase1-dflash2-exl3.md`, runs in `$EV/perf-ab-20261015/f4c-*` |
 | Serving features (F1–F3), release (R1/R2) | F1 graphs run in the perf stack (unqualified); the rest not started | todo |
-| Hazards | Shared branch HEAD does not build `--no-cache` (another session's `*_opt` kernels; the perf branch reverts them). Perf and F4 branches are local only, unmerged and unpushed | todo Housekeeping, R-e |
+| Hazards | The perf/F4 stack is merged into main; the broken `*_opt` drafts were removed. GLM-target build receipts exist, but fresh-image qualification and branch-local follow-up integration must be tracked separately | todo Housekeeping, R-e |
 | Reference indexer source | **Localized 2026-10-15:** above 2051 tokens the indexer's `top_k_per_row_prefill` returns the right pool set in a run-dependent order (216 token rows checked: 38 differ, 0 with a different set; prior 32-repeat oracle shows 3–7 orders for one set); sparse MLA attention accumulates in that order | [indexer result](docs/design/exl3-indexer-localization-result-20261015.md) |
 | Reference determinism test | 2026-10-15, `EXL3_FUSED_MOE=0`: 25/32 rows byte-identical across 3 processes (primary FAIL as registered). All variation <2052 tokens removed, so fused-MoE attribution strengthened; a second source starts exactly where indexer pool top-k becomes non-trivial (2052 = 513 pools of 4). Loop profile is not a neutral pin (4 short16 items 1.19–1.93× H3 limit) | [determinism result](docs/design/exl3-fused-moe-determinism-result-20261015.md) |
 | Reference non-determinism source | **Localized 2026-10-15:** in 96/96 comparisons the first differing tensor is the EXL3 fused-MoE FP32 output (atomic accumulation of top-8 experts), from layer 3, with byte-identical inputs and routing; last-bit noise is absorbed by rounding until a row-dependent layer. Intervention confirms it: `EXL3_FUSED_MOE=0` removes all variation below 2,052 tokens (determinism row above) | [HSL result](docs/design/exl3-hidden-state-localization-result-20261015.md) |
 | Reference runtime mechanism | Probe executed 2026-10-15 (5/6 complete, on01 failed and retained). No recurrence of either singleton, all draws inside the campaign H3 envelope; gate inputs diverge first at layers 8–33, routing follows, collective dispatch identical. Mechanism unresolved; EXL3 plans unobservable (nsys misses forked workers) | [probe result](docs/design/exl3-runtime-mechanism-probe-result-20261015.md) |
-| In flight | **Long-running server up** for operator workloads (2026-10-16): `glm53-exl3-perf-{0,1}`, API on spark0 port 8000. It holds the bench lock, so no A/Bs can run until `serve_perf.py stop`. Both agents stopped with everything committed. M1 GPU work is idle | §9 |
+| In flight | **F4 campaign active (2026-10-16 evening)**. Serving containers `glm53-exl3-perf-{0,1}` **stopped** (operator: stop and leave down; teardown receipt `$EV/f4-campaign-20261016/`). Sparks free; all runs under `flock /tmp/atlas-bench.lock`, one experiment owner. Queue: verify-graphs GPU A/B → thinking-budget validation → verify-step ncu → I-a…I-g → P0 counters. CPU fan-out S-a…S-h + S-f salavages all done on `followup/*` branches (reviewed; merge pending) | todo "Now B" + "Discovered follow-ups", §8/§9 |
 
 ## 2. Established findings (what a restart must not re-derive)
 
@@ -469,7 +574,7 @@ Required pair from `nvidia-cublas` 13.1.1.3:
 
 ## 8. Decode performance and F4 work (operating notes)
 
-**Branches and worktrees.** All three branches are local only and unpushed.
+**Historical branches and worktrees.** The three performance branches below were merged into main on 2026-10-16; their worktrees and builders remain historical operating references. Branch-local follow-up fixes are separate.
 
 | Branch | Worktree | Builder container (spark1) | Binary install (both Sparks) |
 |---|---|---|---|
@@ -487,7 +592,7 @@ Required pair from `nvidia-cublas` 13.1.1.3:
 **Scripts** (perf branch, `tests/exl3_validation/`):
 - `devbuild.sh` syncs the worktree into the builder, builds, and installs
   the binary on both Sparks. Never pipe it into `tail` without `pipefail`.
-- `ab_full.sh LABEL [BINARY] [extra args]` runs `bench_tp2.py` under the
+- `ATLAS_BENCH_BINARY_SOURCE_COMMIT=<actual-build-commit> ab_full.sh LABEL [BINARY] [extra args]` runs `bench_tp2.py` under the
   flock with the verified flag base. It prints TPOT p50 and the per-repeat
   `output_sha256`.
 - `ab_queue.sh` waits for idle Sparks, then runs `ab_full.sh`.
@@ -553,6 +658,51 @@ lists and run IDs are in the ledger.
   serial is not required (decision 2026-10-15; exit criteria in todo
   "Now B").
 
+**F4 campaign 2026-10-16 evening** (merged main `172ce45a` build —
+`~/atlas-dev2/bin/spark.main-172ce45a`, sha256 `50300beb…`, backed up on
+both Sparks; runs `f4c-*` in `$EV/perf-ab-20261015/`, n=3 each, same
+session, one variable per A/B). Correctness gates (`f4c-smoke1`,
+`f4c-kdaperrow1`, `ROLLBACK_CHECK=1`, bridges_200): `fe02685e` fused vs
+`ATLAS_GLM_EXL3_DFLASH_KDA_PER_ROW=1` hash `140b56e3ecb9` identical;
+rollback 62/62 state+argmax identical; both ranks' `DFLASH_ACCEPT` lines
+identical; τ 2.82 plausible. Timed arms (graphs stack + V2/V3/V6 +
+MULTIROW; spec adds `DFLASH=1 _SPEC=1 _K=<k> _DRAFTER_WEIGHTS=nvfp4
+NVFP4_TC W4A16_TC`), tok/s = 1/TPOT p50:
+
+| Workload | serial | k=2 | **k=3** | k=4 | k=5 | k=7 | k=7+VERIFY_PROFILES |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| f4ref_bridges_200 | 21.5 | 28.1 | **30.4** | 29.6 | 29.6 | 26.1 | 25.7 |
+| f4ref_bridges_1024 | 21.1 | 26.2 | **28.1** | 25.5 | 24.8 | 22.8 | 22.5 |
+| f4ref_bridges_nothink_1024 | 21.3 | 25.7 | **26.2** | 23.9 | 22.7 | 19.6 | 19.7 |
+| ab_prose_long | 20.8 | 24.6 | **25.4** | 24.6 | 23.3 | 22.0 | 20.4 |
+
+Accept: tokens/step 2.26 (k=3) → 2.58 (k=7) — small gain vs the verify
+expert fan-out (37 unique experts at k=7), which is why k=3 wins and k=7
+even loses to serial on nothink_1024. Hashes: bridges_200 is byte-identical
+to serial on every arm (200 tokens stay in thinking); the other three
+diverge from serial as labelled (verify-row argmax vs serial). Adjacent-k
+hashes sometimes coincide (k=2/k=3, k=3/k=4 on two workloads). All arms
+3/3 deterministic. `ATLAS_EXL3_VERIFY_PROFILES=1` changes hashes
+(numerics-changing, labelled) and is flat-to-worse at k=7 → leave off.
+Claims: "observed under fingerprint F" (single harness `perf_baseline`
+TPOT, n=3/arm; run dirs hold `fingerprint.json`/`meta.json`).
+
+**Post-sweep validation (2026-10-16 night).** Verify graphs
+(`ATLAS_GLM_EXL3_DFLASH_VERIFY_GRAPH=1`, branch `f4/verify-graphs-by-r` @
+`698cd569`): whole-body capture failed the hash gate (MLA multi-row
+prefill replay); REGION capture (KDA+tail captured, MLA eager) passes —
+hashes byte-identical on/off on all 4 workloads (`f4c-vg2-*`), rollback
+45/45, engagement proven (`F4_VERIFY_GRAPH`: 35/46 regions captured,
+11 eager MLA), +2.2–2.8% at k=3. Thinking budget (branch
+`f4/thinking-budget` @ `91e25b06`): inert when the boundary lands on a
+step end (B=64 byte-identical), fires mid-step (B=63 `fired=1 dropped=1`,
+stream changes), rank parity, rollback 86/86 (`f4c-bgt-*`). Microbenches
+(`followup/ia-ib-ic-microbench`): I-a partial fix landed bit-exact
+(`dcddbc06`, ≈0.05-0.08 ms/token, cause open); I-b CAUSE FOUND — KDA
+state-store traffic amplification 1.55×, `[V,K]` layout −27.8%
+bit-exact standalone (≈0.31 ms/token projected), production flip =
+cross-cutting operator decision (`04cc8c9d`).
+
 **Latest kernel-agent results** (2026-10-16, port branch, binary
 `spark.de0be6fa`; not yet run in-model):
 - `ATLAS_EXL3_VERIFY_PROFILES=1`: 5–8-row launches use 32×256 instead of
@@ -583,7 +733,12 @@ lists and run IDs are in the ledger.
 
 ## 9. Long-running server (operator workloads, 2026-10-16)
 
-**Control** (perf worktree): `python3 tests/exl3_validation/serve_perf.py
+**STATUS 2026-10-16 evening: STOPPED** for the F4 campaign (operator
+decision: stop and leave down). Teardown receipt:
+`$EV/f4-campaign-20261016/`. Restart with `serve_perf.py start` when
+serving resumes; everything below describes the pre-stop state.
+
+**Control** (main repo): `python3 tests/exl3_validation/serve_perf.py
 start|status|stop`.
 - `start` takes `/tmp/atlas-bench.lock` through a detached holder and keeps
   it for the server's lifetime; benches queue behind it.
@@ -594,12 +749,15 @@ start|status|stop`.
 **What's running.**
 - Containers `glm53-exl3-perf-0` (spark0) and `-1` (spark1). They are
   separate from the stopped production `glm53-exl3-atlas-*`.
-- Binary: the frozen copy `~/atlas-serve/spark.5e1674ba` (perf `9ffdb3dd`
-  stack).
+- Binary (since 2026-10-16 18:15 UTC): the frozen copy
+  `~/atlas-serve/spark.main-34d94f34` (merged main `34d94f34`, sha256
+  `99d8655a…`) on both Sparks. The previous `spark.5e1674ba` is kept for
+  rollback (set `BINARY` in `serve_perf.py`).
 - Image `src-4ee96c12b44c`, cpuset 15-19, TP=2/EP=1.
 - `--max-seq-len 16384`, 128-token prefill chunks, one sequence at a time,
   FP8 (`fp8_g128`) KV, request timeout 3600 s.
-- Flags: decode graphs + the exact stack + `SHARED_PACKED` +
+- Flags: decode graphs + the exact stack (now including
+  `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1`, output-identical) + `SHARED_PACKED` +
   `GLM_SPARSE_DECODE_FP8_SPLIT` + `--enable-prefix-caching` (radix tree
   plus 16 Marconi KDA snapshot slots) + `ATLAS_MLA_PREFIX_SKIP=1`.
 - Not enabled: F4 speculation (separate branch and binary) and
@@ -611,12 +769,15 @@ and `/v1/models`; Anthropic is `/v1/messages`; Prometheus metrics are at
 `/metrics`. From a workstation, tunnel with
 `ssh -N -J colum@192.168.1.50 -L 8000:127.0.0.1:8000 colum@10.50.0.10`.
 
-**Observed at start** (smoke and cache check, single runs):
+**Observed at start** (smoke and cache check, single runs; the first two
+rows are the 2026-10-16 18:15 restart on `spark.main-34d94f34`):
 
 | Measurement | Result |
 |---|---|
+| **Prefill** (current) | **2,485-token prompt: 12.4 s TTFT (~200 tok/s)**, recall correct; 2,480 tokens cached on an identical repeat → 0.41 s; a different question over the same prefix → 0.38 s, correct |
+| Same flags, bench A/B | `m1-srv-off`/`m1-srv-on`: 761-token prefill 42.83 → 3.56 s, decode 42.6 ms/token both arms, hashes identical (`00fc1b2b6bd0`, `564e84bc1f25`) |
 | Decode | ~23.6 tok/s (42 ms/token), streaming, 400-token essay, coherent |
-| **Prefill** | **~18–19 tok/s** (1,527-token prompt: 86 s TTFT). Prefill is unoptimized: P2/P4 work and 128-token chunks. This is the main limit on long prompts |
+| Prefill (old binary, superseded) | ~18–19 tok/s (1,527-token prompt: 86 s TTFT) |
 | Prefix cache, default | Never hits on GLM: `mla_prefill_needs_full_recompute()`, hits = misses = 0 |
 | Prefix cache, `ATLAS_MLA_PREFIX_SKIP=1` | 1,005-token prompt: TTFT 55 s cold → 0.4 s on a hit (992 tokens cached) |
 

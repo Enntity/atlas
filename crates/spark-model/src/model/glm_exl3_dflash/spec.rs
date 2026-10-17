@@ -26,10 +26,10 @@ use anyhow::{Context, Result, ensure};
 
 use super::super::types::TransformerModel;
 use super::Exl3DflashObserver;
-use crate::traits::{Model, SequenceState};
+use crate::traits::{Model, SequenceState, ThinkBudgetState};
 
 /// Worker command: one speculative step for the addressed slot; one u32
-/// payload word (the pending token) follows.
+/// payload token and the fixed-width per-sequence processor snapshot follow.
 pub(crate) const EP_CMD_EXL3_DFLASH_SPEC: u32 = 0xFFFF_FFE4;
 
 impl TransformerModel {
@@ -40,6 +40,7 @@ impl TransformerModel {
         &self,
         token: u32,
         seq: &mut SequenceState,
+        budget: &ThinkBudgetState,
     ) -> Result<Option<Vec<u32>>> {
         let Some(obs) = self.exl3_dflash.as_deref() else {
             return Ok(None);
@@ -64,8 +65,32 @@ impl TransformerModel {
                 self.ep_protocol_v2,
             )?;
             self.ep_broadcast_u32(token)?;
+            // The commit-side budget hard gate must truncate identically on
+            // every rank, so the accounting snapshot is replicated with the
+            // step instead of being tracked per rank.
+            self.ep_send_think_budget(budget)?;
         }
-        self.exl3_dflash_spec_local(token, seq).map(Some)
+        self.exl3_dflash_spec_local(token, seq, budget)
+    }
+
+    /// Replicate the thinking-budget snapshot to every rank (fixed-width
+    /// `ep_broadcast_u32` words). The head sends its own state; workers
+    /// receive it in the `EP_CMD_EXL3_DFLASH_SPEC` handler so every rank's
+    /// commit truncates at the same emission (rank symmetry).
+    pub(crate) fn ep_send_think_budget(&self, budget: &ThinkBudgetState) -> Result<()> {
+        for w in budget.to_words() {
+            self.ep_broadcast_u32(w)?;
+        }
+        Ok(())
+    }
+
+    /// Worker side of [`Self::ep_send_think_budget`].
+    pub(crate) fn ep_recv_think_budget(&self) -> Result<ThinkBudgetState> {
+        let mut words = [0u32; ThinkBudgetState::WORDS];
+        for w in &mut words {
+            *w = self.ep_broadcast_u32(0)?;
+        }
+        ThinkBudgetState::from_words(words)
     }
 
     /// The speculative step itself, run identically on every rank.
@@ -73,7 +98,8 @@ impl TransformerModel {
         &self,
         token: u32,
         seq: &mut SequenceState,
-    ) -> Result<Vec<u32>> {
+        budget: &ThinkBudgetState,
+    ) -> Result<Option<Vec<u32>>> {
         let obs: &Exl3DflashObserver = self
             .exl3_dflash
             .as_deref()
@@ -118,9 +144,15 @@ impl TransformerModel {
         let base_tokens = seq.tokens.len();
         let check = obs.rollback_check_every > 0
             && (so.spec_steps + 1).is_multiple_of(obs.rollback_check_every);
-        if check {
-            self.checkpoint_ssm_states(seq)?;
-        }
+        // A masked structural pick in row zero must fall back to serial
+        // without retaining any target state from this verify. Snapshot every
+        // step before verify, as the observer's existing verify probe does.
+        self.checkpoint_ssm_states(seq)?;
+        let before_verify = if check {
+            Some(self.exl3_ssm_fingerprint(seq)?)
+        } else {
+            None
+        };
         let argmax = self.decode_verify_graphed_kgamma(&rows, seq, 0)?;
         let t2 = sync_now(timed)?;
         ensure!(
@@ -130,14 +162,105 @@ impl TransformerModel {
         );
         let accepted = accepted_prefix(&drafts, &argmax).min(obs.force_accept.unwrap_or(obs.k));
         let bonus = argmax[accepted];
-        // Keep `x, d1..d_a`; the bonus is the next step's pending token.
-        seq.seq_len = pos + accepted + 1;
-        seq.tokens.truncate(base_tokens + accepted + 1);
-        self.commit_accepted_prefix(seq, accepted + 1, width)?;
+        let mut emitted = drafts[..accepted].to_vec();
+        emitted.push(bonus);
+        // Thinking-budget hard gate (the commit step is where tokens become
+        // visible): keep only the prefix the serial governor would emit as
+        // plain argmaxes. The first governed position and everything after
+        // it is left to the caller's serial continuation, which emits the
+        // forced `</think>` / sentence-boundary deferral exactly as a serial
+        // decode would. Structural picks also return to serial sampling.
+        // A boundary in row zero restores the complete pre-verify state.
+        let kept = budget.processor_free_emission_len(&emitted);
+        if kept == 0 {
+            // Both ranks make this decision from the same raw verify picks
+            // and wire snapshot. Rejected MLA/indexer rows are overwritten by
+            // serial decode; recurrent and auxiliary state must be restored.
+            seq.seq_len = pos;
+            seq.tokens.truncate(base_tokens);
+            let stream = self.gpu.default_stream();
+            for (i, state) in seq.layer_states.iter_mut().enumerate() {
+                self.layers[i].rollback_aux_verify(
+                    state.as_mut(),
+                    0,
+                    width,
+                    self.gpu.as_ref(),
+                    stream,
+                )?;
+            }
+            self.rollback_ssm_states(seq, 0)?;
+            self.sync_secondary()?;
+            let state_identical = match before_verify {
+                Some(before) => Some(before == self.exl3_ssm_fingerprint(seq)?),
+                None => None,
+            };
+            tracing::info!(
+                "DFLASH_PROCESSOR_BOUNDARY rank={} slot={} pos={pos} kept=0 \
+                 boundary_token={} restored_seq_len={} restored_tokens={} state_identical={}",
+                obs.rank,
+                seq.slot_idx,
+                emitted[0],
+                seq.seq_len,
+                seq.tokens.len(),
+                match state_identical {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "unchecked",
+                }
+            );
+            ensure!(
+                state_identical != Some(false),
+                "EXL3 DFlash zero-prefix KDA/conv restore mismatch"
+            );
+            return Ok(None);
+        }
+        // Engagement telemetry (unconditional): one line per truncating
+        // commit plus the retire summary (`DFLASH_THINKBUDGET scope=final`),
+        // so a plain run proves whether the gate dropped governed tokens.
+        // `pos` is a seq position — it maps directly to `DFLASH_TOKENS`
+        // indices (which start at `prompt_len`).
+        let budget_kept = budget.plain_emission_len(&emitted);
+        // Attribute a truncation to the budget only when it is the first
+        // boundary; an earlier structural mask owns the actual truncation.
+        let dropped = if kept == budget_kept {
+            emitted.len() - kept
+        } else {
+            0
+        };
+        so.think_budget_kept += kept as u64;
+        if dropped > 0 {
+            so.think_budget_fired += 1;
+            so.think_budget_dropped += dropped as u64;
+            tracing::info!(
+                "DFLASH_THINKBUDGET rank={} scope=commit slot={} pos={} kept={} dropped={} \
+                 fired={} count={} budget={:?}",
+                obs.rank,
+                seq.slot_idx,
+                pos,
+                budget_kept,
+                dropped,
+                so.think_budget_fired,
+                budget.thinking_tokens,
+                budget.thinking_budget
+            );
+        }
+        if kept < budget_kept {
+            tracing::debug!(
+                "DFLASH processor boundary rank={} slot={} pos={pos} kept={kept}",
+                obs.rank,
+                seq.slot_idx
+            );
+        }
+        emitted.truncate(kept);
+        // Keep `x, d1..d_{kept-1}` as inputs; the last emitted token stays
+        // pending (full accept: the bonus).
+        seq.seq_len = pos + kept;
+        seq.tokens.truncate(base_tokens + kept);
+        self.commit_accepted_prefix(seq, kept, width)?;
         self.sync_secondary()?;
-        if check && accepted + 1 < width {
+        if check && kept < width {
             let (state_same, argmax_same) =
-                self.exl3_rollback_check(seq, &rows, &argmax, accepted, pos, base_tokens)?;
+                self.exl3_rollback_check(seq, &rows, &argmax, kept - 1, pos, base_tokens)?;
             so.rollback_checks.0 += 1;
             so.rollback_checks.1 += u64::from(state_same);
             so.rollback_checks.2 += u64::from(argmax_same);
@@ -154,20 +277,17 @@ impl TransformerModel {
         let gpu = self.gpu.as_ref();
         let stream = gpu.default_stream();
         let d = so.dstate();
-        obs.make_room(gpu, d, accepted + 1, stream)?;
+        obs.make_room(gpu, d, kept, stream)?;
         gpu.copy_d2d_async(
             obs.verify_save,
             d.ctx_hidden_acc.offset(d.ctx_len * obs.slot_bytes),
-            (accepted + 1) * obs.slot_bytes,
+            kept * obs.slot_bytes,
             stream,
         )?;
-        d.ctx_positions
-            .extend((pos..=pos + accepted).map(|p| p as i32));
-        d.ctx_len += accepted + 1;
+        d.ctx_positions.extend((pos..pos + kept).map(|p| p as i32));
+        d.ctx_len += kept;
         so.pending_capture = None;
 
-        let mut emitted = drafts[..accepted].to_vec();
-        emitted.push(bonus);
         for (i, &t) in emitted.iter().enumerate() {
             so.observe(pos + 1 + i, t);
         }
@@ -180,7 +300,7 @@ impl TransformerModel {
             so.spec_ms[1] += ms(t1, t2);
             so.spec_ms[2] += ms(t2, t3);
         }
-        Ok(emitted)
+        Ok(Some(emitted))
     }
 
     /// Exact rollback check (see `ATLAS_GLM_EXL3_DFLASH_ROLLBACK_CHECK`).

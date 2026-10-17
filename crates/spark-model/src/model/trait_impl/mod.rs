@@ -14,7 +14,9 @@ use spark_runtime::kv_cache::PagedKvCache;
 use super::types::{PinnedMetaStaging, TransformerModel};
 use crate::layer::{AttnMetadataDev, LayerState};
 use crate::speculative::DraftProposer;
-use crate::traits::{ChunkedPrefillPageMetadata, Model, PrefillSlice, SequenceState};
+use crate::traits::{
+    ChunkedPrefillPageMetadata, Model, PrefillSlice, SequenceState, ThinkBudgetState,
+};
 use crate::weight_map::{DenseWeight, MtpWeights};
 
 mod async_chkpt;
@@ -1084,8 +1086,9 @@ impl Model for TransformerModel {
         &self,
         last_token: u32,
         seq: &mut SequenceState,
+        budget: &ThinkBudgetState,
     ) -> Result<Option<Vec<u32>>> {
-        self.exl3_dflash_spec_step_dispatch(last_token, seq)
+        self.exl3_dflash_spec_step_dispatch(last_token, seq, budget)
     }
     fn commit_accepted_prefix(
         &self,

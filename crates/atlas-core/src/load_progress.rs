@@ -27,7 +27,7 @@ impl LoadProgress {
                 inner: Arc::new(Mutex::new(State {
                     total_bytes,
                     loaded_bytes: 0,
-                    current_file: String::new(),
+                    current_file: "loading".to_string(),
                     start: Instant::now(),
                     running: false,
                 })),
@@ -38,7 +38,7 @@ impl LoadProgress {
         let inner = Arc::new(Mutex::new(State {
             total_bytes,
             loaded_bytes: 0,
-            current_file: String::new(),
+            current_file: "loading".to_string(),
             start: Instant::now(),
             running: true,
         }));

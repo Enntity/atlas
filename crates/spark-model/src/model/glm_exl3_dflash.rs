@@ -380,6 +380,13 @@ struct SeqObs {
     spec_emitted: u64,
     /// Rollback checks: (run, state identical, accepted argmax identical).
     rollback_checks: (u64, u64, u64),
+    /// Thinking-budget hard-gate engagement (`DFLASH_THINKBUDGET`):
+    /// truncation events, committed emissions and dropped governed
+    /// emissions. Logged unconditionally at retire so a plain run proves
+    /// whether the gate engaged.
+    think_budget_fired: u64,
+    think_budget_kept: u64,
+    think_budget_dropped: u64,
     /// Summed synchronized ms of (draft, verify, commit) under PROFILE.
     spec_ms: [f64; 3],
 }
@@ -630,6 +637,17 @@ impl Exl3DflashObserver {
                 obs.rollback_checks.1,
                 obs.rollback_checks.2
             );
+            // Unconditional engagement proof for the thinking-budget hard
+            // gate: `fired=0` on a budget-crossing request means the
+            // boundary landed on a step end (the gate had nothing to drop).
+            tracing::info!(
+                "DFLASH_THINKBUDGET rank={} scope=final req={request} slot={slot} \
+                 fired={} kept={} dropped={}",
+                self.rank,
+                obs.think_budget_fired,
+                obs.think_budget_kept,
+                obs.think_budget_dropped
+            );
             if self.profile && obs.spec_steps > 0 {
                 let n = obs.spec_steps as f64;
                 tracing::info!(
@@ -746,6 +764,9 @@ impl TransformerModel {
                 spec_steps: 0,
                 spec_emitted: 0,
                 rollback_checks: (0, 0, 0),
+                think_budget_fired: 0,
+                think_budget_kept: 0,
+                think_budget_dropped: 0,
                 spec_ms: [0.0; 3],
             },
         );

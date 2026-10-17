@@ -670,3 +670,50 @@ D1 2026-10-15 done (config verified drowzeys=base, mimo_v2, 48-layer 9/39 fused_
 - The kernel flag is confirmed at ~3k tokens. Same binary `spark.p13fat`, 3 repeats per arm, chunk 128: 2,943-token prompt 165.80 s → **13.79 s (12.0×)**, 761-token control 42.20 s → 3.46 s (12.2×). Hashes are identical across arms, so the flag is bit-exact. Engagement is confirmed from logs, and the server-side TTFT agrees with the client timer.
 - Chunk sweep, flag on, 2,943 tokens: 128 → 13.79 s, 256 → 11.76 s, 512 → 10.68 s, each with a different hash.
 - Evidence: `perf-ab-20261015/p14L-{off,on}-*`, `p14Lchunk{256,512}-*`; write-up `docs/design/p14-prefill-long-ab-20261016.md` on `followup/p13-fat-moe-multirow` @ `a27d0fb8`.
+
+## 2026-10-16 post-merge re-baseline and server upgrade (major)
+- Decision: serve from the merged main binary (`spark.main-34d94f34`, sha256 `99d8655a…`) with `ATLAS_EXL3_COOP_MOE_FAT_MULTIROW=1` added to the server's exact flag list.
+- Evidence (same session, 3 repeats each, `perf-ab-20261015/m1-*`): merged vs old binary, exact stack + fat-MoE: all hashes identical (`80b1eb5fadf8`, `1c4328172e81`), decode 45.84 vs 45.80 ms/token. Merged, fat-MoE off: `80b1eb5fadf8`. Server numerics flags (SHARED_PACKED + FP8_SPLIT), fat-MoE off vs on: 761-token prefill 42.83 → 3.56 s, decode 42.62 vs 42.65 ms/token, hashes identical (`00fc1b2b6bd0`, `564e84bc1f25`).
+- Server smoke after restart (single run): 2,485-token prompt TTFT 12.4 s cold, 0.41 s on a prefix-cache hit; recall correct.
+- Rollback: set `BINARY` back to `spark.5e1674ba` in `serve_perf.py` and drop the flag. Status: done; unqualified (M1 still open).
+
+## 2026-10-16 F4 campaign + CPU fan-out (parent session, branches pending merge)
+- F4 k sweep (`f4c-*` runs, main `172ce45a` build `50300beb…`, n=3/arm, one
+  variable): adopt **k=3** as the lane default (30.4/28.1/26.2/25.4 tok/s,
+  1.22–1.42× serial); k=7 loses to serial on nothink_1024. `fe02685e` KDA
+  one-launch verify adopted (GPU bit-exact, hash `140b56e3ecb9`).
+  `ATLAS_EXL3_VERIFY_PROFILES=1` stays OFF (flat-to-worse at k=7, labelled
+  numerics-changing).
+- F4 code behind default-off flags on branches: verify graphs keyed by
+  `(slot, r)` (`f4/verify-graphs-by-r` @ `9b05883d`,
+  `ATLAS_GLM_EXL3_DFLASH_VERIFY_GRAPH=1`); thinking-budget enforcement
+  (`f4/thinking-budget` @ `b3efd501`…) is a behavior fix (mirrors serial
+  governor semantics; no flag — the boundary behavior IS the contract).
+- S-a: the F4 contract validation was wrong, not the test — `ensure!`
+  scoped to enabled contracts (`57d268fd`); review found
+  `check_f4_contract` unreachable in production → wired into
+  `validate_config` (`35cb3a7d`). Strict-PCND (require the key) NOT done —
+  recommendation only.
+- S-f salavages all behind default-off flags (PCND): WMMA GEMV rewritten on
+  `mma.sync` (draft had OOB loads/stores), GDN wy3 rewrite (review blocker:
+  base twins didn't chain the update recurrence — fixed `8b94e099`),
+  BF16 vocab gather. MiMo loader: DEFER recommended. Async argmax: design
+  note only (ties to I-d).
+- Serving stack stopped for the campaign at operator direction (stop and
+  leave down); teardown receipt `$EV/f4-campaign-20261016/`.
+
+## 2026-10-16 F4 validation outcomes (parent session)
+- Verify graphs: whole-body capture rejected on the hash gate; adopt REGION
+  capture (`f4/verify-graphs-by-r` @ `698cd569`) — replay-proven regions
+  only (KDA forwards + tail), MLA multi-row prefill stays eager (dynamic
+  host inputs are the divergence source). Parity + engagement both proven
+  (`f4c-vg2-*`).
+- Thinking budget: adopt commit-side truncation (`f4/thinking-budget` @
+  `91e25b06`); validated inert-on-step-end / fires-mid-step with telemetry
+  positive control (`f4c-bgt63-*`).
+- KDA `[V,K]` state layout (I-b): measured −27.8% bit-exact standalone;
+  production flip DEFERRED to operator (cross-cutting: all KDA state
+  readers/writers must transpose together).
+- Engagement telemetry is now standard for default-off lanes (both F4
+  lanes shipped counters after unobservable-engagement failures —
+  measurement rule 6).

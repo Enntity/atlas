@@ -111,20 +111,6 @@ impl Qwen3AttentionLayer {
                 d.mla_v_dim,
                 stream,
             )
-        } else if self.mla_batched_gemv_k.0 != 0 {
-            ops::mla_batched_gemv(
-                gpu,
-                self.mla_batched_gemv_k,
-                attn_out,
-                mla.w_uv.weight,
-                v_extracted,
-                d.mla_v_dim,
-                d.kv_lora,
-                d.nq,
-                d.mla_cache_dim,
-                d.mla_v_dim,
-                stream,
-            )
         } else {
             for head_idx in 0..d.nq as usize {
                 let attn_head = attn_out.offset(head_idx * d.mla_cache_dim as usize * 2);

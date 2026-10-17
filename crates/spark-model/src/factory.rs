@@ -277,6 +277,7 @@ mod tests {
             None, // lora_args
             None, // nllb_lang
             None, // nllb_lora_dir
+            None, // progress
         )
         .map(|_| ())
     }
@@ -446,6 +447,7 @@ mod tests {
             None, // lora_args
             None, // nllb_lang
             None, // nllb_lora_dir
+            None, // progress
         );
         match result {
             Err(e) => assert!(e.to_string().contains("Unsupported model type: 'llama'")),
