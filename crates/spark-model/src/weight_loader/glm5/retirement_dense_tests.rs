@@ -91,3 +91,48 @@ fn actual_fp8_packed_and_keep_f32_conversion_sources_keep_exact_provenance() {
         assert!(store.contains("q.weight_scale_2"));
     }
 }
+
+/// Production loads without a log. A BF16 source is the store's own tensor:
+/// replacing it by its TP shard must reclaim it, so teardown does not free it
+/// a second time (FP4-Local's BF16 KDA conv1d, the NVFP4 release's BF16 KDA
+/// projections). A converted source is a loader allocation, freed directly.
+#[test]
+fn logless_replacement_reclaims_a_store_alias_and_frees_a_conversion() {
+    use atlas_core::scope::ModelResource;
+    for dtype in [WeightDtype::BF16, WeightDtype::FP32] {
+        let gpu = MockGpuBackend::new();
+        let mut store = WeightStore::from_map(HashMap::from([(
+            "q.weight".into(),
+            WeightTensor {
+                ptr: gpu.alloc(16 * dtype.byte_size()).unwrap(),
+                shape: vec![4, 4],
+                dtype,
+            },
+        )]));
+        let source = LoadedDense::load(&store, "q.weight", &gpu, None, false).unwrap();
+        let (local, _, _) = shard_dense_bf16(
+            source.dense.weight,
+            4,
+            4,
+            TpShardKind::ColumnParallel,
+            0,
+            2,
+            &gpu,
+        )
+        .unwrap();
+        source
+            .replaced(local, 16, &gpu)
+            .unwrap()
+            .release(&gpu)
+            .unwrap();
+        assert_eq!(store.was_reclaimed("q.weight"), dtype == WeightDtype::BF16);
+        assert_eq!(gpu.invalid_free_count(), 0);
+        store.release(&gpu).unwrap();
+        assert_eq!(
+            gpu.invalid_free_count(),
+            0,
+            "{dtype:?}: no double free at teardown"
+        );
+        assert_eq!(gpu.alloc_count(), 0);
+    }
+}
