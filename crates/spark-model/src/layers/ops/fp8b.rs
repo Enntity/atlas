@@ -54,15 +54,53 @@ impl Default for MxTiers {
     }
 }
 
+/// The function names of a tier family in [`MX_GEMV_MODULE`]: row-major
+/// then tiled, 8 / 16 / 32 rows (`{stem}_tc{rows}{suffix}[_tiled]`).
+fn tier_names(stem: &str, suffix: &str) -> [[String; 3]; 2] {
+    ["", "_tiled"].map(|tiled| ["8", "16", "32"].map(|t| format!("{stem}_tc{t}{suffix}{tiled}")))
+}
+
+/// The strided FP8 block tiers' names (`fp8b_gemv_tc{8,16,32}_ld`).
+fn ld_names() -> [String; 3] {
+    ["8", "16", "32"].map(|r| format!("fp8b_gemv_tc{r}_ld"))
+}
+
+/// The tier families [`native_kernels`] resolves: (stem, suffix).
+const TIER_FAMILIES: [(&str, &str); 4] = [
+    ("mxfp8_gemv", ""),
+    ("fp8b_gemv", ""),
+    ("fp8b_gemv", "_multi"),
+    ("mxfp8_gemv", "_multi"),
+];
+
+/// The single kernels [`native_kernels`] resolves: (module, function).
+const SINGLE_KERNELS: [(&str, &str); 5] = [
+    (MX_GEMV_MODULE, "mxfp8_to_bf16"),
+    ("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
+    ("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
+    ("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
+    (super::MXFP8_ACT_MODULE, super::MX_QUANT_KERNEL),
+];
+
+/// Every (module, function) [`native_kernels`] looks up: what a target serving
+/// the native GLM paths must build (`fp8b_tests` checks the glm-5.3-flash
+/// sources declare each one).
+pub fn native_kernel_names() -> Vec<(&'static str, String)> {
+    let mut names: Vec<(&'static str, String)> = TIER_FAMILIES
+        .iter()
+        .flat_map(|(stem, suffix)| tier_names(stem, suffix).into_iter().flatten())
+        .chain(ld_names())
+        .map(|f| (MX_GEMV_MODULE, f))
+        .collect();
+    names.extend(SINGLE_KERNELS.iter().map(|(m, f)| (*m, f.to_string())));
+    names
+}
+
 impl MxTiers {
     fn resolve(gpu: &dyn GpuBackend, stem: &str, suffix: &str) -> Self {
-        let k = |t: &str, tiled: &str| {
-            crate::layers::try_kernel(gpu, MX_GEMV_MODULE, &format!("{stem}_tc{t}{suffix}{tiled}"))
-        };
-        Self {
-            row_major: ["8", "16", "32"].map(|t| k(t, "")),
-            tiled: ["8", "16", "32"].map(|t| k(t, "_tiled")),
-        }
+        let [row_major, tiled] = tier_names(stem, suffix)
+            .map(|tier| tier.map(|f| crate::layers::try_kernel(gpu, MX_GEMV_MODULE, &f)));
+        Self { row_major, tiled }
     }
 
     /// The tier for `m` rows (1..=32) of a twin `tiled` or not; zero when the
@@ -109,20 +147,45 @@ pub struct NativeKernels {
 pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
     static K: std::sync::OnceLock<NativeKernels> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
-        let t = |m: &str, f: &str| crate::layers::try_kernel(gpu, m, f);
-        NativeKernels {
-            mx: MxTiers::resolve(gpu, "mxfp8_gemv", ""),
-            fp8b: MxTiers::resolve(gpu, "fp8b_gemv", ""),
-            fp8b_multi: MxTiers::resolve(gpu, "fp8b_gemv", "_multi"),
-            fp8b_ld: ["8", "16", "32"].map(|r| t(MX_GEMV_MODULE, &format!("fp8b_gemv_tc{r}_ld"))),
-            mx_expand: t(MX_GEMV_MODULE, "mxfp8_to_bf16"),
-            mx_multi: MxTiers::resolve(gpu, "mxfp8_gemv", "_multi"),
-            act_quant: t("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
-            w8a8_gemm: t("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
-            w8a16_gemm: t("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
-            mx_quant: t(super::MXFP8_ACT_MODULE, super::MX_QUANT_KERNEL),
+        let [mx, fp8b, fp8b_multi, mx_multi] =
+            TIER_FAMILIES.map(|(stem, suffix)| MxTiers::resolve(gpu, stem, suffix));
+        let [mx_expand, act_quant, w8a8_gemm, w8a16_gemm, mx_quant] =
+            SINGLE_KERNELS.map(|(m, f)| crate::layers::try_kernel(gpu, m, f));
+        let k = NativeKernels {
+            mx,
+            fp8b,
+            fp8b_multi,
+            fp8b_ld: ld_names().map(|f| crate::layers::try_kernel(gpu, MX_GEMV_MODULE, &f)),
+            mx_expand,
+            mx_multi,
+            act_quant,
+            w8a8_gemm,
+            w8a16_gemm,
+            mx_quant,
+        };
+        // A target that serves GLM builds `mxfp8_gemv`; one whose existing
+        // MXFP8 tiers resolve but the native ones do not runs a kernel build
+        // older than this source (e.g. a cached atlas-kernels build-script
+        // output after an mtime-preserving sync of the tree).
+        if k.mx.complete(false) && !(k.fp8b.complete(false) && k.mx_multi.complete(false)) {
+            tracing::error!(
+                "the mxfp8_gemv module lacks the native FP8 block / multi-projection tiers: \
+                 the kernel build is stale (touch kernels/gb10/glm-5.3-flash/nvfp4/mxfp8_gemv.cu \
+                 or `cargo clean -p atlas-kernels` and rebuild)"
+            );
         }
+        k
     })
+}
+
+/// The native kernels of [`native_kernels`] this target lacks, by name
+/// (empty when all resolve).
+pub fn missing_native_kernels(gpu: &dyn GpuBackend) -> Vec<String> {
+    native_kernel_names()
+        .into_iter()
+        .filter(|(m, f)| gpu.kernel(m, f).is_err())
+        .map(|(m, f)| format!("{m}::{f}"))
+        .collect()
 }
 
 /// `output[r, n] = input[r, k] · W^T` for `rows` rows of FP8 block twin `w`

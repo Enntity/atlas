@@ -95,12 +95,15 @@ __device__ __forceinline__ void mx_load(
     #pragma unroll
     for (int i = 0; i < NT; i++) { t.x[i][0] = z; t.x[i][1] = z; }
     if (kb >= K) return;
-    const unsigned long long wo = (unsigned long long)ch * wstep, so = (unsigned long long)ch * sstep;
+    const unsigned long long wo = (unsigned long long)ch * wstep;
     if constexpr (B128) {
+        (void)sstep;
+        (void)s1p;
         if (v0) t.w0 = *(const uint4*)(w0p + wo);
         if (v1) t.w1 = *(const uint4*)(w1p + wo);
         t.s0 = reinterpret_cast<const unsigned int*>(s0p)[ch >> 1];
     } else {
+        const unsigned long long so = (unsigned long long)ch * sstep;
         if (v0) { t.w0 = *(const uint4*)(w0p + wo); t.s0 = s0p[so]; }
         if (v1) { t.w1 = *(const uint4*)(w1p + wo); t.s1 = s1p[so]; }
     }
@@ -231,10 +234,15 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
         auto pair = [&](unsigned int lo, unsigned int hi, __nv_bfloat162 sc) {
             __nv_bfloat162 v = __halves2bfloat162(__ushort_as_bfloat16(s_e4m3[lo]),
                                                   __ushort_as_bfloat16(s_e4m3[hi]));
-            if constexpr (!B128) v = __hmul2(v, sc);
+            if constexpr (!B128) {
+                v = __hmul2(v, sc);
+            } else {
+                (void)sc;
+            }
             return *reinterpret_cast<unsigned int*>(&v);
         };
-        float part[NT][4];
+        // The B128 chunk partials (unused by the MX tiers).
+        [[maybe_unused]] float part[NT][4];
         if constexpr (B128) {
             #pragma unroll
             for (int i = 0; i < NT; i++) part[i][0] = part[i][1] = part[i][2] = part[i][3] = 0.0f;

@@ -35,6 +35,19 @@ use anyhow::{Context, Result, ensure};
 use atlas_core::numeric::{f32_to_bf16, fp8_e4m3_to_f32};
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
+/// The CUDA backend, refusing a kernel build without every native kernel
+/// (names them: a stale atlas-kernels build looks like "no kernel for N rows").
+fn native_backend() -> Result<&'static spark_runtime::cuda_backend::AtlasCudaBackend> {
+    let gpu = backend()?;
+    let missing = ops::missing_native_kernels(gpu);
+    ensure!(
+        missing.is_empty(),
+        "this kernel build lacks {missing:?}: rebuild atlas-kernels (touch \
+         kernels/gb10/glm-5.3-flash/nvfp4/mxfp8_gemv.cu or cargo clean -p atlas-kernels)"
+    );
+    Ok(gpu)
+}
+
 /// `rows x k` pseudo-random BF16 activations (host bits and device copy).
 fn activations(
     gpu: &dyn GpuBackend,
@@ -158,7 +171,7 @@ const NATIVE: NativePolicy = NativePolicy {
 #[test]
 #[ignore = "needs a GB10, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
 fn mla_layer_3_fp8_twins_are_checkpoint_slices_and_exact() -> Result<()> {
-    let gpu = backend()?;
+    let gpu = native_backend()?;
     let stream = gpu.default_stream();
     let nk = native_kernels(gpu);
     let p = l(3, "self_attn");
@@ -288,7 +301,7 @@ fn mla_layer_3_fp8_twins_are_checkpoint_slices_and_exact() -> Result<()> {
 #[test]
 #[ignore = "needs a GB10, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
 fn shared_expert_layer_3_fp8_twins_full_and_split() -> Result<()> {
-    let gpu = backend()?;
+    let gpu = native_backend()?;
     let stream = gpu.default_stream();
     let nk = native_kernels(gpu);
     let p = l(3, "mlp.shared_experts");
@@ -394,7 +407,7 @@ fn shared_expert_layer_3_fp8_twins_full_and_split() -> Result<()> {
 #[test]
 #[ignore = "needs a GB10, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
 fn dense_layer_0_mxfp8_twins_expand_and_project_exactly() -> Result<()> {
-    let gpu = backend()?;
+    let gpu = native_backend()?;
     let stream = gpu.default_stream();
     let nk = native_kernels(gpu);
     let p = l(0, "mlp");
@@ -441,7 +454,7 @@ fn dense_layer_0_mxfp8_twins_expand_and_project_exactly() -> Result<()> {
 #[ignore = "needs a GB10, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
 fn kda_layer_0_fused_qkv_equals_three_launches() -> Result<()> {
     use crate::weight_loader::glm5::kda_mx::{KdaMxPolicy, kda_twin};
-    let gpu = backend()?;
+    let gpu = native_backend()?;
     let stream = gpu.default_stream();
     let nk = native_kernels(gpu);
     let stems = ["q_proj", "k_proj", "v_proj"].map(|n| l(0, &format!("self_attn.{n}")));
@@ -531,7 +544,7 @@ fn native_w8a8_prefill_rows_are_height_invariant() -> Result<()> {
     use crate::weight_loader::glm5::kda_mx::{KdaMxPolicy, kda_twin};
     const HEIGHTS: [usize; 6] = [1, 30, 64, 2048, 8192, 16384];
     const TALL: usize = 16384;
-    let gpu = backend()?;
+    let gpu = native_backend()?;
     let stream = gpu.default_stream();
     let nk = native_kernels(gpu);
     let kda = l(0, "self_attn.q_proj");

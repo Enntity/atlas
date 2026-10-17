@@ -225,3 +225,165 @@ fn ld_rows_pass_the_slice_stride() {
     let x = DevicePtr(0x1000);
     assert!(fp8b_gemv_ld_rows(&gpu, &tiers, x, x, x, x, 5, 4096, 1024, 1000, 0).is_err());
 }
+
+/// `src` without `//` and `/* */` comments (string literals in kernels never
+/// hold either).
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while !rest.is_empty() {
+        if let Some(r) = rest.strip_prefix("//") {
+            rest = r.find('\n').map_or("", |i| &r[i..]);
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.find("*/").map_or("", |i| &r[i + 2..]);
+        } else {
+            let c = rest.chars().next().unwrap();
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn ident(s: &str) -> (&str, &str) {
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    (&s[..end], &s[end..])
+}
+
+/// The name a `__global__` declarator at `s` (just after `__global__`)
+/// declares, stepping over `void` and `__launch_bounds__(...)`.
+fn declarator(mut s: &str) -> Option<&str> {
+    loop {
+        s = s.trim_start_matches(|c: char| c.is_whitespace() || c == '\\');
+        if let Some(r) = s.strip_prefix("void") {
+            s = r;
+        } else if let Some(r) = s.strip_prefix("__launch_bounds__") {
+            let mut depth = 0;
+            let end = r.char_indices().find_map(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            })?;
+            s = &r[end..];
+        } else {
+            let (name, _) = ident(s);
+            return (!name.is_empty()).then_some(name);
+        }
+    }
+}
+
+/// Every kernel `src` declares: plain `__global__` functions and the
+/// instantiations of a `#define M(name, ...)` whose body declares `name`.
+fn declared_kernels(src: &str) -> std::collections::HashSet<String> {
+    let src = strip_comments(src);
+    let mut names = std::collections::HashSet::new();
+    let mut macros: Vec<(String, usize)> = Vec::new();
+    for (i, _) in src.match_indices("__global__") {
+        // Inside a #define? Then it names a macro parameter, handled below.
+        let line_start = src[..i].rfind('\n').map_or(0, |p| p + 1);
+        let mut def = line_start;
+        while def > 0 && src[..def - 1].ends_with('\\') {
+            def = src[..def - 1].rfind('\n').map_or(0, |p| p + 1);
+        }
+        if let Some(d) = src[def..].trim_start().strip_prefix("#define")
+            && let (mname, rest) = ident(d.trim_start())
+            && let Some(params) = rest.strip_prefix('(')
+            && let Some(close) = params.find(')')
+            && let Some(name) = declarator(&src[i + "__global__".len()..])
+        {
+            if let Some(idx) = params[..close]
+                .split(',')
+                .map(str::trim)
+                .position(|p| p == name)
+            {
+                macros.push((mname.to_string(), idx));
+            }
+            continue;
+        }
+        if let Some(name) = declarator(&src[i + "__global__".len()..]) {
+            names.insert(name.to_string());
+        }
+    }
+    for (mname, idx) in macros {
+        for line in src.lines() {
+            let line = line.trim_start();
+            if let Some(args) = line
+                .strip_prefix(mname.as_str())
+                .and_then(|r| r.strip_prefix('('))
+                && let Some(arg) = args.split([',', ')']).nth(idx)
+            {
+                names.insert(arg.trim().to_string());
+            }
+        }
+    }
+    names
+}
+
+#[test]
+fn the_kernel_scanner_sees_plain_and_macro_declared_kernels() {
+    let src = r#"
+extern "C" __global__ void plain(int a) {}
+extern "C" __global__ void __launch_bounds__(W * 32) bounded(int a) {}
+extern "C" __global__ __launch_bounds__(B, 5) void after(int a) {}
+// extern "C" __global__ void commented(int a) {}
+#define TIER(name, NT)                                   \
+    extern "C" __global__ void __launch_bounds__(256) name( \
+        int a) { body<NT>(a); }
+TIER(tier_a, 1)
+TIER(tier_b, 2)
+"#;
+    let got = declared_kernels(src);
+    for want in ["plain", "bounded", "after", "tier_a", "tier_b"] {
+        assert!(got.contains(want), "{want} in {got:?}");
+    }
+    assert!(!got.contains("commented") && !got.contains("name"));
+}
+
+/// Every kernel the native GLM paths look up (`native_kernel_names`) is
+/// declared in the glm-5.3-flash target's sources (its own `nvfp4/` file of
+/// that module, else `common/`), under the module name the build gives that
+/// file (its stem: none of these modules is renamed in a KERNEL.toml).
+#[test]
+fn every_native_kernel_lookup_is_declared_in_the_glm_target() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
+    let tomls = [
+        root.join("common/KERNEL.toml"),
+        root.join("glm-5.3-flash/nvfp4/KERNEL.toml"),
+    ];
+    let mut missing = Vec::new();
+    for (module, func) in native_kernel_names() {
+        for toml in &tomls {
+            let text = std::fs::read_to_string(toml).unwrap();
+            assert!(
+                !text
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{module} ="))
+                        || l.contains(&format!("= \"{module}\""))),
+                "{module} is renamed in {}: the lookup's module name is wrong",
+                toml.display()
+            );
+        }
+        let file = [
+            root.join(format!("glm-5.3-flash/nvfp4/{module}.cu")),
+            root.join(format!("common/{module}.cu")),
+        ]
+        .into_iter()
+        .find(|p| p.exists())
+        .unwrap_or_else(|| panic!("no source file builds module {module}"));
+        let src = std::fs::read_to_string(&file).unwrap();
+        if !declared_kernels(&src).contains(&func) {
+            missing.push(format!("{module}::{func} ({})", file.display()));
+        }
+    }
+    assert!(missing.is_empty(), "not declared: {missing:#?}");
+}

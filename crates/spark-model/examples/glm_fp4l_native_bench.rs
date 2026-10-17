@@ -245,15 +245,15 @@ fn main() -> Result<()> {
         .unwrap_or(7);
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
-    let nk = native_kernels(g);
+    let missing = ops::missing_native_kernels(g);
     ensure!(
-        nk.mx.complete(false)
-            && nk.fp8b.complete(false)
-            && nk.fp8b_multi.complete(false)
-            && nk.mx_multi.complete(false)
-            && nk.fp8b_ld.iter().all(|k| k.0 != 0),
-        "the native mxfp8_gemv tiers are missing: build with ATLAS_TARGET_MODEL=glm-5.3-flash"
+        missing.is_empty(),
+        "this kernel build lacks {missing:?}. With ATLAS_TARGET_MODEL=glm-5.3-flash that is a \
+         stale atlas-kernels build-script output (an mtime-preserving sync left the .cu files \
+         older than the last build): touch kernels/gb10/glm-5.3-flash/nvfp4/mxfp8_gemv.cu or \
+         `cargo clean -p atlas-kernels`, then rebuild"
     );
+    let nk = native_kernels(g);
     let tc8 = g.kernel("w4a16_gemv", "w4a16_gemv_tc8")?;
     let tc8_ld = g.kernel("w4a16_gemv", "w4a16_gemv_tc8_ld")?;
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
