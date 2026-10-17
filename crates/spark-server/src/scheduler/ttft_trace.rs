@@ -21,10 +21,12 @@
 //!   the GPU finishes unless the model syncs inside).
 //! * `pf_sync`: `prefill_chunk` return to the first token sampled (the sampler
 //!   reads the token back, so this ends when the prefill's GPU work does).
-//! * `to_step`: first token sampled to the start of the decode dispatch that
-//!   produced the first visible token (other prompts' prefills in between).
-//! * `steps`, `step`: decode dispatches this request was in until then, and
-//!   the wall time of the last one.
+//! * `to_step`: first token sampled to the start of this request's first
+//!   decode dispatch (other prompts' prefills in between).
+//! * `steps`, `step`: decode dispatches this request was in until its first
+//!   visible token, and the wall time of the last one (the first step holds
+//!   the DFlash first propose: drafter block table, context precompute and,
+//!   past the warm-up, its per-sequence graph capture).
 //! * `ttft`: queue arrival to the end of that decode dispatch.
 //!
 //! A multi-chunk prompt reports `pf_submit`/`pf_sync` for chunk 0 only.
@@ -135,8 +137,8 @@ pub(super) fn step_end(t0: Option<Instant>, active: &[ActiveSeq]) {
             let slot = a.seq.slot_idx;
             let Some(r) = s.get_mut(&slot) else { continue };
             r.steps += 1;
+            r.first_step_start.get_or_insert(t0);
             if a.output_tokens.is_empty() {
-                r.first_step_start.get_or_insert(t0);
                 continue;
             }
             r.last_step = (t0, now);
@@ -226,7 +228,7 @@ impl Rec {
             ("-".to_string(), "-".to_string(), sampled.unwrap_or(step1))
         } else {
             (
-                ms(sampled, Some(step0)),
+                ms(sampled, self.first_step_start),
                 ms(Some(step0), Some(step1)),
                 step1,
             )
@@ -267,12 +269,13 @@ mod tests {
         r.mark(Mark::PrefillSubmitted, at(t0, 170));
         r.mark(Mark::FirstSampled(false), at(t0, 330));
         r.mark(Mark::PrefillStart, at(t0, 999)); // first stamp wins
-        r.steps = 1;
+        r.steps = 2;
+        r.first_step_start = Some(at(t0, 800));
         r.last_step = (at(t0, 900), at(t0, 1000));
         assert_eq!(
             r.line(5),
             "TTFT_TRACE slot=5 prompt=87 cohort=3 queue=100.0 setup=2.0 pf_submit=68.0 \
-             pf_sync=160.0 to_step=570.0 steps=1 step=100.0 ttft=1000.0 first=think"
+             pf_sync=160.0 to_step=470.0 steps=2 step=100.0 ttft=1000.0 first=think"
         );
     }
 
