@@ -142,7 +142,7 @@ def main():
     created, tunnel = [], None
     try:
         for r in (0, 1):
-            busy = remote(r, "docker ps --format '{{.Names}}' | grep -vxE 'atlas-dev-builder[0-9]*|atlas-spin'; nvidia-smi --query-compute-apps=pid --format=csv,noheader", check=False).strip()
+            busy = remote(r, "docker ps --format '{{.Names}}' | grep -vxE 'atlas-(dev|pr)-builder[0-9]*|atlas-spin'; nvidia-smi --query-compute-apps=pid --format=csv,noheader", check=False).strip()
             if busy:
                 raise RuntimeError(f'spark{r} not idle: {busy}')
         for r in (0, 1):
