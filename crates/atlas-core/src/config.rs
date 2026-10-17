@@ -743,10 +743,12 @@ pub struct QuantLayerSpec {
     pub group_size: usize,
     /// How the block scales are STORED, when not plainly: `"csf"` means each
     /// `weight_scale` ships as a compressed `nvfp4_csf_fixed` +
-    /// `nvfp4_csf_exceptions` pair (nvidia FP4-Local's routed experts). The
-    /// safetensors loaders decode those at upload regardless of this field
-    /// (`spark_runtime::weights::nvfp4_csf`); it is read to REPORT the format.
-    /// Empty for plain scales.
+    /// `nvfp4_csf_exceptions` pair (nvidia Qwen FP4-Local's routed experts);
+    /// `"csf_32x2_v1"` as five `csf32_{bases,codes,page_bases,offsets,
+    /// exceptions}` components (nvidia GLM-5.3-Flash-FP4-Local's). The
+    /// safetensors loaders decode both at upload regardless of this field
+    /// (`spark_runtime::weights::nvfp4_csf`, `nvfp4_csf32`); it is read to
+    /// REPORT the format. Empty for plain scales.
     pub weight_scale_encoding: String,
 }
 
