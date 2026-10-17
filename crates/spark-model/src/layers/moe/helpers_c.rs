@@ -283,6 +283,19 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // A packed prefill (`glm_packed_scope`): the BF16 GEMM, row-invariant
+        // there, at every row count.
+        if crate::layers::glm_packed_scope::active() && ctx.config.model_type == "glm5_next" {
+            return ops::bf16_gemm(
+                router_in,
+                self.weights.gate.weight.0,
+                gate_logits,
+                num_tokens,
+                num_experts,
+                hidden_size,
+                stream,
+            );
+        }
         match glm_router_prefill_gemm(
             ctx.config.model_type == "glm5_next",
             num_tokens,

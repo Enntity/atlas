@@ -237,6 +237,7 @@ impl MoeLayer {
         // intermediate columns and blends that partial before the EP
         // all-reduce, which sums the halves; each rank reads half the weights.
         let split = has_shared
+            && !crate::layers::glm_packed_scope::active()
             && is_ep_prefill
             && sp.is_none()
             && !overlap_shared_reduce

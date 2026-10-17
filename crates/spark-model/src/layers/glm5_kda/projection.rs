@@ -73,9 +73,25 @@ pub(super) enum ProjectionPath {
 
 impl ProjectionPath {
     pub(super) fn for_forward(decode: bool, has_transposed: bool, tokens: u32) -> Self {
+        Self::for_forward_pinned(
+            decode,
+            has_transposed,
+            tokens,
+            crate::layers::glm_packed_scope::active(),
+        )
+    }
+
+    /// `packed` (`glm_packed_scope`): the transposed M128 tiles at every row
+    /// count when present, so the family does not depend on the pass height.
+    pub(super) fn for_forward_pinned(
+        decode: bool,
+        has_transposed: bool,
+        tokens: u32,
+        packed: bool,
+    ) -> Self {
         if decode {
             Self::DecodeGemv
-        } else if has_transposed && tokens > 128 {
+        } else if has_transposed && (tokens > 128 || packed) {
             Self::PrefillTransposedM128
         } else {
             Self::PrefillBase
@@ -366,6 +382,7 @@ impl Glm5KdaLayer {
         }
         if !decode
             && m >= 2048
+            && !crate::layers::glm_packed_scope::active()
             && fp8::try_project(
                 ctx.gpu,
                 input,
@@ -487,6 +504,26 @@ mod tests {
         assert_eq!(
             ProjectionPath::for_forward(false, false, 1000),
             ProjectionPath::PrefillBase
+        );
+    }
+
+    /// A packed prefill keeps one family at every row count.
+    #[test]
+    fn packed_prefill_pins_the_transposed_tiles() {
+        for tokens in [2, 50, 128, 129, 4096] {
+            assert_eq!(
+                ProjectionPath::for_forward_pinned(false, true, tokens, true),
+                ProjectionPath::PrefillTransposedM128,
+                "{tokens}"
+            );
+            assert_eq!(
+                ProjectionPath::for_forward_pinned(false, false, tokens, true),
+                ProjectionPath::PrefillBase
+            );
+        }
+        assert_eq!(
+            ProjectionPath::for_forward_pinned(true, true, 1, true),
+            ProjectionPath::DecodeGemv
         );
     }
 

@@ -13,6 +13,9 @@ use std::sync::OnceLock;
 
 /// Rows below this keep cuBLASLt (decode/verify widths).
 const MIN_ROWS: u32 = 256;
+/// The reference row count of the cuBLASLt configuration a packed prefill
+/// falls back to where CUTLASS declines (`fixed_algo`).
+const PACKED_REF_ROWS: u32 = 4096;
 
 fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -53,6 +56,24 @@ pub fn bf16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // A packed prefill (`glm_packed_scope`): one row-invariant kernel for
+    // every row count.
+    if crate::layers::glm_packed_scope::active() {
+        if cutlass_gemm(act, weight, out, [m, n, k], stream)? {
+            return Ok(());
+        }
+        if spark_runtime::cublaslt::bf16_gemm_act_weight_t_fixed(
+            act.0,
+            weight,
+            out.0,
+            [m, n, k],
+            PACKED_REF_ROWS,
+            stream,
+        )? {
+            return Ok(());
+        }
+        anyhow::bail!("packed prefill: no row-invariant BF16 GEMM for {n}x{k}");
+    }
     if enabled() && m >= MIN_ROWS {
         if cutlass_gemm(act, weight, out, [m, n, k], stream)? {
             return Ok(());
