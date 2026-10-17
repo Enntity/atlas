@@ -60,36 +60,49 @@ impl Glm5KdaLayer {
                 out: local(normed),
             })
         };
-        let attn_normed = self.hc_pre(
-            &self.hc.attn,
-            hidden,
-            m_hc,
-            fuse_norm(&self.input_norm),
-            ctx,
-            stream,
-        )?;
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let (det_rows, row) = (
             (sp.map_or(0, |sp| sp.row0), m_hc as usize),
             h as usize * bf16,
         );
-        det.tap("in", hidden, det_rows, row);
-        if !attn_normed {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
+        // ATLAS_GLM_SP_GATHER_OVERLAP: pre, norm and gather a row block at a time.
+        let overlapped = self.sp_seam_overlapped(
+            &self.hc.attn,
+            &self.input_norm,
+            (false, true),
+            hidden,
+            normed,
+            sp,
+            ctx,
+            stream,
+        )?;
+        if !overlapped {
+            let attn_normed = self.hc_pre(
+                &self.hc.attn,
                 hidden,
-                &self.input_norm,
-                local(normed),
                 m_hc,
-                h,
-                ctx.config.rms_norm_eps as f32,
+                fuse_norm(&self.input_norm),
+                ctx,
                 stream,
             )?;
-        }
-        if let Some(sp) = sp {
-            sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            det.tap("in", hidden, det_rows, row);
+            if !attn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    hidden,
+                    &self.input_norm,
+                    local(normed),
+                    m_hc,
+                    h,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+            }
+            if let Some(sp) = sp {
+                sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
@@ -179,7 +192,22 @@ impl Glm5KdaLayer {
             && ctx
                 .comm
                 .is_some_and(|comm| comm.world_size() == 2 && comm.supports_peer_exchange_async());
-        if fused_tp_hc {
+        // ATLAS_GLM_SP_GATHER_OVERLAP: reduce, post + pre, norm and (MoE)
+        // gather a row block at a time; all of it is timed as `tp_reduce`.
+        let moe = matches!(self.ffn, crate::layers::FfnComponent::Moe(_));
+        let overlapped = !fused_tp_hc
+            && self.sp_seam_overlapped(
+                &self.hc.ffn,
+                &self.post_attn_norm,
+                (true, moe),
+                hidden,
+                normed,
+                sp,
+                ctx,
+                stream,
+            )?;
+        if overlapped {
+        } else if fused_tp_hc {
             // `moe_output` is a registered, caller-owned [M,H] BF16 arena.
             // The preceding KDA work is done with it, and FFN overwrites it
             // only after this immediate mHC post consumes the peer payload.
@@ -197,71 +225,73 @@ impl Glm5KdaLayer {
             comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
-        if !fused_tp_hc {
-            det.tap("attn_red", local(normed), det_rows, row);
-        }
-        let mut seam = crate::layers::qwen3_attention::HcSeam::Skipped;
-        if fused_tp_hc {
-            ops::hc_post_bf16_add(
-                ctx.gpu,
-                self.hc_post_bf16_add_k,
-                normed,
-                ctx.buffers.moe_output(),
-                ctx.buffers.hc_streams(),
-                ctx.buffers.hc_post(),
-                ctx.buffers.hc_comb(),
-                ctx.buffers.hc_streams(),
-                m,
-                h,
-                self.hc.hc_mult as u32,
-                stream,
-            )?;
-        } else {
-            seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
-                &self.hc.ffn,
-                Some(local(normed)),
-                hidden,
-                m_hc,
-                self.hc.hc_mult as u32,
-                self.hc.sinkhorn_iters as u32,
-                self.hc.hc_eps,
-                fuse_norm(&self.post_attn_norm),
-                ctx,
-                stream,
-            )?;
-            if !seam.ran() {
-                self.hc_post(local(normed), m_hc, ctx, stream)?;
+        if !overlapped {
+            if !fused_tp_hc {
+                det.tap("attn_red", local(normed), det_rows, row);
             }
-        }
-        profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
+            let mut seam = crate::layers::qwen3_attention::HcSeam::Skipped;
+            if fused_tp_hc {
+                ops::hc_post_bf16_add(
+                    ctx.gpu,
+                    self.hc_post_bf16_add_k,
+                    normed,
+                    ctx.buffers.moe_output(),
+                    ctx.buffers.hc_streams(),
+                    ctx.buffers.hc_post(),
+                    ctx.buffers.hc_comb(),
+                    ctx.buffers.hc_streams(),
+                    m,
+                    h,
+                    self.hc.hc_mult as u32,
+                    stream,
+                )?;
+            } else {
+                seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+                    &self.hc.ffn,
+                    Some(local(normed)),
+                    hidden,
+                    m_hc,
+                    self.hc.hc_mult as u32,
+                    self.hc.sinkhorn_iters as u32,
+                    self.hc.hc_eps,
+                    fuse_norm(&self.post_attn_norm),
+                    ctx,
+                    stream,
+                )?;
+                if !seam.ran() {
+                    self.hc_post(local(normed), m_hc, ctx, stream)?;
+                }
+            }
+            profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
-        let ffn_normed = match seam.ran() {
-            true => seam.normed(),
-            false => self.hc_pre(
-                &self.hc.ffn,
-                hidden,
-                m_hc,
-                fuse_norm(&self.post_attn_norm),
-                ctx,
-                stream,
-            )?,
-        };
-        if !ffn_normed {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_k,
-                hidden,
-                &self.post_attn_norm,
-                local(normed),
-                m_hc,
-                h,
-                ctx.config.rms_norm_eps as f32,
-                stream,
-            )?;
-        }
-        // The routed MoE needs every row; a dense FFN runs only the local ones.
-        if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
-            sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            let ffn_normed = match seam.ran() {
+                true => seam.normed(),
+                false => self.hc_pre(
+                    &self.hc.ffn,
+                    hidden,
+                    m_hc,
+                    fuse_norm(&self.post_attn_norm),
+                    ctx,
+                    stream,
+                )?,
+            };
+            if !ffn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    hidden,
+                    &self.post_attn_norm,
+                    local(normed),
+                    m_hc,
+                    h,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+            }
+            // The routed MoE needs every row; a dense FFN runs only the local ones.
+            if let Some(sp) = sp.filter(|_| moe) {
+                sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
         Ok(FfnPhase {

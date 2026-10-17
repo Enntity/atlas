@@ -86,6 +86,57 @@ impl Qwen3AttentionLayer {
         })
     }
 
+    /// `qwen3_attention::hc_seam_overlapped` for this GLM layer's site
+    /// `site` with block input norm `norm_weight`
+    /// (`ATLAS_GLM_SP_GATHER_OVERLAP`; never under diagnostics, and a post
+    /// only with no norm on the attention output).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn hc_seam_overlapped_glm(
+        &self,
+        hc: &HcWeights,
+        site: &HcSiteWeights,
+        norm_weight: &crate::weight_map::DenseWeight,
+        (post, gather): (bool, bool),
+        hidden: DevicePtr,
+        normed: DevicePtr,
+        sp: Option<crate::layers::glm_sp::SpRows>,
+        diag_this: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        if ctx.config.model_type != "glm5_next"
+            || diag_this
+            || !ops::HcVariant::of(hc).applies_block_input_norm()
+            || (post && self.post_attn_out_norm.is_some())
+        {
+            return Ok(false);
+        }
+        super::super::hc_seam_overlapped(
+            hc,
+            site,
+            (post, gather),
+            hidden,
+            normed,
+            sp,
+            ctx,
+            stream,
+            |out| self.hc_prefill_norm(norm_weight, out, ctx),
+            |input, out, rows| {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    input,
+                    norm_weight,
+                    out,
+                    rows,
+                    ctx.config.hidden_size as u32,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )
+            },
+        )
+    }
+
     /// What ran of the attention site's post fused with the FFN site's
     /// pre-mix (and `norm`; GLM only, never under diagnostics).
     #[allow(clippy::too_many_arguments)]

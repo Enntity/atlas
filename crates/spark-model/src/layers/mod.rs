@@ -9,6 +9,7 @@ pub mod fp8_calibration;
 mod glm5_kda;
 pub mod glm_kv_shard;
 pub mod glm_sp;
+pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod moe;
 mod moe_grouped_decode;

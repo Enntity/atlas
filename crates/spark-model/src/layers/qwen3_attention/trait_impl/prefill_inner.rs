@@ -611,20 +611,35 @@ impl Qwen3AttentionLayer {
             .then(|| self.hc_prefill_norm(&self.input_norm, local(normed), ctx))
             .flatten();
         let mut attn_normed = false;
-        if !ops::qwen4exp_prefill_seam::pre_with_pending(
-            ctx.gpu,
-            self.hc_post_k,
+        // ATLAS_GLM_SP_GATHER_OVERLAP: pre, norm and gather a row block at a time.
+        let attn_overlapped = self.hc_seam_overlapped_glm(
             hc,
             &hc.attn,
-            hc_streams,
+            &self.input_norm,
+            (false, true),
             hidden,
-            post,
-            ctx.buffers.hc_lowrank_scratch(),
-            n,
-            h as u32,
-            eps,
+            normed,
+            sp,
+            diag_this,
+            ctx,
             stream,
-        )? {
+        )?;
+        if !attn_overlapped
+            && !ops::qwen4exp_prefill_seam::pre_with_pending(
+                ctx.gpu,
+                self.hc_post_k,
+                hc,
+                &hc.attn,
+                hc_streams,
+                hidden,
+                post,
+                ctx.buffers.hc_lowrank_scratch(),
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?
+        {
             attn_normed =
                 self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, attn_norm, ctx, stream)?;
         }
@@ -656,7 +671,9 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if attn_overlapped {
+            // The pipelined seam normed and gathered every row.
+        } else if ops::HcVariant::of(hc).applies_block_input_norm() {
             if !attn_normed {
                 ops::rms_norm(
                     ctx.gpu,
@@ -734,7 +751,25 @@ impl Qwen3AttentionLayer {
 
         step(&mut prof, "attn")?;
         det.tap("attn", attn_out, (0, num_tokens), h * 2);
-        if let Some(sp) = sp {
+        // ATLAS_GLM_SP_GATHER_OVERLAP: reduce, post + pre, norm and gather a
+        // row block at a time (GLM's attention output is `norm_output`, the
+        // FFN input it becomes); all of it is timed as `tp_reduce`.
+        let ffn_overlapped = !self.ffn.is_none()
+            && attn_out == ctx.buffers.norm_output()
+            && self.hc_seam_overlapped_glm(
+                hc,
+                &hc.ffn,
+                &self.post_attn_norm,
+                (true, true),
+                hidden,
+                attn_out,
+                sp,
+                diag_this,
+                ctx,
+                stream,
+            )?;
+        if ffn_overlapped {
+        } else if let Some(sp) = sp {
             sp.reduce_scatter(attn_out, h, ctx, stream)?;
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
@@ -820,121 +855,124 @@ impl Qwen3AttentionLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
-        let ffn_norm = block_norm
-            .then(|| self.hc_prefill_norm(&self.post_attn_norm, local(normed2), ctx))
-            .flatten();
-        let seam = self.hc_post_pre_prefill_seam(
-            hc,
-            local(attn_out),
-            hidden,
-            n,
-            diag_this,
-            ffn_norm,
-            ctx,
-            stream,
-        )?;
-        let mut ffn_normed = seam.normed();
-        if !seam.ran() {
-            ops::hc_post_site(
-                ctx.gpu,
-                self.hc_post_k,
+        if !ffn_overlapped {
+            let ffn_norm = block_norm
+                .then(|| self.hc_prefill_norm(&self.post_attn_norm, local(normed2), ctx))
+                .flatten();
+            let seam = self.hc_post_pre_prefill_seam(
                 hc,
                 local(attn_out),
-                hc_streams,
-                post,
-                comb,
-                hc_streams,
+                hidden,
                 n,
-                h as u32,
+                diag_this,
+                ffn_norm,
+                ctx,
                 stream,
             )?;
-        }
-        if diag_this {
-            super::diag_norm_f32(
-                ctx.gpu,
-                hc_streams,
-                h,
-                stream,
-                &format!("V4-prefill L{} hc_post-attn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                hc_streams,
-                (n as usize) * (hc_mult as usize) * h,
-                stream,
-                &format!(
-                    "V4-prefill L{} hc_post-attn ALL_STREAMS",
-                    self.attn_layer_idx
-                ),
-            );
-        }
-
-        step(&mut prof, "hc_attn_post")?;
-        crate::layers::ple::dump::tap_highway(
-            ctx.gpu,
-            hc_streams,
-            model_layer,
-            "post_attn",
-            num_tokens,
-            (hc_mult as usize) * h,
-            stream,
-        );
-
-        // ── FFN sublayer ──
-        if seam.ran() {
-            // The fused seam already wrote the FFN input and post/comb.
-        } else {
-            ffn_normed = self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ffn_norm, ctx, stream)?;
-        }
-        if diag_this {
-            super::diag_norm(
-                ctx.gpu,
-                hidden,
-                h,
-                stream,
-                &format!("V4-prefill L{} hc_pre-ffn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                post,
-                (n as usize) * (hc_mult as usize),
-                stream,
-                &format!("V4-prefill L{} post-ffn", self.attn_layer_idx),
-            );
-            super::diag_norm_f32(
-                ctx.gpu,
-                comb,
-                (n as usize) * (hc_mult as usize) * (hc_mult as usize),
-                stream,
-                &format!("V4-prefill L{} comb-ffn", self.attn_layer_idx),
-            );
-        }
-
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
-            if !ffn_normed {
-                ops::rms_norm(
+            let mut ffn_normed = seam.normed();
+            if !seam.ran() {
+                ops::hc_post_site(
                     ctx.gpu,
-                    self.rms_norm_w_k,
-                    hidden,
-                    &self.post_attn_norm,
-                    local(normed2),
+                    self.hc_post_k,
+                    hc,
+                    local(attn_out),
+                    hc_streams,
+                    post,
+                    comb,
+                    hc_streams,
                     n,
                     h as u32,
-                    eps,
                     stream,
                 )?;
             }
-            if let Some(sp) = sp {
-                sp.all_gather(normed2, h, ctx, stream)?;
+            if diag_this {
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    hc_streams,
+                    h,
+                    stream,
+                    &format!("V4-prefill L{} hc_post-attn", self.attn_layer_idx),
+                );
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    hc_streams,
+                    (n as usize) * (hc_mult as usize) * h,
+                    stream,
+                    &format!(
+                        "V4-prefill L{} hc_post-attn ALL_STREAMS",
+                        self.attn_layer_idx
+                    ),
+                );
             }
-        } else {
-            // Qwen: the FFN site's own `hc_pre` already normed this, exactly
-            // as the attention site's did. There is no
-            // `post_attention_layernorm` in the checkpoint.
-            ctx.gpu
-                .copy_d2d_async(hidden, local(normed2), n as usize * h * 2, stream)?;
-            if let Some(sp) = sp {
-                sp.all_gather(normed2, h, ctx, stream)?;
+
+            step(&mut prof, "hc_attn_post")?;
+            crate::layers::ple::dump::tap_highway(
+                ctx.gpu,
+                hc_streams,
+                model_layer,
+                "post_attn",
+                num_tokens,
+                (hc_mult as usize) * h,
+                stream,
+            );
+
+            // ── FFN sublayer ──
+            if seam.ran() {
+                // The fused seam already wrote the FFN input and post/comb.
+            } else {
+                ffn_normed =
+                    self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ffn_norm, ctx, stream)?;
+            }
+            if diag_this {
+                super::diag_norm(
+                    ctx.gpu,
+                    hidden,
+                    h,
+                    stream,
+                    &format!("V4-prefill L{} hc_pre-ffn", self.attn_layer_idx),
+                );
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    post,
+                    (n as usize) * (hc_mult as usize),
+                    stream,
+                    &format!("V4-prefill L{} post-ffn", self.attn_layer_idx),
+                );
+                super::diag_norm_f32(
+                    ctx.gpu,
+                    comb,
+                    (n as usize) * (hc_mult as usize) * (hc_mult as usize),
+                    stream,
+                    &format!("V4-prefill L{} comb-ffn", self.attn_layer_idx),
+                );
+            }
+
+            if ops::HcVariant::of(hc).applies_block_input_norm() {
+                if !ffn_normed {
+                    ops::rms_norm(
+                        ctx.gpu,
+                        self.rms_norm_w_k,
+                        hidden,
+                        &self.post_attn_norm,
+                        local(normed2),
+                        n,
+                        h as u32,
+                        eps,
+                        stream,
+                    )?;
+                }
+                if let Some(sp) = sp {
+                    sp.all_gather(normed2, h, ctx, stream)?;
+                }
+            } else {
+                // Qwen: the FFN site's own `hc_pre` already normed this, exactly
+                // as the attention site's did. There is no
+                // `post_attention_layernorm` in the checkpoint.
+                ctx.gpu
+                    .copy_d2d_async(hidden, local(normed2), n as usize * h * 2, stream)?;
+                if let Some(sp) = sp {
+                    sp.all_gather(normed2, h, ctx, stream)?;
+                }
             }
         }
 

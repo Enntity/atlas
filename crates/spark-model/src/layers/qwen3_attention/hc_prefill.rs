@@ -18,7 +18,7 @@ pub(super) fn fast_prefill(tokens: u32) -> bool {
         )
 }
 
-fn fused_prefill(model: &str, hidden: u32, hc_mult: u32, tokens: u32) -> bool {
+pub(super) fn fused_prefill(model: &str, hidden: u32, hc_mult: u32, tokens: u32) -> bool {
     model == "glm5_next"
         && hidden == 4096
         && hc_mult == 4

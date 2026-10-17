@@ -186,3 +186,84 @@ fn hc_finalize_norm_matches_finalize_then_rms_norm() -> Result<()> {
     }
     Ok(())
 }
+
+/// `ATLAS_GLM_SP_GATHER_OVERLAP` runs `glm_hc_mix_ss_bf16` and
+/// `glm_hc_post_mix_ss_bf16` on row blocks: each block's raw mix, sum of
+/// squares and (post) updated highway must be the whole call's bytes.
+#[test]
+#[ignore = "needs a GB10 and a glm-5.3-flash kernel build"]
+fn hc_mix_row_blocks_match_the_whole_call() -> Result<()> {
+    let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
+    let g: &dyn GpuBackend = &backend;
+    let m = "glm_hc_prefill_vec";
+    let (tokens, cuts) = (4096usize, [0usize, 1000, 2731, 4096]);
+    let mut r = Lcg(0x5eed);
+    let highway: Vec<f32> = (0..tokens * 4 * H).map(|_| r.f() * 4.0).collect();
+    let block: Vec<f32> = (0..tokens * H).map(|_| r.f() * 2.0).collect();
+    let post: Vec<f32> = (0..tokens * 4).map(|_| r.f() + 1.0).collect();
+    let comb: Vec<f32> = (0..tokens * 16).map(|_| r.f() * 0.5 + 0.25).collect();
+    let hc_fn: Vec<f32> = (0..24 * 4 * H).map(|_| r.f() * 0.02).collect();
+    let (blk, pst, cmb, hfn) = (
+        up(g, &bf16_bytes(&block))?,
+        up(g, &f32_bytes(&post))?,
+        up(g, &f32_bytes(&comb))?,
+        up(g, &f32_bytes(&hc_fn))?,
+    );
+    let hw_row = 4 * H * 2;
+    for with_post in [false, true] {
+        let k = g.kernel(
+            m,
+            if with_post {
+                "glm_hc_post_mix_ss_bf16"
+            } else {
+                "glm_hc_mix_ss_bf16"
+            },
+        )?;
+        let launch = |hw: DevicePtr, scratch: DevicePtr, row0: usize, rows: usize| {
+            let l = KernelLaunch::new(g, k)
+                .grid([(rows as u32).div_ceil(32), 1, 1])
+                .block([256, 1, 1]);
+            let l = if with_post {
+                l.arg_ptr(blk.offset(row0 * H * 2))
+                    .arg_ptr(hw.offset(row0 * hw_row))
+                    .arg_ptr(pst.offset(row0 * 16))
+                    .arg_ptr(cmb.offset(row0 * 64))
+            } else {
+                l.arg_ptr(hw.offset(row0 * hw_row))
+            };
+            l.arg_ptr(hfn)
+                .arg_ptr(scratch)
+                .arg_ptr(scratch.offset(rows * 24 * 4))
+                .arg_u32(rows as u32)
+                .launch(0)
+        };
+        let (hw_whole, hw_blocks) = (up(g, &bf16_bytes(&highway))?, up(g, &bf16_bytes(&highway))?);
+        let whole = g.alloc(tokens * 25 * 4)?;
+        launch(hw_whole, whole, 0, tokens)?;
+        let mix_whole = down(g, whole, tokens * 25 * 4)?;
+        let scratch = g.alloc(tokens * 25 * 4)?;
+        for w in cuts.windows(2) {
+            let (row0, rows) = (w[0], w[1] - w[0]);
+            launch(hw_blocks, scratch, row0, rows)?;
+            let got = down(g, scratch, rows * 25 * 4)?;
+            ensure!(
+                got[..rows * 96] == mix_whole[row0 * 96..(row0 + rows) * 96],
+                "post={with_post}: raw mix of rows {row0}..+{rows} differs"
+            );
+            let ss = tokens * 96;
+            ensure!(
+                got[rows * 96..] == mix_whole[ss + row0 * 4..ss + (row0 + rows) * 4],
+                "post={with_post}: sum of squares of rows {row0}..+{rows} differs"
+            );
+        }
+        ensure!(
+            down(g, hw_whole, tokens * hw_row)? == down(g, hw_blocks, tokens * hw_row)?,
+            "post={with_post}: updated highway differs"
+        );
+        println!("post={with_post}: row blocks bitwise");
+        for p in [hw_whole, hw_blocks, whole, scratch] {
+            g.free(p)?;
+        }
+    }
+    Ok(())
+}
