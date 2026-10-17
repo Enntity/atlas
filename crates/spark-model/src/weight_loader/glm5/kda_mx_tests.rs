@@ -289,3 +289,38 @@ fn freeing_a_twin_returns_everything_it_allocated() {
         assert_eq!(gpu.invalid_free_count(), 0);
     }
 }
+
+/// A decode copy of its own beside the W8A8 operand (`ATLAS_GLM_FP4L_KDA_TILED_TWIN`):
+/// freeing returns both E4M3 buffers, the copy's scales and the operand's.
+#[test]
+fn freeing_a_separate_decode_copy_returns_both_byte_buffers() {
+    let gpu = MockGpuBackend::new();
+    let (st, _, _) = store(&gpu);
+    let allocs = gpu.alloc_count();
+    let policy = KdaMxPolicy {
+        decode: true,
+        w8a8_prefill: true,
+    };
+    let mut mx = kda_twin(
+        policy,
+        &st,
+        "s",
+        [64, 128],
+        TpShardKind::ColumnParallel,
+        0,
+        2,
+        0,
+        &gpu,
+    )
+    .unwrap()
+    .unwrap();
+    // Stand in for the tiled copy: decode gets its own bytes, the shared
+    // twin's row-major scales go (as `kda_twin` frees them then).
+    let shared = mx.decode.unwrap();
+    gpu.free(shared.scales).unwrap();
+    let copy = Mxfp8Weight::alloc(&gpu, 32, 128).unwrap();
+    mx.decode = Some(copy);
+    mx.free(&gpu).unwrap();
+    assert_eq!(gpu.alloc_count(), allocs);
+    assert_eq!(gpu.invalid_free_count(), 0);
+}

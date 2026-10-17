@@ -83,7 +83,9 @@ impl KdaMx {
     /// image; its E4M3 bytes are the twin's, or (W8A8 alone) its own to free.
     pub(super) fn free(self, gpu: &dyn GpuBackend) -> Result<()> {
         if let Some(w) = self.w8a8 {
-            if self.decode.is_none() {
+            // Its E4M3 bytes are the decode twin's unless decode has its own
+            // (tiled) copy or there is no decode.
+            if self.decode.is_none_or(|t| t.data != w.data) {
                 gpu.free(w.data)?;
             }
             w.free(gpu)?;
@@ -176,15 +178,70 @@ pub(super) fn kda_twin(
         }
         None
     };
-    if !policy.decode {
-        // W8A8 alone reads the E4M3 bytes (its operand) and its own tiled
-        // scale image: the row-major scales have no reader.
+    // ATLAS_GLM_FP4L_KDA_TILED_TWIN: decode reads its own chunk-tiled copy
+    // while W8A8 keeps the row-major bytes (+1 B/param resident).
+    let tiled_copy = policy.decode && w8a8.is_some() && tiled_twin_requested()?;
+    if !policy.decode || tiled_copy {
+        // W8A8 reads the E4M3 bytes (its operand) and its own tiled scale
+        // image: the row-major scales have no other reader once decode has
+        // its own copy (or there is no decode).
+        let decode = if tiled_copy {
+            match tiled_decode_copy(gpu, &twin, tn, tk, stream) {
+                Ok(copy) => Some(copy),
+                Err(e) => {
+                    if let Some(w) = w8a8 {
+                        w.free(gpu)?;
+                    }
+                    free_twin(twin)?;
+                    return Err(e.context(format!("{stem}: tiled MXFP8 decode copy")));
+                }
+            }
+        } else {
+            None
+        };
         gpu.free(twin.scales)?;
+        return Ok(Some(KdaMx { decode, w8a8 }));
     }
     Ok(Some(KdaMx {
-        decode: policy.decode.then_some(twin),
+        decode: Some(twin),
         w8a8,
     }))
+}
+
+/// `ATLAS_GLM_FP4L_KDA_TILED_TWIN=1` with `ATLAS_GLM_MXFP8_TILED=1`: a KDA
+/// layer serving W8A8 prefill gives decode / verify a chunk-tiled copy of the
+/// twin (the `_tiled` tiers stream ~10% faster than row-major at these
+/// shapes, `mxfp8_tiled_bench`) instead of sharing the row-major bytes. The
+/// copy costs ~1 B/param (~2.3 GB a rank over 34 layers). Not part of
+/// `ATLAS_GLM_FP4L_NATIVE`. Without `ATLAS_GLM_MXFP8_TILED` it is ignored.
+fn tiled_twin_requested() -> Result<bool> {
+    Ok(
+        std::env::var("ATLAS_GLM_FP4L_KDA_TILED_TWIN").as_deref() == Ok("1")
+            && crate::layers::ops::mxfp8_tiled_requested()?,
+    )
+}
+
+/// A copy of untiled `twin` (`[n, k]`) rewritten into the chunk tiling.
+fn tiled_decode_copy(
+    gpu: &dyn GpuBackend,
+    twin: &Mxfp8Weight,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<Mxfp8Weight> {
+    let mut copy = Mxfp8Weight::alloc(gpu, n, k)?;
+    let built = (|| -> Result<()> {
+        gpu.copy_d2d_async(twin.data, copy.data, n * k, stream)?;
+        gpu.copy_d2d_async(twin.scales, copy.scales, n * k / 32, stream)?;
+        gpu.synchronize(stream)?;
+        crate::layers::ops::mxfp8_tile_if_requested(gpu, &mut copy, n, k, stream)
+    })();
+    if let Err(e) = built {
+        gpu.free(copy.data)?;
+        gpu.free(copy.scales)?;
+        return Err(e);
+    }
+    Ok(copy)
 }
 
 #[cfg(test)]
