@@ -47,6 +47,7 @@ fn with_kda_ffn(
         weight: gpu.alloc(bytes).unwrap(),
     };
     let projection = || Glm5Projection {
+        mxfp8: None,
         nvfp4: QuantizedWeight {
             weight: gpu.alloc(4096 * 4096 / 2).unwrap(),
             weight_scale: gpu.alloc(4096 * 4096 / 16).unwrap(),

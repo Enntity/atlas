@@ -122,6 +122,8 @@ pub struct Glm5KdaLayer {
     w4a16_gemv_batch3_k: KernelHandle,
     w4a16_gemv_batch5_qkv_k: KernelHandle,
     w4a16_gemv_batchm: W4a16BatchmTiers,
+    /// `mxfp8_gemv_tc{8,16,32}` for MXFP8 q/k/v/o twins (zero when absent).
+    mxfp8_gemv_k: [KernelHandle; 3],
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,

@@ -27,7 +27,8 @@ impl Glm5KdaLayer {
             && m == 5
             && self.w4a16_gemv_batch5_qkv_k.0 != 0
             && verify_fused_qkv_enabled()
-            && !crate::layers::canonical_verify::enabled();
+            && !crate::layers::canonical_verify::enabled()
+            && !self.has_mxfp8_projections();
         // Whether Q took the Lt FP8 route, leaving `normed` cast in scratch.
         let mut q_fp8 = false;
         if fused_qkv {

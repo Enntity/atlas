@@ -9,6 +9,8 @@ use crate::layers::ops;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 #[path = "projection_fp8.rs"]
 mod fp8;
+#[path = "projection_mx.rs"]
+mod mx;
 
 /// Balanced `(first_row, rows)` chunks of at most the batch-M GEMV cap, so an
 /// owner-batched verify of `m > 8` rows reuses the exact short-batch kernels.
@@ -37,6 +39,10 @@ pub struct Glm5Projection {
     pub nvfp4: QuantizedWeight,
     /// Optional `[K/2, N]` twin for Atlas' tensor-core prefill GEMMs.
     pub prefill_nvfp4_t: Option<QuantizedWeight>,
+    /// The checkpoint's MXFP8 bytes as this rank's twin, which then serves
+    /// every decode and verify row (`ATLAS_GLM_FP4L_KDA_MXFP8_DECODE`,
+    /// `projection_mx.rs`).
+    pub mxfp8: Option<crate::weight_map::Mxfp8Weight>,
 }
 
 pub struct Glm5KdaWeights {
@@ -116,6 +122,9 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
         if crate::layers::canonical_verify::enabled() {
             // One tensor-core family for every row count (1..=32).
             return crate::layers::canonical_verify::w4a16(
@@ -232,6 +241,9 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
         // ATLAS_GLM_DECODE_GEMV_BATCH: the same bodies behind a weight touch.
         let tier = self.w4a16_gemv_batchm.kernel(m);
         let nvfp4 = &weight.nvfp4;
@@ -341,6 +353,9 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if decode && self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(false);
+        }
         if !decode
             && m >= 2048
             && fp8::try_project(

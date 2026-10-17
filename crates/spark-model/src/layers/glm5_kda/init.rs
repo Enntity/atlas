@@ -117,6 +117,8 @@ impl Glm5KdaLayer {
                 "w4a16_gemv_batch5_qkv",
             ),
             w4a16_gemv_batchm: W4a16BatchmTiers::resolve(gpu),
+            mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
+                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
             w4a16_gemm_k: gpu.kernel("w4a16", "w4a16_gemm")?,
             w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             dense_gemm_k: gpu.kernel("gemm", "dense_gemm_bf16")?,
@@ -195,6 +197,10 @@ impl Glm5KdaLayer {
             ),
             hc_contract_k: gpu.kernel("hyper_connection", &hc_name("hc_contract"))?,
         };
+        ensure!(
+            !layer.has_mxfp8_projections() || layer.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
+            "GLM KDA layer {layer_idx}: MXFP8 q/k/v/o twins need the mxfp8_gemv tiers"
+        );
         // Eager (boot-audited) lookup of the K = 128 dual tier, which
         // `ops::dense_gemv_batchm_dual` then reads from the backend's op cache.
         super::super::ops::dense_gemv_dual_k128_kernel(gpu);

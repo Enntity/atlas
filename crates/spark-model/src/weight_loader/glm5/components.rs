@@ -331,12 +331,24 @@ pub(super) fn load_kda_weights(
             )?;
             source.replaced(local, local_n * local_k * 2, gpu)
         };
+    let mx_policy = super::kda_mx::KdaMxPolicy::from_env()?;
     let load_hot = |name: &str,
                     n: usize,
                     k: usize,
                     kind: TpShardKind,
                     transpose_prefill: bool|
      -> Result<Glm5Projection> {
+        // Opt-in: FP4-Local's own MXFP8 bytes as the decode/verify twin.
+        let mx = super::kda_mx::kda_twin(
+            mx_policy,
+            store,
+            &format!("{p}.{name}"),
+            kind,
+            dims.tp_rank,
+            dims.tp_size,
+            gpu,
+        )?
+        .unwrap_or_default();
         let dense = load_tp_dense(name, n, k, kind)?;
         let local_n = if kind == TpShardKind::ColumnParallel {
             n / dims.tp_size
@@ -367,6 +379,7 @@ pub(super) fn load_kda_weights(
         Ok(Glm5Projection {
             nvfp4: decode_nvfp4,
             prefill_nvfp4_t,
+            mxfp8: mx.decode,
         })
     };
     let width = config.linear_conv_kernel_dim;
