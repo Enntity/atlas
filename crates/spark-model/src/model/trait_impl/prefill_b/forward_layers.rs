@@ -506,6 +506,10 @@ impl TransformerModel {
         // ATLAS_MTP_DRAFTER_PREFILL: capture this chunk's final-layer hidden
         // rows for the whole-prompt drafter prefill. No-op when disabled.
         self.try_mtp_prefill_capture(seq, effective_seq_len_start, proc_count, stream)?;
+        // ATLAS_QWEN4EXP_MTP_PREFILL: the final highway rows this rank holds
+        // (of a split chunk, rank 0's half at row 0), for the drafter.
+        let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
+        self.note_mtp_prompt_rows(seq, effective_seq_len_start, held, 0);
         if let Some(t0) = prefill_t0 {
             self.gpu.synchronize(stream)?;
             let total_us = t0.elapsed().as_micros();

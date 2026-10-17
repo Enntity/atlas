@@ -40,6 +40,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
         })()
@@ -77,6 +78,7 @@ impl TransformerModel {
                 is_last_chunk,
                 stream,
             )?;
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, is_last_chunk, stream)?;
             // The prompt is in: its pixels are done (`SeqVision::items`).
             if is_last_chunk {
@@ -102,6 +104,7 @@ impl TransformerModel {
 
         (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;
+            self.try_mtp_prompt_absorb(seq, tokens, stream);
             self.try_eager_drafter_prefill(seq, true, stream)?;
             Ok(logits)
         })()
