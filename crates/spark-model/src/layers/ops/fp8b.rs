@@ -78,9 +78,10 @@ const TIER_FAMILIES: [(&str, &str); 4] = [
 ];
 
 /// The single kernels [`native_kernels`] resolves: (module, function).
-const SINGLE_KERNELS: [(&str, &str); 4] = [
+const SINGLE_KERNELS: [(&str, &str); 5] = [
     (MX_GEMV_MODULE, "mxfp8_to_bf16"),
     ("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
+    ("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
     ("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
     (super::MXFP8_ACT_MODULE, super::MX_QUANT_KERNEL),
 ];
@@ -142,6 +143,9 @@ pub struct NativeKernels {
     pub mx_multi: MxTiers,
     /// `per_token_group_quant_fp8` (W8A8 prefill activations).
     pub act_quant: KernelHandle,
+    /// `fp8_gemm_t_blockscaled` (W8A8 prefill where cuBLASLt cannot run
+    /// block FP8).
+    pub w8a8_gemm: KernelHandle,
     /// `w8a16_gemm_pipelined` (exact W8A16 prefill GEMM).
     pub w8a16_gemm: KernelHandle,
     /// `mxfp8_quant_act_bf16` (MXFP8 W8A8 prefill activations).
@@ -154,7 +158,7 @@ pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
     *K.get_or_init(|| {
         let [mx, fp8b, fp8b_multi, mx_multi] =
             TIER_FAMILIES.map(|(stem, suffix)| MxTiers::resolve(gpu, stem, suffix));
-        let [mx_expand, act_quant, w8a16_gemm, mx_quant] =
+        let [mx_expand, act_quant, w8a8_gemm, w8a16_gemm, mx_quant] =
             SINGLE_KERNELS.map(|(m, f)| crate::layers::try_kernel(gpu, m, f));
         let k = NativeKernels {
             mx,
@@ -164,6 +168,7 @@ pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
             mx_expand,
             mx_multi,
             act_quant,
+            w8a8_gemm,
             w8a16_gemm,
             mx_quant,
         };
@@ -552,6 +557,123 @@ pub struct BlkPlan {
     pub tail_out: DevicePtr,
 }
 
+/// Per `(n, k)`: whether cuBLASLt runs block FP8 here (probed once,
+/// [`fp8b_w8a8_prepare`]).
+static BLK_LT: std::sync::Mutex<Vec<((usize, usize), bool)>> = std::sync::Mutex::new(Vec::new());
+
+/// Probe (once per shape) whether the W8A8 prefill of an `[n, k]` FP8 block
+/// twin can run on cuBLASLt's pinned block FP8 kernel; when it cannot
+/// (cuBLASLt 13.0 on GB10 answers the VEC128 / BLK128x128 modes with
+/// NOT_SUPPORTED), the shape runs the in-tree `fp8_gemm_t_blockscaled` (the
+/// same W8A8 numerics: per-token-per-128 E4M3 activations, f32 epilogue),
+/// logged once. Errors only when neither can run, so a loader calling this
+/// fails at load, never mid-prefill.
+pub fn fp8b_w8a8_prepare(
+    gpu: &dyn GpuBackend,
+    w: &Fp8BlockWeight,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    if BLK_LT.lock().unwrap().iter().any(|e| e.0 == (n, k)) {
+        return Ok(());
+    }
+    let lt = match spark_runtime::cublaslt::fp8_blkscaled_pinned_prepare(
+        w.scales.0, w.scales.0, n as u32, k as u32,
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            static LOGGED: std::sync::Once = std::sync::Once::new();
+            LOGGED.call_once(|| {
+                tracing::warn!(
+                    "cuBLASLt block FP8 unavailable ({e:#}): native W8A8 prefill runs \
+                     fp8_gemm_t_blockscaled"
+                )
+            });
+            false
+        }
+    };
+    let kernels = native_kernels(gpu);
+    ensure!(
+        kernels.act_quant.0 != 0 && (lt || kernels.w8a8_gemm.0 != 0),
+        "native W8A8 prefill of [{n}, {k}]: no block FP8 GEMM (cuBLASLt refused and \
+         fp8_gemm_t_blockscaled is missing); set ATLAS_GLM_FP4L_FP8_PREFILL=w8a16"
+    );
+    BLK_LT.lock().unwrap().push(((n, k), lt));
+    Ok(())
+}
+
+/// Whether the W8A8 prefill of `w` (`[n, k]`) runs on cuBLASLt (probing it
+/// now if no loader did).
+fn fp8b_w8a8_lt(w: &Fp8BlockWeight, n: usize, k: usize) -> bool {
+    let known = BLK_LT
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| e.0 == (n, k))
+        .map(|e| e.1);
+    known.unwrap_or_else(|| {
+        spark_runtime::cublaslt::fp8_blkscaled_pinned_prepare(
+            w.scales.0, w.scales.0, n as u32, k as u32,
+        )
+        .is_ok()
+    })
+}
+
+/// The in-tree W8A8 block FP8 prefill: per-token-group activation quant and
+/// `fp8_gemm_t_blockscaled` (one fixed kernel; each output word is one
+/// thread's in-order sum, so rows are chunk- and height-invariant), in row
+/// passes that fit the FP8 scratch.
+#[allow(clippy::too_many_arguments)]
+fn fp8b_w8a8_hand(
+    gpu: &dyn GpuBackend,
+    kernels: &NativeKernels,
+    scratch: Fp8ActScratch,
+    w: &Fp8BlockWeight,
+    input: DevicePtr,
+    output: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernels.act_quant.0 != 0 && kernels.w8a8_gemm.0 != 0,
+        "per_token_group_quant_fp8 / fp8_gemm_t_blockscaled are missing"
+    );
+    let chunk = (scratch.act_bytes / k).min(scratch.scale_bytes / (k / FP8_BLOCK * 4)) / 64 * 64;
+    ensure!(
+        chunk > 0,
+        "FP8 W8A8 prefill: the FP8 scratch holds no 64-row [_, {k}] tile"
+    );
+    for first in (0..m).step_by(chunk) {
+        let rows = (m - first).min(chunk) as u32;
+        super::per_token_group_quant_fp8(
+            gpu,
+            kernels.act_quant,
+            input.offset(first * k * 2),
+            scratch.act,
+            scratch.scale,
+            rows,
+            k as u32,
+            stream,
+        )?;
+        super::fp8_gemm_t_blockscaled(
+            gpu,
+            kernels.w8a8_gemm,
+            scratch.act,
+            scratch.scale,
+            w.data,
+            w.scales,
+            output.offset(first * n * 2),
+            rows,
+            n as u32,
+            k as u32,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
 /// `output[m, n] = input[m, k] · W^T` for prefill on FP8 block twin `w`
 /// (untiled), `mode` W8A8 or W8A16 (`Bf16` is the caller's BF16 GEMM).
 #[allow(clippy::too_many_arguments)]
@@ -588,6 +710,9 @@ pub fn fp8b_prefill_gemm(
                 k as u32,
                 stream,
             )
+        }
+        Fp8bPrefill::W8a8 if !fp8b_w8a8_lt(w, n, k) => {
+            fp8b_w8a8_hand(gpu, kernels, scratch, w, input, output, m, n, k, stream)
         }
         Fp8bPrefill::W8a8 => {
             ensure!(

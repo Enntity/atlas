@@ -220,6 +220,13 @@ pub(super) fn load_mla_layer(
     )?;
     if let Some(twins) = native.as_mut() {
         super::mla_native::tile_large_twins(twins, native_prefill, gpu)?;
+        // Pick each W8A8 prefill GEMM now (cuBLASLt block FP8, else the
+        // in-tree kernel): fail at load, never mid-prefill.
+        if native_prefill == crate::layers::ops::Fp8bPrefill::W8a8 {
+            for (twin, [n, k]) in twins.iter() {
+                crate::layers::ops::fp8b_w8a8_prepare(gpu, twin, *n, *k)?;
+            }
+        }
     }
     let opt_in_twins = super::mla_twins::opt_in_mxfp8_twins(
         config,

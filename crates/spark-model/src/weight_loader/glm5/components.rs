@@ -325,7 +325,8 @@ fn load_moe(
         &shared,
         config,
         gpu,
-    )? && let Err(e) = layer.install_shared_native(gpu, native)
+    )? && let Err(e) = prepare_shared_prefill(&native, config, gpu)
+        .and_then(|()| layer.install_shared_native(gpu, native))
     {
         native.free(gpu)?;
         return Err(e);
@@ -333,6 +334,27 @@ fn load_moe(
     // The factory installs optional shared FP8 caches only after all target,
     // MTP and head loading has released replaced checkpoint allocations.
     Ok(FfnComponent::Moe(layer))
+}
+
+/// Pick the native shared expert's W8A8 prefill GEMMs at load (cuBLASLt block
+/// FP8, else the in-tree kernel): fail here, never mid-prefill.
+fn prepare_shared_prefill(
+    native: &crate::layers::moe::shared_native::SharedNative,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+) -> Result<()> {
+    if native.prefill != crate::layers::ops::Fp8bPrefill::W8a8 {
+        return Ok(());
+    }
+    let (h, inter) = (config.hidden_size, config.shared_expert_intermediate_size);
+    for (w, n, k) in [
+        (&native.gate, inter, h),
+        (&native.up, inter, h),
+        (&native.down, h, inter),
+    ] {
+        crate::layers::ops::fp8b_w8a8_prepare(gpu, w, n, k)?;
+    }
+    Ok(())
 }
 
 fn unified_moe_layout_enabled(value: Option<&str>) -> bool {

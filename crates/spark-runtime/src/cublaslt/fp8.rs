@@ -351,6 +351,22 @@ pub fn fp8_gemm_act_weight_t_mx_pinned(
     super::mx_algo::matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)
 }
 
+/// Choose (once) the pinned kernel [`fp8_gemm_act_weight_t_blkscaled_pinned`]
+/// would run for `n x k`, without launching anything: `Err` when this
+/// cuBLASLt cannot run block FP8 on this GPU (e.g. cuBLASLt 13.0 on sm_121
+/// answers the VEC128 / BLK128x128 scale modes with NOT_SUPPORTED), so a
+/// loader can pick another prefill path at load instead of failing mid-pass.
+/// `weight_sf` / `act_sf` are any device pointers (the heuristic reads none).
+pub fn fp8_blkscaled_pinned_prepare(weight_sf: u64, act_sf: u64, n: u32, k: u32) -> Result<()> {
+    anyhow::ensure!(
+        n > 0 && k > 0 && k.is_multiple_of(128),
+        "cuBLASLt block FP8: {n}x{k}"
+    );
+    let ctx = ctx()?;
+    let ops = super::fixed_algo::Operands::Blk128 { weight_sf, act_sf };
+    super::mx_algo::pinned(ctx, n, k, ops).map(|_| ())
+}
+
 /// Block FP8 `out[m, n] = act[m, k] x weight[n, k]^T` (BF16) on ONE in-order
 /// cuBLASLt kernel per `(n, k)`, chosen once without timing and never retuned
 /// (`mx_algo::pinned`): the weight with its f32 `[n/128, k/128]` grid, the
