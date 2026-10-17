@@ -46,7 +46,8 @@ pub const CSF_EXCEPTIONS_SUFFIX: &str = ".nvfp4_csf_exceptions";
 
 /// Row bases above this would carry into the next byte when a code is added
 /// (the reference packs four decoded bytes in one u32 add and relies on it).
-const MAX_BASE: u8 = 240;
+/// Shared with `csf_32x2_v1`, whose NVFP4 bases have the same bound.
+pub(crate) const MAX_BASE: u8 = 240;
 /// Rows per fixed-stream slab.
 const SLAB: usize = 16;
 /// The exception position field is 24 bits wide.
@@ -121,7 +122,8 @@ fn check_against_weight(scale: &str, got: [usize; 2], weight: Option<&[usize]>) 
     };
     ensure!(
         want == Some(got),
-        "CSF scale {scale} decoded to {got:?}, but its weight `{wname}` {w:?} needs          {want:?} ([n, k/2] packed NVFP4 -> [n, k/16])"
+        "CSF scale {scale} decoded to {got:?}, but its weight `{wname}` {w:?} needs \
+         {want:?} ([n, k/2] packed NVFP4 -> [n, k/16])"
     );
     Ok(())
 }
@@ -191,19 +193,32 @@ pub fn decode_nvfp4_csf(
         out[pos] = (word >> POSITION_BITS) as u8;
     }
 
-    // NVFP4 block scales are amax-derived, so non-negative and finite: an E4M3
-    // byte with the sign bit set or the 0x7F NaN code cannot come from a sound
-    // encoder. Checking costs one pass over bytes already in cache and catches
-    // a flipped high bit that every structural check above would let through.
-    if let Some(at) = out.iter().position(|&b| b >= 0x7F) {
+    check_decoded_scales(&out, cols, "CSF")?;
+    Ok((out, [rows, cols]))
+}
+
+/// Refuse a decoded scale matrix holding a byte that is not a non-negative
+/// finite E4M3 scale. NVFP4 block scales are amax-derived, so non-negative
+/// and finite: an E4M3 byte with the sign bit set or the 0x7F NaN code cannot
+/// come from a sound encoder. Checking costs one pass over bytes already in
+/// cache and catches a flipped high bit that every structural check would let
+/// through. Shared by both encodings.
+pub(crate) fn check_decoded_scales(out: &[u8], cols: usize, what: &str) -> Result<()> {
+    // A max over chunks vectorizes; `position` alone does not, and was most
+    // of the slab decode's time. It runs only to name the bad byte.
+    if out
+        .chunks(4096)
+        .any(|c| c.iter().fold(0u8, |m, &b| m.max(b)) >= 0x7F)
+        && let Some(at) = out.iter().position(|&b| b >= 0x7F)
+    {
         bail!(
-            "CSF decoded scale {:#04x} at row {} col {} is negative or NaN — corrupt stream",
+            "{what} decoded scale {:#04x} at row {} col {} is negative or NaN — corrupt stream",
             out[at],
             at / cols,
             at % cols
         );
     }
-    Ok((out, [rows, cols]))
+    Ok(())
 }
 
 /// One decoded `weight_scale`, ready to upload as FP8 E4M3.
