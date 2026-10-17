@@ -8,25 +8,30 @@
 use super::{exl3_spec_eligible, exl3_spec_processors_idle};
 use crate::scheduler::emit_step::emit_token;
 use crate::scheduler::types::ActiveSeq;
-use crate::scheduler::{sched_ctx::SchedCtx, test_support::test_seq};
+use crate::scheduler::{
+    sched_ctx::SchedCtx,
+    test_support::{RespRx, test_seq},
+};
 
 const CLOSE: u32 = 901;
 const FENCE: u32 = 902;
 
-fn thinking_seq(count: u32, budget: Option<u32>) -> ActiveSeq {
-    let (mut a, _rx) = test_seq(vec![10], 64, None, 12);
+/// The receiver is returned so callers keep it alive: a dropped receiver is
+/// a client disconnect, which `emit_token` retires before committing.
+fn thinking_seq(count: u32, budget: Option<u32>) -> (ActiveSeq, RespRx) {
+    let (mut a, rx) = test_seq(vec![10], 64, None, 12);
     a.finished = false;
     a.inside_thinking = true;
     a.think_end_token = Some(CLOSE);
     a.think_start_token = Some(900);
     a.thinking_tokens = count;
     a.thinking_budget = budget;
-    a
+    (a, rx)
 }
 
 #[test]
 fn spec_eligible_refuses_an_exhausted_thinking_budget() {
-    let mut a = thinking_seq(4, Some(4));
+    let (mut a, _rx_a) = thinking_seq(4, Some(4));
     assert!(
         !exl3_spec_eligible(&a),
         "an exhausted budget must defer to serial"
@@ -45,7 +50,7 @@ fn spec_eligible_refuses_an_exhausted_thinking_budget() {
 
 #[test]
 fn forced_draft_crossing_the_budget_truncates_and_defers_to_serial() {
-    let mut a = thinking_seq(2, Some(4));
+    let (mut a, _rx_a) = thinking_seq(2, Some(4));
     let budget = a.think_budget_state();
     // Forced draft: 8 candidate emissions crossing budget 4 from count 2.
     let draft = [50, 51, 52, 53, 54, 55, 56, 57];
@@ -77,7 +82,7 @@ fn forced_draft_crossing_the_budget_truncates_and_defers_to_serial() {
 
 #[test]
 fn natural_think_end_keeps_the_content_tail() {
-    let mut a = thinking_seq(2, Some(4));
+    let (mut a, _rx_a) = thinking_seq(2, Some(4));
     let budget = a.think_budget_state();
     let draft = [50, 51, CLOSE, 60, 61];
     assert_eq!(
@@ -97,7 +102,7 @@ fn natural_think_end_keeps_the_content_tail() {
 
 #[test]
 fn spec_emission_toggles_the_code_fence_for_counted_thinking_tokens() {
-    let mut a = thinking_seq(0, None);
+    let (mut a, _rx_a) = thinking_seq(0, None);
     let mut sched = SchedCtx::for_test();
     sched.limits.code_fence_token = Some(FENCE);
     emit_token(&mut a, FENCE, None, &sched);
@@ -134,8 +139,8 @@ fn spec_emission_decay_mirrors_the_serial_budget_on_reentry() {
 
 #[test]
 fn budget_state_is_per_sequence() {
-    let a = thinking_seq(2, Some(4));
-    let mut b = thinking_seq(0, Some(16));
+    let (a, _rx_a) = thinking_seq(2, Some(4));
+    let (mut b, _rx_b) = thinking_seq(0, Some(16));
     b.thinking_tokens = 0;
     let sa = a.think_budget_state();
     let sb = b.think_budget_state();
@@ -156,7 +161,7 @@ fn mid_step_crossing_at_the_discriminating_budget() {
     // governed position and after — are dropped. This is the exact
     // mid-step crossing the budget-64 GPU arm could not exhibit (there the
     // boundary landed on a step end).
-    let mut a = thinking_seq(61, Some(63));
+    let (mut a, _rx_a) = thinking_seq(61, Some(63));
     let budget = a.think_budget_state();
     let stream = [50, 51, 52, 53];
     let kept = budget.plain_emission_len(&stream);
@@ -177,7 +182,7 @@ fn observed_budget_64_case_stream_ends_at_the_boundary() {
     // at the arming token (count 62 + 2 emissions = #63, #64). Nothing is
     // dropped, so patched == unpatched there — the fix is silent without a
     // mid-step crossing, which is why engagement telemetry exists.
-    let mut a = thinking_seq(62, Some(64));
+    let (mut a, _rx_a) = thinking_seq(62, Some(64));
     let budget = a.think_budget_state();
     let stream = [50, 51];
     let kept = budget.plain_emission_len(&stream);
@@ -193,7 +198,7 @@ fn observed_budget_64_case_stream_ends_at_the_boundary() {
 
 #[test]
 fn confidence_and_unlimited_thinking_use_the_serial_pipeline() {
-    let mut a = thinking_seq(10, Some(1000));
+    let (mut a, _rx_a) = thinking_seq(10, Some(1000));
     let mut sched = SchedCtx::for_test();
     sched.watchdog.confidence_early_stop = true;
     assert!(!exl3_spec_processors_idle(&a, &sched));
@@ -207,7 +212,7 @@ fn confidence_and_unlimited_thinking_use_the_serial_pipeline() {
 
 #[test]
 fn post_close_raw_think_token_is_never_committed() {
-    let mut a = thinking_seq(2, Some(8));
+    let (mut a, _rx_a) = thinking_seq(2, Some(8));
     a.inside_thinking = false;
     a.think_ended = true;
     a.tool_call_start_token = Some(903);
