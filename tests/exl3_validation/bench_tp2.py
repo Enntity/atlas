@@ -43,9 +43,11 @@ HOSTS = {0: Path.home()/'.local/bin/spark0', 1: Path.home()/'.local/bin/spark1'}
 MODEL = ('/root/.cache/huggingface/hub/models--MikeRoz--GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3/'
          'snapshots/dda99c7e935920fa6e235ce410e6f806e1c02720')
 # Serve profiles. The EXL3 TP2 profile is the descriptors' serve command as-is.
-NVFP4_HF_ROOT = '/home/colum/.cache/huggingface'
-NVFP4_REVISION = '36c184c6cda000a481711306df5adde42f63321a'
-NVFP4_MODEL = ('/root/.cache/huggingface/hub/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/'
+# nvidia/ (ModelOpt) is upstream's MODEL.toml target; the weights live on the
+# /nfs1 share both Sparks mount.
+NVFP4_HF_ROOT = '/nfs1'
+NVFP4_REVISION = 'da920bb0b9f4a06727223a349e55468e38352348'
+NVFP4_MODEL = ('/root/.cache/huggingface/hub/models--nvidia--GLM-5.3-Flash-NVFP4/snapshots/'
                + NVFP4_REVISION)
 
 
