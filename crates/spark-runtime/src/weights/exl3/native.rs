@@ -13,8 +13,10 @@ use crate::kernel_args::KernelLaunch;
 
 use super::{HADAMARD_WIDTH, tp::Exl3DeviceShard};
 mod coop;
+mod coop_fused;
 mod numerics;
-pub use coop::{Exl3FusedCoop, coop_fused_input, coop_fused_output, coop_fused_qkv, coop_gemm};
+pub use coop::{coop_fused_input, coop_fused_output, coop_gemm};
+pub use coop_fused::{Exl3FusedCoop, coop_fused_qkv};
 pub use numerics::{
     EXL3_PROFILE_SLOTS, Exl3CooperativeProfile, Exl3LinearNumerics, VerifyScope, in_verify_scope,
     verify_scope,
