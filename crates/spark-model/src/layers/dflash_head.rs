@@ -790,6 +790,8 @@ pub use warm_ctx::WarmCtx;
 pub(crate) mod warm_ctx_store;
 pub use warm_ctx_store::WarmCtxStore;
 #[cfg(test)]
+mod warm_ctx_gpu_tests;
+#[cfg(test)]
 mod warm_ctx_tests;
 pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
 #[cfg(test)]

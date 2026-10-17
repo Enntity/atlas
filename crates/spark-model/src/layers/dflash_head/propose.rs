@@ -307,7 +307,11 @@ impl BlockDiffusionDraftHead {
         //
         // ATLAS_DFLASH_FIRST_APPEND picks what the first propose after
         // prefill appends (`first_append`).
+        let first_propose = dstate.first_append_at == Some(position);
         self.append_decode_ctx(dstate, target_hidden_stack, position, ctx.gpu, _stream)?;
+        if first_propose && super::warm_ctx::dump_dir().is_some() {
+            super::warm_ctx::dump_first_window(dstate, position, ctx.gpu, _stream)?;
+        }
 
         // ── I/O-PARITY DUMP: full ctx_hidden_acc accumulator after the decode
         // append (exactly the slots the block forward attends) ──

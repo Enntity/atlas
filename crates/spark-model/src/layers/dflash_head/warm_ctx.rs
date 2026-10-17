@@ -55,6 +55,8 @@ const WARM_CTX_ENV: &str = "ATLAS_DFLASH_WARM_CTX";
 /// Windows the `restore` store holds (0 = no store: `restore` acts as `seed`).
 const STORE_SLOTS_ENV: &str = "ATLAS_DFLASH_WARM_CTX_SLOTS";
 const DEFAULT_STORE_SLOTS: usize = 8;
+/// Debug: write the drafter window of every request's first propose here.
+const DUMP_DIR_ENV: &str = "ATLAS_DFLASH_CTX_DUMP_DIR";
 
 /// How a prefill fills the drafter's prompt window (module docs).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,6 +129,13 @@ pub fn parse_store_slots(raw: Option<&str>) -> Result<usize> {
 
 pub fn store_slots_from_env() -> Result<usize> {
     parse_store_slots(std::env::var(STORE_SLOTS_ENV).ok().as_deref())
+}
+
+/// `ATLAS_DFLASH_CTX_DUMP_DIR`, read once.
+pub(crate) fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os(DUMP_DIR_ENV).map(Into::into))
+        .as_deref()
 }
 
 /// One prefill pass, as the capture sees it.
@@ -237,4 +246,36 @@ impl CtxRun {
     pub(crate) fn rows_to(run: Option<CtxRun>, end: usize) -> Option<CtxRun> {
         run.filter(|r| r.hi == end && r.lo < end)
     }
+}
+
+/// `ATLAS_DFLASH_CTX_DUMP_DIR`: write the window a request's first propose
+/// attends (`ctx-<pid>-<n>.bin`, `ctx_len` BF16 slots, and a `.json` with
+/// the positions) so a warm turn can be compared with a cold prefill of the
+/// same prompt (`scripts/dflash_warm_ctx_check.py`). Synchronous; debug only.
+pub(crate) fn dump_first_window(
+    d: &super::DflashProposerState,
+    position: usize,
+    gpu: &dyn spark_runtime::gpu::GpuBackend,
+    stream: u64,
+) -> Result<()> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(dir) = dump_dir() else {
+        return Ok(());
+    };
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stem = dir.join(format!("ctx-{}-{n:06}", std::process::id()));
+    let mut rows = vec![0u8; d.ctx_len * d.ctx_slot_bytes];
+    gpu.synchronize(stream)?;
+    gpu.copy_d2h(d.ctx_hidden_acc, &mut rows)?;
+    std::fs::write(stem.with_extension("bin"), &rows)?;
+    let meta = serde_json::json!({
+        "position": position,
+        "ctx_len": d.ctx_len,
+        "ctx_slot_bytes": d.ctx_slot_bytes,
+        "ctx_floor": d.ctx_floor,
+        "warm_ctx": format!("{:?}", d.warm_ctx),
+        "positions": d.ctx_positions,
+    });
+    std::fs::write(stem.with_extension("json"), meta.to_string())?;
+    Ok(())
 }
