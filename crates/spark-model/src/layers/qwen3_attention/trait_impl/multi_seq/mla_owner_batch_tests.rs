@@ -51,6 +51,7 @@ fn owner_batch_projects_index_queries_only_for_a_selecting_owner() {
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            request_id: None,
         };
         let mut cache = PagedKvCache::new(
             KvCacheConfig {

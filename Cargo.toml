@@ -79,6 +79,14 @@ sha2 = "0.10"
 # overhead — just standardizes the API across the workspace.
 parking_lot = "0.12"
 
+# OpenTelemetry tracing
+opentelemetry = { version = "0.33", features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["http-proto", "metrics"] }
+opentelemetry-http = { version = "0.33", features = ["reqwest-blocking"] }
+tracing-opentelemetry = "0.34"
+otel = { package = "opentelemetry", version = "0.33", features = ["trace"] }
+
 # Workspace crates
 # atlas-core: `default-features = false` so each consumer crate forwards the
 # right backend feature explicitly (cuda or metal). Without this, every

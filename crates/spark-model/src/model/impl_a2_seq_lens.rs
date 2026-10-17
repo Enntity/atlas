@@ -21,7 +21,13 @@ impl TransformerModel {
         use crate::layer::{PREFILL_MAX_SUB_CHUNKS, prefill_attention_pieces};
         let end = proc_start + proc_count;
         let mut values = vec![end as u32];
-        let pieces = prefill_attention_pieces(proc_start, proc_count, self.config.index_topk);
+        let dense_threshold = if self.exl3_vocab_head.is_some() {
+            crate::layers::qwen3_attention::GlmIndexBudget::from_config(&self.config, true)?
+                .dense_threshold() as usize
+        } else {
+            self.config.index_topk
+        };
+        let pieces = prefill_attention_pieces(proc_start, proc_count, dense_threshold);
         if pieces.len() > 1 {
             anyhow::ensure!(
                 pieces.len() <= PREFILL_MAX_SUB_CHUNKS,

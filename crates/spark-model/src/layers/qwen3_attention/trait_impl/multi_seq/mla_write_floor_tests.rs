@@ -77,6 +77,7 @@ fn try_writes(
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+            request_id: None,
         };
         let mut cache = PagedKvCache::new(
             KvCacheConfig {

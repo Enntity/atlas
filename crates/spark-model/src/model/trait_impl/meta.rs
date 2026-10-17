@@ -387,6 +387,7 @@ impl TransformerModel {
             marconi_skip_to: 0,
             marconi_exact_snap: None,
             session_hash: 0,
+            request_id: None,
             mtp_capture_gen: 0,
             dspark_owner: Some(dspark_owner),
             chunked_prefill_meta: None,

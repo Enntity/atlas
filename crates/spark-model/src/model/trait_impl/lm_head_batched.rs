@@ -81,6 +81,9 @@ impl TransformerModel {
         stream: u64,
     ) -> Result<DevicePtr> {
         let logits = self.buffers.logits();
+        if self.project_exl3_vocab(normed, logits, padded_n, stream)? {
+            return Ok(logits);
+        }
         let v = self.config.vocab_size;
         if let Some(ref fp8) = self.lm_head_fp8 {
             for i in 0..padded_n {

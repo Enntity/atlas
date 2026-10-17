@@ -1,0 +1,27 @@
+# GLM-5.3-Flash native EXL3 (exllamav3 trellis) checkpoints.
+#
+# An EXL3 checkpoint keeps its attention, MLA, sparse-indexer, KDA,
+# hyper-connection and vision paths on the same kernels as the NVFP4 build,
+# so this target is `nvfp4/` plus the EXL3 kernels in this dir:
+#
+#   common/  ->  nvfp4/  ->  exl3/
+#
+# Sources and KERNEL.toml both layer in that order (`[modules]`, flags and
+# `[shadow_exempt]` from nvfp4/ carry over, including the target-wide
+# `--fmad=false`). A stem here may not shadow one in nvfp4/ — the build
+# refuses it. The nvfp4-only build does not carry these kernels, so a GLM EXL3
+# checkpoint needs `ATLAS_TARGET_QUANT=exl3` (or `*`).
+#
+#   exl3*.cu, exllamav3_*.cuh  native EXL3 linear, coop GEMM, MoE, shared
+#                              expert and mHC kernels
+#   glm_indexer_quant.cu       EXL3 sparse-indexer projection + scoring
+#   kda_fla*.cu(h)             FLA-parity KDA reference policy
+#                              (ATLAS_KDA_FLA_REFERENCE=1; EXL3 projections only)
+
+[build]
+base_quant = "nvfp4"
+
+# Native mHC sigmoid libdevice arithmetic requires contraction.
+# Every other module keeps the target-wide --fmad=false.
+[build.module_nvcc_flags]
+exl3_mhc = ["--fmad=true"]

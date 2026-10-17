@@ -8,6 +8,7 @@ struct Capture {
     inner: MockGpuBackend,
     arguments: Mutex<Vec<Vec<u8>>>,
     lookups: std::sync::atomic::AtomicUsize,
+    symbols: Mutex<Vec<String>>,
     streams: Mutex<Vec<u64>>,
 }
 
@@ -39,7 +40,12 @@ impl GpuBackend for Capture {
     }
     fn kernel(&self, module: &str, symbol: &str) -> Result<KernelHandle> {
         assert_eq!(module, "glm_sparse_prefill_kv_reuse");
-        assert_eq!(symbol, "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad");
+        assert!(matches!(
+            symbol,
+            "glm_sparse_mla_prefill_bf16_head32_tc_kv_pad"
+                | "glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad"
+        ));
+        self.symbols.lock().unwrap().push(symbol.to_string());
         self.lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(KernelHandle(0x777))
@@ -135,7 +141,7 @@ fn decode_tc_disabled_has_no_lookup_launch_sync_or_allocation() {
     let gpu = Capture::default();
     let c = config();
     assert!(!dispatch_decode(&gpu, &args(&c), 19, false).unwrap());
-    initialize_decode(&gpu, &c, false).unwrap();
+    initialize_decode(&gpu, &c, KvCacheDtype::Bf16, false).unwrap();
     assert_eq!(gpu.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
     assert!(values(&gpu).is_empty());
     assert_eq!(gpu.inner.sync_count(), 0);
@@ -159,6 +165,32 @@ fn decode_tc_launch_preserves_all_six_pointers_and_geometry() {
     expected.push(0.0625f32.to_ne_bytes().to_vec());
     assert_eq!(actual, expected);
     assert_eq!(gpu.inner.sync_count(), 0);
+}
+
+#[test]
+fn fp8_serial_decode_selects_existing_reader_without_experimental_flag() {
+    let gpu = Capture::default();
+    let c = config();
+    let mut a = args(&c);
+    a.dtype = KvCacheDtype::Fp8G128;
+
+    assert!(dispatch_decode(&gpu, &a, 19, false).unwrap());
+    assert_eq!(
+        *gpu.symbols.lock().unwrap(),
+        ["glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad"]
+    );
+}
+
+#[test]
+fn fp8_reader_requirement_is_glm_only() {
+    let gpu = Capture::default();
+    let mut c = config();
+    c.model_type = "other".into();
+    let mut a = args(&c);
+    a.dtype = KvCacheDtype::Fp8G128;
+
+    assert!(!dispatch_decode(&gpu, &a, 19, false).unwrap());
+    assert_eq!(gpu.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 #[test]
 fn decode_tc_rejects_invalid_data_before_kernel_lookup() {
@@ -207,7 +239,7 @@ fn decode_tc_rejects_invalid_data_before_kernel_lookup() {
 fn decode_tc_startup_is_exact_zero_rows_null_storage_then_sync() {
     let gpu = Capture::default();
     let c = config();
-    initialize_decode(&gpu, &c, true).unwrap();
+    initialize_decode(&gpu, &c, KvCacheDtype::Bf16, true).unwrap();
     let mut expected = vec![0u64.to_ne_bytes().to_vec(); 6];
     expected.extend(
         [0u32, 32, 512, 2051, 16]
@@ -219,6 +251,18 @@ fn decode_tc_startup_is_exact_zero_rows_null_storage_then_sync() {
     assert_eq!(*gpu.streams.lock().unwrap(), vec![0]);
     assert_eq!(gpu.inner.sync_count(), 1);
     assert_eq!(gpu.inner.alloc_count(), 0);
+}
+
+#[test]
+fn fp8_decode_startup_warmup_uses_the_fp8_reader() {
+    let gpu = Capture::default();
+    let c = config();
+    initialize_decode(&gpu, &c, KvCacheDtype::Fp8G128, true).unwrap();
+    assert_eq!(
+        *gpu.symbols.lock().unwrap(),
+        ["glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad"]
+    );
+    assert_eq!(gpu.inner.sync_count(), 1);
 }
 #[test]
 fn decode_tc_config_and_flag_fail_closed_before_startup() {
@@ -233,7 +277,7 @@ fn decode_tc_config_and_flag_fail_closed_before_startup() {
     ] {
         let mut c = config();
         mutate(&mut c);
-        assert!(initialize_decode(&gpu, &c, true).is_err());
+        assert!(initialize_decode(&gpu, &c, KvCacheDtype::Bf16, true).is_err());
         assert!(dispatch_decode(&gpu, &args(&c), 19, true).is_err());
     }
     for value in ["", "true", "2", " 1"] {

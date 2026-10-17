@@ -72,6 +72,16 @@ pub struct CompletionRequest {
     /// vLLM `ignore_eos` (same as chat completions).
     #[serde(default)]
     pub ignore_eos: bool,
+    /// vLLM extension: token ids that end generation (same as chat).
+    #[serde(default)]
+    pub stop_token_ids: Option<Vec<u32>>,
+    /// vLLM extension: keep the matched stop string (same as chat).
+    #[serde(default)]
+    pub include_stop_str_in_output: bool,
+    /// Minimum tokens before EOS / stop tokens / stop strings may end the
+    /// completion (vLLM `min_tokens`, same semantics as chat). 0 = none.
+    #[serde(default)]
+    pub min_tokens: usize,
     /// Seed for deterministic sampling (same as chat completions).
     pub seed: Option<u64>,
     /// Per-request inference deadline in seconds. `None` uses the server's

@@ -1,0 +1,91 @@
+{
+  "campaign_id": "gate-v2-qualification-20261013-luna1",
+  "status": "UNVERIFIABLE",
+  "passed": false,
+  "reason": "H3/H4 reference leave-one-out failed",
+  "attempts_completed": 26,
+  "request_receipts": 832,
+  "mde": {
+    "short16_responses": 16,
+    "long_responses": 16,
+    "logit_sidecars": 32,
+    "parity_cases": 8,
+    "parity_rows": 32
+  },
+  "frozen_plan_sha256": "ab224d15f268ca873f7fa5b0ce7e8e157f3e905237b7f9ecb48c4c992d7be9e8",
+  "frozen_manifest_sha256": "29187de9eb8c80739c6d95fb655c075788ca1f7821621b2be3c38c25e640e555",
+  "neutrality_proof_sha256": "9678e8431fb59f59b0a9f578ea683d1e0e08c123d72aebab0780b79464287f12",
+  "frozen_evaluator_sha256": "426701ccc0f717ea782116354188b24f421862a676afbdf76f14f6c84f7465dc",
+  "corrected_evaluator_sha256": "96423dbb11555f064423f90e3f8782bfb634d641ed0b2df23b4f8fcb37a535fd",
+  "v1_validator_sha256": "5e799d4ad29573c6da8f260ec36de7d70cf975ad869c6d40fe56880e87a81ba7",
+  "v2_test_sha256": "d68e249732314ac39259fe0af639459a03b10e65c3c3bb70199bb35d2fe0764a",
+  "v1_test_sha256": "2193153a3619403701b63f20bce9a7901347d564d261124dfa8479904289421d",
+  "frozen_incomplete_report_sha256": "9016d7b6aea86617b15e59a9496013196d2a29365d0887d317907e219bea8520",
+  "corrected_report_sha256": "531e9d0077e735c5294b32c4ed86ada7af74b66c098f3d3e68a295f90dff551f",
+  "campaign_input_sha256": "1742fccf7a72cd894e8293148da99aabfabd2eb314d65eb13f78aeb3bb2da3f1",
+  "frozen_evaluator_bug": "v1.validate_runs applied candidate-pair byte identity to the three independent reference held-outs; v2 spec requires only the two candidate attempts to be byte-identical.",
+  "correction": "Added opt-out for candidate identity enforcement, defaulting true; v2 calls it false only for heldout comparison. Identity, provenance, finite-logit checks remain. No thresholds or metric computations changed.",
+  "h3_loo_failures": [
+    {
+      "excluded_reference": 13,
+      "target_index": 13,
+      "fit_reference_count": 14,
+      "fit_indices": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14
+      ],
+      "items_checked": 56,
+      "failures": [
+        {
+          "item": "0/longer/r3/sym_kl",
+          "nearest": 0.05087024759113458,
+          "spread": 0.001790604089123014,
+          "limit": 0.005371812267369042
+        }
+      ],
+      "passed": false
+    }
+  ],
+  "h4_loo_failures": [
+    {
+      "case": [
+        0,
+        "code"
+      ],
+      "row": 1,
+      "excluded_reference": 14,
+      "fit_reference_count": 14,
+      "demonstrated": true,
+      "passed": false,
+      "membership": {
+        "passed": false,
+        "applicable": true,
+        "distances": [
+          0.00027333285218177154,
+          0.0001366066907714272
+        ],
+        "limit": 2.3823660901936028e-05,
+        "byte_class_hash": "356d53bae1f660edca75af056ce74f63e0343586310d7f6d250c50c9ba0d4a91"
+      }
+    }
+  ],
+  "original_frozen_evaluator_report": "qualification-report-final3.json",
+  "corrected_report": "qualification-report-corrected.json",
+  "completion_supplement_sha256": "e75d3b9cfd2505b92d3e52f43dfe9600fed64139be17632214903e6d77b65318",
+  "validation_tests": {
+    "focused_v1_v2_gate_tests": "24 passed",
+    "full_exl3_validation_python_suite": "319 passed"
+  }
+}

@@ -75,19 +75,7 @@ pub(crate) fn resolve_topology(
         && tp_size == ep_size
         && world_size == ep_size;
     if tp_size > 1 {
-        // EXL3 packs each linear into 16x16 trellis tiles laid out
-        // [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be
-        // row-sliced per rank. Refuse before any loader/TP-capability check.
-        if config
-            .quantization_config
-            .as_ref()
-            .is_some_and(|qc| qc.is_exl3())
-        {
-            anyhow::bail!(
-                "EXL3 checkpoints are TP=1 only (packed 16x16 trellis tiles cannot be \
-                 row-sliced); got --tp-size {tp_size}"
-            );
-        }
+        refuse_row_sliced_exl3(config, tp_size)?;
         let loader = spark_model::factory::loader_for_config(config)?;
         if !loader.supports_tp() {
             anyhow::bail!(
@@ -363,6 +351,45 @@ pub(crate) fn init_nccl_comm(
         );
     }
     Ok(None)
+}
+
+/// EXL3 packs each linear into 16x16 trellis tiles laid out
+/// [in/16, out/16, ...]; a tile is atomic, so the tensor cannot be row-sliced
+/// per rank. Refuse before any loader/TP-capability check. The native
+/// GLM-5.3 EXL3 loader shards whole tiles per rank and is TP=2 only
+/// (`preflight_glm53_tp2_packed`), so glm5_next is exempt.
+fn refuse_row_sliced_exl3(
+    config: &atlas_core::config::ModelConfig,
+    tp_size: usize,
+) -> anyhow::Result<()> {
+    if tp_size > 1
+        && config.model_type != "glm5_next"
+        && config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|qc| qc.is_exl3())
+    {
+        anyhow::bail!(
+            "EXL3 checkpoints are TP=1 only (packed 16x16 trellis tiles cannot be \
+             row-sliced); got --tp-size {tp_size}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn only_glm5_next_exl3_may_shard_across_tp_ranks() {
+    let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
+    config.quantization_config = atlas_core::config::parse_quantization_config(
+        &serde_json::json!({"quantization_config": {"quant_method": "exl3"}}),
+    );
+    assert!(config.quantization_config.as_ref().unwrap().is_exl3());
+    config.model_type = "qwen4_exp".into();
+    assert!(refuse_row_sliced_exl3(&config, 2).is_err());
+    assert!(refuse_row_sliced_exl3(&config, 1).is_ok());
+    config.model_type = "glm5_next".into();
+    assert!(refuse_row_sliced_exl3(&config, 2).is_ok());
 }
 
 #[cfg(all(test, feature = "nccl"))]

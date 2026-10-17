@@ -61,6 +61,7 @@ pub fn start_chunked_prefill(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_request_id: std::sync::Arc<str> = std::sync::Arc::from(req.request_id());
     let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_src_lang = req.src_lang_id();
     let req_tgt_lang = req.tgt_lang_id();
@@ -104,12 +105,16 @@ pub fn start_chunked_prefill(
             max_tokens,
             temperature,
             response_tx,
+            stop_watch,
             image_pixels,
             ..
         } => (
             prompt_tokens,
             max_tokens,
-            ResponseSink::Blocking(Some(response_tx)),
+            ResponseSink::Blocking {
+                tx: Some(response_tx),
+                stop_watch,
+            },
             image_pixels,
             temperature,
             None,
@@ -155,6 +160,7 @@ pub fn start_chunked_prefill(
     // prefill hooks cannot touch shared MTP capture/eager-drafter state.
     seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
+    seq.request_id = Some(req_request_id);
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
     seq.tgt_lang_id = req_tgt_lang;
@@ -307,6 +313,8 @@ pub fn start_chunked_prefill(
                 0,
             )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
+            model
+                .ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start
@@ -406,6 +414,7 @@ pub fn start_chunked_prefill(
             req_disable_mtp,
         )?;
         plant_chunk0(model, &mut seq, pc_plant)?;
+        model.ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
         // EP: broadcast chunk 0 tokens to worker.
         // Send full prompt length + all tokens so worker can do
         // identical Marconi prefix-cache lookups (bug #33 fix).
@@ -527,6 +536,7 @@ pub fn start_chunked_prefill(
             top_p,
             min_p,
             eos_tokens,
+            req_seed,
             p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {

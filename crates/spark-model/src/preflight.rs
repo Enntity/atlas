@@ -48,6 +48,19 @@ pub fn preflight(store: &WeightStore, config: &ModelConfig, use_speculative: boo
     }
     // Model-agnostic checks — driven purely by `store.names()` and
     // `config` (which already carries the parsed `config.json` values).
+    if let Some(checkpoint) = store.exl3_checkpoint() {
+        anyhow::ensure!(
+            config.model_type == "glm5_next" && !use_speculative,
+            "Native EXL3 requires non-speculative GLM-5"
+        );
+        anyhow::ensure!(
+            checkpoint.tensor_names().any(|n| n == "lm_head.trellis"),
+            "EXL3 checkpoint is missing packed lm_head"
+        );
+        check_embedding_and_head(store)?;
+        check_layer_count(store, config)?;
+        return Ok(());
+    }
     check_quant_method(config)?;
     deepseek_v4::check_native_dspark_checkpoint(store, config, use_speculative)?;
     check_embedding_and_head(store)?;

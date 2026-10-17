@@ -205,6 +205,7 @@ pub(super) fn run_standard_chunk_loop(
                         p.top_p,
                         p.min_p,
                         &p.eos_tokens,
+                        p.seed,
                         p.grammar_state.as_mut(),
                         &sched.levers.sampling(),
                     ) {
@@ -311,6 +312,7 @@ pub(super) fn run_standard_chunk_loop(
                     p.top_p,
                     p.min_p,
                     &p.eos_tokens,
+                    p.seed,
                     p.grammar_state.as_mut(),
                     &sched.levers.sampling(),
                 ) {

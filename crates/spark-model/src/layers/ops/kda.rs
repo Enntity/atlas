@@ -296,6 +296,11 @@ pub fn kda_preprocess_regresident(
         .launch(stream)
 }
 
+/// Authoritative launch geometry shared with opt-in diagnostic binding.
+pub fn kda_sigmoid_gated_norm_launch_dims(tokens: u32, heads: u32) -> ([u32; 3], [u32; 3]) {
+    ([tokens * heads, 1, 1], [128, 1, 1])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn kda_sigmoid_gated_norm(
     gpu: &dyn GpuBackend,
@@ -310,9 +315,10 @@ pub fn kda_sigmoid_gated_norm(
     eps: f32,
     stream: u64,
 ) -> Result<()> {
+    let (grid, block) = kda_sigmoid_gated_norm_launch_dims(tokens, heads);
     KernelLaunch::new(gpu, kernel)
-        .grid([tokens * heads, 1, 1])
-        .block([128, 1, 1])
+        .grid(grid)
+        .block(block)
         .arg_ptr(input)
         .arg_ptr(gate)
         .arg_ptr(weight)

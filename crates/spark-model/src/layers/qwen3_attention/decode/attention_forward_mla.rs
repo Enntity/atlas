@@ -58,6 +58,7 @@ impl Qwen3AttentionLayer {
             stream,
             pos,
         } = *args;
+        self.validate_exl3_mla_forward(1, ctx, stream)?;
         let mla = self
             .mla
             .as_ref()
@@ -101,7 +102,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     normed,
@@ -140,7 +141,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     q_latent,
@@ -180,7 +181,7 @@ impl Qwen3AttentionLayer {
                         .weight
                         .offset(head_idx * mla.nope * mla.kv_lora_rank * 2);
                     let w_uk_dense = crate::weight_map::DenseWeight { weight: w_uk_head };
-                    ops::dense_gemv(
+                    self.mla_dense_gemv(
                         ctx.gpu,
                         self.dense_gemv_k,
                         q_nope_ptr,
@@ -251,7 +252,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     normed,
@@ -279,7 +280,7 @@ impl Qwen3AttentionLayer {
         let k_rope_single = ctx.buffers.ssm_ba();
         prof!("k_rope+RoPE+wb", {
             if mla_rope > 0 {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     normed,
@@ -437,7 +438,7 @@ impl Qwen3AttentionLayer {
                         .offset(head_idx * mla.v_dim * mla.kv_lora_rank * 2);
                     let v_dst = v_extracted.offset(head_idx * mla.v_dim * 2);
                     let w_uv_dense = crate::weight_map::DenseWeight { weight: w_uv_head };
-                    ops::dense_gemv(
+                    self.mla_dense_gemv(
                         ctx.gpu,
                         self.dense_gemv_k,
                         attn_head,
@@ -467,7 +468,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     v_extracted,

@@ -40,6 +40,7 @@ pub fn prefill_request(
     let logit_bias = req.logit_bias().to_vec();
     let req_min_tokens = req.min_tokens();
     let req_session_hash = req.session_hash();
+    let req_request_id: std::sync::Arc<str> = std::sync::Arc::from(req.request_id());
     let req_adapter_slot = req.adapter_slot(); // M2 per-request LoRA routing
     let req_src_lang = req.src_lang_id();
     let req_tgt_lang = req.tgt_lang_id();
@@ -82,12 +83,16 @@ pub fn prefill_request(
             max_tokens,
             temperature,
             response_tx,
+            stop_watch,
             image_pixels,
             ..
         } => (
             prompt_tokens,
             max_tokens,
-            ResponseSink::Blocking(Some(response_tx)),
+            ResponseSink::Blocking {
+                tx: Some(response_tx),
+                stop_watch,
+            },
             image_pixels,
             temperature,
             None,
@@ -127,6 +132,7 @@ pub fn prefill_request(
     // prefill hooks cannot touch shared MTP capture/eager-drafter state.
     seq.disable_mtp = req_disable_mtp;
     seq.session_hash = req_session_hash;
+    seq.request_id = Some(req_request_id);
     seq.adapter_slot = req_adapter_slot;
     seq.src_lang_id = req_src_lang;
     seq.tgt_lang_id = req_tgt_lang;
@@ -273,6 +279,7 @@ pub fn prefill_request(
             0,
             0,
         )?;
+        model.ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
         model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
         model.ep_broadcast_cmd(prompt_tokens.len() as u32)?;
         model.ep_broadcast_cmd(0)?; // chunk_start = 0 (non-chunked)
@@ -296,6 +303,7 @@ pub fn prefill_request(
             top_p,
             min_p,
             eos_tokens,
+            req_seed,
             grammar_state.as_mut(),
             &sched.levers.sampling(),
         )
@@ -473,6 +481,10 @@ pub fn prefill_request(
 
     // The min_tokens end-token ban, as on the chunked paths.
     spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
+    // Q3: the first token was draw 0; offset the RNG base when it is not in
+    // `output_tokens` so the next draw does not reuse `seed + 0`.
+    let decode_seed =
+        crate::scheduler::sample_step::decode_rng_base(req_seed, !output_tokens.is_empty());
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,
@@ -555,7 +567,7 @@ pub fn prefill_request(
         last_token_time: now,
         request_start,
         decode_start: now,
-        seed: req_seed,
+        seed: decode_seed,
         top_logprobs: req_top_logprobs,
         logprobs_data: Vec::new(),
         timeout_at: req_timeout_at,

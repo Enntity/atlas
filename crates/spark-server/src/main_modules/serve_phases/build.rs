@@ -123,6 +123,7 @@ pub(crate) fn build_model(
     lora_args: Option<spark_model::factory::LoraBuildArgs<'_>>,
     nllb_lang: Option<(u32, u32)>,
     nllb_lora_dir: Option<std::path::PathBuf>,
+    progress: Option<atlas_core::load_progress::LoadProgress>,
 ) -> Result<Box<dyn spark_model::traits::Model>> {
     let mtp_quant: spark_model::layers::MtpQuantization = args
         .mtp_quantization
@@ -169,6 +170,7 @@ pub(crate) fn build_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        progress,
     )
     .context("Failed to build model")
 }

@@ -156,6 +156,15 @@ impl Glm5KdaLayer {
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_post")?;
 
         if self.layer_idx + 1 == ctx.config.num_hidden_layers {
+            if let Some(native) = &self.native_mhc {
+                return native.contract(
+                    ctx.gpu,
+                    ctx.buffers.hc_streams(),
+                    sp.map_or(hidden, |sp| sp.local(hidden, self.hidden_size)),
+                    m as usize,
+                    stream,
+                );
+            }
             ops::hc_contract(
                 ctx.gpu,
                 self.hc_contract_k,

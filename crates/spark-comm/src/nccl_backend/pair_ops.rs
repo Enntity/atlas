@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Two-rank fast-path helpers on [`NcclBackend`]: the BF16 add launch, the
-//! RDMA pair connect/dispatch, and the peer lifeline accessor.
+//! Two-rank fast-path helpers on [`NcclBackend`]: the BF16 add launches
+//! (plain, and the kernel-side flag store / flag-waiting add of
+//! `ATLAS_RDMA_KERNEL_FLAGS=1`), the RDMA pair connect/dispatch, and the peer
+//! lifeline accessor.
 
 #[cfg(atlas_rdma_verbs)]
 use super::{ALL_REDUCE_DTYPE_BYTES, ensure_payload_fits, rdma_pair};
@@ -13,6 +15,88 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 
 impl NcclBackend {
+    #[cfg_attr(not(atlas_rdma_verbs), allow(dead_code))]
+    fn launch_raw(
+        &self,
+        kernel: u64,
+        blocks: u32,
+        threads: u32,
+        params: &mut [*mut c_void],
+        stream: u64,
+        what: &str,
+    ) -> Result<()> {
+        let status = unsafe {
+            cuLaunchKernel(
+                kernel,
+                blocks,
+                1,
+                1,
+                threads,
+                1,
+                1,
+                0,
+                stream,
+                params.as_mut_ptr(),
+                ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("cuLaunchKernel ({what}) failed: status {status}");
+        }
+        Ok(())
+    }
+
+    /// Kernel-side release store of `value` into the host-mapped `flag`.
+    #[cfg_attr(not(atlas_rdma_verbs), allow(dead_code))]
+    fn launch_flag_store(&self, flag: u64, value: u64, stream: u64) -> Result<()> {
+        let mut p_flag = flag;
+        let mut p_value = value;
+        let mut params: [*mut c_void; 2] = [
+            &mut p_flag as *mut u64 as *mut c_void,
+            &mut p_value as *mut u64 as *mut c_void,
+        ];
+        self.launch_raw(
+            self.flag_store_kernel.load(Ordering::Relaxed),
+            1,
+            1,
+            &mut params,
+            stream,
+            "atlas_flag_store_release",
+        )
+    }
+
+    /// `dst[i] += src[i]` after the host-mapped `flag` reaches `expected`.
+    #[cfg_attr(not(atlas_rdma_verbs), allow(dead_code))]
+    fn launch_add_wait(
+        &self,
+        dst: u64,
+        src: u64,
+        count: usize,
+        flag: u64,
+        expected: u64,
+        stream: u64,
+    ) -> Result<()> {
+        let threads: u32 = 256;
+        let blocks: u32 = (count as u32).div_ceil(threads);
+        let (mut p_dst, mut p_src, mut p_n, mut p_flag, mut p_expected) =
+            (dst, src, count as i32, flag, expected);
+        let mut params: [*mut c_void; 5] = [
+            &mut p_dst as *mut u64 as *mut c_void,
+            &mut p_src as *mut u64 as *mut c_void,
+            &mut p_n as *mut i32 as *mut c_void,
+            &mut p_flag as *mut u64 as *mut c_void,
+            &mut p_expected as *mut u64 as *mut c_void,
+        ];
+        self.launch_raw(
+            self.add_wait_kernel.load(Ordering::Relaxed),
+            blocks,
+            threads,
+            &mut params,
+            stream,
+            "bf16_add_inplace_wait",
+        )
+    }
+
     /// `dst[i] += src[i]` over `count` BF16 values on `stream`.
     pub(super) fn launch_add(&self, dst: u64, src: u64, count: usize, stream: u64) -> Result<()> {
         let kernel = self.add_kernel.load(Ordering::Relaxed);
@@ -59,7 +143,31 @@ impl NcclBackend {
             if bytes == 0 {
                 return Ok(true);
             }
-            if rdma.exchange(ptr, ptr, bytes, stream, |dst, src, len| {
+            let kernel_flags = rdma_pair::RdmaPair::kernel_flags()
+                && self.flag_store_kernel.load(Ordering::Relaxed) != 0
+                && self.add_wait_kernel.load(Ordering::Relaxed) != 0;
+            if kernel_flags {
+                if rdma.exchange_kernel_flags(
+                    ptr,
+                    ptr,
+                    bytes,
+                    stream,
+                    |flag, value| self.launch_flag_store(flag, value, stream),
+                    |dst, src, len, flag, expected| {
+                        self.launch_add_wait(
+                            dst,
+                            src,
+                            len / ALL_REDUCE_DTYPE_BYTES,
+                            flag,
+                            expected,
+                            stream,
+                        )
+                    },
+                    |dst, src, len| self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream),
+                )? {
+                    return Ok(true);
+                }
+            } else if rdma.exchange(ptr, ptr, bytes, stream, |dst, src, len| {
                 self.launch_add(dst, src, len / ALL_REDUCE_DTYPE_BYTES, stream)
             })? {
                 return Ok(true);

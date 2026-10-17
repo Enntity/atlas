@@ -202,7 +202,7 @@ pub(super) fn pick_dequantized(
     //     ATLAS_NO_MTP_VERIFY_SAMPLE=1 reverts to the pinned argmax below.
     if ctx.sampling.mtp_verify_sample && a.temperature > 0.0 && !ctx.sampling.force_temp_zero {
         let t_sample = std::time::Instant::now();
-        let step_seed = a.seed.map(|s| s.wrapping_add(a.output_tokens.len() as u64));
+        let step_seed = crate::scheduler::sample_step::rng_step_seed(a.seed, a.output_tokens.len());
         let sampler_shape = spark_runtime::sampler::SamplingParams {
             temperature: a.temperature,
             top_k: a.top_k,

@@ -6,6 +6,7 @@
 
 #include <cuda_bf16.h>
 #include <math.h>
+#include "glm_indexer_score.cuh"
 
 #include "glm_indexer_rows.cuh"
 
@@ -92,60 +93,6 @@ extern "C" __global__ void glm_index_fill_causal_dev(
 // Eight warps score eight pooled keys per CTA. Each warp holds one pool and
 // accumulates its 32 index-head dot products without materializing headwise
 // logits. The cache remains paged with the main KV block table.
-__device__ __forceinline__ void glm_index_logits_bf16_impl(
-    const __nv_bfloat16* __restrict__ query,
-    const __nv_bfloat16* __restrict__ weights,
-    const __nv_bfloat16* __restrict__ index_cache,
-    float* __restrict__ logits,
-    const unsigned int* __restrict__ block_table,
-    unsigned int rows,
-    unsigned int seq_len,
-    unsigned int logits_stride,
-    unsigned int index_heads,
-    unsigned int head_dim,
-    unsigned int pool_size,
-    unsigned int cache_block_size,
-    unsigned long long index_block_stride_bytes) {
-    const unsigned int row = blockIdx.y;
-    const unsigned int warp = threadIdx.x >> 5;
-    const unsigned int lane = threadIdx.x & 31;
-    const unsigned int pool_id = blockIdx.x * 8 + warp;
-    if (row >= rows || pool_id >= logits_stride) return;
-    const unsigned int pool_count = seq_len / pool_size;
-    if (pool_id >= pool_count) {
-        if (lane == 0) logits[(unsigned long long)row * logits_stride + pool_id] = -INFINITY;
-        return;
-    }
-
-    const unsigned int raw_pos = pool_id * pool_size;
-    const unsigned int logical_block = raw_pos / cache_block_size;
-    const unsigned int raw_offset = raw_pos % cache_block_size;
-    const unsigned int physical_block = block_table[logical_block];
-    const unsigned int pool_offset = raw_offset / pool_size;
-    const __nv_bfloat16* key = (const __nv_bfloat16*)((const char*)index_cache
-        + (unsigned long long)physical_block * index_block_stride_bytes)
-        + (unsigned long long)pool_offset * head_dim;
-    const __nv_bfloat16* q = query
-        + (unsigned long long)row * index_heads * head_dim;
-    const __nv_bfloat16* w = weights + (unsigned long long)row * index_heads;
-    float score = 0.0f;
-    for (unsigned int head = 0; head < index_heads; ++head) {
-        float dot = 0.0f;
-        for (unsigned int d = lane; d < head_dim; d += 32) {
-            dot += __bfloat162float(q[(unsigned long long)head * head_dim + d])
-                 * __bfloat162float(key[d]);
-        }
-        for (unsigned int offset = 16; offset; offset >>= 1) {
-            dot += __shfl_down_sync(0xffffffff, dot, offset);
-        }
-        if (lane == 0) score += __bfloat162float(w[head]) * fmaxf(dot, 0.0f);
-    }
-    if (lane == 0) {
-        logits[(unsigned long long)row * logits_stride + pool_id] =
-            score * rsqrtf((float)(head_dim * index_heads));
-    }
-}
-
 extern "C" __global__ void glm_index_logits_bf16(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ weights,
@@ -160,7 +107,7 @@ extern "C" __global__ void glm_index_logits_bf16(
     unsigned int pool_size,
     unsigned int cache_block_size,
     unsigned long long index_block_stride_bytes) {
-    glm_index_logits_bf16_impl(query, weights, index_cache, logits, block_table,
+    glm_index_logits_impl<__nv_bfloat16, true>(query, weights, index_cache, logits, block_table,
         rows, seq_len_start + blockIdx.y + 1, logits_stride, index_heads, head_dim,
         pool_size, cache_block_size, index_block_stride_bytes);
 }
@@ -194,7 +141,7 @@ extern "C" __global__ void glm_index_logits_bf16_dynamic(
         if ((threadIdx.x & 31) == 0 && pool < logits_stride) logits[pool] = -INFINITY;
         return;
     }
-    glm_index_logits_bf16_impl(query, weights, index_cache, logits, block_table,
+    glm_index_logits_impl<__nv_bfloat16, true>(query, weights, index_cache, logits, block_table,
         1, length, logits_stride, index_heads, head_dim, pool_size,
         cache_block_size, index_block_stride_bytes);
 }
@@ -420,6 +367,36 @@ extern "C" __global__ void glm_index_topk_expand(
 // Single-row graph selector: grid=(1,1,1), block=256, shared=16 bytes.
 // Always reset both outputs, including transitions long->short and slot reuse.
 // dense_seq_len belongs to this row until both attention launches finish.
+__device__ __forceinline__ void glm_index_topk_expand_dynamic_impl(
+    const float* __restrict__ logits,
+    int* __restrict__ output,
+    unsigned int rows,
+    const unsigned int* __restrict__ seq_len,
+    unsigned int logits_stride,
+    unsigned int topk_tokens,
+    unsigned int pool_size,
+    unsigned int output_width,
+    unsigned int* __restrict__ dense_seq_len,
+    bool reserve_tail_pool) {
+    if (rows != 1 || blockIdx.x != 0 || blockDim.x != 256) return;
+    const unsigned int length = seq_len[0];
+    const bool valid = length > 0 && pool_size > 0 && topk_tokens > 0
+        && topk_tokens % pool_size == 0
+        && (!reserve_tail_pool || topk_tokens >= pool_size)
+        && (unsigned long long)output_width >= (unsigned long long)topk_tokens + pool_size - 1
+        && (unsigned long long)length <= (unsigned long long)logits_stride * pool_size;
+    const unsigned int dense_threshold = reserve_tail_pool ? topk_tokens - 1 : topk_tokens;
+    const unsigned int history_tokens = reserve_tail_pool ? topk_tokens - pool_size : topk_tokens;
+    if (threadIdx.x == 0)
+        dense_seq_len[0] = valid && length <= dense_threshold ? length : 0;
+    if (!valid || length <= dense_threshold) {
+        for (unsigned int i = threadIdx.x; i < output_width; i += blockDim.x) output[i] = -1;
+        return;
+    }
+    glm_index_topk_expand_impl(logits, output, 1, length, logits_stride,
+        history_tokens, pool_size, output_width);
+}
+
 extern "C" __global__ void glm_index_topk_expand_dynamic(
     const float* __restrict__ logits,
     int* __restrict__ output,
@@ -430,20 +407,25 @@ extern "C" __global__ void glm_index_topk_expand_dynamic(
     unsigned int pool_size,
     unsigned int output_width,
     unsigned int* __restrict__ dense_seq_len) {
-    if (rows != 1 || blockIdx.x != 0 || blockDim.x != 256) return;
-    const unsigned int length = seq_len[0];
-    const bool valid = length > 0 && pool_size > 0 && topk_tokens > 0
-        && topk_tokens % pool_size == 0
-        && (unsigned long long)output_width >= (unsigned long long)topk_tokens + pool_size - 1
-        && (unsigned long long)length <= (unsigned long long)logits_stride * pool_size;
-    if (threadIdx.x == 0)
-        dense_seq_len[0] = valid && length <= topk_tokens ? length : 0;
-    if (!valid || length <= topk_tokens) {
-        for (unsigned int i = threadIdx.x; i < output_width; i += blockDim.x) output[i] = -1;
-        return;
-    }
-    glm_index_topk_expand_impl(logits, output, 1, length, logits_stride,
-        topk_tokens, pool_size, output_width);
+    glm_index_topk_expand_dynamic_impl(logits, output, rows, seq_len, logits_stride,
+        topk_tokens, pool_size, output_width, dense_seq_len, false);
+}
+
+// Native EXL3 reserves one complete pool from configured top-K for raw tails.
+// For top-K=2048/pool=4: history=2044, dense threshold=2047, width=2051;
+// slots2047..2050 stay -1. Same launch and argument ABI as the legacy export.
+extern "C" __global__ void glm_index_topk_expand_dynamic_tail_reserved(
+    const float* __restrict__ logits,
+    int* __restrict__ output,
+    unsigned int rows,
+    const unsigned int* __restrict__ seq_len,
+    unsigned int logits_stride,
+    unsigned int topk_tokens,
+    unsigned int pool_size,
+    unsigned int output_width,
+    unsigned int* __restrict__ dense_seq_len) {
+    glm_index_topk_expand_dynamic_impl(logits, output, rows, seq_len, logits_stride,
+        topk_tokens, pool_size, output_width, dense_seq_len, true);
 }
 
 // Tiled sparse absorbed MLA. One CTA owns one (query, head); its eight warps

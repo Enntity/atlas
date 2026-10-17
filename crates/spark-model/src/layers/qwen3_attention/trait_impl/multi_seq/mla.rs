@@ -64,6 +64,7 @@ impl Qwen3AttentionLayer {
         kv_cache: &mut PagedKvCache,
         meta: AttnMetadataDev,
     ) -> Result<DevicePtr> {
+        self.validate_exl3_mla_forward(c.n, c.fwd, c.stream)?;
         let mla = self
             .mla
             .as_ref()
@@ -144,6 +145,7 @@ impl Qwen3AttentionLayer {
                 // attention metadata (positions / slot / seq_len /
                 // block_table). All other ctx fields are copied verbatim.
                 let ctx_i = crate::layer::ForwardContext {
+                    request_id: c.fwd.request_id.clone(),
                     ssm_batch: None,
                     attn_metadata: Some(meta_i),
                     midchunk_capture: None,

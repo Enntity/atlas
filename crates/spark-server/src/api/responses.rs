@@ -47,8 +47,10 @@ use super::sanitizer::*;
 
 pub async fn responses_endpoint(
     CurrentModel(state): CurrentModel,
+    request_id: Option<axum::extract::Extension<crate::main_modules::middleware::RequestId>>,
     req: Result<Json<crate::openai::ResponsesRequest>, JsonRejection>,
 ) -> Response {
+    let request_id = crate::main_modules::middleware::take_request_id(request_id);
     let Json(r) = match req {
         Ok(r) => r,
         Err(e) => {
@@ -139,6 +141,7 @@ pub async fn responses_endpoint(
             metadata,
             store_flag,
             conversation_id,
+            request_id,
         )
         .await;
     }
@@ -151,7 +154,7 @@ pub async fn responses_endpoint(
     // request. Use the _inner variant because we already have a parsed
     // struct (no raw bytes available to dump at this layer; the Responses
     // handler dumps at its own entry point if --dump is enabled).
-    let resp = chat_completions_inner(state.clone(), None, chat_req.into(), None).await;
+    let resp = chat_completions_inner(state.clone(), None, chat_req.into(), None, request_id).await;
     let conv_pair = conversation_id.map(|cid| (state.conversation_store.clone(), cid));
     translate_chat_response_to_responses(
         resp,

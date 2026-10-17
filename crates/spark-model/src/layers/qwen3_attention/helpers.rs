@@ -57,6 +57,7 @@ impl Qwen3AttentionLayer {
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         weights: &[(DevicePtr, usize, usize)],
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.has_exl3_mla(), "EXL3 MLA cannot install MXFP8 caches");
         anyhow::ensure!(
             self.mxfp8_quantize_k.0 != 0 && self.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
             "GLM MXFP8 twins requested but the mxfp8_gemv kernels are missing"
@@ -100,6 +101,7 @@ impl Qwen3AttentionLayer {
         gpu: &dyn spark_runtime::gpu::GpuBackend,
         weights: &[(DevicePtr, usize, usize)],
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.has_exl3_mla(), "EXL3 MLA cannot install NVFP4 caches");
         let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
         let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
         let stream = gpu.default_stream();

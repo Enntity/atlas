@@ -130,6 +130,7 @@ fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardCon
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+        request_id: None,
     })
 }
 

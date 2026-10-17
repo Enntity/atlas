@@ -413,6 +413,15 @@ pub struct ForwardContext<'a> {
     /// (`self.lora == None` short-circuits first — byte-identical off). Default
     /// `Fold` keeps legacy single-request call sites unchanged.
     pub moe_lora_route: MoeLoraRoute,
+    /// Server request id (`x-request-id`, `main_modules/middleware.rs` —
+    /// client-supplied or generated, surfaced at request admission) for the
+    /// request whose forward pass this is. Propagated unchanged through
+    /// derived contexts (cheap `Arc` clone: the pass borrows no sequence
+    /// state, so later `&mut SequenceState` use stays unblocked). `None` on
+    /// passes with no owning request (tests, internal/verify paths); the C2
+    /// norm-substitution knob (assumption A8) errors when engaged and this
+    /// binding is absent or mismatched.
+    pub request_id: Option<std::sync::Arc<str>>,
 }
 
 /// Per-pass descriptor for mid-chunk SSM tail capture. Points at the reserved

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GLM-5 KDA recurrent block for the conservative GB10 bring-up path.
+mod exl3;
 mod forward_attention;
 mod forward_attention_entry;
 mod forward_attention_qkv;
+mod forward_aux;
 mod forward_ffn;
 mod forward_recurrent;
 mod forward_recurrent_owners;
@@ -11,10 +13,14 @@ mod hc;
 mod indexed_core;
 mod init;
 mod multi_seq;
+mod native_aux;
 mod profile;
 mod projection;
 mod recurrent;
+mod reference_policy;
 mod shared_cache;
+mod upstream;
+mod weight_variants;
 
 use std::mem::size_of;
 
@@ -30,7 +36,8 @@ use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::DenseWeight;
 
 pub(crate) use multi_seq::enabled as kda_multi_seq_enabled;
-pub use projection::{Glm5KdaWeights, Glm5Projection};
+pub use projection::Glm5KdaWeights;
+pub use weight_variants::Glm5Projection;
 
 /// `ATLAS_GLM_KDA_BATCHED_FFN=1`: one FFN pass over a verify block's or a
 /// decode batch's rows, so one EP reduce of every row instead of one a row.
@@ -97,6 +104,15 @@ pub struct Glm5KdaLayer {
     weights: Glm5KdaWeights,
     ffn: FfnComponent,
     hc: HcWeights,
+    native_mhc: Option<super::glm5_exl3_mhc::NativeExl3Mhc>,
+    native_aux: Option<native_aux::NativeKdaAux>,
+    upstream_trace: Option<upstream::UpstreamTrace>,
+    /// C2 norm-substitution knob (spec D1): parsed and validated once per
+    /// model load, shared by every KDA layer. Engages at the layer-0 `gated`
+    /// output (`forward_attention.rs`); `Some` also fail-fasts the
+    /// multi-sequence path (`multi_seq.rs`, assumption A9).
+    norm_substitution:
+        Option<std::sync::Arc<spark_runtime::weights::exl3::norm_substitution::NormSubstitution>>,
     layer_idx: usize,
     ssm_ordinal: usize,
     indexed_trace_logged: std::sync::atomic::AtomicBool,
@@ -145,6 +161,8 @@ pub struct Glm5KdaLayer {
     preprocess_regresident_k: KernelHandle,
     recurrent_regresident_k: KernelHandle,
     register_resident_prefill: bool,
+    /// EXL3-only reference-policy core (`ATLAS_KDA_FLA_REFERENCE=1`).
+    fla_reference: Option<reference_policy::FlaReference>,
     gated_norm_k: KernelHandle,
     hc_expand_k: KernelHandle,
     hc_pre_k: KernelHandle,
@@ -397,3 +415,6 @@ impl TransformerLayer for Glm5KdaLayer {
         }))
     }
 }
+
+#[cfg(test)]
+mod native_aux_tests;

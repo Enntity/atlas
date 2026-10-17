@@ -124,6 +124,8 @@ impl From<ChatCompletionRequest> for ir::ChatRequest {
             min_tokens: req.min_tokens,
             ignore_eos: req.ignore_eos,
             stop: req.stop,
+            stop_token_ids: req.stop_token_ids.unwrap_or_default(),
+            include_stop_str_in_output: req.include_stop_str_in_output,
             stream: req.stream,
             n: req.n,
             response_format,
@@ -394,6 +396,35 @@ mod tests {
         assert_eq!(ir.n, 2);
         assert!(ir.tools.is_empty());
         assert!(ir.response_format.is_none());
+    }
+
+    /// vLLM `stop_token_ids` / `include_stop_str_in_output` used to be
+    /// unknown fields (silently dropped); they now reach the envelope.
+    /// `null` and absent stop ids both mean none.
+    #[test]
+    fn envelope_carries_stop_token_ids() {
+        let req = wire(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stop_token_ids": [42, 7, 42]
+        }));
+        let ir = ir::ChatRequest::from(req);
+        assert_eq!(ir.stop_token_ids, vec![42, 7, 42]);
+        assert!(!ir.include_stop_str_in_output);
+        let req = wire(serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "include_stop_str_in_output": true
+        }));
+        assert!(ir::ChatRequest::from(req).include_stop_str_in_output);
+        for absent in [serde_json::json!(null), serde_json::json!([])] {
+            let req = wire(serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stop_token_ids": absent
+            }));
+            assert!(ir::ChatRequest::from(req).stop_token_ids.is_empty());
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub mod device;
 pub mod cuda_host;
 #[cfg(feature = "cuda")]
 pub mod kernel;
+pub mod load_progress;
 #[cfg(feature = "cuda")]
 pub mod registry;
 #[cfg(feature = "cuda")]

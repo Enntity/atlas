@@ -14,7 +14,6 @@ use crate::openai::{CompletionChoice, CompletionRequest, CompletionResponse, Usa
 
 use super::compact::openai_error_response;
 use super::completions_logprobs::build_completion_logprobs;
-use super::inference_impl::strip_stop_sequences;
 use super::inference_types::{InferenceRequest, RepetitionDetectionParams};
 use super::strip::strip_thinking_tags;
 
@@ -56,6 +55,7 @@ pub(super) async fn run_blocking(
     req: &CompletionRequest,
     prompts: Vec<Vec<u32>>,
     p: CompletionParams,
+    request_id: String,
 ) -> Response {
     // n is validated to 1..=128 at the handler entry. The capacity is a
     // HINT clamped independently of user input (the vec grows amortized
@@ -78,6 +78,7 @@ pub(super) async fn run_blocking(
             let request = InferenceRequest::Blocking {
                 prompt_tokens: Arc::new(prompt_tokens.clone()),
                 session_hash,
+                request_id: request_id.clone(),
                 adapter_slot: p.adapter_slot,
                 src_lang_id: p.src_lang_id,
                 tgt_lang_id: p.tgt_lang_id,
@@ -86,7 +87,7 @@ pub(super) async fn run_blocking(
                 early_stopping: p.early_stopping,
                 image_pixels: Vec::new(),
                 max_tokens: req.max_tokens,
-                min_tokens: 0,
+                min_tokens: req.min_tokens,
                 ignore_eos: req.ignore_eos,
                 temperature: p.temperature,
                 top_k: p.top_k,
@@ -112,15 +113,22 @@ pub(super) async fn run_blocking(
                 suppress_tool_call: false,
                 disable_mtp: false,
                 grammar_spec: None,
-                // Distinct choices need distinct sampling streams; same
-                // offset scheme as chat_blocking's n>1 loop.
+                // Distinct choices need distinct, non-overlapping sampling
+                // streams (`choice_seed`, as chat_blocking's n>1 loop). Each
+                // prompt of a batch is its own request carrying the request
+                // seed, as in vLLM (completion/serving.py:162-184).
                 seed: req
                     .seed
-                    .map(|s| s.wrapping_add((prompt_i * n + n_i) as u64)),
+                    .map(|s| super::choice_seed::choice_seed(s, n_i as u64)),
                 top_logprobs: p.logprobs_k,
                 prompt_logprobs: if req.echo { p.logprobs_k } else { None },
                 echo: req.echo,
                 timeout_at: state.request_deadline(req.timeout),
+                stop_watch: super::chat_blocking::blocking_stop_watch(
+                    &state,
+                    &req.stop,
+                    req.min_tokens,
+                ),
                 response_tx: tx,
             };
 
@@ -146,7 +154,23 @@ pub(super) async fn run_blocking(
                 }
             };
 
-            let completion_text = match state.tokenizer.decode(&response.output_tokens) {
+            // The terminal EOS-set token (model EOS, single-token stop
+            // string, client `stop_token_ids`) is counted but never text —
+            // a non-special client stop id would otherwise leak its piece —
+            // unless `include_stop_str_in_output` keeps a client stop's text.
+            let include = req.include_stop_str_in_output;
+            let visible = match super::stop_match::included_stop_token(
+                include,
+                response.stop_token_id,
+                &p.stop_tokens,
+            ) {
+                Some(_) => &response.output_tokens[..],
+                None => super::chat_blocking::output_tokens_without_stop(
+                    &response.output_tokens,
+                    response.stop_token_id,
+                ),
+            };
+            let completion_text = match state.tokenizer.decode(visible) {
                 Ok(t) => t,
                 Err(e) => {
                     return openai_error_response(
@@ -157,7 +181,18 @@ pub(super) async fn run_blocking(
             };
             // Strips apply to the COMPLETION only; echoed prompt text is
             // returned verbatim per the legacy spec.
-            let completion_text = strip_stop_sequences(completion_text, &req.stop);
+            let floor = if req.stop.is_empty() {
+                0
+            } else {
+                super::chat_blocking::min_tokens_floor(
+                    &state,
+                    visible,
+                    completion_text.len(),
+                    req.min_tokens,
+                )
+            };
+            let (completion_text, stop_matched) =
+                super::stop_match::truncate_at_stop(completion_text, &req.stop, floor, include);
             let completion_text = strip_thinking_tags(&completion_text);
             let text = if req.echo {
                 let prompt_text = state.tokenizer.decode(prompt_tokens).unwrap_or_default();
@@ -194,7 +229,12 @@ pub(super) async fn run_blocking(
             choices.push(CompletionChoice {
                 index: prompt_i * n + n_i,
                 text,
-                finish_reason: response.finish_reason,
+                // A stop string completed on the last budgeted token is
+                // still a stop (vLLM output_processor.py:657-661).
+                finish_reason: stop_corrected_finish(
+                    response.finish_reason,
+                    stop_matched.is_some(),
+                ),
                 logprobs,
             });
         }
@@ -224,4 +264,27 @@ pub(super) async fn run_blocking(
         usage,
     ))
     .into_response()
+}
+
+/// `"length"` → `"stop"` when a client stop string was found in the
+/// completion (twin of `chat_blocking::stop_match_corrected`, on the
+/// legacy string finish reason).
+fn stop_corrected_finish(finish_reason: String, stop_matched: bool) -> String {
+    if stop_matched && finish_reason == "length" {
+        "stop".to_string()
+    } else {
+        finish_reason
+    }
+}
+
+#[cfg(test)]
+mod stop_corrected_finish_tests {
+    use super::stop_corrected_finish;
+
+    #[test]
+    fn stop_match_on_last_budgeted_token_reports_stop() {
+        assert_eq!(stop_corrected_finish("length".into(), true), "stop");
+        assert_eq!(stop_corrected_finish("length".into(), false), "length");
+        assert_eq!(stop_corrected_finish("timeout".into(), true), "timeout");
+    }
 }

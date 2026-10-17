@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "note": "Default P0 workload matrix for tests/exl3_validation/perf_baseline.py. Prompts are non-counting natural text: counting/enumeration prompts inflate decode statistics (measurement-discipline skill) and must not headline a baseline. reasoning-on and reasoning-off share the identical task and corpus (paragraphs_ref) so the pair differs only in reasoning_effort. Near-limit input (~3500 est. tokens) plus max_tokens 512 fits a 4096 context; adjust both together if the context differs. Token lengths are approximate (~4 chars/token); the server-reported usage.prompt_tokens in each raw record is the ground truth.",
+  "prompt_classes": {
+    "prose": {
+      "task": "Using the notes below as background, write a detailed, essay-style explanation of how a modern GPU inference server turns a stream of user requests into generated text. Flow through the material in paragraphs, with no lists or headings.",
+      "paragraphs": [
+        "A decode step on a large language model is dominated by memory movement rather than arithmetic. Each generated token reads the full set of active weights from device memory, touches a single row of activations, and appends a small entry to the key-value cache. Because the arithmetic intensity of that work is low, the achievable rate is bounded by how quickly the device can stream weights, not by how many multiply-accumulate units happen to sit idle while the kernel runs.",
+        "The scheduler decides which requests share a step. Interactive serving wants the first token to arrive quickly, so the scheduler must balance admitting a new request and paying its prefill cost against keeping the running requests moving one token at a time. A conservative admission policy keeps decode latency stable but leaves the device underused; an aggressive one packs the batch but lets queueing delay creep into every request that arrives during a busy stretch.",
+        "The key-value cache is the memory-resident history of every active conversation. It grows with the sequence length, and its per-layer layout determines how much bandwidth each decode step consumes beyond the weights themselves. Paged layouts trade a small amount of indirection for the ability to admit and evict sequences without moving large contiguous blocks, which matters enormously once many conversations share the device.",
+        "Quantization shrinks the weights and the cache so that the same bandwidth carries more useful work per second. Lower bit widths buy throughput but cost accuracy at the margins, and the packing format interacts with the kernels that decode it: a format that the hardware can unpack in registers keeps the arithmetic pipeline fed, while a format that forces round trips through local memory can erase the bandwidth advantage entirely.",
+        "Streaming delivery is what the user actually experiences. As soon as the first token exists it can be sent, and each subsequent token follows as an event on an open connection. The client measures time to first token and the gaps between tokens, which reflect the server's queueing, the prefill pass, and the steady decode cadence respectively. A server that batches aggressively may look excellent on aggregate throughput while making every individual conversation feel sluggish.",
+        "Prefill and decode are different regimes wearing the same code path. Prefill processes many prompt tokens at once and is compute bound, so it can approach the device's peak arithmetic rate, while decode processes one token at a time per sequence and is bound by memory traffic. Treating them as one undifferentiated number hides the tradeoff: whatever time goes into prefill is time a waiting user feels before the first token appears.",
+        "Kernels are where the abstract plan becomes device work. Each layer reduces to a handful of matrix multiplications, an attention pass over the cache, and a collection of elementwise operations, and the dispatch overhead between them is pure loss when the kernels themselves are short. Overlapping copies with computation, fusing elementwise chains, and keeping the working set resident in fast memory are the quiet optimizations that separate a comfortable serving rate from an embarrassing one.",
+        "Measurement ties it all together. Without a fingerprint of the build, the checkpoint, the flags, the prompt class, and the sampling configuration, a timing number is just a rumour. Honest reports separate first-token latency from steady decode rate, keep prefill out of decode statistics, repeat runs enough times to see variance, and preserve the raw records so that a skeptical reader can recompute every claim from the evidence rather than trusting the prose."
+      ],
+      "request_extra": {"reasoning_effort": "none"}
+    },
+    "code": {
+      "task": "Write a complete, well-structured Python module for the scenario described in the notes. Include error handling, brief comments where the intent is not obvious, and a small command-line entry point.",
+      "paragraphs": [
+        "We ingest device telemetry from a fleet of inference hosts. Each host ships JSON lines over a socket: a timestamp, a host identifier, and a map of counter names to integer values. The ingest side must never crash on a malformed line; it should skip the line, count the skip, and keep going, because the stream is long-running and unattended.",
+        "The current prototype looks roughly like this and it blocks forever whenever a peer stalls: import socket, json; s = socket.create_connection((host, port)); while True: line = s.makefile().readline(); rec = json.loads(line); store.append(rec). The rewrite needs a socket timeout, a bounded reconnect loop with backoff, and a clean shutdown on SIGINT that flushes whatever has already been accepted.",
+        "Aggregation runs alongside ingest. For each window of one minute we want per-host sums of every counter, plus the maximum value seen for gauges rather than a sum. Windows are keyed by the floored timestamp, and late records that arrive after their window closed should be dropped into a rejected counter instead of silently reopening history, so the aggregates stay reproducible.",
+        "The storage layer is deliberately dumb: append the aggregated rows to a gzip-compressed JSON-lines file, rotated when it passes a size threshold. The rotation must be atomic from the reader's point of view; a reader should never observe a half-written row. We already lost an afternoon to a torn write during rotation, so please make the write-then-rename pattern explicit and comment it.",
+        "Configuration comes from a small JSON file plus environment overrides, and every option must be explicit: the endpoint address, the window size, the rotation threshold, and the output directory. Fail fast with a clear message when something required is missing rather than inventing a default, because these processes run unattended and a silently wrong default becomes a week-long mystery.",
+        "Testing matters here even though the code is small. Feed the core functions synthetic record lists, including malformed lines, records with missing counters, and timestamps that straddle a window boundary. The tests should assert exact expected aggregates, not merely that the functions ran, and they should run on a plain machine with nothing but the standard library installed."
+      ],
+      "request_extra": {"reasoning_effort": "none"}
+    },
+    "tool-call": {
+      "task": "You are an operations assistant for a model-serving cluster. Use the available tools to investigate the incident described in the notes, then propose concrete next steps. Call the tools as often as is useful.",
+      "paragraphs": [
+        "The serving cluster runs two identical accelerator nodes behind a single gateway. Each node runs one model replica with a fixed memory budget, and the gateway routes each conversation to the node that owns its cache state. Traffic is interactive chat, so tail latency matters more than aggregate throughput, and the on-call rotation treats a first-token latency regression as a user-visible incident even when no requests are failing outright.",
+        "The alert that started this incident is an elevated p95 first-token latency on the interactive route over the last hour. No error rate accompanies it, and no deployment is recorded in the change window, but the evening traffic pattern shifted toward longer conversations this week, which means cache residency is higher than it was when the alert thresholds were tuned. Nothing here is yet known to be causal; the notes only describe the landscape you are investigating.",
+        "The metrics endpoint reports per-node counters for admitted requests, rejected admissions, prefill batches, decode steps, and the running batch-size histogram, sampled once per minute. The log endpoint returns recent structured events: request admissions and completions with their latencies, cache eviction events, and any restart or health-check transitions. Both are read-only and safe to call repeatedly while you form a picture.",
+        "Operators can request a service restart through the control tool, but a restart drops cache state and forces every active conversation to re-prefill, which briefly makes tail latency worse before it gets better. For that reason the tooling requires an explicit confirmation flag, and the runbook says to gather evidence before restarting rather than after, because the pre-restart state is exactly what disappears when the replicas come back fresh.",
+        "Historical context from the last postmortem: a similar latency alert turned out to be a slow disk backing the model store, which lengthened weight reads after an idle-scale event and left no trace in the application logs at all. The lesson recorded was to check device-level counters and the node inventory before drawing conclusions from request-level latency alone, and to keep the raw evidence rather than only the dashboard screenshot."
+      ],
+      "request_extra": {
+        "reasoning_effort": "none",
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_node_status",
+              "description": "Return inventory and health for the serving nodes.",
+              "parameters": {"type": "object", "properties": {}, "required": []}
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_metrics",
+              "description": "Return sampled serving counters for a node.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "node": {"type": "string", "description": "Node name."},
+                  "window_minutes": {"type": "integer", "description": "Sample window."}
+                },
+                "required": ["node"]
+              }
+            }
+          },
+          {
+            "type": "function",
+            "function": {
+              "name": "get_logs",
+              "description": "Return recent structured serving events for a node.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "node": {"type": "string", "description": "Node name."},
+                  "kind": {"type": "string", "description": "Event kind filter."}
+                },
+                "required": ["node"]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "reasoning-off": {
+      "task": "Work through the problem described in the notes carefully, then write up your reasoning and your conclusion.",
+      "paragraphs": [
+        "A latency dashboard for an interactive chat service shows a sawtooth pattern in time-to-first-token: calm for a stretch, then a burst of slow requests, then calm again. The service runs a single model replica with an admission limit, and the team disagrees about where the sawtooth comes from. One engineer believes the admission limit is too permissive and that prefill batches are starving decode; another believes the bursts are simply the evening conversation-length distribution shifting cache pressure upward.",
+        "The measurements available are the per-request timeline, the scheduler's batch-size histogram, and the memory pool's free bytes over time. The per-request timeline shows first-token latency and inter-token gaps separately, which matters because a queueing delay and a slow decode step are different failures with different remedies. The batch-size histogram is sampled, so short excursions can hide between samples.",
+        "One complicating factor is that the service was recently switched to a lower-bit cache format to fit longer conversations in the same memory. That change raises the ceiling on concurrent conversations but introduces a conversion step at cache boundaries, and nobody has yet separated the savings from the conversion cost in the timeline. The team also enabled prefix reuse at the same time, so two things changed together and the dashboards cannot attribute effects to either one alone.",
+        "The traffic pattern itself is worth interrogating rather than assuming. Conversation length is not the same thing as prompt length; a long conversation can reuse a cached prefix cheaply while a short but novel prompt pays full prefill. Evening traffic might contain more novel prompts even if the average conversation length is unchanged, which would raise prefill work without any change to decode behavior or memory pressure.",
+        "To reason well here, distinguish what the evidence shows from what it merely suggests, name the variables that changed together, and propose the cheapest measurement that would separate the competing explanations. The conclusion should state what is known, what remains undetermined, and what single observation would move the argument forward."
+      ],
+      "request_extra": {"reasoning_effort": "none"}
+    },
+    "reasoning-on": {
+      "task": "Work through the problem described in the notes carefully, then write up your reasoning and your conclusion.",
+      "paragraphs_ref": "reasoning-off",
+      "request_extra": {"reasoning_effort": "high"}
+    }
+  },
+  "workloads": [
+    {"name": "prose_short", "prompt_class": "prose", "approx_input_tokens": 128, "max_tokens": 1024, "temperature": 0.7, "seed": 1001, "repeats": 3},
+    {"name": "prose_near_limit", "prompt_class": "prose", "approx_input_tokens": 3500, "max_tokens": 512, "temperature": 0.7, "seed": 1002, "repeats": 3},
+    {"name": "code_short", "prompt_class": "code", "approx_input_tokens": 128, "max_tokens": 1024, "temperature": 0.0, "seed": 1003, "repeats": 3},
+    {"name": "code_near_limit", "prompt_class": "code", "approx_input_tokens": 3500, "max_tokens": 512, "temperature": 0.0, "seed": 1004, "repeats": 3},
+    {"name": "tool_call_short", "prompt_class": "tool-call", "approx_input_tokens": 128, "max_tokens": 512, "temperature": 0.0, "seed": 1005, "repeats": 3},
+    {"name": "tool_call_near_limit", "prompt_class": "tool-call", "approx_input_tokens": 3500, "max_tokens": 512, "temperature": 0.0, "seed": 1006, "repeats": 3},
+    {"name": "reasoning_on_short", "prompt_class": "reasoning-on", "approx_input_tokens": 128, "max_tokens": 1024, "temperature": 0.6, "seed": 1007, "repeats": 3},
+    {"name": "reasoning_on_near_limit", "prompt_class": "reasoning-on", "approx_input_tokens": 3500, "max_tokens": 512, "temperature": 0.6, "seed": 1008, "repeats": 3},
+    {"name": "reasoning_off_short", "prompt_class": "reasoning-off", "approx_input_tokens": 128, "max_tokens": 1024, "temperature": 0.6, "seed": 1007, "repeats": 3},
+    {"name": "reasoning_off_near_limit", "prompt_class": "reasoning-off", "approx_input_tokens": 3500, "max_tokens": 512, "temperature": 0.6, "seed": 1008, "repeats": 3}
+  ]
+}

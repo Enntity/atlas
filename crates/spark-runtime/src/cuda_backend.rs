@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use atlas_core::registry::AtlasRegistry;
 
+mod classic;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
@@ -166,6 +167,9 @@ pub struct AtlasCudaBackend {
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
     cuda_ctx: u64,
+    classic_blas: std::sync::OnceLock<
+        crate::classic_blas::ClassicBf16Pool<crate::classic_blas::ffi::CublasIo>,
+    >,
 }
 
 impl AtlasCudaBackend {
@@ -204,6 +208,7 @@ impl AtlasCudaBackend {
             op_cache: crate::op_cache::OpCache::new(),
             default_stream,
             cuda_ctx,
+            classic_blas: std::sync::OnceLock::new(),
         })
     }
 
@@ -287,6 +292,20 @@ impl AtlasCudaBackend {
 /// that is being dropped.
 impl Drop for AtlasCudaBackend {
     fn drop(&mut self) {
+        // Finish shared classic work while its context and operand allocations still live.
+        if let Some(pool) = self.classic_blas.take() {
+            if let Err(error) = pool.quiesce() {
+                tracing::error!(%error, "classic completion unknown; retaining GPU operands and registry");
+                std::mem::forget(pool);
+                std::mem::forget(self.registry.clone());
+                std::mem::forget(std::mem::replace(
+                    &mut self.op_cache,
+                    crate::op_cache::OpCache::new(),
+                ));
+                return;
+            }
+            drop(pool);
+        }
         let swept = self.sweep_unreleased();
         if swept > 0 {
             // Not necessarily a failure: a load abandoned part-way never

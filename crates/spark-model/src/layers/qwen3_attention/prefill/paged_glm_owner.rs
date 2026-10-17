@@ -206,7 +206,7 @@ impl Qwen3AttentionLayer {
         let (hd, kv_lora) = (mla.nope, mla.kv_lora_rank);
         let key_row = c.index_head_dim * 2;
         let query_row = c.index_n_heads * c.index_head_dim * 2;
-        let weight_row = c.index_n_heads * 2;
+        let weight_row = c.index_n_heads * self.glm_index_weight_element_bytes();
         let latent_row = nq * kv_lora * 2;
         let sizes = ctx.buffers.sizes();
         if !on
@@ -228,7 +228,8 @@ impl Qwen3AttentionLayer {
         }
         let q_absorbed = ctx.buffers.ssm_deinterleaved();
         // Short-context batches (every owner dense) skip wq_b and weights_proj.
-        let index = if any_owner_selects(owners, c.index_topk) {
+        let dense_threshold = self.glm_index_budget(c)?.dense_threshold() as usize;
+        let index = if any_owner_selects(owners, dense_threshold) {
             let query = q_absorbed.offset(rows * latent_row);
             let weights = ctx.buffers.ssm_gates();
             self.glm_index_project_query(q_latent, normed, n, query, weights, ctx, stream)?;

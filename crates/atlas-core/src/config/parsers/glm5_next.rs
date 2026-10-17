@@ -16,6 +16,36 @@ fn usize_field(raw: &Value, name: &str) -> Result<usize> {
     Ok(value as usize)
 }
 
+/// Missing text policy explicitly means the original unclamped activation;
+/// a malformed declared clamp must never silently disable the checkpoint's policy.
+fn parse_text_swiglu_limit(text: &Value) -> Result<Option<f32>> {
+    let Some(value) = text.get("swiglu_limit") else {
+        return Ok(None);
+    };
+    let limit = value
+        .as_f64()
+        .context("glm5_next text swiglu_limit must be numeric")? as f32;
+    ensure!(
+        limit.is_finite() && limit > 0.0,
+        "glm5_next text swiglu_limit must be positive and finite in f32"
+    );
+    Ok(Some(limit))
+}
+
+fn parse_hc_post_multiplier(text: &Value) -> Result<Option<f32>> {
+    let Some(value) = text.get("mhc_post_mult_value") else {
+        return Ok(None);
+    };
+    let multiplier = value
+        .as_f64()
+        .context("glm5_next mhc_post_mult_value must be numeric")? as f32;
+    ensure!(
+        multiplier.is_finite() && multiplier > 0.0,
+        "glm5_next mhc_post_mult_value must be finite and positive in f32"
+    );
+    Ok(Some(multiplier))
+}
+
 pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
     let text = raw
         .get("text_config")
@@ -26,6 +56,8 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
 
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.model_type = "glm5_next".to_string();
+    config.text_swiglu_limit = parse_text_swiglu_limit(text)?;
+    config.hc_post_multiplier = parse_hc_post_multiplier(text)?;
     config.hidden_size = usize_field(text, "hidden_size")?;
     config.num_hidden_layers = usize_field(text, "num_hidden_layers")?;
     config.intermediate_size = usize_field(text, "intermediate_size")?;
@@ -69,6 +101,14 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
     config.num_experts = usize_field(text, "n_routed_experts")?;
     config.n_routed_experts = config.num_experts;
     config.num_experts_per_tok = usize_field(text, "num_experts_per_tok")?;
+    config.moe_expert_groups = text
+        .get("n_group")
+        .map(|_| usize_field(text, "n_group"))
+        .transpose()?;
+    config.moe_topk_groups = text
+        .get("topk_group")
+        .map(|_| usize_field(text, "topk_group"))
+        .transpose()?;
     config.moe_intermediate_size = usize_field(text, "moe_intermediate_size")?;
     config.shared_expert_intermediate_size = text
         .get("n_shared_experts")
@@ -162,3 +202,7 @@ pub fn parse_glm5_next(raw: &Value) -> Result<ModelConfig> {
     finalize_config(&mut config, raw)?;
     Ok(config)
 }
+
+#[cfg(test)]
+#[path = "glm5_next_tests.rs"]
+mod tests;

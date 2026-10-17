@@ -167,7 +167,10 @@ mod tests {
     fn dense_prefill_bf16_explicit_flag() {
         assert!(!parse(None).unwrap());
         assert!(!parse(Some("0")).unwrap());
+        // `3be435f7` made 2 valid: the same BF16 prefill GEMMs with transient
+        // per-call dequant instead of the persistent cache (`transient()`).
         assert!(parse(Some("1")).unwrap());
+        assert!(parse(Some("2")).unwrap());
         for invalid in ["", "true", "3"] {
             assert!(parse(Some(invalid)).is_err());
         }

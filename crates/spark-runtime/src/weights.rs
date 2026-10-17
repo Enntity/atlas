@@ -126,24 +126,8 @@ impl WeightDtype {
     }
 }
 
-/// Convert a little-endian IEEE-754 half-precision (F16) tensor byte buffer
-/// to BF16 bytes. F16 and BF16 are both 2 bytes/element but have different
-/// bit layouts (5-bit vs 8-bit exponent), so the bytes cannot be
-/// reinterpreted — each value goes f16 → f32 (exact) → bf16
-/// (round-to-nearest-even). Shared by both disk loaders so F16 checkpoints
-/// (e.g. centml modelopt W4A4 exports, which ship all unquantized tensors as
-/// F16) land in the store as BF16; [`WeightDtype`] itself stays closed to
-/// store-legal dtypes and F16 can never appear on the RDMA wire.
-pub(crate) fn f16_to_bf16_bytes(src: &[u8]) -> Vec<u8> {
-    use half::{bf16, f16};
-    debug_assert_eq!(src.len() % 2, 0, "F16 tensor byte length must be even");
-    let mut out = Vec::with_capacity(src.len());
-    for pair in src.chunks_exact(2) {
-        let h = f16::from_le_bytes([pair[0], pair[1]]);
-        out.extend_from_slice(&bf16::from_f32(h.to_f32()).to_le_bytes());
-    }
-    out
-}
+mod convert;
+pub(crate) use convert::{f16_to_bf16_bytes, f16_to_f32_bytes};
 
 /// A weight tensor on the GPU.
 pub struct WeightTensor {
@@ -206,6 +190,8 @@ pub struct WeightStore {
     /// quantize-on-load or straight off NVMe by `NgramRowCache`, both of
     /// which need only this (path, offset) locator.
     deferred: HashMap<String, DeferredTensor>,
+    exl3_checkpoint: Option<exl3::Exl3CheckpointRouter>,
+    exl3_companions: Vec<exl3::dense::Exl3DenseDeviceTensor>,
 }
 
 /// Where a skipped tensor lives, so a consumer can read it in place.
@@ -227,6 +213,8 @@ impl WeightStore {
             weights: HashMap::new(),
             reclaimed: std::sync::Mutex::new(std::collections::HashSet::new()),
             deferred: HashMap::new(),
+            exl3_checkpoint: None,
+            exl3_companions: Vec::new(),
         }
     }
 
@@ -258,6 +246,8 @@ impl WeightStore {
             weights,
             reclaimed: std::sync::Mutex::new(std::collections::HashSet::new()),
             deferred: HashMap::new(),
+            exl3_checkpoint: None,
+            exl3_companions: Vec::new(),
         }
     }
 
@@ -464,6 +454,7 @@ impl SafetensorsLoader {
 /// `embedders.2` must precede `embedders.10`; a plain lexicographic sort puts
 /// `10` first and silently mis-maps every table after the ninth.
 pub mod adapter;
+pub mod exl3;
 mod gguf;
 mod loader;
 pub mod mlx_int8;
@@ -505,42 +496,7 @@ mod skip;
 mod store_edit_tests;
 pub use prefix_detect::auto_detect_weight_prefix;
 
-/// Release every weight tensor.
-///
-/// Safe to free per-entry because the loaders allocate per-tensor: the fast
-/// path calls `gpu.alloc(meta.len)` once per tensor before inserting it
-/// (`fast_weights/mod.rs:360-388`), and no loader inserts an `.offset()` view of
-/// a shared block into this map. (Fused per-expert views DO exist — see
-/// `weight_loader/step3p7.rs:93` — but they live in the layer structs that own
-/// the fused allocation, not here, so this cannot double-free them.)
-impl atlas_core::scope::ModelResource<dyn GpuBackend> for WeightStore {
-    fn label(&self) -> &'static str {
-        "weight store"
-    }
-
-    fn release(&mut self, gpu: &dyn GpuBackend) -> anyhow::Result<()> {
-        let mut first_error = None;
-        // `drain` rather than iterate: the map must not be left holding
-        // pointers to memory that is gone, and it makes this idempotent.
-        let reclaimed: std::collections::HashSet<u64> =
-            self.reclaimed.lock().map(|s| s.clone()).unwrap_or_default();
-        for (name, tensor) in self.weights.drain() {
-            // Already freed early by `reclaim` — freeing again is a double free.
-            if reclaimed.contains(&tensor.ptr.0) {
-                continue;
-            }
-            if let Err(e) = gpu.free(tensor.ptr)
-                && first_error.is_none()
-            {
-                first_error = Some(e.context(format!("freeing weight {name}")));
-            }
-        }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
+mod teardown;
 
 #[cfg(test)]
 mod teardown_tests;

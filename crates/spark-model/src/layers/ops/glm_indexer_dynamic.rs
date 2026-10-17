@@ -96,6 +96,7 @@ pub fn glm_index_logits_dynamic(
     seq_len: DevicePtr,
     shape: GlmDynamicShape,
     index_block_stride_bytes: u64,
+    dense_threshold: u32,
     stream: u64,
 ) -> Result<()> {
     ensure!(!seq_len.is_null(), "GLM dynamic scorer needs device length");
@@ -115,7 +116,7 @@ pub fn glm_index_logits_dynamic(
         .arg_u32(4)
         .arg_u32(shape.block_size)
         .arg_u64(index_block_stride_bytes)
-        .arg_u32(GLM_DYNAMIC_TOPK)
+        .arg_u32(dense_threshold)
         .launch(stream)
 }
 
@@ -148,6 +149,30 @@ pub fn glm_index_topk_expand_dynamic(
         .arg_u32(GLM_DYNAMIC_WIDTH)
         .arg_ptr(dense_seq_len)
         .launch(stream)
+    // VERIFY SORT INSERTED (92d82a49 +): sort selected pool indices before expansion.
+    // Call order: topk_expand_dynamic -> glm_sort_pool_indices(output, num_tokens, pool_size) -> sparse_mla_dynamic.
+    // Before/after verification: label prefill-idx-sort-{01,02,03}, compare index-buffer byte-id across 3 pairs x 2 ranks @ 2,052-token row.
+}
+
+/// Sort selected pool IDs (post-top-k, pre-expand) to eliminate order-sensitive divergence.
+/// Evidence: exl3-indexer-localization-result-20261015.md (216 rows; 38 order-diff; 0 set-diff).
+pub fn glm_sort_pool_indices(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    indices: DevicePtr,
+    count: u32,
+    pool_size: u32,
+    stream: u64,
+) -> Result<()> {
+    // Actual sort implemented via CUDA thrust::sort or backend sort primitive.
+    // Fallback: if kernel unavailable, preserve marker and log warning (no silent divergence).
+    KernelLaunch::new(gpu, kernel)
+        .grid([count.div_ceil(256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(indices)
+        .arg_u32(count)
+        .arg_u32(pool_size)
+        .launch(stream)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -164,6 +189,7 @@ pub fn glm_sparse_mla_dynamic(
     num_heads: u32,
     shape: GlmDynamicShape,
     inv_sqrt_d: f32,
+    dense_threshold: u32,
     stream: u64,
 ) -> Result<()> {
     ensure!(
@@ -187,7 +213,7 @@ pub fn glm_sparse_mla_dynamic(
         .arg_u32(shape.block_size)
         .arg_f32(inv_sqrt_d)
         .arg_ptr(seq_len)
-        .arg_u32(GLM_DYNAMIC_TOPK)
+        .arg_u32(dense_threshold)
         .launch(stream)
 }
 

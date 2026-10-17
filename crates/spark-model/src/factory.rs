@@ -9,6 +9,7 @@
 use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_runtime::weights::WeightStore;
+use std::ffi::OsStr;
 
 use crate::mistral_loader::MistralWeightLoader;
 use crate::weight_loader::LongcatWeightLoader;
@@ -20,10 +21,12 @@ use crate::weight_loader::{
 };
 
 mod dspark_admission;
+mod exl3_preflight;
 #[allow(unused_imports)]
 pub(crate) use dspark_admission::{
     admit_lightning_dspark, admit_lightning_dspark_build, admit_lightning_dspark_product_build,
 };
+pub use exl3_preflight::preflight_glm53_tp2_packed;
 #[cfg(test)]
 mod dspark_admission_tests;
 #[cfg(test)]
@@ -136,6 +139,55 @@ pub fn loader_for_config(config: &ModelConfig) -> Result<Box<dyn ModelWeightLoad
     }
 }
 
+/// Review finding m3 ("factory refusal now"): the C2 norm-substitution knob
+/// (`ATLAS_EXL3_NORM_SUBSTITUTE_DIR`) engages only where
+/// `NormSubstitution::from_env` runs — the GLM-5/KDA loaders
+/// (`weight_loader/glm5/{exl3_layers,layers}.rs`). Every other model would
+/// silently ignore a set knob, so abort the load instead (PCND), mirroring
+/// the `Exl3GatePerturbation` refusal in `factory/build.rs`. Called at the
+/// TOP of [`build_model`] so every model type pays it — including the NLLB
+/// path, which returns before [`loader_for_config`] is ever consulted.
+pub(crate) fn refuse_unengaged_norm_substitution(
+    config: &ModelConfig,
+    store: &WeightStore,
+) -> Result<()> {
+    // The native EXL3 branch of `build_model` calls `exl3_layers::load_layers`
+    // (which engages the knob) whatever the loader selection says, so an EXL3
+    // checkpoint engages too. An unsupported model type engages nothing and
+    // is refused further below by `loader_for_config` itself — the clearer
+    // first error here names the env var.
+    let engages = store.exl3_checkpoint().is_some()
+        || loader_for_config(config)
+            .map(|loader| loader.engages_norm_substitution())
+            .unwrap_or(false);
+    ensure_norm_substitution_engaged(
+        std::env::var_os(spark_runtime::weights::exl3::norm_substitution::ENV_SUBSTITUTE_DIR)
+            .as_deref(),
+        &config.model_type,
+        engages,
+    )
+}
+
+/// Env-free core (unit-testable without process-global `set_var` races — see
+/// `model/ssm_tier/capability.rs`): `dir` is the raw
+/// `ATLAS_EXL3_NORM_SUBSTITUTE_DIR` value; unset or empty means the knob is
+/// off and no model is refused.
+fn ensure_norm_substitution_engaged(
+    dir: Option<&OsStr>,
+    model_type: &str,
+    engages: bool,
+) -> Result<()> {
+    if engages || dir.is_none_or(|dir| dir.is_empty()) {
+        return Ok(());
+    }
+    bail!(
+        "{} is only honoured by the GLM-5/KDA load path (weight_loader/glm5); \
+         model type {:?} would silently ignore it",
+        spark_runtime::weights::exl3::norm_substitution::ENV_SUBSTITUTE_DIR,
+        model_type,
+    )
+}
+
 mod build;
 pub(crate) mod glm_dense_cache;
 mod glm_hc_prewarm;
@@ -152,9 +204,215 @@ mod tests {
     use crate::layers::mtp_head::MtpQuantization;
     use spark_runtime::kv_cache::KvCacheDtype;
     use spark_runtime::prefix_cache::PrefixCache;
+    use spark_runtime::weights::exl3::norm_substitution::ENV_SUBSTITUTE_DIR;
+
+    // Process-wide env guard for the substitution-refusal tests (repo
+    // ENV_LOCK pattern: `main_modules/refusal.rs`,
+    // `tool_parser/tests/streaming_frag_env.rs`). Every test whose code path
+    // reads ATLAS_EXL3_NORM_SUBSTITUTE_DIR holds it — including
+    // `test_unsupported_model_type`, since `build_model` now pays the m3
+    // refusal check before loader dispatch.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SubstituteDirGuard {
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SubstituteDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: serialised by ENV_LOCK; no other thread touches this
+            // var without holding the same lock.
+            unsafe {
+                match &self.prev {
+                    Some(prev) => std::env::set_var(ENV_SUBSTITUTE_DIR, prev),
+                    None => std::env::remove_var(ENV_SUBSTITUTE_DIR),
+                }
+            }
+        }
+    }
+
+    fn set_substitute_dir(value: Option<&str>) -> SubstituteDirGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os(ENV_SUBSTITUTE_DIR);
+        // SAFETY: see Drop.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(ENV_SUBSTITUTE_DIR, value),
+                None => std::env::remove_var(ENV_SUBSTITUTE_DIR),
+            }
+        }
+        SubstituteDirGuard { prev, _lock: lock }
+    }
+
+    /// `build_model` with the mock GPU and an empty store — safe only for
+    /// callers whose expected error fires at the very top of the build.
+    fn build_for_test(config: ModelConfig) -> Result<()> {
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let prefix_cache: Box<dyn PrefixCache> =
+            Box::new(spark_runtime::prefix_cache::NoPrefixCaching);
+        build_model(
+            config,
+            WeightStore::empty(),
+            Box::new(gpu),
+            1,
+            16,
+            4096,
+            8,
+            MtpQuantization::Nvfp4,
+            false,
+            prefix_cache,
+            0,
+            None,
+            false,
+            1,
+            KvCacheDtype::Fp8,
+            1024 * 1024 * 1024,
+            0.90,
+            0,
+            vec![],
+            0,
+            None,
+            None, // dflash_args
+            None, // lora_args
+            None, // nllb_lang
+            None, // nllb_lora_dir
+            None, // progress
+        )
+        .map(|_| ())
+    }
+
+    // ── C2 norm-substitution factory refusal (review finding m3) ──────────
+
+    /// Every non-KDA model load — including NLLB, which returns before
+    /// `loader_for_config` — must abort on a set knob, naming the env var and
+    /// the model type instead of silently ignoring it.
+    #[test]
+    fn substitute_dir_set_refuses_non_kda_model_load_naming_var_and_type() {
+        let _env_guard = set_substitute_dir(Some("/nonexistent-fixtures"));
+        for model_type in ["qwen3_next", "nllb", "m2m_100"] {
+            let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = model_type.to_string();
+            let err = build_for_test(config)
+                .expect_err("a non-KDA model must not load with the knob set");
+            let msg = format!("{err:#}");
+            assert!(msg.contains(ENV_SUBSTITUTE_DIR), "{model_type}: {msg}");
+            assert!(msg.contains(model_type), "{model_type}: {msg}");
+        }
+    }
+
+    /// The GLM-5/KDA path is not refused, and its load proceeds into
+    /// `NormSubstitution::from_env` exactly as today (the D1 graph interlock
+    /// rejects the bare test env before any manifest work — proof the parse
+    /// site ran).
+    #[test]
+    fn substitute_dir_set_allows_glm5_kda_and_proceeds_to_from_env() {
+        let _env_guard = set_substitute_dir(Some("/nonexistent-fixtures"));
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "glm5_next".to_string();
+        config.max_position_embeddings = 4096;
+        config.index_topk = 2048; // GLM-5 Atlas bring-up gate in `load_all`
+        let store = WeightStore::empty();
+        refuse_unengaged_norm_substitution(&config, &store)
+            .expect("GLM-5/KDA engages the substitution knob");
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let err = Glm5WeightLoader
+            .load_layers(&store, &config, &gpu, &[])
+            .map(|_| ())
+            .expect_err("the from_env graph interlock must reject this test env");
+        assert!(
+            err.to_string().contains("ATLAS_NO_DECODE_GRAPHS"),
+            "{err:#}"
+        );
+    }
+
+    /// Unset or empty is off for every model — no load is ever refused.
+    #[test]
+    fn substitute_dir_unset_or_empty_never_refuses_any_model() {
+        for value in [None, Some("")] {
+            let _env_guard = set_substitute_dir(value);
+            for model_type in ["qwen3_next", "nllb", "glm5_next"] {
+                let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+                config.model_type = model_type.to_string();
+                refuse_unengaged_norm_substitution(&config, &WeightStore::empty())
+                    .unwrap_or_else(|err| panic!("{model_type}: {err:#}"));
+            }
+        }
+    }
+
+    /// The `exl3_checkpoint()` term of the engagement predicate (review
+    /// finding m3, previously inspection-only): an EXL3 checkpoint store
+    /// engages the knob for ANY model type, because the native EXL3 branch
+    /// of `build_model` runs `exl3_layers::load_layers` (which honours the
+    /// knob) whatever the loader selection says. A real router is opened
+    /// over a minimal on-disk EXL3 fixture and attached via
+    /// `WeightStore::from_exl3` with no companions, so the store carries a
+    /// live checkpoint while the GPU stays the test mock.
+    #[test]
+    fn substitute_dir_set_allows_exl3_checkpoint_store_any_model_type() {
+        struct Fixture(std::path::PathBuf);
+        impl Fixture {
+            fn new() -> Self {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "atlas-factory-exl3-store-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ));
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::write(
+                    dir.join("config.json"),
+                    r#"{"quantization_config":{"quant_method":"exl3","codebook":"mul1"}}"#,
+                )
+                .unwrap();
+                let tensor = 0u16.to_le_bytes();
+                safetensors::serialize_to_file(
+                    vec![(
+                        "linear.trellis".to_string(),
+                        safetensors::tensor::TensorView::new(
+                            safetensors::Dtype::U16,
+                            vec![1],
+                            &tensor,
+                        )
+                        .unwrap(),
+                    )],
+                    None,
+                    &dir.join("model.safetensors"),
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.join("model.safetensors.index.json"),
+                    r#"{"weight_map":{"linear.trellis":"model.safetensors"}}"#,
+                )
+                .unwrap();
+                Self(dir)
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let _env_guard = set_substitute_dir(Some("/nonexistent-fixtures"));
+        let fixture = Fixture::new();
+        let checkpoint =
+            spark_runtime::weights::exl3::Exl3CheckpointRouter::open(&fixture.0).unwrap();
+        let gpu = spark_runtime::gpu::mock::MockGpuBackend::new();
+        let store = WeightStore::from_exl3(checkpoint, &[], &gpu, 0).unwrap();
+        assert!(store.exl3_checkpoint().is_some());
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = "qwen3_next".to_string(); // deliberately not a KDA loader
+        refuse_unengaged_norm_substitution(&config, &store)
+            .expect("an EXL3 checkpoint store engages the substitution knob");
+    }
 
     #[test]
     fn test_unsupported_model_type() {
+        // `build_model` now reads ATLAS_EXL3_NORM_SUBSTITUTE_DIR (review
+        // finding m3); pin it off under the env lock so this test cannot
+        // observe a transient engaged state from the refusal tests below.
+        let _env_guard = set_substitute_dir(None);
         let mut config = ModelConfig::qwen3_next_80b_nvfp4();
         config.model_type = "llama".to_string();
 
@@ -189,6 +447,7 @@ mod tests {
             None, // lora_args
             None, // nllb_lang
             None, // nllb_lora_dir
+            None, // progress
         );
         match result {
             Err(e) => assert!(e.to_string().contains("Unsupported model type: 'llama'")),

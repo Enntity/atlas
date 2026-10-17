@@ -244,9 +244,9 @@ impl ChatCompletionChunk {
     }
 
     /// When `stream_options.include_usage=true`, OpenAI emits a separate
-    /// chunk with `choices:[]` and populated `usage` BEFORE the final
-    /// `finish_reason`-carrying chunk. This helper emits that usage-only
-    /// chunk.
+    /// chunk with `choices:[]` and populated `usage` after the final
+    /// `finish_reason`-carrying chunk. See the
+    /// [streaming events reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events).
     pub fn usage_only_chunk(model: &str, id: &str, usage: Usage) -> Self {
         Self {
             id: id.to_string(),
@@ -291,7 +291,7 @@ impl ChatCompletionChunk {
 
     /// Final chunk carrying only `finish_reason`, with `usage:null`. Used
     /// when `include_usage=true` (the usage sits in `usage_only_chunk`
-    /// emitted just before this one).
+    /// emitted after this one).
     pub fn final_chunk_no_usage(model: &str, id: &str, finish_reason: &str) -> Self {
         Self {
             id: id.to_string(),
@@ -318,9 +318,9 @@ impl ChatCompletionChunk {
 
     /// `return_token_ids`: stamp the exact sampled token IDs onto this
     /// chunk's first choice. No-op when `ids` is empty, so requests that
-    /// did not opt in keep a byte-identical wire format. Summed across a
-    /// stream, the stamped IDs equal `usage.completion_tokens` — a
-    /// benchmark can count them instead of re-tokenizing decoded text.
+    /// did not opt in keep a byte-identical wire format. The IDs cover tokens
+    /// delivered to the stream; terminal EOS is counted in completion usage
+    /// but is not delivered, and rejected output can also omit IDs.
     pub(crate) fn with_token_ids(mut self, ids: Vec<u32>) -> Self {
         if !ids.is_empty()
             && let Some(choice) = self.choices.first_mut()

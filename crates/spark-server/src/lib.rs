@@ -19,6 +19,9 @@ pub mod tokenizer;
 // binary crate root. Its only crate dependency is `tokenizer`, already public above.
 pub mod reasoning_parser;
 
+#[path = "api/completion_text.rs"]
+mod completion_text;
+
 // The three pure modules added in PR 4 (OpenAI compat remaining items) are
 // public here so `cargo test -p spark-server --lib` can exercise their
 // unit tests without needing to build the full binary.

@@ -44,6 +44,7 @@ fn fixture_model(model: &str, run: impl FnOnce(&mut MoeLayer, &ForwardContext, &
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Skip,
+        request_id: None,
     };
     run(&mut layer, &ctx, &gpu);
 }

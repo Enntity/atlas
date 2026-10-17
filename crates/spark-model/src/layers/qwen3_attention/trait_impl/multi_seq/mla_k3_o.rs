@@ -10,6 +10,9 @@ impl Qwen3AttentionLayer {
         long_verify: bool,
         output: DevicePtr,
     ) -> Result<Option<glm_k3_mla_o::StagePlan>> {
+        if self.has_exl3_mla() {
+            return Ok(None);
+        }
         let compare = glm_k3_mla_o::compare::enabled(&c.fwd.config.model_type)?;
         if !glm_k3_mla_o::enabled(&c.fwd.config.model_type)? || !long_verify {
             return Ok(None);

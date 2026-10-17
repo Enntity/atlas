@@ -199,6 +199,37 @@ impl<'a> KernelLaunch<'a> {
     /// overrides `launch_typed` to use `setBuffer:` / `setBytes:` per
     /// arg. The storage vec is not reallocated between building the
     /// args and launching, so all byte slices remain valid.
+    /// Cooperative launch (all CTAs co-resident); see
+    /// `GpuBackend::launch_cooperative_typed`. No debug-sync hook: callers
+    /// that fall back on error need the launch result unchanged.
+    pub fn launch_cooperative(self, stream: u64) -> Result<()> {
+        let mut args: Vec<KernelArg<'_>> = Vec::with_capacity(self.kinds.len());
+        for kind in self.kinds.iter() {
+            let slot = &self.storage[kind.slot as usize];
+            if kind.is_buffer {
+                args.push(KernelArg::Buffer(DevicePtr(*slot)));
+            } else {
+                // SAFETY: as in `launch`: the first `byte_len` LE bytes of a
+                // live u64 slot, borrowed for the duration of this call.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        slot as *const u64 as *const u8,
+                        kind.byte_len as usize,
+                    )
+                };
+                args.push(KernelArg::Bytes(bytes));
+            }
+        }
+        self.gpu.launch_cooperative_typed(
+            self.kernel,
+            self.grid,
+            self.block,
+            self.shared_mem,
+            stream,
+            &args,
+        )
+    }
+
     pub fn launch(self, stream: u64) -> Result<()> {
         // Build typed args. The `&[u8]` slices borrow from `self.storage`
         // (specifically the low N bytes of each u64 slot, LE-packed).

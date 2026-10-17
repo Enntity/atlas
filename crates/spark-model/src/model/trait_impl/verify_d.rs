@@ -37,6 +37,9 @@ impl TransformerModel {
         if k == 0 {
             return Ok(Vec::new());
         }
+        // Speculative-verify forward: EXL3 launches in this scope may use the
+        // ATLAS_EXL3_VERIFY_PROFILES alternatives (prefill/serial never do).
+        let _verify_scope = spark_runtime::weights::exl3::native::verify_scope();
         let ban = seq.eos_ban;
         let ban_rows = ban.row_mask(seq.seq_len, k);
         if self.lightning_dspark_identity.policy().is_some()
@@ -160,6 +163,7 @@ impl TransformerModel {
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
+            request_id: seq.request_id.clone(),
         };
 
         // GLM DFlash lane: a verify block is an ordinary causal prefill chunk
@@ -179,6 +183,7 @@ impl TransformerModel {
             // attention, grouped FFN) as a row of a wider block.
             && (k >= 2 || crate::layers::canonical_verify::enabled()))
         .then(|| ForwardContext {
+            request_id: ctx.request_id.clone(),
             attn_metadata: Some(AttnMetadataDev {
                 positions: metadata.positions,
                 positions_h: metadata.positions,

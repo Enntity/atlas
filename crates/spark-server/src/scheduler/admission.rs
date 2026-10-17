@@ -176,9 +176,10 @@ fn reject_oversized(
             );
             let mut sink = match req {
                 InferenceRequest::Streaming { token_tx, .. } => ResponseSink::Streaming(token_tx),
-                InferenceRequest::Blocking { response_tx, .. } => {
-                    ResponseSink::Blocking(Some(response_tx))
-                }
+                InferenceRequest::Blocking { response_tx, .. } => ResponseSink::Blocking {
+                    tx: Some(response_tx),
+                    stop_watch: None,
+                },
             };
             lifecycle::send_error_to_sink(&mut sink, &message);
             None

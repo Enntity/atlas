@@ -60,7 +60,7 @@ impl Qwen3AttentionLayer {
             let hc_streams_i = hc_streams.offset(i * hc.hc_mult * c.h * 4);
             let post_i = post.offset(i * hc.hc_mult * 4);
             let comb_i = comb.offset(i * hc.hc_mult * hc.hc_mult * 4);
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,

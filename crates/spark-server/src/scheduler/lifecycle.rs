@@ -4,6 +4,9 @@
 
 use super::*;
 
+mod finish_stop;
+pub(super) use finish_stop::finish_stop_token;
+
 /// THE single mapping from a server-side guard (`ActiveSeq::guard_stop`)
 /// to the wire `finish_reason`. Do not map guard names to wire reasons
 /// anywhere else.
@@ -153,6 +156,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
             max_seq_len,
         )
     };
+    let stop_token_id = finish_stop_token(reason, a.output_tokens.last().copied(), &a.eos_tokens);
     match &mut a.sink {
         ResponseSink::Streaming(tx) => {
             let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
@@ -172,17 +176,19 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     cached_prompt_tokens: a.cached_prompt_tokens,
                     accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
                     guard_stop: a.guard_stop,
+                    stop_token_id,
                 },
                 "done frame",
             );
         }
-        ResponseSink::Blocking(tx) => {
+        ResponseSink::Blocking { tx, .. } => {
             if let Some(tx) = tx.take() {
                 let ttft_ms = a.decode_start.duration_since(a.request_start).as_secs_f64() * 1000.0;
                 let decode_ms = a.decode_start.elapsed().as_secs_f64() * 1000.0;
                 let response = InferenceResponse {
                     output_tokens: a.output_tokens.clone(),
                     finish_reason: reason.to_string(),
+                    stop_token_id,
                     time_to_first_token_ms: ttft_ms,
                     decode_time_ms: decode_ms,
                     logprobs: std::mem::take(&mut a.logprobs_data),
@@ -254,7 +260,7 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
                 "error frame",
             );
         }
-        ResponseSink::Blocking(tx) => {
+        ResponseSink::Blocking { tx, .. } => {
             if let Some(tx) = tx.take()
                 && tx.send(Err(anyhow::anyhow!("{msg}"))).is_err()
             {
@@ -298,7 +304,7 @@ fn send_sink_error(sink: &mut ResponseSink, msg: &str, err: anyhow::Error) {
                 "pre-seq error frame",
             );
         }
-        ResponseSink::Blocking(tx) => {
+        ResponseSink::Blocking { tx, .. } => {
             if let Some(tx) = tx.take()
                 && tx.send(Err(err)).is_err()
             {
@@ -379,6 +385,8 @@ pub fn resume_swapped_seq(
     // Restore CPU-side metadata.
     seq.tokens = s.tokens;
     seq.seq_len = s.seq_len;
+    seq.request_id = s.request_id;
+    model.ep_broadcast_request_id_for_seq(seq.slot_idx as u32, seq.request_id.as_deref())?;
     seq.adapter_slot = s.adapter_slot;
     seq.adapter_id = s.adapter_id;
     // Task #25: swap-out released this seq's slot ref (via free_sequence); a

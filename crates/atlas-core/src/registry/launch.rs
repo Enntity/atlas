@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Raw kernel launch: [`AtlasRegistry::launch_on_stream`] and the programmatic
-//! dependent launch (PDL) plumbing it uses for [`mark_pdl`]-ed functions.
+//! dependent launch (PDL) plumbing it uses for [`mark_pdl`]-ed functions, plus
+//! cooperative launch ([`AtlasRegistry::launch_cooperative_on_stream`]) and its
+//! occupancy query.
 
 use std::ffi::c_void;
 
@@ -35,6 +37,24 @@ unsafe extern "C" {
         f: *mut c_void,
         kernelParams: *mut *mut c_void,
         extra: *mut *mut c_void,
+    ) -> i32;
+    fn cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        numBlocks: *mut i32,
+        func: *mut c_void,
+        blockSize: i32,
+        dynamicSMemSize: usize,
+    ) -> i32;
+    fn cuLaunchCooperativeKernel(
+        f: *mut c_void,
+        gridDimX: u32,
+        gridDimY: u32,
+        gridDimZ: u32,
+        blockDimX: u32,
+        blockDimY: u32,
+        blockDimZ: u32,
+        sharedMemBytes: u32,
+        hStream: *mut c_void,
+        kernelParams: *mut *mut c_void,
     ) -> i32;
 }
 
@@ -156,5 +176,112 @@ impl AtlasRegistry {
             )));
         }
         Ok(())
+    }
+
+    /// Cooperative launch (`cuLaunchCooperativeKernel`): every CTA of the grid
+    /// is guaranteed co-resident, which kernels that spin on inter-CTA locks
+    /// require. Opts in to >48KB dynamic shared memory like
+    /// [`Self::launch_on_stream`]. A grid larger than the device can hold
+    /// resident fails synchronously (CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE)
+    /// without enqueuing work.
+    ///
+    /// # Safety
+    /// Same contract as [`Self::launch_on_stream`].
+    pub unsafe fn launch_cooperative_on_stream(
+        &self,
+        raw_func: RawCudaFunc,
+        cfg: LaunchConfig,
+        stream_ptr: u64,
+        kernel_params: &mut [*mut c_void],
+    ) -> Result<()> {
+        if cfg.shared_mem_bytes > 48 * 1024 {
+            const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+            let attr_status = unsafe {
+                cuFuncSetAttribute(
+                    raw_func.0,
+                    CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    cfg.shared_mem_bytes as i32,
+                )
+            };
+            if attr_status != 0 {
+                return Err(AtlasError::KernelLaunch(format!(
+                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED={}) failed: {}",
+                    cfg.shared_mem_bytes,
+                    cuda_error_text(attr_status)
+                )));
+            }
+        }
+        let status = unsafe {
+            cuLaunchCooperativeKernel(
+                raw_func.0,
+                cfg.grid_dim.0,
+                cfg.grid_dim.1,
+                cfg.grid_dim.2,
+                cfg.block_dim.0,
+                cfg.block_dim.1,
+                cfg.block_dim.2,
+                cfg.shared_mem_bytes,
+                stream_ptr as *mut c_void,
+                kernel_params.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(AtlasError::KernelLaunch(format!(
+                "cuLaunchCooperativeKernel failed: {} (grid=[{},{},{}], block=[{},{},{}], shared_mem={})",
+                cuda_error_text(status),
+                cfg.grid_dim.0,
+                cfg.grid_dim.1,
+                cfg.grid_dim.2,
+                cfg.block_dim.0,
+                cfg.block_dim.1,
+                cfg.block_dim.2,
+                cfg.shared_mem_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resident CTAs per SM for a cooperative launch of `raw_func` with
+    /// `block` threads and `smem` dynamic bytes. First sets the function's
+    /// preferred shared-memory carveout to the maximum (100%) and, above
+    /// 48KB, its max dynamic shared size, so the occupancy reported is the
+    /// one the launch gets.
+    pub fn cooperative_blocks_per_sm(
+        &self,
+        raw_func: RawCudaFunc,
+        block: u32,
+        smem: u32,
+    ) -> Result<u32> {
+        const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: i32 = 8;
+        const CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: i32 = 9;
+        let mut attrs = vec![(CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100)];
+        if smem > 48 * 1024 {
+            attrs.push((CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32));
+        }
+        for (attr, value) in attrs {
+            let status = unsafe { cuFuncSetAttribute(raw_func.0, attr, value) };
+            if status != 0 {
+                return Err(AtlasError::KernelLaunch(format!(
+                    "cuFuncSetAttribute({attr}={value}) failed: {}",
+                    cuda_error_text(status)
+                )));
+            }
+        }
+        let mut blocks: i32 = 0;
+        let status = unsafe {
+            cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                &mut blocks,
+                raw_func.0,
+                block as i32,
+                smem as usize,
+            )
+        };
+        if status != 0 {
+            return Err(AtlasError::KernelLaunch(format!(
+                "cuOccupancyMaxActiveBlocksPerMultiprocessor failed: {}",
+                cuda_error_text(status)
+            )));
+        }
+        Ok(blocks.max(0) as u32)
     }
 }

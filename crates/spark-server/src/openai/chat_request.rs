@@ -62,8 +62,8 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
     /// Emit exact sampled token IDs on each streamed chunk's
-    /// `choices[0].token_ids` (vLLM-compatible extension) for precise
-    /// `usage.completion_tokens` counting. Defaults false (opt-in).
+    /// `choices[0].token_ids` (vLLM-compatible extension). Terminal EOS
+    /// contributes to completion usage but is not streamed. Defaults false (opt-in).
     #[serde(default)]
     pub return_token_ids: bool,
     /// Enable chain-of-thought reasoning (Qwen3.5 thinking models).
@@ -113,6 +113,15 @@ pub struct ChatCompletionRequest {
     /// Accepts a single string or array of strings (OpenAI spec).
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Vec<String>,
+    /// vLLM extension: token ids that end generation when sampled. The stop
+    /// token counts in `completion_tokens` but is not part of the returned
+    /// text (vLLM `check_stop`, `v1/core/sched/utils.py:108`). `null` = none.
+    #[serde(default)]
+    pub stop_token_ids: Option<Vec<u32>>,
+    /// vLLM extension: return the matched stop string (or the text of the
+    /// client stop token) at the end of the output instead of cutting it.
+    #[serde(default)]
+    pub include_stop_str_in_output: bool,
     /// Response format constraint (OpenAI-compatible).
     /// `{"type":"text"}` = unconstrained (default),
     /// `{"type":"json_object"}` = any valid JSON,

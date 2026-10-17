@@ -216,6 +216,7 @@ pub(super) fn run_batched_prefill_step(
                 p.top_p,
                 p.min_p,
                 &p.eos_tokens,
+                p.seed,
                 p.grammar_state.as_mut(),
                 &sched.levers.sampling(),
             ) {

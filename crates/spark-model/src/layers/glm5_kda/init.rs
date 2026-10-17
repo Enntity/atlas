@@ -5,7 +5,9 @@
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::{GpuBackend, KernelHandle};
 
-use super::{Glm5KdaLayer, Glm5KdaWeights, indexed_core, recurrent};
+use super::{
+    Glm5KdaLayer, Glm5KdaWeights, Glm5Projection, indexed_core, native_aux, recurrent, upstream,
+};
 use crate::layers::FfnComponent;
 use crate::layers::qwen3_attention::HcWeights;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
@@ -21,6 +23,11 @@ impl Glm5KdaLayer {
         layer_idx: usize,
         config: &atlas_core::config::ModelConfig,
         gpu: &dyn GpuBackend,
+        routed_scratch: Option<crate::layers::glm5_exl3_ffn::MoeScratchBorrow>,
+        perturbation: Option<crate::exl3_gate_perturbation::Exl3GatePerturbation>,
+        norm_substitution: Option<
+            std::sync::Arc<spark_runtime::weights::exl3::norm_substitution::NormSubstitution>,
+        >,
     ) -> Result<Self> {
         ensure!(
             config.linear_key_head_dim == 128,
@@ -66,12 +73,35 @@ impl Glm5KdaLayer {
             |func| super::super::try_kernel_gated(triple_fits, gpu, "dense_gemv_bf16_batchm", func);
         // ATLAS_GLM_DECODE_GEMV_BATCH: the GEMV touch twins live in this target only.
         super::super::ops::gemv_touch_resolve(gpu);
-        let layer = Self {
+        let native_mhc = if weights.q_proj.is_exl3() {
+            Some(crate::layers::glm5_exl3_mhc::NativeExl3Mhc::load(
+                gpu,
+                config.hidden_size,
+                hc.hc_mult,
+                hc.sinkhorn_iters,
+                config.rms_norm_eps as f32,
+                hc.hc_eps,
+                crate::layers::glm5_exl3_mhc::MhcNumericalPolicy::GLM53_TP2_REFERENCE
+                    .with_perturbation(perturbation),
+                config.hc_post_multiplier,
+            )?)
+        } else {
+            None
+        };
+        let mut layer = Self {
             input_norm,
             post_attn_norm,
             weights,
             ffn,
             hc,
+            upstream_trace: if native_mhc.is_some() {
+                upstream::UpstreamTrace::from_env(config, layer_idx)?
+            } else {
+                None
+            },
+            norm_substitution,
+            native_mhc,
+            native_aux: None,
             layer_idx,
             ssm_ordinal: indexed_core::ordinal(config, layer_idx)?,
             indexed_trace_logged: std::sync::atomic::AtomicBool::new(false),
@@ -170,6 +200,7 @@ impl Glm5KdaLayer {
             preprocess_regresident_k,
             recurrent_regresident_k,
             register_resident_prefill,
+            fla_reference: None,
             gated_norm_k: gpu.kernel("kda", "kda_sigmoid_gated_rms_norm")?,
             // Highway-storage-specific mHC kernels (FP32, or BF16 twins).
             hc_expand_k: gpu.kernel("hyper_connection", &hc_name("hc_expand"))?,
@@ -208,6 +239,52 @@ impl Glm5KdaLayer {
                 "independent KDA requires both indexed kernels"
             );
         }
+        let policy = super::reference_policy::parse_policy(
+            std::env::var("ATLAS_KDA_FLA_REFERENCE").ok().as_deref(),
+        )?;
+        let requirements = super::reference_policy::PolicyRequirements {
+            exl3_projections: layer.exl3_projections(),
+            heads: layer.heads,
+            dim: layer.dim,
+            conv_width: layer.conv_width,
+            lower_bound: layer.lower_bound,
+            register_resident_prefill: layer.register_resident_prefill,
+        };
+        layer.fla_reference = super::reference_policy::FlaReference::load(
+            gpu,
+            policy,
+            &requirements,
+            routed_scratch,
+        )?;
+        layer.native_aux = layer.load_native_aux(gpu)?;
         Ok(layer)
+    }
+
+    /// EXL3 only: the loader leaves B/FA/GA as contiguous interior views of
+    /// one merged companion; confirm that before borrowing its base.
+    fn load_native_aux(&self, gpu: &dyn GpuBackend) -> Result<Option<native_aux::NativeKdaAux>> {
+        let Glm5Projection::Exl3(q) = &self.weights.q_proj else {
+            return Ok(None);
+        };
+        let row = self.hidden_size * 2;
+        let (b, fa, ga) = (
+            self.weights.b_proj.weight,
+            self.weights.f_a_proj.weight,
+            self.weights.g_a_proj.weight,
+        );
+        ensure!(
+            !b.is_null() && fa == b.offset(self.heads * row) && ga == fa.offset(self.dim * row),
+            "EXL3 KDA auxiliary weights must be one contiguous merged B/FA/GA base"
+        );
+        native_aux::NativeKdaAux::new(
+            gpu,
+            b,
+            self.hidden_size,
+            self.heads,
+            self.dim,
+            q.capacity(),
+            q.stream(),
+        )
+        .map(Some)
     }
 }

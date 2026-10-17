@@ -55,6 +55,20 @@ fn responses_nested_function_tool_still_accepted() {
     assert_eq!(tools[0].function.name, "get_weather");
 }
 
+/// The Responses `seed` was dropped at lowering (`seed: None`), so a seeded
+/// Responses request sampled unseeded.
+#[test]
+fn responses_seed_reaches_the_chat_request() {
+    let lower = |body: serde_json::Value| {
+        let req: ResponsesRequest = serde_json::from_value(body).expect("deserialize");
+        lower_responses_to_chat(req, |_| None).expect("lower")
+    };
+    let chat = lower(serde_json::json!({"model": "m", "input": "ping", "seed": 1234}));
+    assert_eq!(chat.seed, Some(1234));
+    let chat = lower(serde_json::json!({"model": "m", "input": "ping"}));
+    assert_eq!(chat.seed, None);
+}
+
 #[test]
 fn responses_flat_tool_choice_accepted() {
     let req: ResponsesRequest = serde_json::from_value(serde_json::json!({

@@ -72,6 +72,8 @@ pub struct TransformerModel {
     /// its output straight to lm_head. See `final_norm_rows`.
     pub(super) final_norm_identity: bool,
     pub(super) lm_head_weight: DenseWeight,
+    pub(super) exl3_moe_scratch: Option<crate::layers::glm5_exl3_ffn::MoeScratch>,
+    pub(super) exl3_vocab_head: Option<super::glm_exl3_head::Glm5Exl3VocabHead>,
     pub(super) lm_head_nvfp4: Option<QuantizedWeight>,
     /// TRANSPOSED `[K/2, ldb]` twin of `lm_head_nvfp4` + its PADDED row stride.
     ///
@@ -616,6 +618,11 @@ impl TransformerModel {
     }
 
     pub(super) fn release_pools(&mut self) -> anyhow::Result<()> {
+        // Fail before releasing any operands when native BLAS completion is unknown.
+        self.gpu.quiesce_bf16_resources()?;
+        if let Some(scratch) = &self.exl3_moe_scratch {
+            scratch.quiesce(self.gpu.as_ref())?;
+        }
         crate::layers::moe::invalidate_resident_btile_readers(&self.config, &mut self.layers);
         use atlas_core::scope::ModelResource;
 
@@ -629,6 +636,28 @@ impl TransformerModel {
             }
         };
 
+        for layer in &mut self.layers {
+            if let Some(kda) = layer
+                .as_any_mut()
+                .and_then(|layer| layer.downcast_mut::<crate::layers::Glm5KdaLayer>())
+            {
+                attempt("GLM KDA native projections", kda.release(gpu));
+            }
+        }
+        if let Some(head) = &mut self.exl3_vocab_head {
+            attempt("EXL3 vocabulary head", head.release(gpu));
+        }
+        for layer in &mut self.layers {
+            if let Some(mla) = layer
+                .as_any_mut()
+                .and_then(|layer| layer.downcast_mut::<crate::layers::Qwen3AttentionLayer>())
+            {
+                attempt("GLM MLA native resources", mla.release_exl3_mla(gpu));
+            }
+        }
+        if let Some(scratch) = &mut self.exl3_moe_scratch {
+            attempt("EXL3 model routed scratch", scratch.release(gpu));
+        }
         attempt("derived weights", self.derived.release(gpu));
         attempt("ssm snapshots", self.ssm_snapshots.release(gpu));
         // The pool is Arc'd because slots are handed out to sequences. A live
@@ -652,6 +681,10 @@ impl TransformerModel {
         if let Some(mut store) = self.weight_store.take() {
             attempt("weight store", store.release(gpu));
         }
+        // Failed owners retain pointers for retry; sweeping here would invalidate them.
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         // LAST: whatever the owners above did not cover. Chiefly the loaders'
         // fused weights, which live in layer structs and belong to no pool.
         // Every pointer freed above has already left the ledger, so this
@@ -665,9 +698,20 @@ impl TransformerModel {
             );
         }
 
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(())
+    }
+}
+
+impl TransformerModel {
+    pub(crate) fn attach_exl3_moe_scratch(
+        &mut self,
+        scratch: crate::layers::glm5_exl3_ffn::MoeScratch,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.exl3_moe_scratch.is_none(),
+            "EXL3 routed scratch already attached"
+        );
+        self.exl3_moe_scratch = Some(scratch);
+        Ok(())
     }
 }

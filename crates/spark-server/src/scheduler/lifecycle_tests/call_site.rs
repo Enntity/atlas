@@ -61,3 +61,22 @@ fn terminal_model_error_is_sent_as_error_without_successful_done() {
     };
     assert!(error.to_string().contains("indexed context envelope"));
 }
+
+#[test]
+fn stop_token_id_is_reported_only_for_eos_set_finishes() {
+    // EOS-set terminal token: reported so the API layer can drop it and map
+    // a single-token client stop back to its string.
+    let (a, rx) = test_seq(vec![5, 6, EOS[0]], 7, None, 10);
+    let r = finish_and_recv(a, rx);
+    assert_eq!(r.finish_reason, "stop");
+    assert_eq!(r.stop_token_id, Some(EOS[0]));
+    // "stop" ending on an ordinary token (client stop-string watch, cancel):
+    // the last token is text and must NOT be reported as a stop token.
+    let (a, rx) = test_seq(vec![5, 6, 42], 7, None, 10);
+    let r = finish_and_recv(a, rx);
+    assert_eq!(r.finish_reason, "stop");
+    assert_eq!(r.stop_token_id, None);
+    // Budget exhaustion ("length") reports no stop token.
+    let (a, rx) = test_seq(vec![5, 6, 42], 0, None, 10);
+    assert_eq!(finish_and_recv(a, rx).stop_token_id, None);
+}

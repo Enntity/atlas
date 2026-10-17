@@ -52,6 +52,7 @@ impl Qwen3AttentionLayer {
             let first = owner * rows;
             stage.copy(ctx.gpu, &ffn_spans[..1], 0, first, rows, false, stream)?;
             let owner_ctx = ForwardContext {
+                request_id: ctx.request_id.clone(),
                 attn_metadata: Some(input.meta),
                 midchunk_capture: None,
                 ..*ctx
@@ -172,7 +173,7 @@ impl Qwen3AttentionLayer {
             meta,
             seq_len_start,
             num_tokens,
-            ctx.config.index_topk,
+            self.glm_index_budget(ctx.config)?.dense_threshold() as usize,
         );
         owners.extend(
             passengers
@@ -214,17 +215,19 @@ impl Qwen3AttentionLayer {
         let b = ctx.buffers;
         let (hidden, normed) = (b.hidden_states(), b.norm_output());
         self.hc_pre_prefill(&hc.attn, hc, hidden, n, ctx, stream)?;
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.input_norm,
-            normed,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if !self.exl3_hc_norm(&hc.attn, self.input_norm.weight, normed, n, ctx, stream)? {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.input_norm,
+                normed,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         let coeffs = stash.map(|stage| {
             [
                 (b.hc_post(), stage.post, stage.rows.post),
@@ -246,19 +249,20 @@ impl Qwen3AttentionLayer {
         }
         let streams = b.hc_streams();
         let (post, comb) = (b.hc_post(), b.hc_comb());
-        let seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
-            &hc.ffn,
-            Some(attn_out),
-            hidden,
-            n,
-            hc.hc_mult as u32,
-            hc.sinkhorn_iters as u32,
-            hc.hc_eps,
-            ctx,
-            stream,
-        )?;
+        let seam = !self.has_exl3_mla()
+            && crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+                &hc.ffn,
+                Some(attn_out),
+                hidden,
+                n,
+                hc.hc_mult as u32,
+                hc.sinkhorn_iters as u32,
+                hc.hc_eps,
+                ctx,
+                stream,
+            )?;
         if !seam {
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
@@ -273,19 +277,21 @@ impl Qwen3AttentionLayer {
             )?;
             self.hc_pre_prefill(&hc.ffn, hc, hidden, n, ctx, stream)?;
         }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_w_k,
-            hidden,
-            &self.post_attn_norm,
-            normed,
-            n,
-            h as u32,
-            eps,
-            stream,
-        )?;
+        if !self.exl3_hc_norm(&hc.ffn, self.post_attn_norm.weight, normed, n, ctx, stream)? {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_w_k,
+                hidden,
+                &self.post_attn_norm,
+                normed,
+                n,
+                h as u32,
+                eps,
+                stream,
+            )?;
+        }
         let ffn_out = ffn()?;
-        ops::hc_post_site(
+        self.hc_post_site(
             ctx.gpu,
             self.hc_post_k,
             hc,

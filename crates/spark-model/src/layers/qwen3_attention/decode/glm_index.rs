@@ -47,7 +47,7 @@ impl Qwen3AttentionLayer {
         let h = ctx.config.hidden_size as u32;
         let keys = ctx.buffers.ssm_qkvz();
         let gates = keys.offset(spec.head_dim * 2);
-        ops::dense_gemv(
+        self.mla_dense_gemv(
             ctx.gpu,
             self.dense_gemv_k,
             normed,
@@ -57,18 +57,32 @@ impl Qwen3AttentionLayer {
             h,
             stream,
         )?;
+        let (norm_kernel, norm_weight, norm_bias) = if let Some(native) = &self.exl3_mla {
+            let params = native.index_f32_params()?;
+            (
+                native.index_exec()?.norm,
+                params.norm_weight,
+                params.norm_bias,
+            )
+        } else {
+            (
+                self.glm_index_layernorm_k,
+                indexer.k_norm_weight.weight,
+                indexer.k_norm_bias.weight,
+            )
+        };
         ops::glm_index_layernorm(
             ctx.gpu,
-            self.glm_index_layernorm_k,
+            norm_kernel,
             keys,
-            indexer.k_norm_weight.weight,
-            indexer.k_norm_bias.weight,
+            norm_weight,
+            norm_bias,
             1,
             dim,
             1e-6,
             stream,
         )?;
-        ops::dense_gemv(
+        self.mla_dense_gemv(
             ctx.gpu,
             self.dense_gemv_k,
             normed,
@@ -96,12 +110,20 @@ impl Qwen3AttentionLayer {
             kv_cache.sparse_index_tail_block_stride_bytes(self.attn_layer_idx) as u64,
             stream,
         )?;
+        let (finalize_kernel, ape) = if let Some(native) = &self.exl3_mla {
+            (
+                native.index_exec()?.finalize,
+                native.index_f32_params()?.ape,
+            )
+        } else {
+            (self.glm_index_kpool_finalize_k, indexer.kpool_ape.weight)
+        };
         ops::glm_index_kpool_finalize(
             ctx.gpu,
-            self.glm_index_kpool_finalize_k,
+            finalize_kernel,
             kv_cache.sparse_index_tail_pool_ptr(self.attn_layer_idx),
             kv_cache.sparse_index_tail_map_ptr(),
-            indexer.kpool_ape.weight,
+            ape,
             kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
             meta.slot,
             1,
@@ -164,8 +186,8 @@ impl Qwen3AttentionLayer {
             .expect("GLM decode index requires metadata");
         let h = ctx.config.hidden_size as u32;
         let seq_len = pos + 1;
-        let topk = ctx.config.index_topk as u32;
-        if seq_len <= topk {
+        let budget = self.glm_index_budget(ctx.config)?;
+        if budget.dense_is_exact(seq_len as usize) {
             return Ok(None);
         }
         ensure!(
@@ -176,12 +198,12 @@ impl Qwen3AttentionLayer {
         let index_dim = ctx.config.index_head_dim as u32;
         let pool_size = spec.tokens_per_pool as u32;
         let logits_stride = seq_len.div_ceil(pool_size);
-        let output_width = topk + pool_size - 1;
+        let output_width = budget.physical_width();
         let query = if let Some(query) = precomputed_query {
             query
         } else {
             let query = ctx.buffers.ssm_deinterleaved();
-            ops::dense_gemv(
+            self.mla_dense_gemv(
                 ctx.gpu,
                 self.dense_gemv_k,
                 q_latent,
@@ -194,16 +216,38 @@ impl Qwen3AttentionLayer {
             query
         };
         let weights = ctx.buffers.ssm_gates();
-        ops::dense_gemv(
-            ctx.gpu,
-            self.dense_gemv_k,
-            normed,
-            &indexer.weights_proj,
-            weights,
-            index_heads,
-            h,
-            stream,
-        )?;
+        let logits_kernel = if let Some(native) = &self.exl3_mla {
+            let exec = native.index_exec()?;
+            exec.validate(
+                1,
+                ctx.config.index_n_heads,
+                ctx.config.index_head_dim,
+                ctx.config.hidden_size,
+                ctx.buffers.sizes().ssm_gates,
+                stream,
+            )?;
+            exec.query_and_weights(
+                ctx.gpu,
+                normed,
+                indexer.weights_proj.weight,
+                query,
+                weights,
+                1,
+            )?;
+            exec.logits
+        } else {
+            self.mla_dense_gemv(
+                ctx.gpu,
+                self.dense_gemv_k,
+                normed,
+                &indexer.weights_proj,
+                weights,
+                index_heads,
+                h,
+                stream,
+            )?;
+            self.glm_index_logits_decode_k
+        };
         super::super::glm_index_capacity::tile_rows(
             1,
             logits_stride as usize,
@@ -212,7 +256,7 @@ impl Qwen3AttentionLayer {
         let logits = ctx.buffers.expert_down_out();
         ops::glm_index_logits(
             ctx.gpu,
-            self.glm_index_logits_decode_k,
+            logits_kernel,
             query,
             weights,
             kv_cache.sparse_index_pool_ptr(self.attn_layer_idx),
@@ -241,7 +285,7 @@ impl Qwen3AttentionLayer {
             1,
             pos,
             logits_stride,
-            topk,
+            budget.history_tokens(),
             pool_size,
             output_width,
             stream,

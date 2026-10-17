@@ -61,11 +61,12 @@ impl TransformerModel {
         let key = (seq.slot_idx, k, layer_idx);
         self.verify_pieces
             .run(key, self.gpu.as_ref(), comm, stream, |comm| {
-                // The verify context carries no mid-chunk capture (the one
-                // field that is not `Copy`).
+                // The verify context carries no mid-chunk capture and clones the request
+                // id (the two fields that are not `Copy`).
                 let ctx = ForwardContext {
                     comm: Some(comm),
                     midchunk_capture: None,
+                    request_id: ctx.request_id.clone(),
                     ..*ctx
                 };
                 for li in layer_idx..end {

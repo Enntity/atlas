@@ -79,16 +79,20 @@ mod tests {
     fn explicit_stop_preserves_same_event_prefix_but_not_following_tokens() {
         let mut s = state();
         let prefix = while_open(&mut s, |s| {
-            let text = super::super::apply_stop_string_holdback(
+            let (text, matched) = super::super::apply_stop_string_holdback(
                 "hello STOP trailing",
-                &["STOP".into()],
-                3,
-                &mut s.accumulated_content,
-                &mut s.stop_string_emitted_len,
-                &mut s.stop_string_triggered,
+                false,
+                crate::api::stop_match::HoldbackParams {
+                    stops: &["STOP".into()],
+                    buffer_len: 3,
+                    include_stop_str: false,
+                },
+                &mut s.stop_holdback,
             );
+            s.stop_string_triggered = s.stop_holdback.triggered;
             assert!(s.stop_string_triggered);
-            s.note_stop_string_match();
+            assert_eq!(matched.as_deref(), Some("STOP"));
+            s.note_stop_string_match(matched);
             vec![StreamDelta::Content {
                 text,
                 token_ids: vec![1],
@@ -102,7 +106,7 @@ mod tests {
             }]
         });
         assert!(later.is_empty());
-        assert_eq!(s.accumulated_content, "hello ");
+        assert_eq!(s.stop_holdback.acc, "hello ");
         assert!(s.stop_string_matched);
     }
 }

@@ -52,6 +52,19 @@ use pdl::pdl_kernel;
 pub use pdl::{configure_pdl, pdl_enabled};
 
 impl GpuBackend for AtlasCudaBackend {
+    fn require_bf16_gemm(&self) -> Result<()> {
+        Ok(())
+    }
+    fn quiesce_bf16_resources(&self) -> Result<()> {
+        self.quiesce_classic_blas()
+    }
+    fn require_bf16_gemm_numerics(&self, numerics: crate::gpu::Bf16GemmNumerics) -> Result<()> {
+        self.require_bf16_numerics(numerics)
+    }
+    fn bf16_gemm_act_weight_t(&self, request: crate::gpu::Bf16Gemm) -> Result<()> {
+        self.dispatch_bf16(request)
+    }
+
     fn alloc(&self, bytes: usize) -> Result<DevicePtr> {
         let mut dptr: u64 = 0;
         let status = unsafe { cuMemAlloc_v2(&mut dptr, bytes) };
@@ -190,6 +203,42 @@ impl GpuBackend for AtlasCudaBackend {
             // that faulted, and grid/block alone do not identify it.
             anyhow::anyhow!("Kernel launch failed ({}): {e}", kernel_name(raw_func.0))
         })
+    }
+
+    fn launch_cooperative_typed(
+        &self,
+        func: KernelHandle,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        stream: u64,
+        args: &[crate::gpu::KernelArg<'_>],
+    ) -> Result<()> {
+        let (storage, starts) = crate::gpu::pack_kernel_args(args);
+        let mut params: Vec<*mut c_void> = starts
+            .iter()
+            .map(|&i| &storage[i] as *const u64 as *mut c_void)
+            .collect();
+        let raw_func = RawCudaFunc(func.0 as *mut c_void);
+        let cfg = LaunchConfig {
+            grid_dim: (grid[0], grid[1], grid[2]),
+            block_dim: (block[0], block[1], block[2]),
+            shared_mem_bytes: shared_mem,
+        };
+        let registry = self.registry();
+        unsafe { registry.launch_cooperative_on_stream(raw_func, cfg, stream, &mut params) }
+            .map_err(|e| anyhow::anyhow!("Cooperative kernel launch failed: {e}"))
+    }
+
+    fn cooperative_blocks_per_sm(
+        &self,
+        func: KernelHandle,
+        block: u32,
+        shared_mem: u32,
+    ) -> Result<u32> {
+        self.registry()
+            .cooperative_blocks_per_sm(RawCudaFunc(func.0 as *mut c_void), block, shared_mem)
+            .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     fn stream_is_capturing(&self, stream: u64) -> bool {

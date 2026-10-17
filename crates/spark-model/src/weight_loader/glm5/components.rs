@@ -364,7 +364,7 @@ pub(super) fn load_kda_weights(
         let prefill_nvfp4_t = transpose_prefill
             .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
             .transpose()?;
-        Ok(Glm5Projection {
+        Ok(Glm5Projection::Nvfp4 {
             nvfp4: decode_nvfp4,
             prefill_nvfp4_t,
         })

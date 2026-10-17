@@ -6,6 +6,7 @@
 
 mod build;
 mod config;
+mod exl3;
 mod kernel_gate;
 mod kv_cache;
 mod preflight;

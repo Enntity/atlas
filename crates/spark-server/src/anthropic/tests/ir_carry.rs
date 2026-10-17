@@ -401,6 +401,14 @@ fn response_stop_reason_mapping() {
     let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
     assert_eq!(json["stop_reason"], "stop_sequence");
     assert_eq!(json["stop_sequence"], "END");
+
+    // A recorded stop does not leak into a tool_use finish (streaming parity).
+    let mut c = choice();
+    c.finish_reason = crate::ir::FinishReason::ToolCalls;
+    c.matched_stop = Some("END".into());
+    let json = serde_json::to_value(MessagesResponse::from(ir_response(c))).unwrap();
+    assert_eq!(json["stop_reason"], "tool_use");
+    assert!(json["stop_sequence"].is_null());
 }
 
 #[test]

@@ -152,6 +152,10 @@ pub(crate) fn load_model(
     // ModelOpt-exported checkpoints drop a sibling `hf_quant_config.json`
     // whose TOP LEVEL is already the quantization block.
     serve_phases::merge_sidecar_quant_config(&model_dir, &mut config);
+    if args.language_model_only {
+        tracing::info!("Language-model-only execution explicitly selected");
+        config.vision = None;
+    }
 
     // Vision pixel budget, resolved ONCE and installed on the config before
     // anything derived from it exists.
@@ -464,6 +468,20 @@ pub(crate) fn load_model(
     config.fp8_kv_headroom = args.fp8_kv_headroom;
 
     // 3. Load model weights
+    // Native GLM-5.3 EXL3 only: qwen4_exp EXL3 checkpoints take the
+    // `quant_format::exl3` path and have no packed TP=2 arithmetic to pin.
+    if config.model_type == "glm5_next"
+        && config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|quant| quant.quant_method == "exl3")
+    {
+        spark_model::factory::preflight_glm53_tp2_packed(
+            &config,
+            gpu.as_ref(),
+            max_batch_tokens_pre,
+        )?;
+    }
     spark_runtime::progress::phase(5, "weight load");
     let oom_reserve_bytes = args.oom_guard_mb * 1024 * 1024;
     tracing::info!("OOM guard reserve: {} MB", args.oom_guard_mb);
@@ -496,22 +514,26 @@ pub(crate) fn load_model(
     // detection code path mid-load). The returned trait object is
     // currently only consulted via `detect_nvfp4_variant`; explicit
     // use at each load site is a follow-up migration.
-    let quant_format = spark_model::quant_format::detect_quant_format(&config, &store);
-    // EXL3 has no Nvfp4Variant at all (`base_variant` refuses to guess), so
-    // only ask for it for the formats that do map onto the variant dispatch.
-    let variant = if quant_format.name() == "exl3" {
-        "n/a (exl3)".to_string()
+    if store.exl3_checkpoint().is_some() {
+        tracing::info!("Quantization format: native EXL3/mul1 (packed rank-local projections)");
     } else {
-        format!("{:?}", quant_format.base_variant())
-    };
-    tracing::info!(
-        "Quantization format: {} (base variant {variant}), ignored globs = {}",
-        quant_format.name(),
-        match &config.quantization_config {
-            Some(qc) => qc.ignore_modules.len(),
-            None => 0,
-        },
-    );
+        let quant_format = spark_model::quant_format::detect_quant_format(&config, &store);
+        // EXL3 has no Nvfp4Variant at all (`base_variant` refuses to guess), so
+        // only ask for it for the formats that do map onto the variant dispatch.
+        let variant = if quant_format.name() == "exl3" {
+            "n/a (exl3)".to_string()
+        } else {
+            format!("{:?}", quant_format.base_variant())
+        };
+        tracing::info!(
+            "Quantization format: {} (base variant {variant}), ignored globs = {}",
+            quant_format.name(),
+            match &config.quantization_config {
+                Some(qc) => qc.ignore_modules.len(),
+                None => 0,
+            },
+        );
+    }
 
     // MTP throughput-aware gate is applied at RUNTIME, not here. The earlier
     // static "FP8 ⇒ MTP off" weight-quant heuristic was removed: hardcoding the
@@ -724,6 +746,29 @@ pub(crate) fn load_model(
     } else {
         None
     };
+    // Start load-progress logging: scan model dir for weight-file bytes.
+    let model_dir_path = model_dir.as_path();
+    let total_weight_bytes: u64 = std::fs::read_dir(model_dir_path)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.ends_with(".safetensors")
+                || n.ends_with(".bin")
+                || n.ends_with(".pth")
+                || n.ends_with(".ckpt")
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+    let load_interval: u64 = std::env::var("ATLAS_LOAD_LOG_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let progress = atlas_core::load_progress::LoadProgress::new(total_weight_bytes, load_interval);
+    progress.update(0, "model_load_start");
+
     let model = serve_phases::build_model(
         &args,
         &config,
@@ -742,6 +787,7 @@ pub(crate) fn load_model(
         lora_args,
         nllb_lang,
         nllb_lora_dir,
+        Some(progress),
     )?;
 
     // Kernel load audit + the fail-closed boot gate. Every lookup is eager, so

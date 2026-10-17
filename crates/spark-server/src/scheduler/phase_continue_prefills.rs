@@ -366,6 +366,7 @@ pub(super) fn continue_in_progress_prefills(
                         p.top_p,
                         p.min_p,
                         &p.eos_tokens,
+                        p.seed,
                         p.grammar_state.as_mut(),
                         &sched.levers.sampling(),
                     ) {

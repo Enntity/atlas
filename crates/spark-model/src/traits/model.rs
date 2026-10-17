@@ -94,6 +94,13 @@ pub fn padded_batch_n(n: usize) -> usize {
 }
 
 pub trait Model: Send + Sync {
+    /// Keep issued prefill chunks within the configured budget. Decode-row
+    /// allocation headroom must not expand a model's selected quantized
+    /// prefill geometry. Ordinary models retain idle arena expansion.
+    fn requires_configured_prefill_chunk_budget(&self) -> bool {
+        false
+    }
+
     /// Release the device memory this model owns, in reverse construction
     /// order.
     ///
@@ -1313,6 +1320,17 @@ pub trait Model: Send + Sync {
     /// single-sequence broadcast.
     fn ep_broadcast_cmd_for_seq(&self, _seq_id: u32, _cmd: u32) -> Result<()> {
         Ok(()) // no-op for non-EP models
+    }
+
+    /// Bind the admitted request identity on the addressed worker sequence.
+    /// `None` explicitly clears an earlier binding, including slot reuse.
+    /// Both peers must run the same wire protocol implementation.
+    fn ep_broadcast_request_id_for_seq(
+        &self,
+        _seq_id: u32,
+        _request_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(()) // no transport for models without a worker implementation
     }
 
     /// Set the request-local native-decode fence on the worker's matching

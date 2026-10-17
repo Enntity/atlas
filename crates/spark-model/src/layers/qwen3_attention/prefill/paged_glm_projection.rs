@@ -39,6 +39,10 @@ impl Qwen3AttentionLayer {
         stream: u64,
         accelerated: bool,
     ) -> Result<()> {
+        self.validate_exl3_mla_forward(m as usize, ctx, stream)?;
+        if self.try_exl3_mla_projection(ctx.gpu, input, weight, output, m, n, k, stream)? {
+            return Ok(());
+        }
         // The existing helper selects BF16 cuBLAS when enabled, otherwise its
         // established TC/scalar fallback. No weight or activation conversion.
         if accelerated && ctx.config.model_type == "glm5_next" {

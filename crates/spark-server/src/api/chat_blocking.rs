@@ -28,6 +28,8 @@ pub(super) struct BlockingPathArgs {
     pub req_ctx: Option<axum::extract::Extension<crate::rate_limiter::RequestContext>>,
     pub prompt_tokens: Vec<u32>,
     pub session_hash: u64,
+    /// Server request id resolved at admission (assumption A8).
+    pub request_id: String,
     /// M2 per-request LoRA routing: resolved adapter slot (`-1` = defer to active).
     pub adapter_slot: i32,
     /// Resolved source-language token id (0 = deployment default).
@@ -75,6 +77,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         req_ctx,
         prompt_tokens,
         session_hash,
+        request_id,
         adapter_slot,
         src_lang_id,
         tgt_lang_id,
@@ -122,12 +125,15 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
     // and the Tier 5c retry path all share the same Arc — no Vec<u32>
     // deep clones (~40 KB on a typical long-context opencode prompt).
     let prompt_tokens = std::sync::Arc::new(prompt_tokens);
+    let single_token_stops =
+        super::inference_impl::single_token_stop_map(&state.tokenizer, &req.stop);
 
     for choice_idx in 0..n {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let request = InferenceRequest::Blocking {
             prompt_tokens: prompt_tokens.clone(),
             session_hash,
+            request_id: request_id.clone(),
             adapter_slot,
             src_lang_id,
             tgt_lang_id,
@@ -164,11 +170,15 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             suppress_tool_call,
             disable_mtp: false,
             grammar_spec: grammar_spec.clone(),
-            seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
+            // Non-overlapping per-choice RNG streams (`choice_seed`).
+            seed: req
+                .seed
+                .map(|s| super::choice_seed::choice_seed(s, choice_idx as u64)),
             top_logprobs,
             prompt_logprobs: None,
             echo: false,
             timeout_at,
+            stop_watch: blocking_stop_watch(&state, &req.stop, req.min_tokens),
             response_tx: tx,
         };
 
@@ -215,10 +225,31 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
+        // The terminal stop token is dropped before decoding unless
+        // `include_stop_str_in_output` keeps a client stop's text.
+        let include = req.include_stop_str_in_output;
+        let visible = match super::stop_match::included_stop_token(
+            include,
+            response.stop_token_id,
+            &stop_tokens,
+        ) {
+            Some(_) => &response.output_tokens[..],
+            None => output_tokens_without_stop(&response.output_tokens, response.stop_token_id),
+        };
         let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking, tools_active);
-        let (output_text_i, matched_stop) =
-            super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
+            decode_visible_text(&state, visible, enable_thinking, tools_active);
+        let floor = if req.stop.is_empty() {
+            0
+        } else {
+            min_tokens_floor(&state, visible, output_text_i.len(), req.min_tokens)
+        };
+        let (output_text_i, text_stop) =
+            super::stop_match::truncate_at_stop(output_text_i, &req.stop, floor, include);
+        let matched_stop = super::stop_match::resolve_matched_stop(
+            text_stop,
+            response.stop_token_id,
+            &single_token_stops,
+        );
 
         let mut choice = build_choice_message(
             &state,
@@ -265,8 +296,17 @@ pub(super) fn decode_response_text(
     enable_thinking: bool,
     tools_active: bool,
 ) -> (Option<String>, String) {
-    let output_tokens =
-        output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
+    let output_tokens = output_tokens_without_stop(&response.output_tokens, response.stop_token_id);
+    decode_visible_text(state, output_tokens, enable_thinking, tools_active)
+}
+
+/// [`decode_response_text`] over an already-chosen visible token slice.
+fn decode_visible_text(
+    state: &AppState,
+    output_tokens: &[u32],
+    enable_thinking: bool,
+    tools_active: bool,
+) -> (Option<String>, String) {
     // GLM's native tool opener also closes reasoning, but belongs to the tool
     // parser. Prefer the FIRST boundary; a later </think> must not swallow the
     // tool call. This never scans arbitrary reasoning text for call syntax.
@@ -358,12 +398,52 @@ fn split_at_first_think_end(
 /// The scheduler retains a terminal stop token in blocking output for usage
 /// accounting. Do not expose its decoded text when a tokenizer does not mark
 /// that EOS token as special (Laguna's `</assistant>` is one such token).
-fn output_tokens_without_stop<'a>(tokens: &'a [u32], finish_reason: &str) -> &'a [u32] {
-    if finish_reason == "stop" {
-        tokens.split_last().map_or(tokens, |(_, visible)| visible)
-    } else {
-        tokens
+///
+/// Drop the terminal EOS-set token (model EOS / single-token client stop)
+/// before decoding. Keyed on the scheduler's `stop_token_id`, NOT on
+/// `finish_reason == "stop"`: a client stop-STRING finish (and a cancel) is
+/// also "stop" but ends on an ordinary text token — dropping it would cut
+/// the tail of the stop string itself (`"Observation:"` → `"Observation"`),
+/// so the final strip would miss it and leak it into the content.
+pub(super) fn output_tokens_without_stop(tokens: &[u32], stop_token_id: Option<u32>) -> &[u32] {
+    match tokens.split_last() {
+        Some((&last, visible)) if Some(last) == stop_token_id => visible,
+        _ => tokens,
     }
+}
+
+/// vLLM `min_tokens` for the final stop-string truncation: the byte offset in
+/// the `content_len`-byte decoded content below which no stop string may end
+/// — the text of the first `min_tokens` of the `visible` output tokens
+/// (`stop_match::content_floor`). 0 without `min_tokens`.
+pub(super) fn min_tokens_floor(
+    state: &AppState,
+    visible: &[u32],
+    content_len: usize,
+    min_tokens: usize,
+) -> usize {
+    if min_tokens == 0 {
+        return 0;
+    }
+    let decoded_len = |ids: &[u32]| state.tokenizer.decode(ids).map_or(0, |s| s.len());
+    let below = decoded_len(&visible[..min_tokens.min(visible.len())]);
+    super::stop_match::content_floor(content_len, decoded_len(visible), below)
+}
+
+/// Scheduler-side stop-string watch for one blocking choice: decodes with
+/// the same special-token skipping as `decode_response_text`, dormant over
+/// the first `min_tokens` output tokens.
+pub(super) fn blocking_stop_watch(
+    state: &Arc<AppState>,
+    stops: &[String],
+    min_tokens: usize,
+) -> Option<super::stop_match::StopStringWatch> {
+    let state = state.clone();
+    super::stop_match::StopStringWatch::new(
+        stops,
+        min_tokens,
+        Arc::new(move |ids: &[u32]| state.tokenizer.decode(ids).unwrap_or_default()),
+    )
 }
 
 /// Recover tool calls from reasoning for legacy parsers that depend on F7.
@@ -550,8 +630,19 @@ mod tests {
     fn blocking_decode_excludes_terminal_stop_token() {
         let tokens = [10, 11, 24];
 
-        assert_eq!(output_tokens_without_stop(&tokens, "stop"), &[10, 11]);
-        assert_eq!(output_tokens_without_stop(&tokens, "length"), &tokens);
+        assert_eq!(output_tokens_without_stop(&tokens, Some(24)), &[10, 11]);
+        assert_eq!(output_tokens_without_stop(&tokens, None), &tokens);
+    }
+
+    /// A stop-STRING finish reports "stop" but its last token is the text
+    /// that completed the stop string; the old `finish_reason == "stop"`
+    /// rule dropped it, so "Observation:" decoded as "Observation" and the
+    /// final strip missed the stop.
+    #[test]
+    fn blocking_decode_keeps_last_token_of_stop_string_finish() {
+        let tokens = [10, 11, 24];
+        assert_eq!(output_tokens_without_stop(&tokens, None), &tokens);
+        assert_eq!(output_tokens_without_stop(&tokens, Some(99)), &tokens);
     }
 
     #[test]

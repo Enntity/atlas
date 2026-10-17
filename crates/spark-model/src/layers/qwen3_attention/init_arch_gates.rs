@@ -21,6 +21,7 @@
 //! model cannot use.
 
 use spark_runtime::gpu::{GpuBackend, KernelHandle};
+use spark_runtime::kv_cache::KvCacheDtype;
 
 use atlas_core::config::ModelConfig;
 
@@ -79,9 +80,31 @@ pub(super) fn gated(enabled: bool, gpu: &dyn GpuBackend, module: &str, func: &st
     }
 }
 
+/// Whether a decode row may launch `glm_indexer::glm_index_fill_causal_dev`,
+/// which writes a dense row's causal IDs as its selection. An `fp8_g128` row
+/// always needs it (its only reader takes explicit IDs). A GLM kpool-indexer
+/// model needs it for every KV dtype, because the canonical few-row form
+/// (`ops::glm_kv_canonical_rank`, on by default for a TP=2 pair) also attends
+/// a dense row through causal IDs. A BF16 GLM TP=2 pair that left this
+/// handle 0 failed its first decode with `CUDA_ERROR_INVALID_HANDLE`.
+pub(super) fn needs_causal_id_fill(glm_kpool_indexer: bool, kv_dtype: KvCacheDtype) -> bool {
+    glm_kpool_indexer || kv_dtype == KvCacheDtype::Fp8G128
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GLM resolves the causal-ID fill for every KV dtype (the canonical
+    /// form's dense rows use it under BF16 too); other models only for
+    /// `fp8_g128`.
+    #[test]
+    fn causal_id_fill_covers_glm_bf16_rows() {
+        assert!(needs_causal_id_fill(true, KvCacheDtype::Bf16));
+        assert!(needs_causal_id_fill(true, KvCacheDtype::Fp8G128));
+        assert!(needs_causal_id_fill(false, KvCacheDtype::Fp8G128));
+        assert!(!needs_causal_id_fill(false, KvCacheDtype::Bf16));
+    }
 
     /// A plain GQA model (qwen3.6-27B shape) must claim NONE of the
     /// cross-architecture families — that is the ~24-lookup saving.

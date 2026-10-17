@@ -80,6 +80,8 @@ pub enum KernelArg<'a> {
 }
 
 pub use crate::gpu_args::pack_kernel_args;
+mod gemm;
+pub use gemm::{Bf16Gemm, Bf16GemmNumerics};
 
 pub use crate::gpu_pitched::{
     HOST_PINNED_ALIGN, HostPitched, Pitched, copy_d2h_pitched_async,
@@ -90,6 +92,27 @@ pub use crate::gpu_pitched::{
 ///
 /// Implementations: `AtlasCudaBackend` (production), `MockGpuBackend` (tests).
 pub trait GpuBackend: Send + Sync {
+    /// Fail before allocation when the backend cannot execute native BF16 GEMM.
+    fn require_bf16_gemm(&self) -> Result<()> {
+        anyhow::bail!("GPU backend does not support native BF16 GEMM")
+    }
+    /// Complete backend-owned BF16 work before model operands or resources are released.
+    fn quiesce_bf16_resources(&self) -> Result<()> {
+        Ok(())
+    }
+    fn require_bf16_gemm_numerics(&self, numerics: Bf16GemmNumerics) -> Result<()> {
+        match numerics {
+            Bf16GemmNumerics::CublasLt => self.require_bf16_gemm(),
+            Bf16GemmNumerics::Glm53Classic | Bf16GemmNumerics::Glm53AuxiliaryClassic => {
+                anyhow::bail!("GPU backend does not support explicit shared classic BF16 GEMM")
+            }
+        }
+    }
+    fn bf16_gemm_act_weight_t(&self, request: Bf16Gemm) -> Result<()> {
+        request.validate()?;
+        anyhow::bail!("GPU backend does not support native BF16 GEMM")
+    }
+
     /// Allocate `bytes` of device memory.
     fn alloc(&self, bytes: usize) -> Result<DevicePtr>;
 
@@ -187,6 +210,33 @@ pub trait GpuBackend: Send + Sync {
             .map(|&i| &storage[i] as *const u64 as *mut std::ffi::c_void)
             .collect();
         self.launch(func, grid, block, shared_mem, stream, &mut params)
+    }
+
+    /// Cooperative typed-args launch (`cuLaunchCooperativeKernel` on CUDA):
+    /// all CTAs are co-resident, as inter-CTA spin locks require. Backends
+    /// without cooperative launch return an error; callers fall back.
+    fn launch_cooperative_typed(
+        &self,
+        _func: KernelHandle,
+        _grid: [u32; 3],
+        _block: [u32; 3],
+        _shared_mem: u32,
+        _stream: u64,
+        _args: &[KernelArg<'_>],
+    ) -> Result<()> {
+        anyhow::bail!("cooperative kernel launch is not supported by this GPU backend")
+    }
+
+    /// Resident CTAs per SM a cooperative launch of `func` gets with `block`
+    /// threads and `shared_mem` dynamic bytes (CUDA: sets the max-shared
+    /// carveout, then cuOccupancyMaxActiveBlocksPerMultiprocessor).
+    fn cooperative_blocks_per_sm(
+        &self,
+        _func: KernelHandle,
+        _block: u32,
+        _shared_mem: u32,
+    ) -> Result<u32> {
+        anyhow::bail!("occupancy query is not supported by this GPU backend")
     }
 
     /// Whether `stream` is inside an active CUDA-graph capture. Telemetry

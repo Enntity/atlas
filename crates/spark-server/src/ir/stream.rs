@@ -32,13 +32,15 @@ pub enum StreamDelta {
     /// Terminal event: finish reason + final usage. `token_ids` are the
     /// residual sampled ids not yet attached to any earlier delta
     /// (tokens whose decoded text was buffered or suppressed, tool-call
-    /// body tokens); carrying them on the terminal event keeps
-    /// Σ token_ids == `usage.completion_tokens` for clients that opted
-    /// into `return_token_ids`.
+    /// body tokens). Terminal EOS is counted in completion usage but not
+    /// streamed; rejected output can also omit IDs. `matched_stop` carries
+    /// the client stop string that triggered termination (Anthropic `stop_sequence` echo;
+    /// None when the stop was an EOS token or max_tokens).
     Finish {
         reason: super::response::FinishReason,
         usage: super::response::Usage,
         token_ids: Vec<u32>,
+        matched_stop: Option<String>,
     },
     /// Stream-level error payload, sent verbatim as SSE data.
     Error { message: String },

@@ -6,6 +6,8 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod counters;
+
 #[derive(Debug)]
 pub struct MockAlloc {
     pub bytes: usize,
@@ -18,6 +20,10 @@ pub struct MockGpuBackend {
     allocs: Mutex<HashMap<u64, MockAlloc>>,
     next_ptr: Mutex<u64>,
     launches: Mutex<Vec<MockLaunch>>,
+    bf16_gemms: Mutex<Vec<Bf16Gemm>>,
+    pending_gemm_failures: AtomicUsize,
+    kernel_requests: Mutex<Vec<(String, String)>>,
+    pending_kernel_failures: AtomicUsize,
     /// Copy/sync shape counters. These exist so tests can assert the SHAPE of a
     /// bulk transfer, not just its bytes: the SSM snapshot spill regressed to
     /// 60 blocking `copy_d2h` calls (one full stream drain each, ~400 ms for
@@ -75,6 +81,10 @@ impl MockGpuBackend {
             allocs: Mutex::new(HashMap::new()),
             next_ptr: Mutex::new(0x1000_0000),
             launches: Mutex::new(Vec::new()),
+            bf16_gemms: Mutex::new(Vec::new()),
+            pending_gemm_failures: AtomicUsize::new(0),
+            kernel_requests: Mutex::new(Vec::new()),
+            pending_kernel_failures: AtomicUsize::new(0),
             syncs: AtomicUsize::new(0),
             d2h_blocking: AtomicUsize::new(0),
             d2h_async: AtomicUsize::new(0),
@@ -89,92 +99,6 @@ impl MockGpuBackend {
             live_streams: AtomicUsize::new(0),
             live_events: AtomicUsize::new(0),
         }
-    }
-
-    /// `(streams, events)` created and not yet destroyed: the leak check of
-    /// whatever owns them.
-    pub fn live_streams_and_events(&self) -> (usize, usize) {
-        (
-            self.live_streams.load(Ordering::Relaxed),
-            self.live_events.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Queue one `free` failure: the next `free` call returns an error and
-    /// consumes one queued failure. Lets cleanup-path tests prove a failed
-    /// free keeps its resource observable/retryable instead of silently
-    /// leaking (queue N to fail N consecutive frees).
-    pub fn fail_next_free(&self) {
-        self.pending_free_failures.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// `destroy_graph` calls so far — the tripwire proving a cleanup error
-    /// path does NOT destroy pooled graphs.
-    pub fn destroy_graph_count(&self) -> usize {
-        self.destroyed_graphs
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// `free` calls whose pointer was not the base of a live allocation: a
-    /// double free, or an offset view into a block. The real backend rejects
-    /// both with `CUDA_ERROR_INVALID_VALUE` and puts the pointer back on its
-    /// cleanup ledger; the mock accepts them silently, so this counter is how
-    /// a teardown test sees them.
-    pub fn invalid_free_count(&self) -> usize {
-        self.invalid_frees.load(Ordering::Relaxed)
-    }
-
-    pub fn alloc_count(&self) -> usize {
-        self.allocs.lock().len()
-    }
-
-    pub fn launch_count(&self) -> usize {
-        self.launches.lock().len()
-    }
-
-    /// `synchronize` calls so far — a proxy for "full stream drains", the cost
-    /// a batched gather exists to amortize.
-    pub fn sync_count(&self) -> usize {
-        self.syncs.load(Ordering::Relaxed)
-    }
-
-    /// BLOCKING `copy_d2h` calls (each one drains the stream on the real
-    /// backend). A bulk gather must have zero of these.
-    pub fn d2h_blocking_count(&self) -> usize {
-        self.d2h_blocking.load(Ordering::Relaxed)
-    }
-
-    /// `copy_d2h_async` calls (enqueue-only).
-    pub fn d2h_async_count(&self) -> usize {
-        self.d2h_async.load(Ordering::Relaxed)
-    }
-
-    /// `copy_d2d` + `copy_d2d_async` calls so far — one eager launch each on
-    /// the real backend.
-    pub fn d2d_count(&self) -> usize {
-        self.d2d.load(Ordering::Relaxed)
-    }
-
-    /// `copy_d2d_2d_async` calls so far — one `cudaMemcpy2DAsync` each,
-    /// whatever the row count.
-    pub fn d2d_2d_count(&self) -> usize {
-        self.d2d_2d.load(Ordering::Relaxed)
-    }
-
-    /// Pitched host↔device copies so far (either direction).
-    pub fn host_pitched_count(&self) -> usize {
-        self.host_pitched.load(Ordering::Relaxed)
-    }
-
-    /// `memset_async` calls so far.
-    pub fn memset_count(&self) -> usize {
-        self.memsets.load(Ordering::Relaxed)
-    }
-
-    /// `alloc_host_pinned` calls — the tripwire for a staging buffer that is
-    /// re-allocated per event instead of reused.
-    pub fn host_pinned_alloc_count(&self) -> usize {
-        self.host_pinned_allocs.load(Ordering::Relaxed)
     }
 
     pub fn read_alloc(&self, ptr: DevicePtr) -> Option<Vec<u8>> {
@@ -210,14 +134,6 @@ impl MockGpuBackend {
         alloc.data[offset..offset + bytes].copy_from_slice(&staged);
         Ok(())
     }
-
-    /// Every launch recorded so far, in dispatch order. Lets a test assert
-    /// WHICH kernel shape ran (grid/block signature), not just how many —
-    /// the mock's `kernel()` hands out one shared handle, so geometry is
-    /// the only per-launch identity available.
-    pub fn launches_snapshot(&self) -> Vec<MockLaunch> {
-        self.launches.lock().clone()
-    }
 }
 
 /// Find the allocation containing `ptr` (supports offset pointers).
@@ -244,6 +160,29 @@ fn find_alloc_mut(
 }
 
 impl GpuBackend for MockGpuBackend {
+    fn require_bf16_gemm(&self) -> Result<()> {
+        Ok(())
+    }
+    fn require_bf16_gemm_numerics(&self, numerics: super::Bf16GemmNumerics) -> Result<()> {
+        match numerics {
+            super::Bf16GemmNumerics::CublasLt
+            | super::Bf16GemmNumerics::Glm53Classic
+            | super::Bf16GemmNumerics::Glm53AuxiliaryClassic => Ok(()),
+        }
+    }
+    fn bf16_gemm_act_weight_t(&self, request: Bf16Gemm) -> Result<()> {
+        request.validate()?;
+        self.bf16_gemms.lock().push(request);
+        if self
+            .pending_gemm_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!("mock BF16 GEMM failed (injected)");
+        }
+        Ok(())
+    }
+
     fn op_cache(&self) -> &crate::op_cache::OpCache {
         &self.op_cache
     }
@@ -395,7 +334,17 @@ impl GpuBackend for MockGpuBackend {
     }
 
     #[track_caller]
-    fn kernel(&self, _module: &str, _func_name: &str) -> Result<KernelHandle> {
+    fn kernel(&self, module: &str, func_name: &str) -> Result<KernelHandle> {
+        self.kernel_requests
+            .lock()
+            .push((module.into(), func_name.into()));
+        if self
+            .pending_kernel_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            anyhow::bail!("mock required kernel unavailable: {module}::{func_name}");
+        }
         Ok(KernelHandle(0xDEAD))
     }
 

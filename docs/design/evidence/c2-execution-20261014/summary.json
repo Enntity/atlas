@@ -1,0 +1,197 @@
+{
+  "schema": "atlas-c2-incomplete-campaign-summary-v1",
+  "scope": "diagnostic eight-request/two-rank slice only; no new numerical qualification verdict",
+  "status": "treatment-not-collected",
+  "causality": "unresolved",
+  "c1_first_measurement": "undischarged",
+  "scoring": "not performed; analyzer guards retained",
+  "evidence_root": "/home/colum/Workspace/atlas-exl3-validation-20261010",
+  "preparation_root": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014",
+  "execution_plan_sha256": "a11cf786645084f8dcf5096b8a1f58c5d8de70846bc1c4edffb22625e69afaa1",
+  "runtime_source": "2fbb787cd49f2b524746b04707b90aadd1f150fc",
+  "runtime_image_id": "sha256:011423015fc1da354e07fbe5ee1b49751efb4e3a886159f2a23f458744cbcff0",
+  "actual_kv_cache": "fp8_g128",
+  "baseline_repeats": [
+    {
+      "run": "arm-a-repeat-00",
+      "final_rows": 8,
+      "final_rows_equal_archived_same_image": true,
+      "rank_row_norm_pairs": 16,
+      "all_norm_pairs_equal_archived_candidate": true,
+      "collection_sha256": {
+        "manifest.json": "769519179a4966de7b42fbd069bd4d8eb67d758c7afb98e5bf55b6c593a2a0cb",
+        "logits.npz": "28b7b3a8aaea03c2bf4e152c0194b9f014aee1bc2b4c2cabda2173b647d0df95",
+        "pre_registration.json": "a287aafd315e110eda7dcabc363bdd9e9c5412c517ec1aeb014df0d1cab6a92f"
+      },
+      "final_row_sha256": [
+        "89bc7b275f641ad2548443bcabe098c13bbca1d6b4e316852f90697bd3be5c3b",
+        "c43c5b422f387412cb5575d00df64150c4c77c9640d34688832b7d0661b32f37",
+        "a4bbc8a09b863617fdc75828e26c534baf887cbe37fcc23ab0f667e9a137ab82",
+        "1e6f6c520f4a872a9f2b5af77a8226be7548623b50f94e45a225495d856ab5f4",
+        "70d1345b6f264a055f88179168b25522d2a49c962b91092275add09dd4b53e59",
+        "d22b524f723e628c739e2dbfd71d6e91c09352476fb5282cee820fabf1e3465e",
+        "1e151191c735b78f4d648e02a8413a921a6f48bc09125f9dac163095bc9a1da9",
+        "afc142f356481591084057bd354b2e4e9236ecb4629704aeab13796be6007e63"
+      ],
+      "norm_comparison_inventory_sha256": "e9ed88c793ed1f3097803810c45313820cebdb1ee5a17147043703a70e0de06a"
+    },
+    {
+      "run": "arm-a-repeat-01",
+      "final_rows": 8,
+      "final_rows_equal_archived_same_image": true,
+      "rank_row_norm_pairs": 16,
+      "all_norm_pairs_equal_archived_candidate": true,
+      "collection_sha256": {
+        "manifest.json": "fdcc8fc10634b04a1dd1b44934fa51f4d1a200326190aead42b9bbd6964f07f8",
+        "logits.npz": "28b7b3a8aaea03c2bf4e152c0194b9f014aee1bc2b4c2cabda2173b647d0df95",
+        "pre_registration.json": "c23383d3d5861497ee87d1722dfa763f274ba80e9e74ae5fb67a468a8f466f72"
+      },
+      "final_row_sha256": [
+        "89bc7b275f641ad2548443bcabe098c13bbca1d6b4e316852f90697bd3be5c3b",
+        "c43c5b422f387412cb5575d00df64150c4c77c9640d34688832b7d0661b32f37",
+        "a4bbc8a09b863617fdc75828e26c534baf887cbe37fcc23ab0f667e9a137ab82",
+        "1e6f6c520f4a872a9f2b5af77a8226be7548623b50f94e45a225495d856ab5f4",
+        "70d1345b6f264a055f88179168b25522d2a49c962b91092275add09dd4b53e59",
+        "d22b524f723e628c739e2dbfd71d6e91c09352476fb5282cee820fabf1e3465e",
+        "1e151191c735b78f4d648e02a8413a921a6f48bc09125f9dac163095bc9a1da9",
+        "afc142f356481591084057bd354b2e4e9236ecb4629704aeab13796be6007e63"
+      ],
+      "norm_comparison_inventory_sha256": "06c18c31cc7f4ef409d2a1fc88f4ecba802c528b5fbe58796ffe2dab24c73372"
+    }
+  ],
+  "baseline_byte_deterministic": true,
+  "observer_neutrality": {
+    "scope": "only eight selected final-logit rows under this pinned image and capture profile",
+    "source": "/home/colum/Workspace/atlas-exl3-validation-20261010/gate-v2-qualification-20261013-luna1/attempts/v2cand01/attempt-files/short16",
+    "source_sha256": {
+      "manifest.json": "51e954e924c6f648a3b856b7e358e7d6ac15a2a35ce99219c543911a1d9a98ad",
+      "logits.npz": "1174833ed9bd4413d09bd3e1fd03da42eaf061c892963d76b211ae52d589cc61",
+      "pre_registration.json": "964f7c67f1d7f4d2f970b8ee5584ac159734347d95e2d15a040aa4682d1fcb83"
+    },
+    "all_rows_equal": true
+  },
+  "attempts": [
+    {
+      "name": "c2-refexact-01",
+      "phase": "failed-before-create",
+      "failure": {
+        "schema": "atlas-c2-ab-failure-v1",
+        "exception_type": "ValueError",
+        "message": "generated container name absence could not be proven",
+        "utc_time": "2026-10-14T15:53:18.611589+00:00"
+      },
+      "failure_sha256": "90e20e965c0d569859bfeb765d03d45ab119708c3c166ef01faa1f3c8279541e",
+      "lifecycle_sha256": "c127253303b7392816bcb1110e18525c659ff29558685967b78d5cb59a723c5d"
+    },
+    {
+      "name": "c2-refexact-02",
+      "phase": "failed-first-treatment-request",
+      "failure": {
+        "schema": "atlas-c2-ab-failure-v1",
+        "exception_type": "RuntimeError",
+        "message": "rank 0 command failed (1): python3",
+        "utc_time": "2026-10-14T16:13:07.702539+00:00"
+      },
+      "failure_sha256": "04db8506aa976f6f6d7023979e67577365a2e17a2ce6d6315e17739384534242",
+      "rank_failure_logs": [
+        {
+          "rank": 0,
+          "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/c2-refexact-02/runs/arm-b-repeat-00/remote-0716-rank0.stdout",
+          "sha256": "420c30d4b6c40c2807dadfcc7298ed97fa2ce4a49cf8d8b64ab4043e291398f1",
+          "fatal_error": "2026-10-14T16:12:56.576406Z ERROR spark::ep_peer_lifeline: EP peer lost: bootstrap connection to 192.168.100.2:40312 closed; terminating rank"
+        },
+        {
+          "rank": 1,
+          "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/c2-refexact-02/runs/arm-b-repeat-00/remote-0723-rank1.stdout",
+          "sha256": "47e38cfa9f3207878a8acd450b6ce1cdcbda1dff9afe0cfc2bb94af2f05eecfb",
+          "fatal_error": "2026-10-14T16:12:56.573766Z ERROR spark::main_modules::serve_phases::build: EP worker fatal error: Prefill chunk layer 0 failed: norm substitution requires the ForwardContext request-id binding; terminating rank"
+        }
+      ],
+      "collector_failure_log": {
+        "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/c2-refexact-02/runs/arm-b-repeat-00/remote-0714-rank0.stderr",
+        "sha256": "9217e394df9a032cb6dc2da037376e9a694ab23617100ea561aaa000433c6d3d"
+      }
+    }
+  ],
+  "partial_treatment": {
+    "completed_requests": 0,
+    "logits_manifest_present": false,
+    "logits_archive_present": false,
+    "substitution_receipts_found": 1,
+    "unconsumed_fixture_entries": 15,
+    "single_rank0_receipt": {
+      "file": "ffn-L0-rank0-000000-norm_substitution.json",
+      "sha256": "d8c1cfb7f3859f70932821c4568ca2542b58948e6879ef0e88bfac883f668341",
+      "payload_file": "ffn-L0-rank0-000000-norm_substitution-gated.bin",
+      "payload_sha256": "4f4c1ab2f3dc8db7498c09cd7bd18ac90b5a92ee43c631f7689f3fa941a42174",
+      "tp_rank": 0,
+      "invocation": 0,
+      "request_id": "c2-20261014-req-00",
+      "pre_substitution_sha256": "4f4c1ab2f3dc8db7498c09cd7bd18ac90b5a92ee43c631f7689f3fa941a42174",
+      "payload_stage": "post-substitution"
+    }
+  },
+  "lifecycles": [
+    {
+      "run": "arm-a-repeat-00",
+      "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/c2-refexact-02/runs/arm-a-repeat-00/lifecycle.json",
+      "sha256": "b914f75d3273a4c85f0031635bb2e17be5c64431d1a0187f5da692a9ed57e02b",
+      "ranks_stopped_and_waited": [
+        "0",
+        "1"
+      ],
+      "teardown_errors": []
+    },
+    {
+      "run": "arm-a-repeat-01",
+      "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/c2-refexact-02/runs/arm-a-repeat-01/lifecycle.json",
+      "sha256": "384c5b9ce45b28b1184a610ff1d532969c0029a3b6d479db29f4e35f78e360e1",
+      "ranks_stopped_and_waited": [
+        "0",
+        "1"
+      ],
+      "teardown_errors": []
+    },
+    {
+      "run": "arm-b-repeat-00",
+      "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/c2-refexact-02/runs/arm-b-repeat-00/lifecycle.json",
+      "sha256": "583db3d919b027439f560b7963a33d8000adc1c9df30c7efb866667f79e7b5d4",
+      "ranks_stopped_and_waited": [
+        "0",
+        "1"
+      ],
+      "teardown_errors": []
+    }
+  ],
+  "post_failure_host_inspection": {
+    "status": "both-hosts-released",
+    "scope": "recorded post-failure inspection at 2026-10-14T16:15:20Z\u201316:15:23Z",
+    "hosts": [
+      {
+        "host": "spark0",
+        "snapshot": "== host spark0 (colum@10.50.0.10) 2026-10-14T16:15:20Z",
+        "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/preflight/after-refexact02/spark0.txt",
+        "sha256": "b83f04ba2568e6c2bd8b6e05c85d4ec2ffe27af27d340626f4cac31cd08d2ed9",
+        "active_gpu_compute_processes": 0,
+        "c2_container_exit_codes": {
+          "atlas-c2-c2-refexact-02-arm-a-repeat-00-r0": 0,
+          "atlas-c2-c2-refexact-02-arm-a-repeat-01-r0": 0,
+          "atlas-c2-c2-refexact-02-arm-b-repeat-00-r0": 74
+        }
+      },
+      {
+        "host": "spark1",
+        "snapshot": "== host spark1 (colum@10.50.0.11) 2026-10-14T16:15:22Z",
+        "path": "/home/colum/Workspace/atlas-exl3-validation-20261010/q2-c2-execution-20261014/preflight/after-refexact02/spark1.txt",
+        "sha256": "de9c81eacc8b838e118a59601bcbc848deb57192ec08144a832150e0c2bc2966",
+        "active_gpu_compute_processes": 0,
+        "c2_container_exit_codes": {
+          "atlas-c2-c2-refexact-02-arm-a-repeat-00-r1": 0,
+          "atlas-c2-c2-refexact-02-arm-a-repeat-01-r1": 0,
+          "atlas-c2-c2-refexact-02-arm-b-repeat-00-r1": 74
+        }
+      }
+    ]
+  },
+  "analyzer_sha256": "465dd92b395c3d551af70d6901cc6b9b59ed7584fd99120682d599fbce709ae9"
+}

@@ -396,6 +396,7 @@ impl TransformerModel {
             routed_lora_layers: self.routed_slot_layers(seq.adapter_slot),
             midchunk_capture: None,
             moe_lora_route: self.moe_lora_route(seq.adapter_slot),
+            request_id: seq.request_id.clone(),
         };
 
         // ── 4. Forward through all layers ──

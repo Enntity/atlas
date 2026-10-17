@@ -113,6 +113,9 @@ pub struct NcclBackend {
     registered_handles: Mutex<Vec<*mut c_void>>,
     /// Kernel handle for bf16_add_inplace (set via set_add_kernel).
     add_kernel: AtomicU64,
+    /// `atlas_flag_store_release` / `bf16_add_inplace_wait` (ATLAS_RDMA_KERNEL_FLAGS=1).
+    flag_store_kernel: AtomicU64,
+    add_wait_kernel: AtomicU64,
     /// Whether the communicator is in a degraded/unhealthy state.
     unhealthy: AtomicBool,
     /// Number of successful reconnections (for diagnostics).
@@ -229,6 +232,8 @@ impl NcclBackend {
             recv_capacity: if world_size == 2 { recv_capacity } else { 0 },
             registered_handles: Mutex::new(Vec::new()),
             add_kernel: AtomicU64::new(0),
+            flag_store_kernel: AtomicU64::new(0),
+            add_wait_kernel: AtomicU64::new(0),
             unhealthy: AtomicBool::new(false),
             reconnect_count: AtomicU64::new(0),
             master_addr: master_addr.to_owned(),

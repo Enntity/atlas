@@ -183,6 +183,12 @@ impl ExpertIndex {
     /// tier. Validates the format version.
     #[cfg(unix)]
     pub fn load(dir: &std::path::Path) -> Result<Self> {
+        let load_interval: u64 = std::env::var("ATLAS_LOAD_LOG_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let progress = atlas_core::load_progress::LoadProgress::new(0, load_interval);
+        progress.update(0, "expert_index_start");
         let p = dir.join(Self::MANIFEST_NAME);
         let json = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
         let index: ExpertIndex =
@@ -194,6 +200,8 @@ impl ExpertIndex {
                 ExpertRecordHeader::VERSION
             );
         }
+        progress.update(0, "expert_index_done");
+        drop(progress);
         Ok(index)
     }
 

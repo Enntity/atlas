@@ -29,21 +29,10 @@ impl From<crate::ir::ChatResponse> for MessagesResponse {
                     input: tc.arguments,
                 });
             }
-            stop_reason = match c.finish_reason {
-                // A client stop sequence gets its dedicated reason + echo.
-                crate::ir::FinishReason::Stop if c.matched_stop.is_some() => "stop_sequence",
-                crate::ir::FinishReason::Stop => "end_turn",
-                crate::ir::FinishReason::ToolCalls => "tool_use",
-                crate::ir::FinishReason::Length => "max_tokens",
-                // Safety-filtered output maps to Anthropic's dedicated
-                // refusal stop reason (2025-05 API), not a normal end_turn.
-                crate::ir::FinishReason::ContentFilter => "refusal",
-                // Not an Anthropic stop reason on purpose: an engine abort
-                // must not read as end_turn (the truncation this exists for).
-                crate::ir::FinishReason::Error => "error",
-                crate::ir::FinishReason::Other(_) => "end_turn",
-            };
-            stop_sequence = c.matched_stop;
+            // Shared with the streaming translator: `stop_sequence` is
+            // echoed only on a Stop finish (never alongside tool_use).
+            (stop_reason, stop_sequence) =
+                super::helpers::anthropic_stop(&c.finish_reason, c.matched_stop);
         }
 
         MessagesResponse {

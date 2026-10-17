@@ -39,7 +39,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.mla_dense_gemv(
                     ctx.gpu,
                     self.dense_gemv_k,
                     attn_out,
@@ -51,7 +51,7 @@ impl Qwen3AttentionLayer {
                 )?;
             }
         } else if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
-            ops::dense_gemv(
+            self.mla_dense_gemv(
                 ctx.gpu,
                 self.dense_gemv_k,
                 attn_out,

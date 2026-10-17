@@ -7,6 +7,9 @@ use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
+#[path = "exl3_kda_tests.rs"]
+mod native_exl3;
+
 fn with_kda(rank: usize, run: impl FnOnce(&Gpu, &atlas_core::config::ModelConfig, &Glm5KdaLayer)) {
     with_kda_ffn(rank, false, run);
 }
@@ -46,7 +49,7 @@ fn with_kda_ffn(
     let dense = |bytes| DenseWeight {
         weight: gpu.alloc(bytes).unwrap(),
     };
-    let projection = || Glm5Projection {
+    let projection = || Glm5Projection::Nvfp4 {
         nvfp4: QuantizedWeight {
             weight: gpu.alloc(4096 * 4096 / 2).unwrap(),
             weight_scale: gpu.alloc(4096 * 4096 / 16).unwrap(),
@@ -96,6 +99,9 @@ fn with_kda_ffn(
         0,
         &config,
         &gpu,
+        None,
+        None,
+        None,
     )
     .unwrap();
     run(&gpu, &config, &layer);

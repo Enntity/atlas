@@ -387,6 +387,7 @@ impl TransformerModel {
             // an adapter is resident (presence gate, like forward_k2/k3).
             // Base (Skip) batches still pay nothing.
             moe_lora_route: self.decode_moe_route(),
+            request_id: crate::traits::single_request_id(seqs),
             derived: &self.derived,
             levers: &self.levers,
             stats: &self.stats,

@@ -94,6 +94,11 @@ pub enum InferenceRequest {
         prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
+        /// Server request id (`x-request-id`, `main_modules/middleware.rs`;
+        /// client-supplied or generated) resolved at request admission. Carried
+        /// onto `SequenceState.request_id` and every `ForwardContext` of the
+        /// request (assumption A8).
+        request_id: String,
         /// M2 per-request LoRA routing: adapter pool SLOT this request applies
         /// (`-1` = defer to installed active; byte-identical to today). Set from
         /// the resolved `adapter` field; carried onto `SequenceState.adapter_slot`.
@@ -199,6 +204,10 @@ pub enum InferenceRequest {
         echo: bool,
         /// Request timeout as absolute deadline. None = no timeout.
         timeout_at: Option<std::time::Instant>,
+        /// Client stop STRINGS watched scheduler-side so a blocking request
+        /// stops generating once one appears (streaming requests do this in
+        /// the API layer via `cancel_flag`). `None` = no stop strings.
+        stop_watch: Option<crate::api::stop_match::StopStringWatch>,
         response_tx: tokio::sync::oneshot::Sender<anyhow::Result<InferenceResponse>>,
     },
     /// Streaming: sends tokens as they're generated.
@@ -210,6 +219,8 @@ pub enum InferenceRequest {
         prompt_tokens: std::sync::Arc<Vec<u32>>,
         /// Session hash for SSM snapshot isolation (hash of first 64 prompt tokens).
         session_hash: u64,
+        /// Server request id resolved at admission. See the Blocking variant.
+        request_id: String,
         /// M2 per-request LoRA routing: adapter pool SLOT (`-1` = defer to
         /// installed active). See the Blocking variant.
         adapter_slot: i32,
@@ -329,6 +340,12 @@ pub struct TokenLogprobs {
 pub struct InferenceResponse {
     pub output_tokens: Vec<u32>,
     pub finish_reason: String,
+    /// The EOS-set token that ended the sequence (model EOS or a
+    /// single-token client stop), which is then the LAST entry of
+    /// `output_tokens` and not visible text. `None` when the sequence
+    /// ended any other way — notably a client stop-STRING finish, whose
+    /// last token is ordinary text that must not be dropped.
+    pub stop_token_id: Option<u32>,
     pub time_to_first_token_ms: f64,
     pub decode_time_ms: f64,
     /// Per-token logprobs (populated when top_logprobs is requested).
@@ -379,6 +396,10 @@ pub enum StreamEvent {
         /// "fuzzy_repetition"), if any — dump/observability only, never
         /// part of the OpenAI wire format.
         guard_stop: Option<&'static str>,
+        /// See [`InferenceResponse::stop_token_id`]. Streaming never sends
+        /// this token as a `Token` event, so it is the only way the API
+        /// layer learns WHICH single-token client stop ended the turn.
+        stop_token_id: Option<u32>,
     },
     Error(String),
 }

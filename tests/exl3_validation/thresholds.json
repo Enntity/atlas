@@ -1,0 +1,8 @@
+{
+  "abs": 0.15,
+  "rel": 0.02,
+  "kl": 0.005,
+  "cross_entropy": 0.15,
+  "top_k": 10,
+  "argmax": "exact"
+}

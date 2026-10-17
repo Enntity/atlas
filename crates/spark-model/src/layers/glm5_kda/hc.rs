@@ -7,6 +7,7 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::Glm5KdaLayer;
 use crate::layer::ForwardContext;
+use crate::layers::glm5_exl3_mhc::MhcResidualPrecision;
 use crate::layers::ops;
 use crate::layers::qwen3_attention::HcSiteWeights;
 
@@ -22,6 +23,51 @@ fn fast_prefill(tokens: u32) -> bool {
 }
 
 impl Glm5KdaLayer {
+    pub(super) fn exl3_hc_norm(
+        &self,
+        site: &HcSiteWeights,
+        norm_weight: DevicePtr,
+        normed: DevicePtr,
+        rows: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(native) = &self.native_mhc else {
+            return Ok(false);
+        };
+        use crate::layers::glm5_exl3_mhc::NativeMhcBuffers;
+        native.pre_norm(
+            ctx.gpu,
+            site,
+            norm_weight,
+            NativeMhcBuffers {
+                highway: ctx.buffers.hc_streams(),
+                normed,
+                post: ctx.buffers.hc_post(),
+                comb: ctx.buffers.hc_comb(),
+            },
+            rows as usize,
+            self.mhc_residual_precision(site, rows),
+            stream,
+        )?;
+        Ok(true)
+    }
+
+    /// SSOT for the mHC residual-precision path selection
+    /// (docs/plans/l1-escalation-tooling-spec.md B10): the upstream capture
+    /// binding records exactly what `pre_norm` receives here.
+    pub(super) fn mhc_residual_precision(
+        &self,
+        site: &HcSiteWeights,
+        rows: u32,
+    ) -> MhcResidualPrecision {
+        if self.layer_idx == 0 && std::ptr::eq(site, &self.hc.attn) {
+            MhcResidualPrecision::Rounded
+        } else {
+            MhcResidualPrecision::for_fused_rows(rows as usize)
+        }
+    }
+
     pub(super) fn hc_pre(
         &self,
         site: &HcSiteWeights,
@@ -109,6 +155,18 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(native) = &self.native_mhc {
+            return native.post(
+                ctx.gpu,
+                block_out,
+                ctx.buffers.hc_streams(),
+                ctx.buffers.hc_post(),
+                ctx.buffers.hc_comb(),
+                ctx.buffers.hc_streams(),
+                tokens as usize,
+                stream,
+            );
+        }
         ops::hc_post(
             ctx.gpu,
             self.hc_post_k,

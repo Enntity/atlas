@@ -234,6 +234,7 @@ impl TransformerModel {
             routed_lora_layers: None, // #30: decode/verify never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
+            request_id: seq.request_id.clone(),
         };
 
         // ── Phase 2: CUDA graph capture / replay ──

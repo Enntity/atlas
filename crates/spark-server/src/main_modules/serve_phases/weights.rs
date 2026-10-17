@@ -50,6 +50,17 @@ pub(crate) fn load_weight_store(
     oom_reserve_bytes: usize,
 ) -> Result<spark_runtime::weights::WeightStore> {
     use spark_runtime::weights::WeightLoader;
+    if config
+        .quantization_config
+        .as_ref()
+        .is_some_and(|q| q.quant_method == "exl3")
+    {
+        anyhow::ensure!(
+            ep_size == 1 && !args.speculative && !args.dflash && !args.self_speculative,
+            "EXL3 validation requires EP=1 and speculative decoding disabled"
+        );
+        return super::exl3::load(config, model_dir, gpu, oom_reserve_bytes);
+    }
     let mult = quant_multiplier(config);
     let glm_mtp_distributed = spark_model::speculative::glm_repair_policy::mtp_distributed();
     let unused_mtp_prefix = unused_glm_mtp_prefix(config, args.speculative);

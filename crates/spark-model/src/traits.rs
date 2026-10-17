@@ -113,6 +113,11 @@ pub struct SequenceState {
     /// prefill. The model uses this to tag saved snapshots and verify ownership
     /// before restoring. 0 = no session tracking (legacy behavior).
     pub session_hash: u64,
+    /// Server request id (`x-request-id`) for the request owning this
+    /// sequence. Set by the scheduler at admission and carried onto every
+    /// `ForwardContext` of the request's forward passes (assumption A8).
+    /// `None` for host-only/test states and requests with no owning id.
+    pub request_id: Option<std::sync::Arc<str>>,
     /// Ownership stamp for the SINGLE-SLOT whole-prompt hidden capture
     /// (`mtp_prefill_hidden`). Written by `try_mtp_prefill_capture` when THIS
     /// sequence's chunk 0 (re)starts the capture, with the model's monotonic
@@ -290,6 +295,18 @@ pub struct SequenceState {
     pub early_stopping: bool,
 }
 
+/// Request binding for a batched `ForwardContext`: exactly ONE owning
+/// request can be bound. A mixed batch has no single id and stays unbound
+/// (same reasoning as `MoeLoraRoute::Refuse` on packed prefill) — the C2
+/// norm-substitution knob then errors on the pass instead of guessing
+/// (assumption A8, `layer::ForwardContext::request_id`).
+pub fn single_request_id(seqs: &[&mut SequenceState]) -> Option<std::sync::Arc<str>> {
+    match seqs {
+        [seq] => seq.request_id.clone(),
+        _ => None,
+    }
+}
+
 impl SequenceState {
     /// A detached, host-only sequence state: no GPU resources, no SSM
     /// slot, no layer states, every counter zeroed. The single source
@@ -313,6 +330,7 @@ impl SequenceState {
             marconi_skip_to: 0,
             marconi_exact_snap: None,
             session_hash: 0,
+            request_id: None,
             mtp_capture_gen: 0,
             dspark_owner: None,
             adapter_id: 0,

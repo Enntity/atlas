@@ -39,6 +39,15 @@ pub use dflash_loader::{
 };
 pub use gemma4::Gemma4WeightLoader;
 pub use glm5::Glm5WeightLoader;
+pub use glm5::exl3::Exl3ProjectionSpec;
+pub use glm5::exl3_ffn::{Exl3FfnActivation, Exl3FfnBuffers, Glm5Exl3Ffn};
+pub use glm5::exl3_kda_loader::{
+    Exl3KdaDenseSlot, Glm5Exl3KdaDenseResources, Glm5Exl3KdaResources,
+};
+pub use glm5::exl3_numerics::{
+    GLM53_PACKED_PROFILE_CACHE_SHA256, GLM53_TP2_HEAD_BITS, glm53_tp2_packed_numerics,
+};
+pub use glm5::exl3_projection::{Exl3OutputSemantics, Glm5Exl3Projection};
 pub use laguna::LagunaWeightLoader;
 pub use longcat::LongcatWeightLoader;
 pub use minimax::MinimaxM2WeightLoader;
@@ -202,6 +211,18 @@ pub trait ModelWeightLoader {
     ///
     /// See `weight_loader/minimax.rs` for the reference implementation.
     fn supports_tp(&self) -> bool;
+
+    /// Whether this loader's [`Self::load_layers`] engages the C2
+    /// norm-substitution knob (calls `NormSubstitution::from_env` — today only
+    /// `weight_loader/glm5/{exl3_layers,layers}.rs` do). Consulted by
+    /// `factory::refuse_unengaged_norm_substitution` so a model load that
+    /// cannot honour `ATLAS_EXL3_NORM_SUBSTITUTE_DIR` aborts loudly instead
+    /// of silently ignoring it. Default `false`; a loader that engages the
+    /// knob must override or the factory refuses its load while the knob is
+    /// set.
+    fn engages_norm_substitution(&self) -> bool {
+        false
+    }
 
     /// Load all transformer layers from the weight store.
     ///

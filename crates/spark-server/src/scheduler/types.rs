@@ -47,7 +47,13 @@ pub(super) struct VisionSlice {
 
 /// How to deliver results for an active sequence.
 pub(super) enum ResponseSink {
-    Blocking(Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>),
+    Blocking {
+        tx: Option<tokio::sync::oneshot::Sender<Result<InferenceResponse>>>,
+        /// Client stop-string watch (see `emit_step::retire_if_cancelled`).
+        /// Rides on the sink so it follows the sequence through prefill
+        /// promotion, preemption and swap without extra plumbing.
+        stop_watch: Option<crate::api::stop_match::StopStringWatch>,
+    },
     Streaming(tokio::sync::mpsc::Sender<StreamEvent>),
 }
 
@@ -61,8 +67,8 @@ impl ResponseSink {
         match self {
             // `None` means the sender was already taken by lifecycle teardown;
             // that path owns cleanup, so do not treat it as live.
-            ResponseSink::Blocking(Some(tx)) => tx.is_closed(),
-            ResponseSink::Blocking(None) | ResponseSink::Streaming(_) => false,
+            ResponseSink::Blocking { tx: Some(tx), .. } => tx.is_closed(),
+            ResponseSink::Blocking { tx: None, .. } | ResponseSink::Streaming(_) => false,
         }
     }
 }
@@ -426,7 +432,12 @@ pub(super) struct ActiveSeq {
     pub request_start: Instant,
     /// Decode start time (set after prefill completes, for decode throughput).
     pub decode_start: Instant,
-    /// Seed for deterministic sampling.
+    /// Seed for deterministic sampling: the RNG base for decode draws
+    /// (`sample_step::rng_step_seed(seed, output_tokens.len())`). Equals the
+    /// request seed, or request seed + 1 when a sequence admitted to decode
+    /// did not record its sampled first token in `output_tokens` (see
+    /// `sample_step::decode_rng_base`; finished-at-admission sequences never
+    /// draw again and keep the raw seed).
     pub seed: Option<u64>,
     /// Number of top logprobs to return per token. None = disabled.
     pub top_logprobs: Option<u8>,
@@ -541,6 +552,9 @@ pub(super) fn consume_budget(remaining: &mut usize) -> bool {
 pub(super) struct SwappedSeq {
     pub tokens: Vec<u32>,
     pub session_hash: u64,
+    /// Server request id preserved across spill/restore (assumption A8): a
+    /// swapped-then-resumed sequence must keep its `ForwardContext` binding.
+    pub request_id: Option<std::sync::Arc<str>>,
     /// M2 per-request LoRA routing: preserved across spill/restore so a
     /// swapped-then-resumed sequence keeps its adapter (unlike `cancel_flag`,
     /// which is intentionally dropped). CPU metadata, restored like `tokens`.

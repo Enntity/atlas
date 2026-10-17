@@ -99,6 +99,7 @@ fn qkv_phase_d2d(
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+        request_id: None,
     };
     let positions = vec![1; n];
     let c = MultiSeqCtx::new(

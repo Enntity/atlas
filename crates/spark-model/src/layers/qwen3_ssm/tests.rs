@@ -165,6 +165,7 @@ fn run_batched_verify(
         // paths (they bail via `reject_decode_lora` before the fold) — same
         // convention as `layer/tests.rs`.
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+        request_id: None,
     };
     let kv_config = spark_runtime::kv_cache::KvCacheConfig {
         block_size: 16,
@@ -377,6 +378,7 @@ fn active_row_without_ple_carry_is_refused() {
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+        request_id: None,
     };
     let err = layer
         .decode_multi_seq_inner_hc(
@@ -549,6 +551,7 @@ fn single_verify_k4_d2d(
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
+        request_id: None,
     };
     let kv_config = spark_runtime::kv_cache::KvCacheConfig {
         block_size: 16,

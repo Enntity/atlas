@@ -235,6 +235,15 @@ impl InferenceRequest {
         }
     }
 
+    /// Server request id (`x-request-id`) resolved at request admission.
+    /// Copied onto `SequenceState.request_id` at prefill (assumption A8).
+    pub fn request_id(&self) -> &str {
+        match self {
+            InferenceRequest::Blocking { request_id, .. } => request_id,
+            InferenceRequest::Streaming { request_id, .. } => request_id,
+        }
+    }
+
     /// M2 per-request LoRA routing: the adapter pool slot this request selects
     /// (`-1` = defer to installed active). Copied onto `SequenceState.adapter_slot`
     /// by the scheduler at prefill; the batched decode routes the bgmv on it.
@@ -452,27 +461,53 @@ pub(crate) fn tokenize_stop_sequences(
     tokenizer: &crate::tokenizer::ChatTokenizer,
     stops: &[String],
 ) -> Vec<u32> {
-    let mut tokens = Vec::new();
+    let mut tokens: Vec<u32> = encode_single_token_stops(tokenizer, stops, true)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+/// `(token id, original stop string)` for every client stop that encodes to
+/// exactly one token, in request order. Those ids are merged into the
+/// scheduler's EOS set, so a hit never reaches the text matchers; the map lets
+/// the API layer report WHICH stop string ended the turn
+/// (`stop_match::stop_string_for_token`).
+pub(crate) fn single_token_stop_map(
+    tokenizer: &crate::tokenizer::ChatTokenizer,
+    stops: &[String],
+) -> Vec<(u32, String)> {
+    // Quiet: `tokenize_stop_sequences` already logged this request's stops.
+    encode_single_token_stops(tokenizer, stops, false)
+}
+
+fn encode_single_token_stops(
+    tokenizer: &crate::tokenizer::ChatTokenizer,
+    stops: &[String],
+    log: bool,
+) -> Vec<(u32, String)> {
+    let mut map = Vec::new();
     for s in stops {
         match tokenizer.encode(s) {
-            Ok(ids) if ids.len() == 1 => tokens.push(ids[0]),
-            Ok(ids) if ids.len() > 1 => {
+            Ok(ids) if ids.len() == 1 => map.push((ids[0], s.clone())),
+            Ok(ids) if ids.len() > 1 && log => {
                 tracing::info!(
                     "Multi-token stop '{}' ({} tokens) — use string matching",
                     s,
                     ids.len()
                 );
             }
-            Ok(_) => {} // Empty encoding
-            Err(e) => tracing::warn!("Failed to tokenize stop '{}': {e}", s),
+            Ok(_) => {} // Empty encoding (or multi-token, quiet)
+            Err(e) if log => tracing::warn!("Failed to tokenize stop '{}': {e}", s),
+            Err(_) => {}
         }
     }
-    tokens.sort_unstable();
-    tokens.dedup();
-    tokens
+    map
 }
 
-/// Strip any matching stop sequence from the end of the output text.
+/// Truncate the output text at the earliest client stop string.
 /// Per OpenAI spec, returned text must not contain the stop sequence.
 pub(crate) fn strip_stop_sequences(text: String, stops: &[String]) -> String {
     strip_stop_sequences_matched(text, stops).0
@@ -481,23 +516,24 @@ pub(crate) fn strip_stop_sequences(text: String, stops: &[String]) -> String {
 /// [`strip_stop_sequences`], also reporting WHICH stop sequence matched
 /// (feeds Anthropic's `stop_sequence` response field via the IR's
 /// `matched_stop`).
+///
+/// Searches the WHOLE text, not just its end: a blocking request stops
+/// generating only at the next scheduler checkpoint after the stop string
+/// appears (`stop_match::StopStringWatch`), so tokens can follow it, and a
+/// request that hit EOS / `max_tokens` may contain it mid-text. Same matcher
+/// as the streaming hold-back ([`super::stop_match::find_stop_string`]).
 pub(crate) fn strip_stop_sequences_matched(
     mut text: String,
     stops: &[String],
 ) -> (String, Option<String>) {
-    // Try longest-first so overlapping prefixes (`["</answer", "</answer>"]`)
-    // don't truncate at the shorter (wrong) match boundary. strip_suffix
-    // is end-anchored, so usually only one of the two end-matches at a
-    // time, but defensive ordering handles the cases where it doesn't.
-    let mut sorted: Vec<&String> = stops.iter().collect();
-    sorted.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    for s in sorted {
-        if let Some(stripped) = text.strip_suffix(s.as_str()) {
-            text.truncate(stripped.len());
-            return (text, Some(s.clone()));
+    match super::stop_match::find_stop_string(&text, 0, stops) {
+        Some((start, stop)) => {
+            let stop = stop.to_string();
+            text.truncate(start);
+            (text, Some(stop))
         }
+        None => (text, None),
     }
-    (text, None)
 }
 
 /// Strip `<think>...</think>` reasoning content from model output.
@@ -523,5 +559,42 @@ pub(crate) fn extract_thinking(
         p.extract_thinking(text, enable_thinking)
     } else {
         (None, text.to_string())
+    }
+}
+
+#[cfg(test)]
+mod strip_stop_tests {
+    use super::strip_stop_sequences_matched;
+
+    fn stops(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The old suffix-only strip returned this text unchanged: a blocking
+    /// response that ran past its stop leaked the stop and everything after.
+    #[test]
+    fn truncates_at_mid_text_stop() {
+        let (text, matched) = strip_stop_sequences_matched(
+            "a Observation: more text".into(),
+            &stops(&["Observation:"]),
+        );
+        assert_eq!(text, "a ");
+        assert_eq!(matched.as_deref(), Some("Observation:"));
+    }
+
+    /// Earliest-completing stop wins across several (vLLM check_stop_strings).
+    #[test]
+    fn earliest_match_across_multiple_stops() {
+        let (text, matched) =
+            strip_stop_sequences_matched("x END y STOP".into(), &stops(&["STOP", "END"]));
+        assert_eq!(text, "x ");
+        assert_eq!(matched.as_deref(), Some("END"));
+    }
+
+    #[test]
+    fn no_match_leaves_text_alone() {
+        let (text, matched) = strip_stop_sequences_matched("plain".into(), &stops(&["zz"]));
+        assert_eq!(text, "plain");
+        assert_eq!(matched, None);
     }
 }

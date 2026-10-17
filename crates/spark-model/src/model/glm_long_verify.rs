@@ -328,6 +328,7 @@ impl TransformerModel {
             routed_lora_layers: None,
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(),
+            request_id: crate::traits::single_request_id(seqs),
         };
         let save_slots = self
             .dflash_hidden_save

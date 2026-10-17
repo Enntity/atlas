@@ -50,7 +50,12 @@ impl Qwen3AttentionLayer {
         let meta = ctx
             .attn_metadata
             .expect("GLM paged prefill requires metadata");
-        let owners = glm_chunk_pieces(meta, seq_len_start, args.num_tokens, ctx.config.index_topk);
+        let owners = glm_chunk_pieces(
+            meta,
+            seq_len_start,
+            args.num_tokens,
+            self.glm_index_budget(ctx.config)?.dense_threshold() as usize,
+        );
         let floor = owner::honoured_write_floor(kv_write_floor);
         self.glm_chunk_attention(&owners, kv_cache, ctx, args, floor)
     }
@@ -151,15 +156,17 @@ impl Qwen3AttentionLayer {
             ctx,
             stream,
         )?;
+        let dense_threshold = self.glm_index_budget(ctx.config)?.dense_threshold() as usize;
         for o in owners {
             let on = o.rows as u32;
             let octx = ForwardContext {
+                request_id: ctx.request_id.clone(),
                 attn_metadata: Some(o.meta),
                 midchunk_capture: None,
                 ..*ctx
             };
             let sequence_end = o.end()?;
-            let use_dense = o.dense_is_exact(ctx.config.index_topk);
+            let use_dense = o.dense_is_exact(dense_threshold);
             let o_normed = normed.offset(o.row0 * h as usize * bf16);
             let o_latent = q_latent.offset(o.row0 * q_lora as usize * bf16);
             let rows_of = |base: DevicePtr, row_bytes: usize| base.offset(o.row0 * row_bytes);
@@ -290,7 +297,7 @@ impl Qwen3AttentionLayer {
                 if !accelerated {
                     ensure!(
                         cache_dtype == KvCacheDtype::Bf16,
-                        "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1"
+                        "fp8_g128 GLM sparse attention requires ATLAS_GLM_SPARSE_PREFILL_TC=1 and ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1"
                     );
                     ops::glm_sparse_mla_prefill(
                         ctx.gpu,

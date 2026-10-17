@@ -1,0 +1,123 @@
+{
+  "endpoint": "http://127.0.0.1:8000",
+  "model": "MikeRoz/GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3",
+  "utc": "2026-10-10T19:17:26Z",
+  "results": [
+    {
+      "name": "short-greedy",
+      "text": "The capital of France is Paris.",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 24,
+        "completion_tokens": 9,
+        "total_tokens": 33,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 2038.3532679999998,
+        "response_token/s": 2.191757109507809
+      },
+      "wall_s": 5.71
+    },
+    {
+      "name": "long-generation",
+      "text": "# TCP Congestion Control: A Systems Engineer's Overview\n\nTCP congestion control prevents a sender from overwhelming both the network and the receiver. While flow control (via the receive window) protects the receiver, congestion control protects the network itself\u2014routers with finite buffers that drop packets when queues overflow. The core mechanism is the **congestion window (cwnd)**, a sender-side limit on unacknowledged bytes in flight. The effective send rate is bounded by the minimum of cwnd and the receiver's advertised window.\n\n## Slow Start\n\nWhen a connection begins, cwnd starts small (typically 10 segments per modern `initcwnd`). During slow start, cwnd grows **exponentially**: for each ACK received, cwnd increases by one segment, roughly doubling the window every round-trip time (RTT). This continues until cwnd reaches the **slow start threshold (ssthresh)**, at which point the sender transitions to congestion avoidance. Slow start also exits early if loss is detected.\n\n## Congestion Avoidance\n\nTo avoid inducing loss, growth becomes **linear** (additive increase): cwnd grows by roughly one segment per RTT, implemented as one MSS per ACK received (AIMD\u2014Additive Increase, Multiplicative Decrease). This probing behavior is deliberately conservative: the sender continuously tests for available bandwidth while backing off sharply when congestion appears.\n\n## Responding to Loss\n\nTCP infers congestion from packet loss, detected two ways:\n\n- **Triple duplicate ACKs** (fast retransmit): The sender retransmits the missing segment immediately and performs **fast recovery**\u2014ssthresh is set to half the current cwnd, cwnd drops to that value (multiplicative decrease), and the sender continues transmitting without returning to slow start. NewReno refines this to handle multiple losses in one window; CUBIC, the default on Linux, replaces the linear growth with a cubic function of time since the last congestion event, recovering window size faster after a drop.\n- **Retransmission timeout (RTO)**: The more severe signal. ssthresh is halved, cwnd resets to a few segments (or one), and slow start restarts.\n\n## Modern Refinements\n\n**ECN (Explicit Congestion Notification)** allows routers to mark packets instead of dropping them, letting senders react before loss occurs (DCTCP in data centers leverages this heavily). **BBR**, developed at Google, abandons loss-based inference entirely, instead estimating bottleneck bandwidth and minimum RTT to keep the amount of data in flight near the bandwidth-delay product\u2014avoiding bufferbloat in deep-buffered paths.\n\n## Practical Implications\n\nFor systems work, remember: throughput is capped by cwnd/RTT, so high-latency links need large windows; loss on wireless links can be misinterpreted as congestion; and tuning `initcwnd`, buffers, and congestion-control algorithms (via `sysctl` and `setsockopt`) can dramatically affect application performance.",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 32,
+        "completion_tokens": 612,
+        "total_tokens": 644,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 1875.4748789999999,
+        "response_token/s": 2.1834909331688244
+      },
+      "wall_s": 281.7
+    },
+    {
+      "name": "multi-turn-first",
+      "text": "Nice to meet you, Dana! I'll remember that you're a beekeeper. Feel free to ask me anything about your hives, honey harvests, or anything else bee-related \u2014 or anything else entirely.",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 24,
+        "completion_tokens": 49,
+        "total_tokens": 73,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 3,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 1473.103864,
+        "response_token/s": 2.2096135923600877
+      },
+      "wall_s": 23.2
+    },
+    {
+      "name": "multi-turn-followup",
+      "text": "Your name is Dana, and you keep bees.",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 86,
+        "completion_tokens": 14,
+        "total_tokens": 100,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 4706.318775,
+        "response_token/s": 2.21123974848097
+      },
+      "wall_s": 10.59
+    },
+    {
+      "name": "sampled",
+      "text": "Why don't scientists trust atoms?\n\nBecause they make up everything!",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 23,
+        "completion_tokens": 15,
+        "total_tokens": 38,
+        "prompt_tokens_details": {
+          "cached_tokens": 0,
+          "audio_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0,
+          "audio_tokens": 0,
+          "accepted_prediction_tokens": 0,
+          "rejected_prediction_tokens": 0
+        },
+        "time_to_first_token_ms": 1465.345652,
+        "response_token/s": 2.215600790238967
+      },
+      "wall_s": 7.79
+    }
+  ],
+  "failures": []
+}

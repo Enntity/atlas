@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(super) mod bootstrap;
 pub(super) mod cmd_ring;
+mod kernel_flags;
 mod oneshot;
 mod proxy;
 use cmd_ring::CmdRing;

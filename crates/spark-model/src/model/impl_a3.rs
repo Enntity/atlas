@@ -341,6 +341,10 @@ impl TransformerModel {
     }
 
     pub(super) fn lm_head(&self, hidden: DevicePtr, stream: u64) -> Result<DevicePtr> {
+        let bf16_logits = self.buffers.logits();
+        if self.project_exl3_vocab(hidden, bf16_logits, 1, stream)? {
+            return Ok(bf16_logits);
+        }
         let h = self.config.hidden_size as u32;
         let v = self.config.vocab_size as u32;
         // Pick the output buffer: FP32 scratch when use_fp32_logits is on,

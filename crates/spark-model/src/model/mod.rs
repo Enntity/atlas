@@ -31,6 +31,9 @@ pub(crate) mod drafter_context;
 pub(crate) mod drop;
 pub mod glm_c4;
 pub(crate) mod glm_cache_plan;
+pub mod glm_exl3_head;
+#[cfg(test)]
+mod glm_exl3_teardown_tests;
 mod glm_fused_chunk;
 pub mod glm_independent;
 pub(crate) mod glm_k3_head;
@@ -77,6 +80,7 @@ pub(crate) mod qwen4exp_batch_fast;
 pub(crate) mod qwen4exp_exact_verify;
 pub(crate) mod qwen4exp_lmhead_split;
 pub(crate) mod qwen4exp_mtp_depth;
+mod request_identity;
 pub(crate) mod ssm_batched_copy;
 pub(crate) mod ssm_indexed_decode;
 pub(crate) mod ssm_pool;

@@ -9,9 +9,9 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle, mock::MockGpuBacke
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 use std::{collections::VecDeque, sync::Arc};
 
-pub(super) const STREAM: u64 = 7;
+pub(in crate::model) const STREAM: u64 = 7;
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Event {
+pub(in crate::model) enum Event {
     Idle(u64),
     Timed(u64, usize, usize),
     Sync(u64),
@@ -23,7 +23,7 @@ pub(super) enum Event {
     HostRecv(usize),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Failure {
+pub(in crate::model) enum Failure {
     Idle,
     Timed,
     Sync,
@@ -31,7 +31,7 @@ pub(super) enum Failure {
     Host,
 }
 #[derive(Default)]
-pub(super) struct Record {
+pub(in crate::model) struct Record {
     pub events: Mutex<Vec<Event>>,
     pub words: Mutex<VecDeque<u32>>,
     pub failure: Mutex<Option<Failure>>,
@@ -207,7 +207,7 @@ impl CommBackend for Comm {
     }
 }
 
-pub(super) struct Fixture {
+pub(in crate::model) struct Fixture {
     pub model: TransformerModel,
     pub record: Arc<Record>,
     pub gpu: Arc<MockGpuBackend>,
@@ -242,7 +242,7 @@ impl Fixture {
         cfg.ep_rank = rank;
         cfg.adapter_max_rank = 0;
         let buffers =
-            spark_runtime::buffers::BufferArena::new(&cfg, 8, 32, 16, 1, gpu.as_ref()).unwrap();
+            spark_runtime::buffers::BufferArena::new(&cfg, 8, 32, 16, 2, gpu.as_ref()).unwrap();
         let kv = PagedKvCache::new(
             KvCacheConfig {
                 block_size: 16,
@@ -268,7 +268,7 @@ impl Fixture {
         });
         let ssm_pools = crate::model::ssm_pools::SsmPools::new(
             &cfg,
-            1,
+            2,
             false,
             false,
             true,
@@ -292,7 +292,7 @@ impl Fixture {
             vec![],
             gpu,
             32,
-            1,
+            2,
             crate::layers::MtpQuantization::Bf16,
             false,
             Box::new(spark_runtime::prefix_cache::NoPrefixCaching),

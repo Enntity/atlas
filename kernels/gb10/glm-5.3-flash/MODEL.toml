@@ -1,3 +1,6 @@
+# Quant variants: nvfp4/ (hf_id below) and exl3/, which composes on nvfp4/
+# for native EXL3 checkpoints (e.g. MikeRoz/GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3).
+# Both share this file; serve picks the variant from the checkpoint's quant.
 [model]
 name = "glm-5.3-flash"
 hf_id = "nvidia/GLM-5.3-Flash-NVFP4"

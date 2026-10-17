@@ -236,6 +236,9 @@ impl From<MessagesRequest> for ir::ChatRequest {
             min_tokens: 0,
             ignore_eos: false,
             stop: req.stop_sequences,
+            // Anthropic Messages has no stop-token-id channel.
+            stop_token_ids: Vec::new(),
+            include_stop_str_in_output: false,
             stream: req.stream,
             n: 1,
             response_format: None,

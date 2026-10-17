@@ -57,6 +57,7 @@ impl Glm5KdaLayer {
         rows: usize,
         ctx: &ForwardContext,
     ) -> Result<Option<IndexedCore>> {
+        self.ensure_policy_off("indexed")?;
         let Some((shape, layer)) = select(
             ctx.ssm_batch,
             self.ssm_ordinal,

@@ -178,6 +178,22 @@ __device__ __forceinline__ void glm_kv_pad_body(
     float l_r0 = 0.f,    l_r1 = 0.f;
 
     unsigned int num_kv_blocks = (kv_len - kv_begin + BC_512 - 1) / BC_512;
+    if constexpr (!SPLIT) {
+        // Skip trailing tiles whose selected IDs are all -1 (dense short-context
+        // decode pads to index_width). Such a tile is a no-op for the online
+        // softmax (max unchanged, p == 0, masked K/V zero-filled), so stopping
+        // after the tile holding the last valid ID is bit-identical.
+        __shared__ int smem_last_valid;
+        if (tid == 0) smem_last_valid = -1;
+        __syncthreads();
+        int last_valid = -1;
+        for (unsigned int i = kv_begin + tid; i < kv_len; i += blockDim.x)
+            if (indices[i] >= 0) last_valid = static_cast<int>(i);
+        if (last_valid >= 0) atomicMax(&smem_last_valid, last_valid);
+        __syncthreads();
+        if (smem_last_valid >= 0)
+            num_kv_blocks = (static_cast<unsigned int>(smem_last_valid) + 1u - kv_begin + BC_512 - 1) / BC_512;
+    }
 
     // === Initial Q + K[0] load (256 threads) ===
     {

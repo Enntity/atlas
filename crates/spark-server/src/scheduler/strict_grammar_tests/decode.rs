@@ -43,6 +43,7 @@ fn first(gs: Option<&mut GrammarState>, suppress: &[u32]) -> anyhow::Result<u32>
         1.0,
         0.0,
         suppress,
+        None,
         gs,
         &levers,
     )

@@ -18,7 +18,12 @@ mod decode;
 // V4: `pub(crate)` so the DeepSeek-V4 weight loader (`weight_loader::deepseek_v4`)
 // and the V4 attention submodules can call `helpers::yarn_rope_mscale`. Non-V4
 // code paths are unaffected by the wider visibility.
+mod exl3_mhc_dispatch;
+mod exl3_mla;
+pub(crate) mod exl3_mla_trace;
+mod glm_index_budget;
 mod glm_index_capacity;
+pub(crate) use glm_index_budget::GlmIndexBudget;
 pub(crate) mod glm_k3_mla_o;
 mod glm_long_context;
 mod glm_sparse_graphs_policy;
@@ -182,3 +187,6 @@ mod split_ref_seqs_tests {
         assert_ne!(split_ref_seqs(1, 4), split_ref_seqs(1, 16));
     }
 }
+
+#[cfg(test)]
+mod exl3_mla_tests;

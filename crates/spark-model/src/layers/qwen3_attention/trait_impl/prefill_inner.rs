@@ -645,7 +645,9 @@ impl Qwen3AttentionLayer {
         }
 
         let normed = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if self.exl3_hc_norm(&hc.attn, self.input_norm.weight, normed, n, ctx, stream)? {
+            // The native kernel already emitted the normalized BF16 input.
+        } else if ops::HcVariant::of(hc).applies_block_input_norm() {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -769,7 +771,7 @@ impl Qwen3AttentionLayer {
         }
 
         if self.ffn.is_none() {
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
@@ -805,7 +807,7 @@ impl Qwen3AttentionLayer {
         let seam =
             self.hc_post_pre_prefill_seam(hc, local(attn_out), hidden, n, diag_this, ctx, stream)?;
         if !seam {
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,
@@ -880,7 +882,9 @@ impl Qwen3AttentionLayer {
         }
 
         let normed2 = ctx.buffers.norm_output();
-        if ops::HcVariant::of(hc).applies_block_input_norm() {
+        if self.exl3_hc_norm(&hc.ffn, self.post_attn_norm.weight, normed2, n, ctx, stream)? {
+            // The native kernel already emitted the normalized BF16 input.
+        } else if ops::HcVariant::of(hc).applies_block_input_norm() {
             ops::rms_norm(
                 ctx.gpu,
                 self.rms_norm_w_k,
@@ -937,7 +941,7 @@ impl Qwen3AttentionLayer {
             && !is_last_layer
             && ops::qwen4exp_prefill_seam::defer_post(ctx.gpu, hc, dense_out, n, h as u32);
         if !deferred {
-            ops::hc_post_site(
+            self.hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
                 hc,

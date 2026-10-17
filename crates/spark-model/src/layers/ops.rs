@@ -112,6 +112,8 @@ mod kda;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "ops/kda_commit_tests.rs"]
 mod kda_commit_tests;
+#[path = "ops/kda_fla.rs"]
+mod kda_fla;
 #[path = "ops/kda_indexed.rs"]
 mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
@@ -300,6 +302,7 @@ pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
 pub use hyper_connection_lowrank::*;
 pub use kda::*;
+pub use kda_fla::*;
 pub use kda_indexed::*;
 pub use kv_cache::*;
 pub use kv_cache_fp8k::*;

@@ -4,6 +4,15 @@
 
 mod components;
 mod dense;
+pub mod exl3;
+pub mod exl3_ffn;
+pub mod exl3_index;
+pub mod exl3_index_exec;
+pub mod exl3_kda_loader;
+pub mod exl3_layers;
+pub mod exl3_mla;
+pub mod exl3_numerics;
+pub mod exl3_projection;
 mod expert_tp;
 mod layers;
 mod mla_twins;
@@ -28,6 +37,12 @@ pub struct Glm5WeightLoader;
 
 impl ModelWeightLoader for Glm5WeightLoader {
     fn supports_tp(&self) -> bool {
+        true
+    }
+
+    /// `load_all` calls `NormSubstitution::from_env` (spec D1) — this load
+    /// path engages the C2 substitution knob.
+    fn engages_norm_substitution(&self) -> bool {
         true
     }
 

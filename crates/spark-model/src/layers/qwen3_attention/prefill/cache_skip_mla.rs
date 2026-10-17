@@ -46,6 +46,10 @@ impl Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        self.validate_exl3_mla_forward(m as usize, ctx, stream)?;
+        if self.try_exl3_mla_projection(ctx.gpu, input, weight, output, m, n, k, stream)? {
+            return Ok(());
+        }
         let tc = crate::layers::w4a16_gemv_tiers::tc_kernel(m);
         if m <= 32
             && tc.0 != 0

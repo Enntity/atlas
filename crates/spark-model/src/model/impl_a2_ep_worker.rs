@@ -8,6 +8,7 @@
 //! - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
 //! - 0xFFFFFFF6: set request-local native-only fence → disabled (0/1)
 //! - 0xFFFFFFF7: synchronize vision metadata and BF16 encoder rows
+//! - 0xFFFFFFF9: bind request identity → UTF8 byte length, then packed LE words (`request_identity`)
 //! - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
 //! - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
 //! - 0xFFFFFFEC: serve this rank's half of a split DFlash propose (`draft_assist`)
@@ -16,6 +17,10 @@ use anyhow::Result;
 
 use super::types::TransformerModel;
 use crate::traits::{Model, SequenceState};
+
+#[cfg(test)]
+#[path = "impl_a2/idle_command_fixture.rs"]
+pub(super) mod idle_command_fixture;
 
 #[cfg(test)]
 #[path = "impl_a2/idle_command_tests.rs"]

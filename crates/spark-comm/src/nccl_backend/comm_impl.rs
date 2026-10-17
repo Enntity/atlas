@@ -242,6 +242,11 @@ impl CommBackend for NcclBackend {
         unsafe { nccl::nccl_mem_free(ptr as *mut c_void) }
     }
 
+    fn set_flag_kernels(&self, store: u64, add_wait: u64) {
+        self.flag_store_kernel.store(store, Ordering::Relaxed);
+        self.add_wait_kernel.store(add_wait, Ordering::Relaxed);
+    }
+
     fn set_add_kernel(&self, handle: u64) {
         self.add_kernel.store(handle, Ordering::Relaxed);
         tracing::info!(
@@ -251,6 +256,16 @@ impl CommBackend for NcclBackend {
     }
 
     fn all_gather(&self, send_ptr: u64, recv_ptr: u64, bytes: usize) -> Result<()> {
+        self.all_gather_on_stream(send_ptr, recv_ptr, bytes, self.legacy_stream)
+    }
+
+    fn all_gather_on_stream(
+        &self,
+        send_ptr: u64,
+        recv_ptr: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<()> {
         let comm = *self.comm.lock();
         let result = unsafe {
             nccl::ncclAllGather(
@@ -259,7 +274,7 @@ impl CommBackend for NcclBackend {
                 bytes,
                 NcclDataType::Uint8,
                 comm,
-                self.legacy_stream,
+                stream,
             )
         };
         nccl::check_nccl(result, "ncclAllGather")?;

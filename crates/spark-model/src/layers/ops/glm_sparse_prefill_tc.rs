@@ -54,6 +54,48 @@ fn enabled(model: &str, name: &str) -> Result<bool> {
     }
 }
 
+/// Assembly-time check: an `fp8_g128` GLM latent cache has no sparse prefill
+/// reader other than the tensor-core K=V kernel, so it requires both opt-ins.
+/// Checking only per request lets the first >2047-token prefill fail on every
+/// rank and terminate the TP group.
+pub fn validate_glm_sparse_prefill_startup(
+    config: &ModelConfig,
+    kv_dtype: KvCacheDtype,
+    layer_dtypes: &[KvCacheDtype],
+    tc: bool,
+    kv_reuse: bool,
+) -> Result<()> {
+    let fp8 = kv_dtype == KvCacheDtype::Fp8G128 || layer_dtypes.contains(&KvCacheDtype::Fp8G128);
+    if config.model_type != "glm5_next" || !fp8 {
+        return Ok(());
+    }
+    ensure!(
+        tc && kv_reuse,
+        "--kv-cache-dtype fp8_g128 on glm5_next requires ATLAS_GLM_SPARSE_PREFILL_TC=1 and \
+         ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1 (got TC={}, KV_REUSE={})",
+        u8::from(tc),
+        u8::from(kv_reuse)
+    );
+    validate_config(config)
+}
+
+/// [`validate_glm_sparse_prefill_startup`] with the opt-ins read from the
+/// environment; malformed values fail here rather than on the first request.
+pub fn validate_glm_sparse_prefill_startup_env(
+    config: &ModelConfig,
+    kv_dtype: KvCacheDtype,
+    layer_dtypes: &[KvCacheDtype],
+) -> Result<()> {
+    let model = &config.model_type;
+    validate_glm_sparse_prefill_startup(
+        config,
+        kv_dtype,
+        layer_dtypes,
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_TC")?,
+        enabled(model, "ATLAS_GLM_SPARSE_PREFILL_KV_REUSE")?,
+    )
+}
+
 /// Opt-in pipelined `fp8_g128` prefill kernel, bit-identical to the kv_pad one.
 const PIPE: &str = "ATLAS_GLM_SPARSE_PREFILL_PIPE";
 /// The pipe kernel's selected-slot capacity (`GLM_PIPE_SLOTS`); it also
@@ -249,8 +291,8 @@ pub fn glm_sparse_decode_tc_enabled(model: &str) -> Result<bool> {
     enabled(model, "ATLAS_GLM_SPARSE_DECODE_TC")
 }
 
-/// The repaired K3 caller supplies one temporal row after existing semantic
-/// selection. Ordinary decode and prefill do not call this entry.
+/// Dispatch one-row sparse decode. BF16 remains behind the repaired-decode
+/// opt-in; GLM `fp8_g128` uses this existing reader as a required path.
 pub fn try_glm_sparse_decode_tc(
     gpu: &dyn GpuBackend,
     args: &GlmSparsePrefillTc<'_>,
@@ -270,7 +312,11 @@ fn dispatch_decode(
     stream: u64,
     enabled: bool,
 ) -> Result<bool> {
-    if !enabled {
+    // fp8_g128 has no non-TC sparse reader. Keep the experimental flag as
+    // the opt-in for BF16, but always select its existing FP8 reader.
+    let required_fp8_reader =
+        a.config.model_type == "glm5_next" && a.dtype == KvCacheDtype::Fp8G128;
+    if !enabled && !required_fp8_reader {
         return Ok(false);
     }
     validate_geometry(a)?;
@@ -292,14 +338,23 @@ fn dispatch_decode(
     Ok(true)
 }
 
-/// Complete lazy code loading and shared-memory initialization before serving.
-/// Factory policy validates repaired MTP2/BF16 admission before calling this.
+/// Complete lazy code loading for the selected cache dtype before serving.
+/// Factory policy validates the repaired BF16 lane before calling this.
 pub fn initialize_glm_sparse_decode_tc(gpu: &dyn GpuBackend, config: &ModelConfig) -> Result<()> {
     initialize_decode(
         gpu,
         config,
+        KvCacheDtype::Bf16,
         glm_sparse_decode_tc_enabled(&config.model_type)?,
     )
+}
+
+/// Initialize the required serial reader for GLM's FP8 latent cache.
+pub fn initialize_glm_sparse_fp8_decode_tc(
+    gpu: &dyn GpuBackend,
+    config: &ModelConfig,
+) -> Result<()> {
+    initialize_decode(gpu, config, KvCacheDtype::Fp8G128, true)
 }
 
 /// Validate the pipe's flag combination and warm its kernel before serving, so
@@ -322,11 +377,16 @@ pub fn initialize_glm_sparse_prefill_pipe(
     Ok(())
 }
 
-fn initialize_decode(gpu: &dyn GpuBackend, config: &ModelConfig, enabled: bool) -> Result<()> {
+fn initialize_decode(
+    gpu: &dyn GpuBackend,
+    config: &ModelConfig,
+    dtype: KvCacheDtype,
+    enabled: bool,
+) -> Result<()> {
     if !enabled {
         return Ok(());
     }
-    warm(gpu, config, KvCacheDtype::Bf16, false)
+    warm(gpu, config, dtype, false)
 }
 
 fn warm(gpu: &dyn GpuBackend, config: &ModelConfig, dtype: KvCacheDtype, pipe: bool) -> Result<()> {

@@ -1,0 +1,10 @@
+{
+  "_comment": "PROVISIONAL. Set 2026-10-11 before any tuning and before any measured Q4 run; no model output informed these numbers. They are placeholders until the qualified serial profile has been measured on the held-out corpus (>= min_trials trials per case); the agreed thresholds are then recorded here in a separate commit citing that run, and every later profile is judged against them and by run_q4.py --compare against the serial run. A category passes when its pooled pass rate over all its cases and trials is >= pass_rate and the run used >= min_trials trials per case; otherwise run_q4.py reports FAIL or INSUFFICIENT_TRIALS.",
+  "arithmetic": {"pass_rate": 0.85, "min_trials": 5},
+  "code": {"pass_rate": 0.80, "min_trials": 5},
+  "tool_args": {"pass_rate": 0.90, "min_trials": 5},
+  "structured": {"pass_rate": 0.85, "min_trials": 5},
+  "multilingual": {"pass_rate": 0.75, "min_trials": 5},
+  "long_context": {"pass_rate": 0.70, "min_trials": 5},
+  "sustained": {"pass_rate": 0.80, "min_trials": 5}
+}

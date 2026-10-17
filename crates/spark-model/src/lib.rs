@@ -19,6 +19,7 @@
 
 pub mod det_trace;
 pub mod engine;
+pub mod exl3_gate_perturbation;
 pub mod factory;
 pub mod forward;
 pub mod layer;

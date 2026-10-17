@@ -67,6 +67,138 @@ fn qwen3_next_fixture_parses_layout_routing_and_quantization() {
 }
 
 #[test]
+fn glm5_next_maps_nested_hybrid_mla_kda_and_ep_shape() {
+    let mut layer_types = Vec::with_capacity(45);
+    for layer in 0..45 {
+        layer_types.push(if (layer + 1) % 4 == 0 {
+            "deepseek_sparse_attention"
+        } else {
+            "linear_attention"
+        });
+    }
+    let mut raw = serde_json::json!({
+        "model_type": "glm5_next",
+        "text_config": {
+            "model_type": "glm5_next_text",
+            "hidden_size": 4096,
+            "num_hidden_layers": 45,
+            "num_nextn_predict_layers": 1,
+            "intermediate_size": 12288,
+            "vocab_size": 154880,
+            "max_position_embeddings": 1048576,
+            "rms_norm_eps": 1e-5,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 64,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 256,
+            "qk_rope_head_dim": 0,
+            "v_head_dim": 256,
+            "linear_attn_config": {
+                "num_heads": 64,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0
+            },
+            "n_routed_experts": 288,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 2048,
+            "n_shared_experts": 1,
+            "norm_topk_prob": true,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "first_k_dense_replace": 3,
+            "layer_types": layer_types,
+            "hc_mult": 4,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1e-6,
+            "index_n_heads": 32,
+            "index_head_dim": 128,
+            "index_topk": 2048,
+            "index_kpool": 4,
+            "index_kpool_compress": true,
+            "index_kpool_always_select_tail": true,
+            "indexer_types": vec!["full"; 45]
+        },
+        "quantization_config": {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+            "ignore": ["lm_head", "*.self_attn.q_proj"]
+        }
+    });
+    let object = raw.as_object_mut().unwrap();
+    object.insert("image_token_id".into(), serde_json::json!(151655));
+    object.insert("video_token_id".into(), serde_json::json!(151656));
+    object.insert(
+        "vision_config".into(),
+        serde_json::json!({
+            "depth": 24,
+            "hidden_size": 1024,
+            "num_heads": 16,
+            "patch_size": 14,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "intermediate_size": 4096,
+            "out_hidden_size": 4096,
+            "projection_intermediate_size": 10240,
+            "in_channels": 3,
+            "rms_norm_eps": 1e-5,
+            "swiglu_limit": 10.0
+        }),
+    );
+
+    let cfg = parse_config(&raw.to_string()).unwrap();
+    assert_eq!(cfg.model_type, "glm5_next");
+    assert_eq!(cfg.moe_expert_groups, Some(1));
+    assert_eq!(cfg.moe_topk_groups, Some(1));
+    assert_eq!(cfg.text_swiglu_limit, None);
+    raw["text_config"]["swiglu_limit"] = serde_json::json!(10.0);
+    assert_eq!(
+        parse_config(&raw.to_string()).unwrap().text_swiglu_limit,
+        Some(10.0)
+    );
+    assert_eq!(cfg.weight_prefix, "model.language_model");
+    assert_eq!(cfg.num_attention_layers(), 11);
+    assert_eq!(cfg.num_ssm_layers(), 34);
+    assert_eq!(cfg.num_key_value_heads, 64);
+    assert_eq!(cfg.head_dim, 256);
+    assert_eq!(cfg.qk_nope_head_dim, 256);
+    assert_eq!(cfg.qk_rope_head_dim, 0);
+    assert_eq!(cfg.linear_num_key_heads, 64);
+    assert_eq!(cfg.linear_num_value_heads, 64);
+    assert_eq!(cfg.kda_gate_lower_bound, -5.0);
+    assert_eq!(cfg.num_experts, 288);
+    assert_eq!(cfg.num_experts_per_tok, 8);
+    assert_eq!(cfg.shared_expert_intermediate_size, 2048);
+    assert_eq!(cfg.mlp_only_layers, vec![0, 1, 2]);
+    assert_eq!(cfg.routed_scaling_factor, 2.5);
+    assert_eq!(cfg.hc_mult, 4);
+    assert_eq!(cfg.index_topk, 2048);
+    assert_eq!(cfg.index_kpool, 4);
+    assert!(cfg.index_kpool_always_select_tail);
+    assert_eq!(cfg.num_mtp_modules, 1);
+    assert_eq!(cfg.mtp_num_hidden_layers, 1);
+    assert!(cfg.nested_config);
+    assert!(!cfg.attn_gated);
+    let vision = cfg.vision.as_ref().expect("GLM vision config");
+    assert!(vision.is_glm5_next);
+    assert_eq!(vision.patch_size, 14);
+    assert_eq!(vision.projection_intermediate_size, 10240);
+    assert_eq!(vision.out_hidden_size, 4096);
+    assert_eq!(vision.image_pad_token_id, 151655);
+    assert_eq!(vision.image_start_token_id, 154830);
+    assert_eq!(vision.image_end_token_id, 154831);
+    assert_eq!(vision.video_start_token_id, 154832);
+    assert_eq!(vision.video_end_token_id, 154833);
+    let quant = cfg.quantization_config.unwrap();
+    assert_eq!(quant.quant_method, "modelopt");
+    assert_eq!(quant.quant_algo, "NVFP4");
+}
+
+#[test]
 fn qwen35_moe_nested_config_maps_attention_ssm_and_layout_controls() {
     let json = r#"{
         "model_type": "qwen3_5_moe",

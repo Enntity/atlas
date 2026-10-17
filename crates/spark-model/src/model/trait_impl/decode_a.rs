@@ -101,8 +101,15 @@ impl TransformerModel {
         // full-arena zero (~1.7GB memset/step, sized for max prefill tokens) is
         // unnecessary — skip it for V4 to reclaim that decode-step memset
         // bandwidth. (Other MLA models keep the zero.)
+        // ATLAS_DECODE_ARENA_FILL=skip drops the clear (~85 MB, ~0.5 ms/token
+        // on GLM-5.3 EXL3); =poison fills 0xFF (NaN) instead, which makes any
+        // read of unwritten scratch visible in the output.
         if self.config.kv_lora_rank > 0 && self.config.o_lora_rank == 0 {
-            self.buffers.zero_all(self.gpu.as_ref(), stream)?;
+            match decode_arena_fill() {
+                Some(0) => self.buffers.zero_all(self.gpu.as_ref(), stream)?,
+                Some(value) => self.buffers.fill_all(self.gpu.as_ref(), value, stream)?,
+                None => {}
+            }
         }
 
         // 1. Embedding lookup. `seq.tokens` is the history WITHOUT `token`
@@ -296,6 +303,7 @@ impl TransformerModel {
             routed_lora_layers: None, // #30: single-seq decode never routes prefill.
             midchunk_capture: None,
             moe_lora_route: self.decode_moe_route(), // route-aware: base(Skip) decodes; adapter refuses
+            request_id: seq.request_id.clone(),
         };
 
         // Profile mode: use per-layer sync decode for timing breakdown.
@@ -470,4 +478,16 @@ impl TransformerModel {
 
         Ok(self.decode_logits_ptr())
     }
+}
+
+/// Byte for the per-step MLA arena clear: 0 by default, `None` to skip.
+fn decode_arena_fill() -> Option<u8> {
+    static FILL: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *FILL.get_or_init(
+        || match std::env::var("ATLAS_DECODE_ARENA_FILL").as_deref() {
+            Ok("skip") => None,
+            Ok("poison") => Some(0xFF),
+            _ => Some(0),
+        },
+    )
 }

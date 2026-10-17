@@ -263,11 +263,12 @@ impl Qwen3AttentionLayer {
                 ops::ShardRank { rank: 0, world: 1 },
             ),
         };
+        let dense_threshold = self.glm_index_budget(ctx.config)?.dense_threshold() as usize;
         // A lone sharded causal owner (the merge form) localizes here.
         let localize = match owners {
             [o] if shard.is_some()
                 && o.rows <= MERGE_MAX_ROWS
-                && o.dense_is_exact(ctx.config.index_topk) =>
+                && o.dense_is_exact(dense_threshold) =>
             {
                 let (ids, counts) = self.glm_shard_localize_target(kv_cache, o.rows as u32)?;
                 Some((

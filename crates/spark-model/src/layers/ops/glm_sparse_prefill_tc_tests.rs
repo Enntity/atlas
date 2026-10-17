@@ -280,3 +280,32 @@ fn the_pin_sets_the_split_grid_of_verify_owners_and_nothing_else() {
         assert_eq!(launch(3, scratch, flags), [1, 3, 1]);
     }
 }
+
+#[test]
+fn fp8_g128_startup_requires_both_sparse_prefill_opt_ins() {
+    let c = config();
+    let (fp8, bf16) = (KvCacheDtype::Fp8G128, KvCacheDtype::Bf16);
+    let tc_err = validate_glm_sparse_prefill_startup(&c, fp8, &[], false, false).unwrap_err();
+    assert!(format!("{tc_err:#}").contains("ATLAS_GLM_SPARSE_PREFILL_TC=1"));
+    let reuse_err = validate_glm_sparse_prefill_startup(&c, fp8, &[], true, false).unwrap_err();
+    assert!(format!("{reuse_err:#}").contains("ATLAS_GLM_SPARSE_PREFILL_KV_REUSE=1"));
+    assert!(validate_glm_sparse_prefill_startup(&c, fp8, &[], true, true).is_ok());
+    assert!(validate_glm_sparse_prefill_startup(&c, bf16, &[], false, false).is_ok());
+    assert!(validate_glm_sparse_prefill_startup(&c, bf16, &[bf16, fp8], false, false).is_err());
+}
+
+#[test]
+fn fp8_g128_startup_check_is_glm_only_and_validates_geometry() {
+    let mut other = config();
+    other.model_type = "qwen3_next".into();
+    assert!(
+        validate_glm_sparse_prefill_startup(&other, KvCacheDtype::Fp8G128, &[], false, false)
+            .is_ok()
+    );
+    let mut wrong = config();
+    wrong.index_topk = 1024;
+    assert!(
+        validate_glm_sparse_prefill_startup(&wrong, KvCacheDtype::Fp8G128, &[], true, true)
+            .is_err()
+    );
+}
