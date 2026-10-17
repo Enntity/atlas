@@ -67,3 +67,29 @@ image requests from their headers under per-request and in-flight row limits
 multi-chunk prompts splicing a cached image's rows; text output is unchanged.
 Its commits are mostly `shared:` and keep GLM's admitted sizes; they sit in
 the `sparkqwen` layer too. Measurements in SparkQwen's `results/2026-10-17-vision/`.
+
+SparkGLM's FP4-Local release (`sparkglm/atlas-20261017-fp4local` @ `b3b016ab`,
+now the `sparkglm` branch head; SparkGLM's product pin stays
+`sparkglm/atlas-20261015-vision` until the product moves it) adds the
+FP4-Local series on the `sparkglm` layer: NVIDIA's
+`nvidia/GLM-5.3-Flash-FP4-Local` checkpoint (QAD; NVFP4 experts with
+`csf_32x2_v1` compressed scales, MXFP8 KDA/dense/lm_head, FP8 128x128 block
+MLA/shared experts). It carries the lossless `csf_32x2_v1` block-scale decoder
+in every safetensors loader, including per-slice decode under expert TP; the
+FP4-Local GLM loader with production numerics by default (KDA, shared and dense
+re-quantized to NVFP4, MLA through MXFP8 twins, the lm_head split shard from
+the checkpoint's own MXFP8); the shared FP4-Local commits from the `sparkqwen`
+layer (CSF, MXFP8 twins and GEMV, cuBLASLt MXFP8 W8A8 with pinned, timed kernel
+selection); exact prefill switches (`ATLAS_GLM_KDA_CONV_PLANES`,
+`_KDA_SIDE_PROJ_LT`, `_HC_PREFILL_FUSE2`, `_SP_GATHER_OVERLAP`; logprob hash unchanged); and a
+tools + `response_format` union grammar that fixes fenced JSON when both are
+set (ToolEvalBench 88 to 91). Opt-in and off by default: `ATLAS_GLM_FP4L_NATIVE`
+(every layer in the checkpoint's own format; ~10-16% slower decode on GB10,
+same ToolEvalBench score), the DFlash warm-turn drafter context
+(`ATLAS_DFLASH_WARM_CTX`), packed short-prompt prefill
+(`ATLAS_GLM_PACKED_PREFILL`, experimental: not yet exact), a TTFT trace, a
+tail-split minimum and a MoE prefill row bound. The old
+`nvidia/GLM-5.3-Flash-NVFP4` checkpoint still loads with an identical
+prompt-logprob hash (`246cd1331b41`). Its `shared:` commits sit in the
+`sparkglm` layer until the shared layer moves. Measurements in SparkGLM's
+`results/2026-10-17-fp4local/`.
