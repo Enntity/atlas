@@ -7,6 +7,9 @@ mod setup;
 use super::*;
 use spark_runtime::weights::exl3::native::Exl3LinearWorkspace;
 
+// One per dense FFN layer, built once at load: the variant size gap costs
+// nothing worth an extra indirection on the projection path.
+#[allow(clippy::large_enum_variant)]
 enum DenseProjections {
     Packed {
         weights: Box<[Exl3DeviceShard; 3]>,

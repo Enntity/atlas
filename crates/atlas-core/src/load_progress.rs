@@ -117,8 +117,7 @@ impl Drop for LoadProgress {
             let mut s = self.inner.lock().unwrap();
             s.running = false;
         }
-        if let Some(_) = self.handle.take() {
-            // Detached; loop exits on next sleep because running=false.
-        }
+        // Detached; loop exits on next sleep because running=false.
+        drop(self.handle.take());
     }
 }

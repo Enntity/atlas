@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Exercise real model teardown with a failure at the GPU completion boundary.
+// The real model and recording layer of `prefill_stream_tests`.
+#[allow(clippy::duplicate_mod)]
 #[path = "trait_impl/prefill_stream_test_fixture.rs"]
 mod fixture;
 use anyhow::{Result, ensure};

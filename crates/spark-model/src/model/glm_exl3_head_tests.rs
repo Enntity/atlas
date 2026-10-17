@@ -204,6 +204,8 @@ fn fixture_numerics() -> Exl3LinearNumerics {
     }
 }
 
+// The real model and recording layer of `prefill_stream_tests`.
+#[allow(clippy::duplicate_mod)]
 #[path = "trait_impl/prefill_stream_test_fixture.rs"]
 mod fixture;
 

@@ -581,11 +581,11 @@ fn main() {
                         let cached = ptx_cache
                             .as_ref()
                             .and_then(|dir| cache_key(job).map(|key| dir.join(key)));
-                        if let Some(entry) = &cached {
-                            if std::fs::copy(entry, &job.out_file).is_ok() {
-                                cache_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                continue;
-                            }
+                        if let Some(entry) = &cached
+                            && std::fs::copy(entry, &job.out_file).is_ok()
+                        {
+                            cache_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
                         }
                         if let Err(e) = compute.compile(
                             &job.cu_file,
