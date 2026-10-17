@@ -104,6 +104,34 @@ fn k3_record_outcome(
     }
 }
 
+/// A K=3 verdict's re-propose from `token`, at the request's own depth.
+fn k3_propose(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    token: u32,
+    num_drafts: usize,
+) {
+    let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+    match model.run_mtp_propose_multi(
+        token,
+        a.seq.seq_len,
+        crate::scheduler::spec_step::effective_drafts_under_grammar(
+            a,
+            a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
+        ),
+        &mut a.seq,
+        0,
+        _mtp_grammar_mask.as_deref(),
+    ) {
+        Ok(d) if !d.is_empty() => a.pending_drafts = d,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("run_mtp_propose_multi: {e:#}");
+        }
+    }
+}
+
 /// K=3 verify: [last_token, draft1, draft2] → [v0, v1, v2]. Three outcomes.
 ///
 /// `verify_ctx` carries the tokenizer special-token IDs the
@@ -349,24 +377,7 @@ pub fn step_verify_k3(
             tracing::error!("trim_proposer_state: {e:#}");
         }
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            v2,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(
-                a,
-                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
-            ),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
-        }
+        k3_propose(model, a, sched, v2, num_drafts);
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
@@ -408,24 +419,7 @@ pub fn step_verify_k3(
             return;
         }
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            v1,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(
-                a,
-                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
-            ),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
-        }
+        k3_propose(model, a, sched, v1, num_drafts);
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
@@ -465,24 +459,7 @@ pub fn step_verify_k3(
             return;
         }
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            v0,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(
-                a,
-                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
-            ),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
-        }
+        k3_propose(model, a, sched, v0, num_drafts);
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
