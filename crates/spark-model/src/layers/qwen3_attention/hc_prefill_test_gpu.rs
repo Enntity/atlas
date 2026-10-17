@@ -117,7 +117,7 @@ fn hc_finalize_norm_matches_finalize_then_rms_norm() -> Result<()> {
         let suffix = if bf16_highway { "_bf16" } else { "" };
         let reference = g.kernel(m, &format!("glm_hc_pre_finalize_ss_vec{suffix}"))?;
         let fused = g.kernel(m, &format!("glm_hc_pre_finalize_ss_norm{suffix}"))?;
-        for tokens in [1usize, 31, 2048, 5387] {
+        for tokens in [1usize, 31, 2048, 5387, 8192, 16384] {
             let mut r = Lcg(tokens as u64 * 2 + bf16_highway as u64);
             let highway: Vec<f32> = (0..tokens * 4 * H).map(|_| r.f() * 4.0).collect();
             let raw_mix: Vec<f32> = (0..tokens * 24).map(|_| r.f() * 40.0).collect();

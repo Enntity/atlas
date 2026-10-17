@@ -60,7 +60,7 @@ fn kda_conv_planes_match_pack_then_conv() -> Result<()> {
         weight: upload(g, &random(width * d_conv as usize, &mut seed, false))?,
     };
     let state0 = random(width * d_conv as usize, &mut seed, true);
-    for m in [1u32, 31, 2048, 5387, 8192] {
+    for m in [1u32, 31, 2048, 5387, 8192, 16384] {
         let planes = upload(g, &random(m as usize * width, &mut seed, false))?;
         let rows = m as usize * width * 2;
         let (packed, want, got) = (g.alloc(rows)?, g.alloc(rows)?, g.alloc(rows)?);
