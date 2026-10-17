@@ -173,10 +173,10 @@ impl TransformerModel {
     pub(in crate::model) fn prepare_vision_embed_deferred_dispatch(
         &self,
         seq: &mut SequenceState,
-        images: &[VisionItem],
+        images: Vec<VisionItem>,
     ) -> Result<()> {
         if self.vision_encoder.is_none() {
-            return self.prepare_vision_embed_dispatch(seq, images);
+            return self.prepare_vision_embed_dispatch(seq, &images);
         }
         let sms = self
             .config
@@ -187,8 +187,9 @@ impl TransformerModel {
         seq.vision.rows_base = 0;
         seq.vision.skip_rows = 0;
         seq.vision.computed_from = 0;
-        Self::stage_vision_grids(seq, images, sms);
-        seq.vision.items = images.to_vec();
+        Self::stage_vision_grids(seq, &images, sms);
+        // Moved, not copied: the request's only copy of the pixels.
+        seq.vision.items = images;
         seq.vision.deferred = true;
         Ok(())
     }

@@ -100,7 +100,7 @@ impl Model for TransformerModel {
     fn prepare_vision_embed_for_chunked(
         &self,
         seq: &mut SequenceState,
-        images: &[crate::VisionItem],
+        images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         self.prepare_vision_embed_deferred_dispatch(seq, images)
     }

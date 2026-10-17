@@ -104,7 +104,7 @@ fn a_glm_prefill_encodes_per_chunk_even_with_the_prefix_cache_off() {
     let image = test_tower::image(16);
     f.order();
     f.model
-        .prepare_vision_embed_deferred_dispatch(&mut f.seq, &[image])
+        .prepare_vision_embed_deferred_dispatch(&mut f.seq, vec![image])
         .unwrap();
     assert!(f.seq.vision.deferred);
     assert_eq!(f.seq.vision.rows_encoded, 0, "nothing encoded yet");
@@ -125,7 +125,7 @@ fn every_tower_encodes_per_chunk_not_at_admission() {
     let image = test_tower::image(16);
     f.order();
     f.model
-        .prepare_vision_embed_deferred_dispatch(&mut f.seq, &[image])
+        .prepare_vision_embed_deferred_dispatch(&mut f.seq, vec![image])
         .unwrap();
     assert!(f.seq.vision.deferred);
     assert_eq!(f.seq.vision.rows_encoded, 0, "nothing encoded at admission");

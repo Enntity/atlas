@@ -27,6 +27,9 @@ pub struct VisionItem {
     /// produce the same encoder rows, so their KV may be shared; the prompt's
     /// placeholder tokens alone cannot tell two images apart (issue #58).
     pub content_hash: u128,
+    /// The in-flight budget this item's pixels hold (`vision_budget`),
+    /// returned when the last copy drops. Not part of its identity.
+    pub held: crate::vision_budget::HeldRows,
 }
 
 impl VisionItem {
@@ -43,7 +46,14 @@ impl VisionItem {
             grid_h,
             grid_w,
             content_hash,
+            held: Default::default(),
         }
+    }
+
+    /// The item, holding `permit` until its last copy drops.
+    pub fn holding(mut self, permit: crate::vision_budget::VisionRowPermit) -> Self {
+        self.held = crate::vision_budget::HeldRows(Some(std::sync::Arc::new(permit)));
+        self
     }
 
     /// Temporal extent, in groups. 1 for a still.
