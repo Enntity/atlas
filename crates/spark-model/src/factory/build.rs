@@ -262,17 +262,7 @@ pub fn build_model(
     let free_before_layers = gpu.free_memory().unwrap_or(0);
     let mut native_moe_scratch = None;
     let mut layers = if store.exl3_checkpoint().is_some() {
-        // F4 phase 1: ATLAS_GLM_EXL3_DFLASH=1 admits the draft-only DFlash2
-        // observer (env-configured, loaded below); CLI speculative modes stay
-        // refused because EXL3 verify is phase 2.
         let spec_requested = use_speculative || self_speculative || dflash_args.is_some();
-        if crate::model::glm_exl3_dflash::enabled() {
-            anyhow::ensure!(
-                !spec_requested,
-                "{}",
-                crate::model::glm_exl3_dflash::cli_spec_refusal()
-            );
-        }
         anyhow::ensure!(
             !spec_requested && lora_args.is_none(),
             "EXL3 validation requires speculative decoding and LoRA disabled"
@@ -322,22 +312,6 @@ pub fn build_model(
             / config.num_hidden_layers.max(1) as f64,
     );
     let embed = loader.load_embedding(&store, &config, gpu.as_ref())?;
-    // F4 phase 1 draft-only DFlash2 observer: drafter weights, scratch and
-    // the replicated packed vocabulary head land before the KV budget is
-    // sized, so their memory is accounted. Attached after construction.
-    let exl3_dflash_parts =
-        if store.exl3_checkpoint().is_some() && crate::model::glm_exl3_dflash::enabled() {
-            Some(crate::model::glm_exl3_dflash::load(
-                &store,
-                &config,
-                gpu.as_ref(),
-                embed.weight,
-                max_seq_len,
-                max_batch_size,
-            )?)
-        } else {
-            None
-        };
     // n-gram fused embedding (LongCat family; None everywhere else). Built
     // before `config` is moved into the model. Staged for `max_batch_tokens`
     // because that is exactly the widest embed the arena can be handed.
@@ -1202,9 +1176,6 @@ pub fn build_model(
     // nothing owning the ability to release it.
     if let Some(head) = native_head {
         model.attach_exl3_vocab_head(head)?;
-    }
-    if let Some(parts) = exl3_dflash_parts {
-        model.attach_exl3_dflash(parts)?;
     }
     model.adopt_weight_store(store);
     if let Some(ref p) = progress {

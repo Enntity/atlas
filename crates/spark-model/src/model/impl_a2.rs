@@ -483,11 +483,6 @@ impl TransformerModel {
                 self.ep_worker_recv_vision_state(seq)?
             }
             super::glm_long_verify::EP_CMD_GLM_LONG_TAIL => self.glm_long_receive_tail(seq)?,
-            super::glm_exl3_dflash::EP_CMD_EXL3_DFLASH_SPEC => {
-                let token = self.ep_broadcast_u32(0)?;
-                let budget = self.ep_recv_think_budget()?;
-                let _ = self.exl3_dflash_spec_local(token, seq, &budget)?;
-            }
             0xFFFFFFF6 => self.ep_worker_set_native_fence(seq)?,
             crate::traits::EP_CMD_PC_PLANT => self.pc_plant_receive(seq)?,
             super::trait_impl::finish_leaf::EP_CMD_CACHE_SEQUENCE => {

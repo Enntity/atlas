@@ -148,11 +148,7 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if let Some(fla) = &self.fla_reference {
-            return self.fla_verify_rows(
-                fla, packed, convolved, g1, beta, core_out, state, row0, tokens, ctx, stream,
-            );
-        }
+        self.ensure_policy_off("speculative verify")?;
         let records = !state.kda_records.is_null();
         ensure!(
             tokens >= 1

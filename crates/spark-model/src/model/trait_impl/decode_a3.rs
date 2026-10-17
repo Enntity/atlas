@@ -83,8 +83,6 @@ impl TransformerModel {
             // activation. Cheap d2d when the layer index matches; otherwise a
             // hashmap-free position() probe over a 5-element vec.
             self.try_dflash_capture(i, 0, stream)?;
-            // F4 draft-only observer capture (ATLAS_GLM_EXL3_DFLASH=1).
-            self.exl3_dflash_decode_capture(i, stream)?;
         }
         if wide {
             self.qsa_commit_staged_seq(seq, 1, stream)?;

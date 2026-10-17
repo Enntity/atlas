@@ -76,28 +76,6 @@ extern "C" __global__ void kda_fla_conv_decode(float* __restrict__ conv_state, c
     kda_fla_prep::conv_channel(conv_state, x, weight, out, ch, 1, dim, true);
 }
 
-// Speculative verify: `rows` consecutive decode conv steps, each with the
-// arithmetic of kda_fla_conv_decode (conv_channel, one row at a time), and
-// the window after row t copied to snaps + t * snap_stride (f32 elements,
-// same [dim, 4] layout). The live window ends at the last row.
-// Grid (ceil(dim/256)), block 256.
-extern "C" __global__ void kda_fla_conv_rows_snap(float* __restrict__ conv_state,
-                                                  const __nv_bfloat16* __restrict__ x,
-                                                  const __nv_bfloat16* __restrict__ weight,
-                                                  __nv_bfloat16* __restrict__ out, unsigned int dim,
-                                                  unsigned int rows, float* __restrict__ snaps,
-                                                  unsigned long long snap_stride) {
-    const unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (ch >= dim) return;
-    for (unsigned int t = 0; t < rows; ++t) {
-        kda_fla_prep::conv_channel(conv_state, x + (unsigned long long)t * dim, weight,
-                                   out + (unsigned long long)t * dim, ch, 1, dim, true);
-        const float* st = conv_state + (unsigned long long)ch * 4;
-        float* sn = snaps + (unsigned long long)t * snap_stride + (unsigned long long)ch * 4;
-        for (int j = 0; j < 4; ++j) sn[j] = st[j];
-    }
-}
-
 // L2 norm of the q and k planes of conv_out [T, 3*heads*128] into
 // q_l2 / k_l2 [T, heads, 128] BF16. One 128-vector per 16 lanes: each lane
 // owns 8 contiguous elements; per-lane sum starts e1*e1, then fma e0, e2..e7;

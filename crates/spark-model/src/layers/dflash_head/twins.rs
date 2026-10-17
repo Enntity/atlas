@@ -339,9 +339,6 @@ impl BlockDiffusionDraftHead {
         rows: u32,
         stream: u64,
     ) -> Result<()> {
-        if let Some(external) = self.external_head.as_ref() {
-            return external.project(gpu, input, out, rows as usize, stream);
-        }
         let (vocab, h) = (self.vocab_size as u32, self.hidden_size as u32);
         if let Some(q4) = self.twins.lm_head_q4.as_ref()
             && self.nvfp4_tc_rows(gpu, q4, input, out, rows, vocab, h, stream)?

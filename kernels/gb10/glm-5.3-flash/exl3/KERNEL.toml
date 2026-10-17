@@ -14,7 +14,6 @@
 #
 #   exl3*.cu, exllamav3_*.cuh  native EXL3 linear, coop GEMM, MoE, shared
 #                              expert and mHC kernels
-#   exl3_dflash_capture.cu     DFlash hidden-state capture on the EXL3 path
 #   glm_indexer_quant.cu       EXL3 sparse-indexer projection + scoring
 #   kda_fla*.cu(h)             FLA-parity KDA reference policy
 #                              (ATLAS_KDA_FLA_REFERENCE=1; EXL3 projections only)

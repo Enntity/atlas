@@ -95,36 +95,6 @@ pub fn step_decode_only(
     // empirically as a 51s broadcast timeout on the worker followed by
     // stale comm data reads. See decode_a2.rs for the full rationale.
 
-    // F4 native EXL3 DFlash2 speculative lane (ATLAS_GLM_EXL3_DFLASH_SPEC=1):
-    // a greedy, processor-free single sequence verifies the drafter's
-    // proposal and emits accepted drafts + bonus. `None` from the model
-    // (lane off, drafter unhealthy, capacity) falls through to serial decode.
-    if n == 1 && exl3_spec_eligible(&active[0]) && exl3_spec_processors_idle(&active[0], sched) {
-        let a = &mut active[0];
-        let budget = a.think_budget_state();
-        match model.exl3_dflash_spec_step(a.last_token, &mut a.seq, &budget) {
-            Ok(Some(tokens)) => {
-                a.last_token_time = Instant::now();
-                for tok in tokens {
-                    emit_token(a, tok, None, sched);
-                    a.last_token = tok;
-                    if a.finished {
-                        break;
-                    }
-                }
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!("EXL3 DFlash speculative step: {e:#}");
-                for mut a in active.drain(..) {
-                    send_error(model, &mut a, &format!("{e:#}"));
-                }
-                return;
-            }
-        }
-    }
-
     // Decode, PREEMPTING on KV exhaustion instead of failing the whole batch.
     //
     // Sequences grow one block per `block_size` tokens as they decode; when
@@ -182,67 +152,3 @@ pub fn step_decode_only(
         sched,
     );
 }
-
-impl ActiveSeq {
-    /// Snapshot of the thinking-budget accounting for one F4 speculative
-    /// step (`ThinkBudgetState`). SSOT: read at the single dispatch point so
-    /// the model-side commit replay and the serial governor see the same
-    /// per-sequence state; copied onto the EP wire for rank symmetry.
-    pub fn think_budget_state(&self) -> spark_model::traits::ThinkBudgetState {
-        spark_model::traits::ThinkBudgetState {
-            inside_thinking: self.inside_thinking,
-            thinking_tokens: self.thinking_tokens,
-            thinking_budget: self.thinking_budget,
-            force_end_thinking: self.force_end_thinking,
-            spontaneous_think_budget: self.spontaneous_think_budget,
-            think_watchdog_fires: self.think_watchdog_fires,
-            think_start_token: self.think_start_token,
-            think_end_token: self.think_end_token,
-            tool_call_start_token: self.tool_call_start_token,
-        }
-    }
-}
-
-/// Confidence observes logits and can arm a forced close even when the raw
-/// pick is ordinary text. Leave such thinking steps to the canonical pipeline.
-/// Structural picks are separately stopped at the model's commit boundary.
-fn exl3_spec_processors_idle(a: &ActiveSeq, sched: &crate::scheduler::sched_ctx::SchedCtx) -> bool {
-    let confidence_watch = a.inside_thinking
-        && !sched.levers.disable_watchdogs
-        && sched.watchdog.confidence_early_stop;
-    // Unlimited thinking still has the serial hard override; avoid a
-    // speculative block crossing that otherwise untracked boundary.
-    let unlimited_thinking = a.inside_thinking && a.thinking_budget.is_none();
-    !(sched.levers.adadec_diagnostic || confidence_watch || unlimited_thinking)
-}
-
-/// The F4 EXL3 speculative lane emits raw verify argmaxes, so it only takes
-/// steps whose serial sampling would also be a plain argmax: greedy, no
-/// grammar, logprobs, penalties or bias, and no pending thinking-end /
-/// tool-call forcing. Everything else decodes serially.
-fn exl3_spec_eligible(a: &ActiveSeq) -> bool {
-    a.temperature == 0.0
-        && a.grammar_state.is_none()
-        && a.top_logprobs.is_none()
-        && a.repetition_penalty == 1.0
-        && a.presence_penalty == 0.0
-        && a.frequency_penalty == 0.0
-        && a.lz_penalty == 0.0
-        && a.dry_multiplier == 0.0
-        && a.logit_bias.is_empty()
-        && !a.force_end_thinking
-        && !a.think_just_ended
-        && !a.require_tool_call
-        // Thinking-budget gate (draft side): when the budget is already
-        // exhausted the step could emit at most the single arming-trip token
-        // before the serial governor takes over — defer to serial, which
-        // emits that token and arms exactly like this path would. A step
-        // that reaches the boundary MID-STREAM is truncated at commit
-        // (`ThinkBudgetState::plain_emission_len`, the hard gate).
-        && (!a.inside_thinking
-            || a.thinking_budget.is_none_or(|b| a.thinking_tokens < b))
-}
-
-#[cfg(test)]
-#[path = "decode_step_tests.rs"]
-mod decode_step_tests;

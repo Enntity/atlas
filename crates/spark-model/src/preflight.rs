@@ -49,15 +49,6 @@ pub fn preflight(store: &WeightStore, config: &ModelConfig, use_speculative: boo
     // Model-agnostic checks — driven purely by `store.names()` and
     // `config` (which already carries the parsed `config.json` values).
     if let Some(checkpoint) = store.exl3_checkpoint() {
-        // F4 phase 1: the DFlash2 observer is draft-only and never makes the
-        // target speculative; a CLI speculative mode is phase 2.
-        if crate::model::glm_exl3_dflash::enabled() {
-            anyhow::ensure!(
-                !use_speculative,
-                "{}",
-                crate::model::glm_exl3_dflash::cli_spec_refusal()
-            );
-        }
         anyhow::ensure!(
             config.model_type == "glm5_next" && !use_speculative,
             "Native EXL3 requires non-speculative GLM-5"

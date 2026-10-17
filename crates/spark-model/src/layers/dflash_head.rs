@@ -44,21 +44,6 @@ pub use startup_diagnostics::DsparkDiagnostics;
 #[cfg(test)]
 mod product_policy_tests;
 
-/// Drafter logits projection supplied by the target when its vocabulary head
-/// is not a plain BF16/NVFP4 matrix (native EXL3). `out[rows, vocab]` BF16 =
-/// `input[rows, hidden]` BF16 · headᵀ, stream-ordered on `stream`, graph-safe
-/// (stable pointers, no host synchronization).
-pub trait DraftLogitsHead: Send + Sync {
-    fn project(
-        &self,
-        gpu: &dyn GpuBackend,
-        input: DevicePtr,
-        out: DevicePtr,
-        rows: usize,
-        stream: u64,
-    ) -> Result<()>;
-}
-
 /// Kernel handles for the DFlash γ-block forward chain. All resolved once
 /// at `BlockDiffusionDraftHead::from_weights` against the active GPU backend
 /// (which compiles target-specific PTX at startup); subsequent
@@ -566,10 +551,6 @@ pub struct BlockDiffusionDraftHead {
     /// it must not mutate the target model's lm_head. `None` on the
     /// BF16 path.
     pub lm_head_shared_fp8: Option<crate::weight_map::Fp8DenseWeight>,
-    /// Logits projection owned outside this head (the native EXL3 target's
-    /// packed vocabulary, `ATLAS_GLM_EXL3_DFLASH=1`). When set it replaces
-    /// every other lm_head path; `lm_head_shared` is then NULL.
-    pub external_head: Option<Box<dyn DraftLogitsHead>>,
 
     // === Weights from the drafter checkpoint ===
     /// Hidden-norm applied to the projected target context before mixing
@@ -824,7 +805,6 @@ mod small_m_gemm;
 mod context_window;
 mod markov_slots;
 use markov_slots::{MARKOV_BAN_DEPTH_OFFSET, MARKOV_PREV_BYTES};
-mod profile_tail;
 mod twins;
 pub use twins::{ConvTwinKind, DflashTwins, LayerMxfp8};
 

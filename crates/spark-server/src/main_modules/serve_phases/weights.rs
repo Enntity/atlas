@@ -55,19 +55,8 @@ pub(crate) fn load_weight_store(
         .as_ref()
         .is_some_and(|q| q.quant_method == "exl3")
     {
-        let spec_requested = args.speculative || args.dflash || args.self_speculative;
-        // F4 phase 1: ATLAS_GLM_EXL3_DFLASH=1 runs the draft-only DFlash2
-        // observer inside the model (env-configured); CLI speculative modes
-        // would enter the EXL3 verify lane, which is phase 2.
-        if spark_model::model::glm_exl3_dflash::enabled() {
-            anyhow::ensure!(
-                !spec_requested,
-                "{}",
-                spark_model::model::glm_exl3_dflash::cli_spec_refusal()
-            );
-        }
         anyhow::ensure!(
-            ep_size == 1 && !spec_requested,
+            ep_size == 1 && !args.speculative && !args.dflash && !args.self_speculative,
             "EXL3 validation requires EP=1 and speculative decoding disabled"
         );
         return super::exl3::load(config, model_dir, gpu, oom_reserve_bytes);

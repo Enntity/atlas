@@ -741,7 +741,6 @@ impl BlockDiffusionDraftHead {
             lm_head_shared,
             lm_head_nvfp4,
             lm_head_shared_fp8: None,
-            external_head: None,
             hidden_norm: weights.hidden_norm,
             norm: weights.norm,
             fc: weights.fc,
@@ -922,9 +921,7 @@ impl BlockDiffusionDraftHead {
         // Acceptance gate (G.4 design doc §16.7): bench must hold
         // ≥43% accept (vs 44.9% BF16) AND ≥11.0 tok/s (vs 8.70). If hard
         // fail, layer-by-layer ablation; skip layer 0 first.
-        let bf16_only = head.startup.diagnostics.bf16_weights_only;
-        let fp8_requested =
-            !bf16_only && std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
+        let fp8_requested = std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
         let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
             && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
         if fp8_requested && !fp8_kernels_present {
@@ -1005,9 +1002,7 @@ impl BlockDiffusionDraftHead {
             // reading vocab×hidden BF16 from it is a 4×-oversized read
             // (CUDA-700 ILA). The decode path already drafts logits through
             // the NVFP4 twin via w4a16 in that case.
-            // Also skip when there is no shared BF16 head (an external
-            // logits head, e.g. the native EXL3 target, supplies logits).
-            if head.lm_head_nvfp4.is_none() && head.lm_head_shared.0 != 0 {
+            if head.lm_head_nvfp4.is_none() {
                 tracing::info!(
                     "DFlash Phase G: quantizing shared lm_head [{} × {}]",
                     head.vocab_size,
@@ -1031,10 +1026,6 @@ impl BlockDiffusionDraftHead {
             );
         }
 
-        if bf16_only {
-            tracing::info!("DFlash drafter: BF16 weights only (no FP8/MXFP8/NVFP4 twins)");
-            return Ok(head);
-        }
         head.install_twins(gpu)?;
         Ok(head)
     }

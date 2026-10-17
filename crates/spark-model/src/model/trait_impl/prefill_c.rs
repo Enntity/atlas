@@ -538,8 +538,6 @@ impl TransformerModel {
                         anyhow::anyhow!("Two-phase prefill attention layer {i} failed: {e}")
                     })?;
             }
-            // F4 draft-only observer (ATLAS_GLM_EXL3_DFLASH=1).
-            self.exl3_dflash_prefill_layer(seq, i, proc_start, proc_count, stream)?;
         }
 
         // ── 5. Update sequence state ──
