@@ -132,6 +132,25 @@ fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     decode_bytes(&bytes, fmt)
 }
 
+/// Refuse an image whose decoded buffer (native color type) would exceed
+/// [`DECODE_MAX_ALLOC`]: a ~1 MB PNG may declare 16384^2 RGBA16 (2 GiB).
+fn check_decode_size(total_bytes: u64) -> Result<()> {
+    ensure!(
+        total_bytes <= DECODE_MAX_ALLOC,
+        "image decodes to {} MiB, more than the {} MiB limit; send a smaller image",
+        total_bytes >> 20,
+        DECODE_MAX_ALLOC >> 20
+    );
+    Ok(())
+}
+
+/// Whether an EXIF orientation turns the image a quarter turn (swapping the
+/// sides its header declares).
+fn orientation_swaps_sides(o: image::metadata::Orientation) -> bool {
+    use image::metadata::Orientation::*;
+    matches!(o, Rotate90 | Rotate270 | Rotate90FlipH | Rotate270FlipH)
+}
+
 /// Decode already-sniffed image bytes into a `DynamicImage`.
 fn decode_bytes(bytes: &[u8], fmt: image::ImageFormat) -> Result<DynamicImage> {
     // Decode through `ImageReader` rather than `load_from_memory_with_format`
@@ -161,6 +180,9 @@ fn decode_bytes(bytes: &[u8], fmt: image::ImageFormat) -> Result<DynamicImage> {
     // any JPEG without the tag — the earlier behaviour, preserved exactly
     // where there is nothing to apply.
     let mut decoder = reader.into_decoder().context("image decode failed")?;
+    // `from_decoder` does not apply `max_alloc` (only `ImageReader::decode`
+    // reserves against it), so check the decoded size here.
+    check_decode_size(decoder.total_bytes())?;
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
@@ -250,16 +272,14 @@ pub(crate) fn normalize_channel(vcfg: &VisionConfig, channel: usize, raw: u8) ->
 /// `pub(crate)` alias name used by the video path — see [`target_size_for`].
 ///
 /// For a Qwen video's frames: each temporal group is one encoder sequence, so
-/// it is capped at the encoder's capacity like a still ([`qwen_area_bound`]).
+/// it is fitted to the encoder's capacity like a still ([`qwen_fit`]).
 pub(crate) fn target_size_for(
     orig_h: u32,
     orig_w: u32,
     vcfg: &VisionConfig,
     max_pixels: Option<usize>,
 ) -> (u32, u32) {
-    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let bound = qwen_area_bound(max_pixels, vcfg.patch_size);
-    target_size_with_max_pixels(orig_h, orig_w, grid_unit, bound)
+    qwen_fit(vcfg, orig_h, orig_w, max_pixels)
 }
 
 fn target_size_with_max_pixels(
@@ -267,6 +287,17 @@ fn target_size_with_max_pixels(
     orig_w: u32,
     grid_unit: u32,
     max_pixels: Option<usize>,
+) -> (u32, u32) {
+    snapped_target(orig_h, orig_w, grid_unit, max_pixels, f32::round)
+}
+
+/// [`target_size_with_max_pixels`] with each side snapped by `snap`.
+fn snapped_target(
+    orig_h: u32,
+    orig_w: u32,
+    grid_unit: u32,
+    max_pixels: Option<usize>,
+    snap: fn(f32) -> f32,
 ) -> (u32, u32) {
     let long_side = orig_h.max(orig_w) as f32;
     let area = (orig_h as f32) * (orig_w as f32);
@@ -279,37 +310,64 @@ fn target_size_with_max_pixels(
     // Safety net, always applied.
     let abs_scale = (ABS_MAX_DIM as f32) / long_side;
     let scale = bound_scale.min(abs_scale).min(1.0); // never upscale
-    let side = |orig: u32, snap: fn(f32) -> f32| {
-        (snap(orig as f32 * scale / grid_unit as f32) as u32).max(1) * grid_unit
-    };
-    let (target_h, target_w) = (side(orig_h, f32::round), side(orig_w, f32::round));
-    // Rounding can land above the area bound (2064x2032 under 2048^2 rounds
-    // to 2080x2048); floor instead then, as HF's `smart_resize` does, so the
-    // bound is a real bound.
-    match max_pixels.filter(|&p| p > 0) {
-        Some(p) if target_h as usize * target_w as usize > p => {
-            (side(orig_h, f32::floor), side(orig_w, f32::floor))
-        }
-        _ => (target_h, target_w),
-    }
+    let side = |orig: u32| (snap(orig as f32 * scale / grid_unit as f32) as u32).max(1) * grid_unit;
+    (side(orig_h), side(orig_w))
 }
 
-/// The area bound the Qwen tower can encode: `max_pixels`, capped by the
-/// encoder's patch capacity (`derive_max_patches`, which clamps to
-/// `CEILING_MAX_PATCHES`) so no image comes out larger than one encoder
-/// batch. `None` keeps the 1280px long-side fallback, which the fallback
-/// capacity (6400 patches = 1280^2) already holds.
-pub(crate) fn qwen_area_bound(max_pixels: Option<usize>, patch_size: usize) -> Option<usize> {
-    let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, patch_size).0;
-    max_pixels
+/// The Qwen target of a still (or a video's frames), fitted to the encoder's
+/// patch capacity (`derive_max_patches`, at most `CEILING_MAX_PATCHES`).
+///
+/// A size that fits is exactly [`target_size_with_max_pixels`]'s (images
+/// that were served before are byte-identical). One that does not (a
+/// 2880x1800 screenshot under the checkpoint's 4096^2 bound, or the 1280px
+/// fallback at patch 14) is resized to the capacity's area instead, and
+/// floored as HF's `smart_resize` does when rounding lands above it
+/// (2064x2032 -> 2016x2048, not 2080x2048).
+fn qwen_fit(
+    vcfg: &VisionConfig,
+    orig_h: u32,
+    orig_w: u32,
+    max_pixels: Option<usize>,
+) -> (u32, u32) {
+    let ps = vcfg.patch_size.max(1);
+    let grid_unit = (ps * vcfg.spatial_merge_size) as u32;
+    let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, ps).0;
+    let patches = |(h, w): (u32, u32)| (h as usize / ps) * (w as usize / ps);
+    let base = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
+    if patches(base) <= p_max {
+        return base;
+    }
+    let bound = max_pixels
         .filter(|&p| p > 0)
-        .map(|p| p.min(p_max.saturating_mul(patch_size * patch_size)))
+        .unwrap_or(usize::MAX)
+        .min(p_max.saturating_mul(ps * ps));
+    let mut fit = snapped_target(orig_h, orig_w, grid_unit, Some(bound), f32::round);
+    if fit.0 as usize * fit.1 as usize > bound {
+        fit = snapped_target(orig_h, orig_w, grid_unit, Some(bound), f32::floor);
+    }
+    // A strip's short side cannot go below one grid unit, so the area can
+    // still exceed the bound: shorten the long side until the grid fits.
+    let unit = grid_unit as usize;
+    let unit_patches = (unit / ps) * (unit / ps);
+    let max_units = (p_max / unit_patches.max(1)).max(1);
+    let (uh, uw) = (fit.0 as usize / unit, fit.1 as usize / unit);
+    if uh * uw > max_units {
+        let short = uh.min(uw);
+        let long = (max_units / short).max(1);
+        let (uh, uw) = if uh <= uw {
+            (short, long)
+        } else {
+            (long, short)
+        };
+        fit = ((uh * unit) as u32, (uw * unit) as u32);
+    }
+    fit
 }
 
 /// Target (H, W) in pixels of a still of `orig_h x orig_w`, for either tower.
 /// One function for the header probe and the decode, so the two agree.
-/// Refuses a Qwen grid past the encoder's patch capacity (a backstop: the
-/// bound above already keeps it inside).
+/// Refuses a Qwen grid past the encoder's patch capacity (a backstop:
+/// [`qwen_fit`] already keeps it inside).
 fn still_target(
     vcfg: &VisionConfig,
     orig_h: u32,
@@ -326,9 +384,7 @@ fn still_target(
             false,
         );
     }
-    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let bound = qwen_area_bound(max_pixels, vcfg.patch_size);
-    let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, bound);
+    let (th, tw) = qwen_fit(vcfg, orig_h, orig_w, max_pixels);
     let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, vcfg.patch_size).0;
     let patches = (th as usize / vcfg.patch_size) * (tw as usize / vcfg.patch_size);
     ensure!(
@@ -364,17 +420,20 @@ pub fn preprocess_image_with_max_pixels(
 /// Decode and patch an image whose geometry [`probe_image`] already fixed.
 fn preprocess_probed(probed: ProbedImage, vcfg: &VisionConfig) -> Result<(Vec<f32>, usize, usize)> {
     let max_pixels = probed.max_pixels;
+    // Decodes at once are few: each holds its decoded image and its f32.
+    let _slot = probe::decode_slot();
     let img = decode_bytes(&probed.bytes, probed.fmt)?;
     drop(probed.bytes);
     let img = img.to_rgb8();
     let (orig_w, orig_h) = (img.width(), img.height());
     let (th, tw) = still_target(vcfg, orig_h, orig_w, max_pixels)?;
-    // EXIF orientation may swap the sides the header declared; the patch
-    // count, which admission charged, cannot change.
+    // The probe sized the oriented image with the same function: the grid
+    // admission charged is the grid decoded, exactly.
     ensure!(
-        (th as usize / vcfg.patch_size) * (tw as usize / vcfg.patch_size)
-            == probed.grid_h * probed.grid_w,
-        "decoded image geometry disagrees with its header"
+        (th, tw) == probed.target,
+        "decoded image geometry {th}x{tw} disagrees with its header's {}x{}",
+        probed.target.0,
+        probed.target.1
     );
 
     let img = if vcfg.is_glm5_next {
@@ -436,6 +495,8 @@ pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) 
 
 mod probe;
 pub use probe::{ProbedImage, probe_image};
+#[doc(hidden)]
+pub mod fixtures;
 
 #[cfg(test)]
 #[path = "vision_preprocess_format_tests.rs"]

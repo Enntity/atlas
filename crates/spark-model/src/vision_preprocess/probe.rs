@@ -17,8 +17,9 @@ pub struct ProbedImage {
     pub(super) bytes: Vec<u8>,
     pub(super) fmt: image::ImageFormat,
     pub(super) max_pixels: Option<usize>,
-    /// Patch grid the decode will produce (sides may swap under EXIF
-    /// orientation; their product cannot).
+    /// Target (H, W) in pixels of the oriented image, as the decode sizes it.
+    pub(super) target: (u32, u32),
+    /// Patch grid the decode will produce.
     pub grid_h: usize,
     pub grid_w: usize,
 }
@@ -55,7 +56,9 @@ impl ProbedImage {
 }
 
 /// Read `data_uri`'s header and fix the geometry its decode will have.
-/// Allocates only the compressed bytes.
+/// Allocates only the compressed bytes. The EXIF orientation is read too: the
+/// decode turns the image upright before sizing it, and GLM's sizing is not
+/// symmetric in its sides.
 pub fn probe_image(
     data_uri: &str,
     vcfg: &VisionConfig,
@@ -65,21 +68,67 @@ pub fn probe_image(
     validate_geometry(vcfg)?;
     let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
     let fmt = sniff_format(&bytes)?;
-    let (w, h) = limited_reader(&bytes, fmt)
-        .into_dimensions()
+    let mut decoder = limited_reader(&bytes, fmt)
+        .into_decoder()
         .context("image decode failed")?;
+    let (w, h) = decoder.dimensions();
     ensure!(
         w > 0 && h > 0 && w <= DECODE_MAX_SIDE && h <= DECODE_MAX_SIDE,
         "image dimensions {w}x{h} are outside 1..={DECODE_MAX_SIDE}"
     );
+    check_decode_size(decoder.total_bytes())?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    drop(decoder);
+    let (w, h) = if orientation_swaps_sides(orientation) {
+        (h, w)
+    } else {
+        (w, h)
+    };
     let (th, tw) = still_target(vcfg, h, w, max_pixels)?;
     Ok(ProbedImage {
         bytes,
         fmt,
         max_pixels,
+        target: (th, tw),
         grid_h: th as usize / vcfg.patch_size,
         grid_w: tw as usize / vcfg.patch_size,
     })
+}
+
+/// Decodes running at once, server-wide: each holds a decoded image (up to
+/// [`DECODE_MAX_ALLOC`]) and its f32 patches, and the request path runs on a
+/// blocking pool of hundreds of threads. min(cores, 8).
+fn decode_slots() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(8)
+}
+
+static DECODES: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// A decode slot, held for one image's decode and patching; waits for one.
+pub(super) struct DecodeSlot(());
+
+pub(super) fn decode_slot() -> DecodeSlot {
+    let (lock, cv) = &DECODES;
+    let limit = decode_slots();
+    let mut busy = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while *busy >= limit {
+        busy = cv.wait(busy).unwrap_or_else(|e| e.into_inner());
+    }
+    *busy += 1;
+    DecodeSlot(())
+}
+
+impl Drop for DecodeSlot {
+    fn drop(&mut self) {
+        let (lock, cv) = &DECODES;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        cv.notify_one();
+    }
 }
 
 #[cfg(test)]

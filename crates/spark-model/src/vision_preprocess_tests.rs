@@ -164,33 +164,8 @@ fn glm_explicit_budget_counts_temporal_volume_for_encoder_capacity() {
 }
 
 /// A `vision_config` for the shipped Qwen3-VL geometry.
-pub(super) fn ok_cfg() -> VisionConfig {
-    VisionConfig {
-        is_glm5_next: false,
-        in_channels: 3,
-        depth: 27,
-        hidden_size: 1152,
-        num_heads: 16,
-        patch_size: 16,
-        temporal_patch_size: 2,
-        spatial_merge_size: 2,
-        intermediate_size: 4304,
-        out_hidden_size: 2048,
-        projection_intermediate_size: 0,
-        rms_norm_eps: 1e-6,
-        swiglu_limit: 0.0,
-        deepstack_visual_indexes: vec![8, 16, 24],
-        image_pad_token_id: 151_655,
-        video_pad_token_id: 151_656,
-        image_start_token_id: 0,
-        image_end_token_id: 0,
-        video_start_token_id: 0,
-        video_end_token_id: 0,
-        // These tests drive `preprocess_image_with_max_pixels` directly
-        // with an explicit bound, so the config-carried one is not the
-        // subject here.
-        max_pixels: None,
-    }
+fn ok_cfg() -> VisionConfig {
+    super::fixtures::qwen_config()
 }
 
 /// A 1×1 PNG, the smallest decodable input.
