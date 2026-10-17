@@ -164,7 +164,7 @@ fn glm_explicit_budget_counts_temporal_volume_for_encoder_capacity() {
 }
 
 /// A `vision_config` for the shipped Qwen3-VL geometry.
-fn ok_cfg() -> VisionConfig {
+pub(super) fn ok_cfg() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
         in_channels: 3,

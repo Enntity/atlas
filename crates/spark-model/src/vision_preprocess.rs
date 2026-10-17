@@ -95,35 +95,52 @@ pub(crate) fn decode_data_uri_bytes(data_uri: &str) -> Result<(String, Vec<u8>)>
     Ok((mime, bytes))
 }
 
-/// The image formats `decode_image` reads (the `image` crate features enabled
+/// The image formats `decode_bytes` reads (the `image` crate features enabled
 /// in this crate's Cargo.toml), as the client is told when it sends another.
 const SUPPORTED_IMAGE_FORMATS: &str = "send JPEG, PNG, GIF, WebP, BMP, TIFF or ICO";
 
-/// Decode a base64 data URI or raw base64 string into a `DynamicImage`.
-fn decode_image(data_uri: &str) -> Result<DynamicImage> {
-    let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
-
-    // Probe format from magic bytes. Anything we cannot read is refused by
-    // name, so the client learns what to send instead of seeing a decoder
-    // error about a JPEG it never sent.
-    let fmt = image::guess_format(&bytes)
+/// The format of `bytes`, from their magic bytes. Anything we cannot read is
+/// refused by name, so the client learns what to send instead of seeing a
+/// decoder error about a JPEG it never sent.
+fn sniff_format(bytes: &[u8]) -> Result<image::ImageFormat> {
+    let fmt = image::guess_format(bytes)
         .map_err(|_| anyhow::anyhow!("unrecognized image format; {SUPPORTED_IMAGE_FORMATS}"))?;
     if !fmt.reading_enabled() {
         bail!("{fmt:?} images are not supported; {SUPPORTED_IMAGE_FORMATS}");
     }
-    // Decode through `ImageReader` rather than `load_from_memory_with_format`
-    // so the limits are ours. (The free function is not unlimited — it applies
-    // `Limits::default()`, i.e. 512 MiB alloc — but it sets NO dimension cap,
-    // and the alloc cap is documented as non-strict.) A 40-byte PNG header can
-    // declare 65535×65535; the dimension limit rejects that from the header,
-    // before any buffer is reserved.
-    let mut reader = ImageReader::new(std::io::Cursor::new(&bytes));
+    Ok(fmt)
+}
+
+/// A reader over `bytes` with our decoder limits.
+fn limited_reader(bytes: &[u8], fmt: image::ImageFormat) -> ImageReader<std::io::Cursor<&[u8]>> {
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes));
     reader.set_format(fmt);
     let mut limits = Limits::default();
     limits.max_image_width = Some(DECODE_MAX_SIDE);
     limits.max_image_height = Some(DECODE_MAX_SIDE);
     limits.max_alloc = Some(DECODE_MAX_ALLOC);
     reader.limits(limits);
+    reader
+}
+
+/// Decode a base64 data URI or raw base64 string into a `DynamicImage` (the
+/// probe and the decode do this in two steps outside tests).
+#[cfg(test)]
+fn decode_image(data_uri: &str) -> Result<DynamicImage> {
+    let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
+    let fmt = sniff_format(&bytes)?;
+    decode_bytes(&bytes, fmt)
+}
+
+/// Decode already-sniffed image bytes into a `DynamicImage`.
+fn decode_bytes(bytes: &[u8], fmt: image::ImageFormat) -> Result<DynamicImage> {
+    // Decode through `ImageReader` rather than `load_from_memory_with_format`
+    // so the limits are ours. (The free function is not unlimited — it applies
+    // `Limits::default()`, i.e. 512 MiB alloc — but it sets NO dimension cap,
+    // and the alloc cap is documented as non-strict.) A 40-byte PNG header can
+    // declare 65535×65535; the dimension limit rejects that from the header,
+    // before any buffer is reserved.
+    let reader = limited_reader(bytes, fmt);
 
     // ★ EXIF ORIENTATION IS APPLIED. A camera writes the sensor's raw pixels
     // and records how to turn them upright in an EXIF tag rather than rotating
@@ -231,13 +248,18 @@ pub(crate) fn normalize_channel(vcfg: &VisionConfig, channel: usize, raw: u8) ->
 /// permitting 4096² could never exceed 1280 on the long side, so the model's
 /// own declared bound could only ever lower the resolution, never raise it.
 /// `pub(crate)` alias name used by the video path — see [`target_size_for`].
+///
+/// For a Qwen video's frames: each temporal group is one encoder sequence, so
+/// it is capped at the encoder's capacity like a still ([`qwen_area_bound`]).
 pub(crate) fn target_size_for(
     orig_h: u32,
     orig_w: u32,
-    grid_unit: u32,
+    vcfg: &VisionConfig,
     max_pixels: Option<usize>,
 ) -> (u32, u32) {
-    target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels)
+    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
+    let bound = qwen_area_bound(max_pixels, vcfg.patch_size);
+    target_size_with_max_pixels(orig_h, orig_w, grid_unit, bound)
 }
 
 fn target_size_with_max_pixels(
@@ -257,9 +279,63 @@ fn target_size_with_max_pixels(
     // Safety net, always applied.
     let abs_scale = (ABS_MAX_DIM as f32) / long_side;
     let scale = bound_scale.min(abs_scale).min(1.0); // never upscale
-    let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
-    let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
-    (target_h, target_w)
+    let side = |orig: u32, snap: fn(f32) -> f32| {
+        (snap(orig as f32 * scale / grid_unit as f32) as u32).max(1) * grid_unit
+    };
+    let (target_h, target_w) = (side(orig_h, f32::round), side(orig_w, f32::round));
+    // Rounding can land above the area bound (2064x2032 under 2048^2 rounds
+    // to 2080x2048); floor instead then, as HF's `smart_resize` does, so the
+    // bound is a real bound.
+    match max_pixels.filter(|&p| p > 0) {
+        Some(p) if target_h as usize * target_w as usize > p => {
+            (side(orig_h, f32::floor), side(orig_w, f32::floor))
+        }
+        _ => (target_h, target_w),
+    }
+}
+
+/// The area bound the Qwen tower can encode: `max_pixels`, capped by the
+/// encoder's patch capacity (`derive_max_patches`, which clamps to
+/// `CEILING_MAX_PATCHES`) so no image comes out larger than one encoder
+/// batch. `None` keeps the 1280px long-side fallback, which the fallback
+/// capacity (6400 patches = 1280^2) already holds.
+pub(crate) fn qwen_area_bound(max_pixels: Option<usize>, patch_size: usize) -> Option<usize> {
+    let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, patch_size).0;
+    max_pixels
+        .filter(|&p| p > 0)
+        .map(|p| p.min(p_max.saturating_mul(patch_size * patch_size)))
+}
+
+/// Target (H, W) in pixels of a still of `orig_h x orig_w`, for either tower.
+/// One function for the header probe and the decode, so the two agree.
+/// Refuses a Qwen grid past the encoder's patch capacity (a backstop: the
+/// bound above already keeps it inside).
+fn still_target(
+    vcfg: &VisionConfig,
+    orig_h: u32,
+    orig_w: u32,
+    max_pixels: Option<usize>,
+) -> Result<(u32, u32)> {
+    if vcfg.is_glm5_next {
+        return glm_target_size(
+            vcfg,
+            orig_h,
+            orig_w,
+            vcfg.temporal_patch_size,
+            max_pixels,
+            false,
+        );
+    }
+    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
+    let bound = qwen_area_bound(max_pixels, vcfg.patch_size);
+    let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, bound);
+    let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, vcfg.patch_size).0;
+    let patches = (th as usize / vcfg.patch_size) * (tw as usize / vcfg.patch_size);
+    ensure!(
+        patches <= p_max,
+        "image resizes to {patches} patches, more than the encoder's {p_max}"
+    );
+    Ok((th, tw))
 }
 
 /// Preprocess a single base64-encoded image for the Qwen3-VL encoder.
@@ -282,34 +358,33 @@ pub fn preprocess_image_with_max_pixels(
     vcfg: &VisionConfig,
     max_pixels: Option<usize>,
 ) -> Result<(Vec<f32>, usize, usize)> {
-    // Before anything divides by them.
-    validate_geometry(vcfg)?;
-    let img = decode_image(data_uri)?;
+    probe_image(data_uri, vcfg, max_pixels)?.preprocess(vcfg)
+}
+
+/// Decode and patch an image whose geometry [`probe_image`] already fixed.
+fn preprocess_probed(probed: ProbedImage, vcfg: &VisionConfig) -> Result<(Vec<f32>, usize, usize)> {
+    let max_pixels = probed.max_pixels;
+    let img = decode_bytes(&probed.bytes, probed.fmt)?;
+    drop(probed.bytes);
     let img = img.to_rgb8();
     let (orig_w, orig_h) = (img.width(), img.height());
+    let (th, tw) = still_target(vcfg, orig_h, orig_w, max_pixels)?;
+    // EXIF orientation may swap the sides the header declared; the patch
+    // count, which admission charged, cannot change.
+    ensure!(
+        (th as usize / vcfg.patch_size) * (tw as usize / vcfg.patch_size)
+            == probed.grid_h * probed.grid_w,
+        "decoded image geometry disagrees with its header"
+    );
 
-    let (th, tw, img) = if vcfg.is_glm5_next {
-        let (th, tw) = glm_target_size(
-            vcfg,
-            orig_h,
-            orig_w,
-            vcfg.temporal_patch_size,
-            max_pixels,
-            false,
-        )?;
+    let img = if vcfg.is_glm5_next {
         let allow_upscale = vcfg.temporal_patch_size * orig_h as usize * (orig_w as usize)
             < glm_pixel_budget(vcfg, max_pixels, false).0;
-        (th, tw, glm_resize_or_pad(&img, th, tw, allow_upscale))
+        glm_resize_or_pad(&img, th, tw, allow_upscale)
     } else {
-        let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-        let (th, tw) = target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels);
         // Resize with CatmullRom — closest BICUBIC match in the `image` crate,
         // matching HF's `Qwen2VLImageProcessor` which uses PIL resample=3 (BICUBIC).
-        (
-            th,
-            tw,
-            image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom),
-        )
+        image::imageops::resize(&img, tw, th, image::imageops::FilterType::CatmullRom)
     };
 
     let ps = vcfg.patch_size;
@@ -358,6 +433,9 @@ pub fn image_pad_count(grid_h: usize, grid_w: usize, spatial_merge_size: usize) 
     let sms = spatial_merge_size.max(1);
     (grid_h / sms) * (grid_w / sms)
 }
+
+mod probe;
+pub use probe::{ProbedImage, probe_image};
 
 #[cfg(test)]
 #[path = "vision_preprocess_format_tests.rs"]
