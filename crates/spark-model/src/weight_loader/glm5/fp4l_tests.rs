@@ -404,3 +404,6 @@ fn hc_fn_stays_bf16_and_base_scale_are_bf16_or_f32() {
         }
     }
 }
+
+#[path = "fp4l_test_gpu.rs"]
+mod gpu;

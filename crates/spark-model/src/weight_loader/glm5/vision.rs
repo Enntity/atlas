@@ -33,7 +33,7 @@ fn dense_ptr(store: &WeightStore, name: &str) -> Result<DevicePtr> {
 
 /// The BF16 weight of the vision linear `stem` and its logical `[rows, cols]`
 /// (a packed NVFP4 `[rows, cols/2]` U8 counts its unpacked columns).
-fn linear(
+pub(super) fn linear(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     stem: &str,
@@ -62,7 +62,7 @@ fn linear_ptr(store: &WeightStore, gpu: &dyn GpuBackend, stem: &str) -> Result<D
     linear(store, gpu, stem).map(|(ptr, _)| ptr)
 }
 
-fn concat_weights(
+pub(super) fn concat_weights(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     direct: &str,
