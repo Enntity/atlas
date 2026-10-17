@@ -923,8 +923,8 @@ impl BlockDiffusionDraftHead {
         // ≥43% accept (vs 44.9% BF16) AND ≥11.0 tok/s (vs 8.70). If hard
         // fail, layer-by-layer ablation; skip layer 0 first.
         let bf16_only = head.startup.bf16_weights_only;
-        let fp8_requested = !bf16_only
-            && std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
+        let fp8_requested =
+            !bf16_only && std::env::var("ATLAS_DFLASH_DRAFTER_FP8").ok().as_deref() == Some("1");
         let fp8_kernels_present = head.kernels.fp8_gemm_n128_row_scaled.0 != 0
             && head.kernels.fp8_gemm_n128_row_scaled_m16.0 != 0;
         if fp8_requested && !fp8_kernels_present {

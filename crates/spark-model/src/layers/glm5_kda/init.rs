@@ -250,8 +250,12 @@ impl Glm5KdaLayer {
             lower_bound: layer.lower_bound,
             register_resident_prefill: layer.register_resident_prefill,
         };
-        layer.fla_reference =
-            super::reference_policy::FlaReference::load(gpu, policy, &requirements, routed_scratch)?;
+        layer.fla_reference = super::reference_policy::FlaReference::load(
+            gpu,
+            policy,
+            &requirements,
+            routed_scratch,
+        )?;
         layer.native_aux = layer.load_native_aux(gpu)?;
         Ok(layer)
     }

@@ -56,10 +56,23 @@ impl LoadProgress {
                 }
                 let (loaded, total, file, elapsed) = {
                     let s = inner_c.lock().unwrap();
-                    (s.loaded_bytes, s.total_bytes, s.current_file.clone(), s.start.elapsed().as_secs_f64())
+                    (
+                        s.loaded_bytes,
+                        s.total_bytes,
+                        s.current_file.clone(),
+                        s.start.elapsed().as_secs_f64(),
+                    )
                 };
-                let bw = if elapsed > 0.0 { loaded as f64 / elapsed } else { 0.0 };
-                let pct = if total > 0 { (loaded as f64 / total as f64) * 100.0 } else { 0.0 };
+                let bw = if elapsed > 0.0 {
+                    loaded as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let pct = if total > 0 {
+                    (loaded as f64 / total as f64) * 100.0
+                } else {
+                    0.0
+                };
                 tracing::info!(
                     target: "atlas.load_progress",
                     loaded_bytes = loaded,
@@ -71,11 +84,17 @@ impl LoadProgress {
                 );
             }
         });
-        Self { inner, handle: Some(handle), interval_secs }
+        Self {
+            inner,
+            handle: Some(handle),
+            interval_secs,
+        }
     }
 
     pub fn update(&self, loaded_bytes: u64, current_file: &str) {
-        if self.interval_secs == 0 { return; }
+        if self.interval_secs == 0 {
+            return;
+        }
         let mut s = self.inner.lock().unwrap();
         s.loaded_bytes = loaded_bytes;
         s.current_file = current_file.to_string();

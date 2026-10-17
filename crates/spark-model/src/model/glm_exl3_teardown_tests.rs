@@ -2,8 +2,8 @@
 //! Exercise real model teardown with a failure at the GPU completion boundary.
 #[path = "trait_impl/prefill_stream_test_fixture.rs"]
 mod fixture;
-use fixture::Fixture;
 use anyhow::{Result, ensure};
+use fixture::Fixture;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use std::sync::{
     Arc, Mutex,

@@ -483,9 +483,11 @@ impl TransformerModel {
 /// Byte for the per-step MLA arena clear: 0 by default, `None` to skip.
 fn decode_arena_fill() -> Option<u8> {
     static FILL: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
-    *FILL.get_or_init(|| match std::env::var("ATLAS_DECODE_ARENA_FILL").as_deref() {
-        Ok("skip") => None,
-        Ok("poison") => Some(0xFF),
-        _ => Some(0),
-    })
+    *FILL.get_or_init(
+        || match std::env::var("ATLAS_DECODE_ARENA_FILL").as_deref() {
+            Ok("skip") => None,
+            Ok("poison") => Some(0xFF),
+            _ => Some(0),
+        },
+    )
 }

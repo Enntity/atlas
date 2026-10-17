@@ -540,7 +540,10 @@ fn main() {
     let cache_key = |job: &CompileJob| -> Option<String> {
         let mut flags = job.extra_flags.clone();
         for knob in ["ATLAS_EXTRA_NVCC_FLAGS", "ATLAS_KERNEL_NO_STRICT"] {
-            flags.push(format!("{knob}={}", std::env::var(knob).unwrap_or_default()));
+            flags.push(format!(
+                "{knob}={}",
+                std::env::var(knob).unwrap_or_default()
+            ));
         }
         let inputs = atlas_closure::ClosureInputs {
             sources: vec![job.cu_file.clone()],

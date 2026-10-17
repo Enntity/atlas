@@ -755,7 +755,10 @@ pub(crate) fn load_model(
         .filter_map(|e| e.ok())
         .filter(|e| {
             let n = e.file_name().to_string_lossy().to_string();
-            n.ends_with(".safetensors") || n.ends_with(".bin") || n.ends_with(".pth") || n.ends_with(".ckpt")
+            n.ends_with(".safetensors")
+                || n.ends_with(".bin")
+                || n.ends_with(".pth")
+                || n.ends_with(".ckpt")
         })
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())

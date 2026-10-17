@@ -237,9 +237,15 @@ impl NativeExl3Mhc {
                 rounded_splits
             } else {
                 // Same split count exl3_mhc_pre_norm derives from gridDim.x.
-                let splits: u32 = if rows < 8 && self.hidden <= 4096 { 8 } else { 4 };
+                let splits: u32 = if rows < 8 && self.hidden <= 4096 {
+                    8
+                } else {
+                    4
+                };
                 ensure!(
-                    self.hidden.is_multiple_of(splits) && 25 * splits * 4 <= self.hidden * 2 && self.hidden <= 4096,
+                    self.hidden.is_multiple_of(splits)
+                        && 25 * splits * 4 <= self.hidden * 2
+                        && self.hidden <= 4096,
                     "split mHC partials must fit the normed row"
                 );
                 KernelLaunch::new(gpu, partials)
