@@ -21,16 +21,24 @@ impl TransformerModel {
     /// `max_seq_len`; `startup_parity` checks the vision pixel bound), so the
     /// head and the worker agree.
     ///
-    /// The native GLM tower keeps a deferred request inside its window: the
-    /// per-chunk encode past its 16384-row output is not yet measured on GLM
-    /// (follow-up: size `GLM_MAX_OUTPUT_ROWS` like the Qwen window).
+    /// The native GLM tower on a multi-rank world keeps a deferred request
+    /// inside its window: that is what the rank protocol admitted before
+    /// (the header was checked against `GLM_MAX_OUTPUT_ROWS`), and the
+    /// per-chunk encode past it is not measured on GLM. A single GLM rank
+    /// never checked the header, so it keeps the context bound (its chunks
+    /// are still checked against the window). Follow-up: size
+    /// `GLM_MAX_OUTPUT_ROWS` like the Qwen window.
     pub(crate) fn vision_row_bounds(&self) -> VisionRowBounds {
         let ve = self.vision_encoder.as_ref();
         let window = ve.map_or(0, |ve| ve.output_rows());
         let glm = ve.is_some_and(|ve| ve.glm.is_some());
         VisionRowBounds {
             window,
-            request: if glm { window } else { self.config.max_seq_len },
+            request: if glm && self.multi_rank_protocol_active() {
+                window
+            } else {
+                self.config.max_seq_len
+            },
         }
     }
 
