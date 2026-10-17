@@ -5,6 +5,7 @@
 mod components;
 mod dense;
 mod expert_tp;
+mod fp4l;
 mod layers;
 mod mla_twins;
 pub(crate) mod retirement;
@@ -60,7 +61,7 @@ impl ModelWeightLoader for Glm5WeightLoader {
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<DenseWeight> {
-        dense_auto(store, &format!("{}.norm.weight", config.weight_prefix), gpu)
+        fp4l::norm_bf16(store, &format!("{}.norm.weight", config.weight_prefix), gpu)
     }
 
     fn load_lm_head(
