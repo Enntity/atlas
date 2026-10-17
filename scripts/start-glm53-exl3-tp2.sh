@@ -7,7 +7,7 @@
 # (glm53-exl3-head / glm53-exl3-worker are preserved as fallback; this script
 # never touches them). Serve profile = Atlas validated defaults: BF16 KV,
 # eager/no decode graphs, EP=1, max context 4096, prefill chunk 128,
-# serial single-sequence admission (C1). See continue.md step 7 and
+# serial single-sequence admission (C1). See
 # docs/design/exl3-support.md for what is and is not qualified.
 #
 # Usage (spark0): RANK=0 bash scripts/start-glm53-exl3-tp2.sh

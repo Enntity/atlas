@@ -28,7 +28,7 @@ the historical singleton reappears.
   `dda99c7e935920fa6e235ce410e6f806e1c02720`; TP=2/EP=1; temperature 0;
   seed 42; eager; full short16-then-long request order; chunk128 runner;
   reference effective MLA format `auto`→`fp8_ds_mla`
-  (continue.md §6 frozen comparison profile).
+  (the frozen comparison profile).
 - Cache handling (registered here explicitly because it changes both arms
   identically): freeze a per-rank copy of the **present** cache state, then
   initialize an isolated writable copy from that same snapshot for each

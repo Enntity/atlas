@@ -1,6 +1,6 @@
 # R-a — `ATLAS_DECODE_ARENA_FILL=skip` safety audit
 
-**Item:** todo.md `R-a` — arena-skip safety audit
+**Item:** `R-a` — arena-skip safety audit
 **Branch:** `followup/ra-arena-skip-audit` (off `perf/decode-vllm-parity-20261015` @ `794e9400`)
 **Date:** 2026-10-16
 **Mode:** READ-ONLY source audit. No GPU work, no source edits, no server runs.

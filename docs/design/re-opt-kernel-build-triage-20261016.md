@@ -37,7 +37,7 @@ Nothing was implemented. The owner decision is still pending.
 ## 1. Reproduction (builder container, no GPU)
 
 Host access: `spark1` does not resolve from this workstation
-(`ssh spark1 …` → `Could not resolve hostname`). Per `continue.md` §5
+(`ssh spark1 …` → `Could not resolve hostname`). Per the host access notes
 (`spark1 = colum@10.50.0.11`, hostname `gx10-235f`, reached through jump host
 `colum@192.168.1.50`), the working route is the wrapper
 `/home/colum/.local/bin/spark1`.
@@ -284,7 +284,7 @@ and no launch site sets it. `KernelLaunch::shared_mem(bytes)` exists
 So even once it compiles, the first launch runs with 0 bytes of dynamic shared
 memory while the kernel writes `weight_cache[0..1023]` — undefined behaviour /
 `CUDA_ERROR_INVALID_VALUE`, not a slow path. For the reference geometry
-(hidden 4096, intermediate 2048/1024-local per `continue.md` §6) the sizes stay
+(hidden 4096, intermediate 2048/1024-local per the serving profile) the sizes stay
 well under the 48 KB cap: 4096 B (MoE matmul), 512 B (output hadamard),
 12800 B (fused linear at k=2048) and 20992 B (k=4096) — matching the
 `k <= 11136` guard already in `native.rs:195` and `exl3_fused_linear.cuh:60`.

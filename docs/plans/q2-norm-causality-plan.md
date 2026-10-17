@@ -3,7 +3,7 @@
 Status (2026-10-12, after the independent review `CODE_REVIEW_2026-10-12.md`):
 **C1 closed from native captures** (operator decision; flagged, see below).
 **C2 is the next experiment.** Sequencing authority for the post-attribution
-diagnostic work; follow-ups in `todo.md` reference this plan. The plan also
+diagnostic work. The plan also
 covers neighboring model/configuration coverage and a repeatable Rust/vLLM
 implementation review. Those sections are planned work, not new
 qualification or an expansion of GPU experiment authorization.
@@ -377,7 +377,7 @@ checklist and this plan, preserving failed runs and superseded conclusions.
    identities; source-versus-runtime gaps; and the smallest next experiments.
    State correctness scope and performance scope separately. "No finding in
    reviewed paths" is not proof for unreviewed branches. Reconcile new results
-   into `q2-diagnostic.md`, `todo.md`, `continue.md` and `decisions.md` without
+   into the experiment log and decision record without
    overwriting original evidence or marking unexecuted work complete.
 
 ## Performance and the meaning of optimal
@@ -416,8 +416,7 @@ kernel count, reference parity or compilation.
 
 ```text
 Review the current Atlas implementation and Q2 investigation end to end.
-Read AGENTS.md, CONTRIBUTING.md, continue.md, todo.md, decisions.md,
-q2-diagnostic.md and docs/plans/q2-norm-causality-plan.md. Apply the
+Read AGENTS.md, CONTRIBUTING.md and docs/plans/q2-norm-causality-plan.md. Apply the
 measurement-discipline skill. Follow the plan's repeatable review procedure
 and neighboring-types coverage matrix; use independent subagent reviews for
 Atlas implementation, vLLM semantics and evidence/harness validity.
@@ -485,8 +484,7 @@ must additionally:
   `q2-gate-v2-20261012/`).
 - Reference engine source (hash-pinned): `/home/colum/Workspace/vllm-reference-src/`
   + `/home/colum/Workspace/atlas-exl3-validation-20261010/arithmetic-audit/`.
-- In-repo: `q2-diagnostic.md` (experiment log), `todo.md` (G1–G9 follow-ups),
-  `decisions.md`, `tests/exl3_validation/` (harnesses),
+- In-repo: `tests/exl3_validation/` (harnesses),
   `docs/design/exl3-statistical-gate.md` (frozen v1 gate),
   `docs/design/exl3-statistical-gate-v2.md` (v2 + Amendment 1, pending
   sign-off).

@@ -3,8 +3,7 @@
 Parent contract: [q2-norm-causality-plan.md](q2-norm-causality-plan.md)
 §"Fallback-suspect ordering" (L1 escalation) and §"Constraints" (v24
 production obligations) are the authority for semantics; this file is the
-implementation contract only and never relaxes the parent. todo.md "Now" #4
-and "Next" (v24 prerequisites) name the work. Purpose: implement every
+implementation contract only and never relaxes the parent. Purpose: implement every
 CPU-only piece now so the next GPU windows execute runs instead of growing
 code. **No GPU work happens under this spec.** Assumptions/constraints are
 folded here (2026-10-12 "validation-campaign logging convention"; no
@@ -336,7 +335,7 @@ the file nears the readability limit).
 
 Acceptance D5: pytest green with a fake `nvcc` (argv capture + canned PTX)
 and a synthetic manifest/binding pair; negative tests for each fail-closed
-condition. A real GPU replay under both lanes is owed (todo.md "Next").
+condition. A real GPU replay under both lanes is owed.
 
 ## Source-bound L1 collection helper
 
@@ -417,7 +416,7 @@ from a qualification verdict.
 ## Out of scope (record, do not build)
 
 - All GPU execution: the ablation rerun, L1 capture collection, image
-  builds and neutrality proofs. They remain owed items in todo.md.
+  builds and neutrality proofs. They remain owed items.
 - G1 (layers 4–44 bisection): D1 deliberately permits only `{0,1}`;
   widening is its own reviewed change.
 - The production v24 fix itself and any neighbor-coverage matrix work.

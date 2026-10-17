@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# Read-only inspection of both Sparks (continue.md "Before any GPU work"):
+# Read-only inspection of both Sparks (before any GPU work):
 # containers (incl. which image the stopped glm53-exl3-atlas-* containers
 # reference), GPU processes / ownership, and host identity. Never mutates
 # anything. Answer this before any restart or GPU experiment.

@@ -424,7 +424,7 @@ were measured with the checkpoint tokenizer; every trial records
 `usage.prompt_tokens` to confirm them on the live server.
 ## Concurrency and context (F2/F3)
 
-`f2_concurrency.py` and `f3_context.py` qualify todo.md F2 and F3 against a
+`f2_concurrency.py` and `f3_context.py` qualify F2 and F3 against a
 live server. Both use `harness_client.py` (standard library only: strict SSE
 parsing, an overall per-request deadline and cancellation enforced by closing
 the socket, token-for-token comparison) and write one receipt that is never

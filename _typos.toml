@@ -212,7 +212,7 @@ extend-exclude = [
     "tests/exl3_validation/q4/build_corpus.py",
     "tests/exl3_validation/q4/checkers.py",
 # Evidence artifacts: verbatim logs and dumps, not prose.
-    "atlas-launch-smoke-20261010/",
+    "tests/exl3_validation/receipts/",
 # Experiment notes and dev scripts: informal shorthand, not user-facing.
     "docs/experiments/",
     "scripts/dev/",

@@ -27,14 +27,14 @@ entries as such instead of deleting them.
 
 - **A1 — Frozen comparison profile.** TP=2/EP=1, BF16 KV, eager, context
   4096, chunk 128, one-sequence admission, no prefix caching or
-  speculation (continue.md §6). CPU-only diagnostic tooling must not touch
+  speculation. CPU-only diagnostic tooling must not touch
   it.
 - **A2 — Evidence discipline.** Durable root
   `/home/colum/Workspace/atlas-exl3-validation-20261010`; fresh attempt
   names and capture roots; never reuse or delete failed attempts; `/tmp`
-  is not durable evidence (continue.md §3).
+  is not durable evidence.
 - **A3 — One experiment owner** across both Sparks at a time; re-inspect
-  hosts before any GPU work (continue.md §3).
+  hosts before any GPU work.
 - **A4 — Metric SSOT.** Scoring metrics come from
   `tests/exl3_validation/statistical_gate.py::row_metrics`; no re-derived
   metrics in C2 tooling.
