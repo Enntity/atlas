@@ -236,20 +236,15 @@ pub(super) fn drain_pending_requests(
         taken.push((idx, g.requests.remove(idx)));
     }
 
-    // Requests left for want of a batch slot wait silently otherwise (the KV
-    // gate names its own holds): a staggered stream on a pair already serving
-    // other traffic waited ~20 s for its first chunk with nothing in the log.
-    // On change only, like the KV gate.
-    static LAST_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let held = g.requests.len();
-    if LAST_HELD.swap(held, std::sync::atomic::Ordering::Relaxed) != held && held > 0 {
-        tracing::info!(
-            "Prefill admission: {held} request(s) wait for a batch slot \
-             ({} decoding + {} prefilling of {max_batch_size})",
-            active.len(),
-            prefilling.len(),
-        );
-    }
+    // Why the rest wait, on change only (`admission_hold`).
+    admission_hold::log_on_change(
+        g.requests.len(),
+        selected.len(),
+        cap,
+        active.len(),
+        prefilling.len(),
+        max_batch_size,
+    );
 
     // Re-sort into policy-selected order.
     let mut result = Vec::with_capacity(selected.len());
@@ -450,5 +445,6 @@ pub(super) fn compact_survivors_into_range(model: &dyn Model, survivors: &mut [A
     }
 }
 
+mod admission_hold;
 mod send;
 pub use send::*;
