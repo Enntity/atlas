@@ -144,8 +144,6 @@ RTO = "RTO"
 acceptence = "acceptence"
 # `controllen` — `msg_controllen` is the standard POSIX `msghdr` field name.
 controllen = "controllen"
-# `murr` — intentional shorthand in KV column-codecs plan notes.
-murr = "murr"
 # `ede` — intentional shorthand in experiment notes for 'edge'.
 ede = "ede"
 # `caf` — used as 'café' in test fixtures (without accent).
@@ -167,7 +165,7 @@ pn = "pn"
 # `aout` — variable name in dev scripts.
 aout = "aout"
 # `nothink` — the thinking-disabled workload/template variant
-# (`f4ref_bridges_nothink_1024`, `tools+nothink`). Not a typo of "nothing".
+# (`tools+nothink`). Not a typo of "nothing".
 nothink = "nothink"
 
 [default.extend-identifiers]

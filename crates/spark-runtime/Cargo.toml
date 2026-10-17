@@ -72,7 +72,6 @@ required-features = ["test-utils"]
 
 [dependencies]
 atlas-core = { workspace = true }
-atlas-codecs = { path = "../atlas-codecs" }
 # NVMe prefix spill tier: the O_DIRECT record store (CUDA-free, anyhow+libc).
 atlas-tier = { workspace = true }
 atlas-kernels = { workspace = true }
