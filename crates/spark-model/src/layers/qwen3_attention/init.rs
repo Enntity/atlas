@@ -10,7 +10,7 @@ use spark_runtime::kv_cache::KvCacheDtype;
 // `gate` must be called through a real path, not through a `let`-bound
 // function pointer: coercing a `#[track_caller]` fn to a pointer inserts a shim
 // and the audit would name the shim instead of the dispatch site below.
-use super::init_arch_gates::{ArchProbes, gated as gate};
+use super::init_arch_gates::{ArchProbes, gated as gate, needs_causal_id_fill};
 use super::init_glm::{GlmIndexSelection, paged_decode_mla};
 use super::types::{HeadGateActivation, Qwen3AttentionLayer};
 use crate::layers::FfnComponent;
@@ -371,7 +371,7 @@ impl Qwen3AttentionLayer {
             } else {
                 KernelHandle(0)
             },
-            glm_index_fill_causal_dev_k: if kv_dtype == KvCacheDtype::Fp8G128 {
+            glm_index_fill_causal_dev_k: if needs_causal_id_fill(glm, kv_dtype) {
                 gpu.kernel("glm_indexer", "glm_index_fill_causal_dev")?
             } else {
                 KernelHandle(0)

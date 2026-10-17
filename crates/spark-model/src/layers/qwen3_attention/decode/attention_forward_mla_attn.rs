@@ -42,6 +42,11 @@ impl Qwen3AttentionLayer {
         let fp8 = self.kv_dtype == spark_runtime::kv_cache::KvCacheDtype::Fp8G128;
         let sparse_indices = match sparse_indices {
             None if fp8 || causal_ids => {
+                anyhow::ensure!(
+                    self.glm_index_fill_causal_dev_k.0 != 0,
+                    "GLM dense decode row needs glm_index_fill_causal_dev, not loaded for {:?} KV",
+                    self.kv_dtype
+                );
                 let indices = ctx.buffers.expert_gate_out();
                 ops::glm_index_fill_causal_dev(
                     ctx.gpu,
