@@ -140,8 +140,6 @@ dbe = "dbe"
 AIMD = "AIMD"
 # `RTO` — Retransmission Timeout (TCP).
 RTO = "RTO"
-# `acceptence` — intentional variant in follow-up-ideas.md notes.
-acceptence = "acceptence"
 # `controllen` — `msg_controllen` is the standard POSIX `msghdr` field name.
 controllen = "controllen"
 # `ede` — intentional shorthand in experiment notes for 'edge'.
@@ -218,8 +216,6 @@ extend-exclude = [
 # Experiment notes and dev scripts: informal shorthand, not user-facing.
     "docs/experiments/",
     "scripts/dev/",
-# Follow-up ideas: informal notes.
-    "follow-up-ideas.md",
 # Archived C1 replay: historical scripts with abbreviated variable names.
     "tests/exl3_validation/archive/",
 # Test fixtures with intentional variants.
