@@ -293,10 +293,21 @@ fn build_mtp_moe(
 
     // Router precision matters more than router size here: at 512 experts the
     // top-10 weights cluster tightly. Same treatment as `ffn::build_moe`.
-    let gate_nvfp4 = Some(q(&gate, n_experts, h)?);
+    // `ATLAS_QWEN4EXP_MTP_BF16_ROUTER=1`: the drafter's router stays BF16
+    // (TensorFold's), the target's untouched. Drafts only, never output.
+    let gate_nvfp4 = if env_on("ATLAS_QWEN4EXP_MTP_BF16_ROUTER") {
+        None
+    } else {
+        Some(q(&gate, n_experts, h)?)
+    };
     let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
         .context("qwen4_exp MTP: MoeLayer")?;
     Ok(FfnComponent::Moe(moe))
+}
+
+/// A drafter-only precision switch (`ATLAS_QWEN4EXP_MTP_BF16_*`) is `1`.
+fn env_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
 }
 
 /// Load the Qwen3.8-Flash-Next MTP draft module.
@@ -327,7 +338,12 @@ pub fn load_qwen4exp_mtp_module(
     // be built for this rank's share of the experts though it holds all 512.
     // The MTP tensors are never sliced or EP-skipped at upload, so every one
     // is here in full.
-    let config = &config.tp1_view();
+    let mut config = config.tp1_view();
+    // `ATLAS_QWEN4EXP_MTP_BF16_ATTN=1`: the drafter's Q/K/V/O stay at the
+    // checkpoint's BF16 (the `--attn-proj-dtype bf16` arms), the target's
+    // keep theirs. The shared expert cannot follow: `ExpertWeight` is NVFP4.
+    config.attn_proj_bf16 |= env_on("ATLAS_QWEN4EXP_MTP_BF16_ATTN");
+    let config = &config;
     let h = config.hidden_size;
     let variant = crate::weight_map::detect_nvfp4_variant(store, config);
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
