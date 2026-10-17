@@ -154,8 +154,14 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
-            let split_disabled = pc_policy::tail_split_disabled();
-            if !split_disabled && cut > chunk_start && cut < total {
+            // `ATLAS_TAIL_SPLIT_MIN_TOKENS` keeps a short prompt to one pass.
+            if pc_policy::tail_split_at(
+                total,
+                chunk_start,
+                cut,
+                pc_policy::tail_split_disabled(),
+                pc_policy::tail_split_min_tokens(),
+            ) {
                 anyhow::ensure!(
                     passengers.is_none(),
                     "GLM fused chunk cannot take the tail-checkpoint split"

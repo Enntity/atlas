@@ -99,6 +99,9 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_NO_TAIL_SPLIT", || {
         Ok(pc::tail_split_disabled() as u64)
     }),
+    ("ATLAS_TAIL_SPLIT_MIN_TOKENS", || {
+        Ok(pc::tail_split_min_tokens() as u64)
+    }),
     ("ATLAS_GLM_PREFILL_SP", || Ok(glm_sp::requested() as u64)),
     // Sequence-parallel prefill needs the BF16 highway, which needs the
     // DFlash lane.
