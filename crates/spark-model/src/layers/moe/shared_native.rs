@@ -118,12 +118,15 @@ impl MoeLayer {
         ctx.config.expert_tp || self.shared_native.is_some()
     }
 
-    /// Install the native shared expert and free the runtime NVFP4 copies
-    /// it replaces (originals and transposed twins), leaving null weights so
-    /// no NVFP4 shared path can be taken. Runs at load, before the deferred
-    /// shared FP8 cache (which then skips this layer). The layer must be on
-    /// legacy B-tile storage (the resident B-tile arena binds the shared
-    /// NVFP4 copies).
+    /// Install the native shared expert and free every copy derived from the
+    /// runtime NVFP4 one it replaces: the NVFP4 originals, their transposed
+    /// twins (and the unified layout's gate/up receipt over them) and any
+    /// E4M3 predecode (`shared_*_fp8`, the `ATLAS_GLM_TARGET_SHARED_FP8` cache
+    /// or the FP8 prefill predecode), leaving null weights so no derived
+    /// shared path can be taken. Runs at load; the deferred cache then skips
+    /// this layer. A checkpoint-native BF16 / FP8 shared expert of another
+    /// model is authoritative and refused. The layer must be on legacy B-tile
+    /// storage (the resident B-tile arena binds the shared NVFP4 copies).
     pub(crate) fn install_shared_native(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -131,14 +134,23 @@ impl MoeLayer {
     ) -> Result<()> {
         self.btile_storage.require_legacy()?;
         ensure!(
-            self.shared_gate_up_receipt.is_none()
-                && self.shared_gate_fp8.is_none()
-                && self.shared_up_fp8.is_none()
-                && self.shared_down_fp8.is_none()
-                && self.bf16_shared_expert.is_none()
-                && self.fp8_shared_expert.is_none(),
-            "native shared expert: another shared copy is already installed"
+            self.bf16_shared_expert.is_none() && self.fp8_shared_expert.is_none(),
+            "native shared expert: the layer holds a checkpoint-native BF16 / FP8 shared expert"
         );
+        // Native takes precedence over every derived copy.
+        self.shared_gate_up_receipt = None;
+        for p in [
+            self.shared_gate_fp8.take(),
+            self.shared_up_fp8.take(),
+            self.shared_down_fp8.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            gpu.free(p)?;
+        }
+        self.shared_fp8_cache.layer = None;
+        self.shared_fp8_cache.verify = false;
         let shared = std::mem::replace(
             &mut self.weights.shared_expert,
             ExpertWeight {
