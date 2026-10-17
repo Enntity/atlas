@@ -9,6 +9,13 @@ Decode rates come from perf_baseline's TPOT (prefill never leaks into them).
 
   python3 tests/exl3_validation/bench_tp2.py --image IMAGE --label base \
       --out $EV/perf-ab-20261015 [--env KEY=VALUE ...] [--workload decode_prose]
+
+--profile glm53-nvfp4-ep2 serves the GLM-5.3-Flash NVFP4 checkpoint in upstream's
+dual-Spark layout (EP=2, TP=1) for upstream non-regression A/Bs. It keeps the
+descriptors' docker/NCCL/RDMA arguments, drops every ATLAS_* env and the EXL3
+driver-cache mount (upstream defaults only), mounts the hosts' HF cache and
+replaces the serve command. Run it under `flock /tmp/atlas-bench.lock`;
+--print-argv shows both ranks' argv without touching the Sparks.
 """
 import argparse
 import gzip
@@ -35,6 +42,30 @@ OBSERVER_ENV = 'ATLAS_EXL3_LOGITS_DIR'
 HOSTS = {0: Path.home()/'.local/bin/spark0', 1: Path.home()/'.local/bin/spark1'}
 MODEL = ('/root/.cache/huggingface/hub/models--MikeRoz--GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3/'
          'snapshots/dda99c7e935920fa6e235ce410e6f806e1c02720')
+# Serve profiles. The EXL3 TP2 profile is the descriptors' serve command as-is.
+NVFP4_HF_ROOT = '/home/colum/.cache/huggingface'
+NVFP4_REVISION = '36c184c6cda000a481711306df5adde42f63321a'
+NVFP4_MODEL = ('/root/.cache/huggingface/hub/models--RedHatAI--GLM-5.3-Flash-NVFP4/snapshots/'
+               + NVFP4_REVISION)
+
+
+def nvfp4_ep2_serve(rank):
+    # Upstream's GLM-5.3-Flash dual-Spark layout; KV dtype and LM head come from
+    # MODEL.toml (bf16 KV). No --language-model-only: upstream's CLI lacks it.
+    return ['serve', NVFP4_MODEL, '--world-size', '2', '--tp-size', '1', '--ep-size', '2',
+            '--rank', str(rank), '--master-addr', '192.168.100.1', '--master-port', '29721',
+            '--bind', '0.0.0.0', '--port', '8011', '--max-seq-len', '4096',
+            '--max-batch-size', '1', '--max-num-seqs', '1', '--gpu-memory-utilization', '0.88',
+            '--swap-space-gb', '0', '--oom-guard-mb', '1024', '--request-timeout', '1200']
+
+
+PROFILES = {
+    'glm53-exl3-tp2': {'model': MODEL, 'revision': 'dda99c7e935920fa6e235ce410e6f806e1c02720',
+                       'serve': None, 'hf_root': None},
+    'glm53-nvfp4-ep2': {'model': NVFP4_MODEL, 'revision': NVFP4_REVISION,
+                        'serve': nvfp4_ep2_serve, 'hf_root': NVFP4_HF_ROOT},
+}
+DEFAULT_PROFILE = 'glm53-exl3-tp2'
 SSH_TUNNEL = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15', '-J', 'colum@192.168.1.50',
               '-N', '-L']
 
@@ -57,7 +88,9 @@ def remote(rank, command, check=True, timeout=300):
     return result.stdout
 
 
-def create_argv(rank, image, name, extra_env, binary=None, capture=None, cpuset=None):
+def create_argv(rank, image, name, extra_env, binary=None, capture=None, cpuset=None,
+                profile=DEFAULT_PROFILE):
+    prof = PROFILES[profile]
     argv = json.loads((DESCRIPTORS/f'cand-rank{rank}-create-command.json').read_text())
     out, i = [], 0
     while i < len(argv):
@@ -65,9 +98,19 @@ def create_argv(rank, image, name, extra_env, binary=None, capture=None, cpuset=
             i += 2; continue
         if argv[i] in ('--volume', '-v') and argv[i+1].endswith(':/tmp/capture'):
             i += 2; continue
+        if prof['serve']:  # another model: keep only the docker/NCCL/RDMA arguments
+            if argv[i] == '--env' and argv[i+1].split('=', 1)[0].startswith(('ATLAS_', 'CUDA_CACHE_PATH')):
+                i += 2; continue
+            if argv[i] in ('--volume', '-v') and argv[i+1].split(':')[1] in (
+                    '/tmp/cuda-driver-cache', '/root/.cache/huggingface'):
+                i += 2; continue
         out.append(argv[i]); i += 1
     out[out.index('--name')+1] = name
     at = out.index(DESCRIPTOR_IMAGE)
+    if prof['serve']:
+        out[at:] = ['--volume', f"{prof['hf_root']}:/root/.cache/huggingface:ro", DESCRIPTOR_IMAGE] \
+            + prof['serve'](rank)
+        at = out.index(DESCRIPTOR_IMAGE)
     overrides = []
     for item in extra_env:
         key = item.split('=', 1)[0]
@@ -124,18 +167,30 @@ def main():
                     help='source commit of the mounted binary, required with --binary')
     ap.add_argument('--cpuset', help='docker --cpuset-cpus for both ranks')
     ap.add_argument('--capture', action='store_true', help='dump per-step logits under /home/colum/atlas-dev/capture/<run>')
+    ap.add_argument('--profile', choices=sorted(PROFILES), default=DEFAULT_PROFILE,
+                    help='model and serve layout (default: the EXL3 TP2 descriptors)')
+    ap.add_argument('--print-argv', action='store_true',
+                    help='print both ranks\' docker create argv as JSON and exit')
     args = ap.parse_args()
+    prof = PROFILES[args.profile]
+    if args.capture and prof['serve']:
+        ap.error('--capture uses the EXL3 logits observer; it needs the EXL3 profile')
     if bool(args.binary) != bool(args.binary_source_commit):
         ap.error('--binary and --binary-source-commit must be supplied together')
     if args.binary_source_commit and not re.fullmatch(r'[0-9a-fA-F]{7,40}', args.binary_source_commit):
         ap.error('--binary-source-commit must be a 7-40 character hexadecimal commit ID')
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    run = Path(args.out)/f'{args.label}-{stamp}'
-    run.mkdir(parents=True)
     names = {r: f'atlas-bench-{args.label}-{stamp.lower()}-r{r}' for r in (0, 1)}
     capture = f'/home/colum/atlas-dev/capture/{args.label}-{stamp}' if args.capture else None
-    argvs = {r: create_argv(r, args.image, names[r], args.env, args.binary, capture, args.cpuset) for r in (0, 1)}
-    meta = {'label': args.label, 'image': args.image, 'env_overrides': args.env, 'argv': argvs,
+    argvs = {r: create_argv(r, args.image, names[r], args.env, args.binary, capture, args.cpuset,
+                            args.profile) for r in (0, 1)}
+    if args.print_argv:
+        print(json.dumps(argvs, indent=2))
+        return 0
+    run = Path(args.out)/f'{args.label}-{stamp}'
+    run.mkdir(parents=True)
+    meta = {'label': args.label, 'profile': args.profile, 'image': args.image,
+            'env_overrides': args.env, 'argv': argvs,
             'binary': args.binary, 'binary_source_commit': args.binary_source_commit,
             'capture': capture,
             'utc': stamp, 'classification': 'unqualified-uninstrumented'}
@@ -167,7 +222,7 @@ def main():
         while True:
             probe = subprocess.run(['curl', '-fsS', '--max-time', '3', endpoint+'/v1/models'],
                                    capture_output=True, text=True)
-            if probe.returncode == 0 and MODEL in probe.stdout:
+            if probe.returncode == 0 and prof['model'] in probe.stdout:
                 break
             for r in (0, 1):
                 state = remote(r, f"docker inspect --format '{{{{.State.Status}}}}' {names[r]}").strip()
@@ -180,7 +235,7 @@ def main():
         if capture:
             for r in (0, 1):
                 remote(r, f'touch {capture}/rank{r}/capture-enabled')
-        cmd = [sys.executable, str(HERE/'perf_baseline.py'), '--endpoint', endpoint, '--model', MODEL,
+        cmd = [sys.executable, str(HERE/'perf_baseline.py'), '--endpoint', endpoint, '--model', prof['model'],
                '--workloads', args.workloads, '--raw-out', str(run/'raw.jsonl'),
                '--summary-out', str(run/'summary.json'), '--initial-state', 'unknown',
                '--unqualified', '--fingerprint', str(run/'fingerprint.json')]
@@ -193,7 +248,7 @@ def main():
             'binary_sha256_r1': meta.get('binary_sha256_r1'),
             'serve_flags': argvs[0],
             'environment': args.env, 'hosts': ['spark0', 'spark1'],
-            'checkpoint_revision': 'dda99c7e935920fa6e235ce410e6f806e1c02720'}))
+            'checkpoint_revision': prof['revision']}))
         result = subprocess.run(cmd, capture_output=True, text=True)
         (run/'perf_baseline.log').write_text(result.stdout + result.stderr)
         meta['perf_rc'] = result.returncode

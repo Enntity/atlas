@@ -74,5 +74,42 @@ class BenchLifecycleTests(unittest.TestCase):
         remote.assert_not_called()
 
 
+class ProfileArgvTests(unittest.TestCase):
+    DESCRIPTOR = ['docker', 'create', '--name', 'old', '--network', 'host',
+                  '--env', 'NCCL_IB_HCA=rocep1s0f0', '--env', 'CUDA_CACHE_PATH=/tmp/cuda-driver-cache',
+                  '--volume', '/h/cache:/tmp/cuda-driver-cache', '--env', 'ATLAS_KDA_FLA_REFERENCE=1',
+                  '--env', 'ATLAS_EXL3_LOGITS_DIR=/tmp/capture',
+                  '--volume', '/home/colum/glm53-local:/root/.cache/huggingface:ro',
+                  '--volume', '/tmp/x/capture:/tmp/capture', bench_tp2.DESCRIPTOR_IMAGE,
+                  'serve', bench_tp2.MODEL, '--tp-size', '2', '--kv-cache-dtype', 'fp8_g128']
+
+    def argv(self, profile, **kwargs):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        (Path(tmp.name) / 'cand-rank1-create-command.json').write_text(json.dumps(self.DESCRIPTOR))
+        with patch.object(bench_tp2, 'DESCRIPTORS', Path(tmp.name)):
+            return bench_tp2.create_argv(1, 'img', 'new', ['ATLAS_X=1'], '/bin/spark', None, '15-19',
+                                         profile, **kwargs)
+
+    def test_exl3_profile_keeps_descriptor_serve_command(self):
+        out = self.argv('glm53-exl3-tp2')
+        self.assertIn('ATLAS_KDA_FLA_REFERENCE=1', out)
+        self.assertEqual(out[out.index('img') + 1:], self.DESCRIPTOR[-6:])
+
+    def test_nvfp4_profile_drops_exl3_env_and_serves_ep2(self):
+        out = self.argv('glm53-nvfp4-ep2')
+        envs = [out[i + 1] for i, a in enumerate(out) if a == '--env']
+        self.assertEqual(envs, ['NCCL_IB_HCA=rocep1s0f0', 'ATLAS_X=1'])
+        vols = [out[i + 1] for i, a in enumerate(out) if a == '--volume']
+        self.assertEqual(vols, [f'{bench_tp2.NVFP4_HF_ROOT}:/root/.cache/huggingface:ro',
+                                '/bin/spark:/usr/local/bin/spark:ro'])
+        self.assertEqual(out[out.index('--cpuset-cpus') + 1], '15-19')
+        serve = out[out.index('img') + 1:]
+        self.assertEqual(serve, bench_tp2.nvfp4_ep2_serve(1))
+        self.assertEqual(serve[serve.index('--ep-size') + 1], '2')
+        self.assertEqual(serve[serve.index('--tp-size') + 1], '1')
+        self.assertNotIn('--kv-cache-dtype', serve)
+
+
 if __name__ == '__main__':
     unittest.main()
