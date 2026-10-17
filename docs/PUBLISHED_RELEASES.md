@@ -39,10 +39,10 @@ commits.
 
 | | SparkGLM | SparkQwen |
 |---|---|---|
-| Product `main` pin | `sparkglm/atlas-20261015-vision` @ `16315004`, 2026-10-15 ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261016-fp4local` @ `9f64bf6b`, 2026-10-16 ([sparkqwen#8](https://github.com/Enntity/sparkqwen/pull/8)) |
+| Product `main` pin | `sparkglm/atlas-20261015-vision` @ `16315004`, 2026-10-15 ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f`, 2026-10-16 ([sparkqwen#11](https://github.com/Enntity/sparkqwen/pull/11)) |
 | Shared layer | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
 | Atlas-Inf base | `7ffd183f` | same |
-| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261015-vision` @ `1954e759` |
+| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261016-fp4local` @ `9f64bf6b` |
 
 The pinned engines are the current `sparkglm`, `sparkqwen` and
 `spark-shared` branch heads. Their measurements (text output, vision, fill, RigMark and a
@@ -53,4 +53,10 @@ FP4-Local series on the `sparkqwen` layer: NVIDIA's
 with lossless CSF scale decoding, MXFP8 decode, W8A8 MXFP8 prefill, a packed
 NVFP4 PLE table and native NVFP4 MTP experts; the NVFP4 checkpoint loads as
 before. Its measurements, including RigMark through the release image, are in
-SparkQwen's `results/2026-10-16-fp4local/`.
+SparkQwen's `results/2026-10-16-fp4local/`. SparkQwen's drafter release
+(`sparkqwen/atlas-20261016-drafter`) then gives the MTP drafter the target's own
+rows for the prompt and every verified token, queues a long prompt's first
+prefill chunk behind the prefills in flight, and carries the W8A8 review
+hardening; its model-independent scheduler commits are marked `shared:` and
+sit in the `sparkqwen` layer until the shared layer moves. Measurements in
+SparkQwen's `results/2026-10-16-drafter/`.
