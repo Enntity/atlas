@@ -32,6 +32,17 @@
 //! - F32 norms -> BF16 round to nearest even (`norm_bf16`), not the store's
 //!   truncating `dense_f32_safe`.
 //!
+//! `ATLAS_GLM_FP4L_NATIVE=1` (`layers::glm_native`, each group also on its
+//! own switch) instead serves every group in the checkpoint's own format,
+//! exactly: KDA q/k/v/o on their MXFP8 bytes (`kda_mx`), MLA q_a / q_b / kv_a
+//! / o and the shared experts on their FP8 block bytes (`mla_native`,
+//! `shared_native`), the dense MLP on its MXFP8 bytes (`dense::native_dense`).
+//! Decode / verify rows (up to 64) run the row-invariant MXFP8 / FP8 block
+//! GEMV tiers; prefill runs `ATLAS_GLM_FP4L_FP8_PREFILL` (W8A8 by default).
+//! Per rank per decode step that reads ~1.49 GB more than production (KDA
+//! +1.07, dense +0.21, shared +0.23, MLA -0.02) and keeps ~2.3 GB less
+//! resident.
+//!
 //! After a layer is built nothing reads its quantized sources again, so
 //! [`release_expanded`] frees them there, keeping resident memory at the
 //! derived copies alone.
