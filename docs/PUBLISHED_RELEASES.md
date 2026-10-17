@@ -39,10 +39,10 @@ commits.
 
 | | SparkGLM | SparkQwen |
 |---|---|---|
-| Product `main` pin | `sparkglm/atlas-20261015-vision` @ `16315004`, 2026-10-15 ([sparkglm#52](https://github.com/Enntity/sparkglm/pull/52)) | `sparkqwen/atlas-20261017-vision` @ `92dd5435`, 2026-10-17 ([sparkqwen#12](https://github.com/Enntity/sparkqwen/pull/12)) |
+| Product `main` pin | `sparkglm/atlas-20261017-fp4local` @ `b3b016ab`, 2026-10-17 ([sparkglm#53](https://github.com/Enntity/sparkglm/pull/53)) | `sparkqwen/atlas-20261017-vision` @ `92dd5435`, 2026-10-17 ([sparkqwen#12](https://github.com/Enntity/sparkqwen/pull/12)) |
 | Shared layer | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
 | Atlas-Inf base | `7ffd183f` | same |
-| Previous pin | `sparkglm/atlas-20261014-vpc` @ `289cefbc` | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f` |
+| Previous pin | `sparkglm/atlas-20261015-vision` @ `16315004` | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f` |
 
 The pinned engines are the current `sparkglm`, `sparkqwen` and
 `spark-shared` branch heads. Their measurements (text output, vision, fill, RigMark and a
@@ -69,8 +69,8 @@ Its commits are mostly `shared:` and keep GLM's admitted sizes; they sit in
 the `sparkqwen` layer too. Measurements in SparkQwen's `results/2026-10-17-vision/`.
 
 SparkGLM's FP4-Local release (`sparkglm/atlas-20261017-fp4local` @ `b3b016ab`,
-now the `sparkglm` branch head; SparkGLM's product pin stays
-`sparkglm/atlas-20261015-vision` until the product moves it) adds the
+the `sparkglm` branch head and SparkGLM's product pin since
+[sparkglm#53](https://github.com/Enntity/sparkglm/pull/53); image `ghcr.io/enntity/atlas-sparkglm:c8ced64316bf`) adds the
 FP4-Local series on the `sparkglm` layer: NVIDIA's
 `nvidia/GLM-5.3-Flash-FP4-Local` checkpoint (QAD; NVFP4 experts with
 `csf_32x2_v1` compressed scales, MXFP8 KDA/dense/lm_head, FP8 128x128 block
