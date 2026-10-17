@@ -324,12 +324,7 @@ pub fn start_chunked_prefill(
             if multi {
                 return Ok(());
             }
-            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-            model.ep_broadcast_cmd(chunk_len as u32)?;
-            model.ep_broadcast_cmd(0)?; // chunk_start
-            model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-            model.ep_broadcast_tokens(&prompt_tokens)?;
-            Ok(())
+            send_first_chunk(model, &seq, chunk_len, &prompt_tokens)
         })() {
             let msg = format!("deferred prefill EP broadcast failed: {e:#}");
             send_error_to_sink(&mut sink, &msg);
@@ -423,16 +418,7 @@ pub fn start_chunked_prefill(
             req_disable_mtp,
         )?;
         plant_chunk0(model, &mut seq, pc_plant)?;
-        // EP: broadcast chunk 0 tokens to worker.
-        // Send full prompt length + all tokens so worker can do
-        // identical Marconi prefix-cache lookups (bug #33 fix).
-        // Uses bulk broadcast (single NCCL op) instead of per-token broadcast
-        // which caused NCCL timeouts on long prompts (6K+ tokens = 6K+ broadcasts).
-        model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-        model.ep_broadcast_cmd(chunk_len as u32)?;
-        model.ep_broadcast_cmd(0)?; // chunk_start
-        model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-        model.ep_broadcast_tokens(&prompt_tokens)?;
+        send_first_chunk(model, &seq, chunk_len, &prompt_tokens)?;
 
         let _pt0 = std::time::Instant::now();
         let chunk_res = model.prefill_chunk(
@@ -641,6 +627,25 @@ pub fn start_chunked_prefill(
     } else {
         Ok(StartPrefillResult::InProgress(p))
     }
+}
+
+/// EP: send the worker a prompt's chunk-0 command (a no-op on one GPU).
+/// Sends the full prompt length + all tokens so the worker can do identical
+/// Marconi prefix-cache lookups (bug #33 fix). Uses bulk broadcast (single
+/// NCCL op) instead of per-token broadcast, which caused NCCL timeouts on
+/// long prompts (6K+ tokens = 6K+ broadcasts).
+pub(super) fn send_first_chunk(
+    model: &dyn Model,
+    seq: &SequenceState,
+    chunk_len: usize,
+    prompt_tokens: &[u32],
+) -> Result<()> {
+    model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
+    model.ep_broadcast_cmd(chunk_len as u32)?;
+    model.ep_broadcast_cmd(0)?; // chunk_start
+    model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
+    model.ep_broadcast_tokens(prompt_tokens)?;
+    Ok(())
 }
 
 /// Plant the requested shared-prefix checkpoint (`shared_prefix`) in a
