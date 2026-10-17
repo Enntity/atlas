@@ -9,12 +9,18 @@
 //! not depend on how many rows share the launch. So a 1-row decode, a k-row
 //! DFlash verify and a multi-sequence batch agree bit for bit, the property
 //! the canonical W4A16 tier gave the NVFP4 twins.
+//!
+//! Every prefill projection of a layer with a W8A8 operand
+//! (`ATLAS_GLM_FP4L_KDA_W8A8_PREFILL`) is the cuBLASLt MXFP8 W8A8 GEMM:
+//! the activation quantized per row and 32 values into the arena's FP8
+//! scratch, then the row bucket's in-order kernel, row-invariant too.
 
 use anyhow::{Result, ensure};
 use spark_runtime::gpu::DevicePtr;
 
 use super::{Glm5KdaLayer, Glm5Projection};
 use crate::layer::ForwardContext;
+use crate::layers::ops;
 
 impl Glm5KdaLayer {
     /// `output[m, n] = input[m, k] · W^T` on `weight`'s MXFP8 twin; `false`,
@@ -39,7 +45,7 @@ impl Glm5KdaLayer {
             "GLM KDA MXFP8 decode: the mxfp8_gemv tiers are missing from the kernel target"
         );
         let (m, n, k) = (m as usize, n as usize, k as usize);
-        crate::layers::ops::mxfp8_gemv_rows(
+        ops::mxfp8_gemv_rows(
             ctx.gpu,
             &self.mxfp8_gemv_k,
             twin,
@@ -51,6 +57,42 @@ impl Glm5KdaLayer {
             n,
             stream,
         )?;
+        Ok(true)
+    }
+
+    /// `output[m, n] = input[m, k] · W^T` as the W8A8 GEMM on `weight`'s
+    /// MXFP8 operand, quantizing `input` into the arena's FP8 activation
+    /// scratch first unless `cast` is false (the previous projection of the
+    /// same rows left it there); `false`, nothing launched, without one.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::glm5_kda) fn try_project_w8a8(
+        &self,
+        input: DevicePtr,
+        weight: &Glm5Projection,
+        output: DevicePtr,
+        m: u32,
+        n: u32,
+        k: u32,
+        cast: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let Some(w) = weight.w8a8.as_ref() else {
+            return Ok(false);
+        };
+        let (m, n, k) = (m as usize, n as usize, k as usize);
+        ensure!(
+            w.n == n && w.k == k && self.mx_quant_k.0 != 0,
+            "GLM KDA W8A8: operand [{}, {}] for a [{n}, {k}] projection, quant kernel {}",
+            w.n,
+            w.k,
+            self.mx_quant_k.0
+        );
+        let act = ops::mx_act_scratch(ctx.buffers, m, k)?;
+        if cast {
+            ops::mx_quant_rows(ctx.gpu, self.mx_quant_k, input, act, 0..m, k, stream)?;
+        }
+        w.gemm(act, output, m, stream)?;
         Ok(true)
     }
 

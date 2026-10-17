@@ -338,7 +338,8 @@ pub(super) fn load_kda_weights(
                     kind: TpShardKind,
                     transpose_prefill: bool|
      -> Result<Glm5Projection> {
-        // Opt-in: FP4-Local's own MXFP8 bytes as the decode/verify twin.
+        // Opt-in: FP4-Local's own MXFP8 bytes as the decode/verify twin
+        // and/or the W8A8 prefill operand (`kda_mx`).
         let mx = super::kda_mx::kda_twin(
             mx_policy,
             store,
@@ -346,9 +347,20 @@ pub(super) fn load_kda_weights(
             kind,
             dims.tp_rank,
             dims.tp_size,
+            config.max_batch_tokens,
             gpu,
         )?
         .unwrap_or_default();
+        if mx.serves_all() {
+            // Decode, verify and prefill all read the MXFP8 twin: no BF16
+            // expansion, no NVFP4 copies.
+            return Ok(Glm5Projection {
+                nvfp4: crate::weight_map::QuantizedWeight::null(),
+                prefill_nvfp4_t: None,
+                mxfp8: mx.decode,
+                w8a8: mx.w8a8,
+            });
+        }
         let dense = load_tp_dense(name, n, k, kind)?;
         let local_n = if kind == TpShardKind::ColumnParallel {
             n / dims.tp_size
@@ -373,13 +385,15 @@ pub(super) fn load_kda_weights(
         // source is no longer needed. Releasing it keeps the safe 92% memory
         // budget viable on GB10 instead of retaining two projection copies.
         dense.release(gpu)?;
-        let prefill_nvfp4_t = transpose_prefill
+        // W8A8 serves every prefill row, so no transposed prefill twin.
+        let prefill_nvfp4_t = (transpose_prefill && mx.w8a8.is_none())
             .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
             .transpose()?;
         Ok(Glm5Projection {
             nvfp4: decode_nvfp4,
             prefill_nvfp4_t,
             mxfp8: mx.decode,
+            w8a8: mx.w8a8,
         })
     };
     let width = config.linear_conv_kernel_dim;

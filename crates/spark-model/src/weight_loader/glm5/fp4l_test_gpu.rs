@@ -15,8 +15,10 @@
 //! - ViT block 0: MXFP8 qkv exact, W4A16 NVFP4 MLP within one BF16 ulp, the
 //!   gate/up concatenation in order.
 //!
-//!   ATLAS_GLM_FP4L_CKPT=<checkpoint dir> cargo test --release -p spark-model --lib \
-//!       glm5::fp4l::tests::gpu -- --ignored --nocapture --test-threads=1
+//! ```text
+//! ATLAS_GLM_FP4L_CKPT=<checkpoint dir> cargo test --release -p spark-model --lib \
+//!     glm5::fp4l::tests::gpu -- --ignored --nocapture --test-threads=1
+//! ```
 
 use super::*;
 use crate::weight_map::test_checkpoint::read_checkpoint_tensor;
@@ -436,7 +438,7 @@ fn vit_block_0_linears_expand_to_the_host_reference() -> Result<()> {
     let gpu = backend()?;
     let b = |x: &str| format!("model.visual.blocks.0.{x}");
     let (qkv, gate, up) = (b("attn.qkv"), b("mlp.gate_proj"), b("mlp.up_proj"));
-    let mut names = with_parts(&[qkv.clone()], &["weight", "weight_scale"]);
+    let mut names = with_parts(std::slice::from_ref(&qkv), &["weight", "weight_scale"]);
     names.extend(with_parts(
         &[gate.clone(), up.clone()],
         &["weight", "weight_scale", "weight_scale_2"],
@@ -501,13 +503,16 @@ fn kda_mxfp8_decode_twins_are_checkpoint_bytes_and_row_invariant() -> Result<()>
         .map(|name| gpu.kernel("mxfp8_gemv", name).unwrap());
     let stems = [l(0, "self_attn.q_proj"), l(0, "self_attn.o_proj")];
     let (store, host) = upload(gpu, &with_parts(&stems, &["weight", "weight_scale"]))?;
-    let policy = KdaMxPolicy { decode: true };
+    let policy = KdaMxPolicy {
+        decode: true,
+        w8a8_prefill: false,
+    };
     for rank in 0..2 {
         for (stem, kind) in [
             (&stems[0], crate::tp_shard::TpShardKind::ColumnParallel),
             (&stems[1], crate::tp_shard::TpShardKind::RowParallel),
         ] {
-            let twin = kda_twin(policy, &store, stem, kind, rank, 2, gpu)?
+            let twin = kda_twin(policy, &store, stem, kind, rank, 2, 0, gpu)?
                 .and_then(|m| m.decode)
                 .context("twin")?;
             ensure!(
@@ -587,6 +592,92 @@ fn kda_mxfp8_decode_twins_are_checkpoint_bytes_and_row_invariant() -> Result<()>
                 "rank {rank} {stem}: twin == checkpoint, rows 1..32 invariant, err {worst:.2e}"
             );
         }
+    }
+    Ok(())
+}
+
+/// `ATLAS_GLM_FP4L_KDA_W8A8_PREFILL`: the W8A8 prefill GEMM on layer 0's
+/// rank-0 q twin gives each row the same bytes at every row count (1 ..
+/// 2048), within the MXFP8-activation error (~3e-2) of an f64 reference on
+/// the exact weights.
+#[test]
+#[ignore = "needs a GB10, cuBLASLt with MXFP8, a glm-5.3-flash kernel build and ATLAS_GLM_FP4L_CKPT"]
+fn kda_w8a8_prefill_is_row_invariant_on_the_checkpoint_twin() -> Result<()> {
+    use crate::layers::ops::{
+        MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MxAct, mx_lt_scale_bytes, mx_quant_rows,
+    };
+    use crate::weight_loader::glm5::kda_mx::{KdaMxPolicy, kda_twin};
+    let gpu = backend()?;
+    let stream = gpu.default_stream();
+    let stem = l(0, "self_attn.q_proj");
+    let (store, host) = upload(
+        gpu,
+        &with_parts(std::slice::from_ref(&stem), &["weight", "weight_scale"]),
+    )?;
+    const M: usize = 2048;
+    let policy = KdaMxPolicy {
+        decode: false,
+        w8a8_prefill: true,
+    };
+    let mx = kda_twin(
+        policy,
+        &store,
+        &stem,
+        crate::tp_shard::TpShardKind::ColumnParallel,
+        0,
+        2,
+        M,
+        gpu,
+    )?
+    .context("twin")?;
+    ensure!(mx.decode.is_none(), "W8A8 alone keeps no decode twin");
+    let w = mx.w8a8.context("W8A8 operand")?;
+    let (n, k) = (w.n, w.k);
+    let mut seed = 0x51_7cc1_b727_220a_u64;
+    let x: Vec<u16> = (0..M * k)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            f32_to_bf16(((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5)
+        })
+        .collect();
+    let xb: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let input = gpu.alloc(xb.len())?;
+    gpu.copy_h2d(&xb, input)?;
+    let act = MxAct {
+        q: gpu.alloc(M * k)?,
+        sf: gpu.alloc(mx_lt_scale_bytes(M, k))?,
+    };
+    let quant = gpu.kernel(MXFP8_ACT_MODULE, MX_QUANT_KERNEL)?;
+    let out = gpu.alloc(M * n * 2)?;
+    let run = |m: usize| -> Result<Vec<u16>> {
+        gpu.memset(act.sf, 0, mx_lt_scale_bytes(M, k))?;
+        mx_quant_rows(gpu, quant, input, act, 0..m, k, stream)?;
+        w.gemm(act, out, m, stream)?;
+        gpu.synchronize(stream)?;
+        bf16s(gpu, out, m * n)
+    };
+    let full = run(M)?;
+    for m in [1usize, 13, 64, 100, 777] {
+        ensure!(
+            run(m)? == full[..m * n],
+            "{m} rows differ from the same rows at {M}"
+        );
+    }
+    let (_, _, wb) = &host[&format!("{stem}.weight")];
+    let (_, _, sb) = &host[&format!("{stem}.weight_scale")];
+    let wf = mxfp8_to_bf16_host(&wb[..n * k], &sb[..n * k / 32], n, k)?;
+    let mut worst = 0f64;
+    for c in (0..n).step_by(97) {
+        let terms = (0..k).map(|j| f(x[j]) as f64 * f(wf[c * k + j]) as f64);
+        let (r, scale) = terms.fold((0f64, 0f64), |(s, a), t| (s + t, a + t.abs()));
+        worst = worst.max((f(full[c]) as f64 - r).abs() / scale.max(1e-30));
+    }
+    ensure!(worst < 5e-2, "row 0 relative error {worst}");
+    eprintln!("W8A8 [{n}, {k}]: rows invariant 1..{M}, row 0 error {worst:.2e}");
+    for p in [input, act.q, act.sf, out, w.data, w.sf] {
+        gpu.free(p)?;
     }
     Ok(())
 }

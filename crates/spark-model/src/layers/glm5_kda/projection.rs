@@ -43,6 +43,9 @@ pub struct Glm5Projection {
     /// every decode and verify row (`ATLAS_GLM_FP4L_KDA_MXFP8_DECODE`,
     /// `projection_mx.rs`).
     pub mxfp8: Option<crate::weight_map::Mxfp8Weight>,
+    /// The checkpoint's MXFP8 bytes as the W8A8 prefill operand, which then
+    /// serves every prefill row (`ATLAS_GLM_FP4L_KDA_W8A8_PREFILL`).
+    pub w8a8: Option<ops::MxW8a8>,
 }
 
 pub struct Glm5KdaWeights {
@@ -355,6 +358,11 @@ impl Glm5KdaLayer {
     ) -> Result<bool> {
         if decode && self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
             return Ok(false);
+        }
+        if !decode && self.try_project_w8a8(input, weight, output, m, n, k, cast, ctx, stream)? {
+            // `input`'s MXFP8 image stays in the scratch for the next
+            // projection of the same rows (`cast` false reuses it).
+            return Ok(true);
         }
         if !decode
             && m >= 2048

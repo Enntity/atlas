@@ -11,12 +11,18 @@ use spark_runtime::weights::{WeightDtype, WeightTensor};
 use std::collections::HashMap;
 
 #[test]
-fn the_switch_is_explicit_zero_or_one() {
-    assert_eq!(KdaMxPolicy::parse(None).unwrap(), KdaMxPolicy::default());
-    assert!(KdaMxPolicy::parse(Some("1")).unwrap().decode);
-    assert!(!KdaMxPolicy::parse(Some("0")).unwrap().decode);
+fn the_switches_are_explicit_zero_or_one() {
+    assert_eq!(
+        KdaMxPolicy::parse(None, None).unwrap(),
+        KdaMxPolicy::default()
+    );
+    let both = KdaMxPolicy::parse(Some("1"), Some("1")).unwrap();
+    assert!(both.decode && both.w8a8_prefill);
+    let decode = KdaMxPolicy::parse(Some("1"), Some("0")).unwrap();
+    assert!(decode.decode && !decode.w8a8_prefill);
     for bad in ["", "true", "2", "on"] {
-        assert!(KdaMxPolicy::parse(Some(bad)).is_err(), "{bad:?}");
+        assert!(KdaMxPolicy::parse(Some(bad), None).is_err(), "{bad:?}");
+        assert!(KdaMxPolicy::parse(None, Some(bad)).is_err(), "{bad:?}");
     }
 }
 
@@ -61,12 +67,15 @@ fn store(gpu: &MockGpuBackend) -> (WeightStore, Vec<u8>, Vec<u8>) {
 #[test]
 fn each_ranks_twin_is_its_slice_of_the_checkpoint_bytes() {
     let (n, k) = (64usize, 128usize);
-    let on = KdaMxPolicy { decode: true };
+    let on = KdaMxPolicy {
+        decode: true,
+        w8a8_prefill: false,
+    };
     for rank in 0..2 {
         let gpu = MockGpuBackend::new();
         let (st, w, s) = store(&gpu);
         // q/k/v: column-parallel, the rank's half of the rows.
-        let twin = kda_twin(on, &st, "s", TpShardKind::ColumnParallel, rank, 2, &gpu)
+        let twin = kda_twin(on, &st, "s", TpShardKind::ColumnParallel, rank, 2, 0, &gpu)
             .unwrap()
             .unwrap()
             .decode
@@ -81,7 +90,7 @@ fn each_ranks_twin_is_its_slice_of_the_checkpoint_bytes() {
             s[rows.start * k / 32..rows.end * k / 32]
         );
         // o: row-parallel, the rank's half of every row's K (whole scale blocks).
-        let twin = kda_twin(on, &st, "s", TpShardKind::RowParallel, rank, 2, &gpu)
+        let twin = kda_twin(on, &st, "s", TpShardKind::RowParallel, rank, 2, 0, &gpu)
             .unwrap()
             .unwrap()
             .decode
@@ -107,11 +116,14 @@ fn off_or_not_mxfp8_builds_nothing() {
     let allocs = gpu.alloc_count();
     let off = KdaMxPolicy::default();
     assert!(
-        kda_twin(off, &st, "s", TpShardKind::ColumnParallel, 0, 2, &gpu)
+        kda_twin(off, &st, "s", TpShardKind::ColumnParallel, 0, 2, 0, &gpu)
             .unwrap()
             .is_none()
     );
-    let on = KdaMxPolicy { decode: true };
+    let on = KdaMxPolicy {
+        decode: true,
+        w8a8_prefill: false,
+    };
     // The NVFP4 release's BF16 projection, and an absent one.
     let bf16 = WeightStore::from_map(HashMap::from([(
         "b.weight".to_string(),
@@ -123,7 +135,7 @@ fn off_or_not_mxfp8_builds_nothing() {
     )]));
     for (store, stem) in [(&bf16, "b"), (&st, "absent")] {
         assert!(
-            kda_twin(on, store, stem, TpShardKind::RowParallel, 0, 2, &gpu)
+            kda_twin(on, store, stem, TpShardKind::RowParallel, 0, 2, 0, &gpu)
                 .unwrap()
                 .is_none()
         );
@@ -133,5 +145,37 @@ fn off_or_not_mxfp8_builds_nothing() {
         allocs + 1,
         "only the BF16 fixture allocated"
     );
-    assert!(kda_twin(on, &st, "s", TpShardKind::Replicated, 0, 2, &gpu).is_err());
+    assert!(kda_twin(on, &st, "s", TpShardKind::Replicated, 0, 2, 0, &gpu).is_err());
+}
+
+/// W8A8 reads the twin's E4M3 bytes in place (no copy) with its own tiled
+/// scale image; alone it frees the row-major scales, with decode it keeps
+/// one untiled twin for both, and only then are NVFP4 copies unneeded.
+#[test]
+fn w8a8_shares_the_twin_bytes_and_serves_all_only_with_decode() {
+    let (n, k) = (64usize, 128usize);
+    for decode in [false, true] {
+        let gpu = MockGpuBackend::new();
+        let (st, w, _) = store(&gpu);
+        let policy = KdaMxPolicy {
+            decode,
+            w8a8_prefill: true,
+        };
+        // m_max 0: no cuBLASLt tuning at load (the mock has none).
+        let mx = kda_twin(policy, &st, "s", TpShardKind::ColumnParallel, 1, 2, 0, &gpu)
+            .unwrap()
+            .unwrap();
+        let op = mx.w8a8.as_ref().unwrap();
+        assert_eq!((op.n, op.k), (n / 2, k));
+        assert_eq!(read(&gpu, op.data, n / 2 * k), w[n / 2 * k..]);
+        assert_eq!(mx.serves_all(), decode);
+        match &mx.decode {
+            Some(twin) => {
+                assert_eq!(twin.data, op.data, "one copy of the E4M3 bytes");
+                assert!(!twin.tiled, "W8A8 needs the untiled layout");
+                assert!(gpu.read_alloc(twin.scales).is_some());
+            }
+            None => assert!(!decode),
+        }
+    }
 }
