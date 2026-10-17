@@ -19,6 +19,7 @@ use super::super::compact::openai_error_response;
 use crate::tokenizer::Glm5VisionPlaceholder;
 
 mod glm5_vision;
+mod media;
 #[cfg(test)]
 use glm5_vision::checked_glm5_video_timestamps;
 
@@ -79,6 +80,10 @@ pub(super) struct BuildOut {
 /// encoder-input string it resolved to (always a data: URI or raw base64 by
 /// the time it is in here — remote URLs are fetched or refused at
 /// collection time).
+/// Bytes (as data URIs) the remote fetches of one request may bring in: the
+/// size of the largest request body, so fetching cannot multiply it.
+const REMOTE_FETCH_TOTAL_MAX: usize = 32 << 20;
+
 struct MediaInput {
     kind: MediaKind,
     uri: String,
@@ -95,6 +100,7 @@ fn collect_message_media(
     media: &mut Vec<MediaInput>,
     image_pad_counts: &mut Vec<usize>,
     remote: &super::remote_image::RemoteImagePolicy,
+    fetched: &mut usize,
 ) -> Result<(), Response> {
     // ORDER IS A CONTRACT, and the order is the CLIENT'S. The template emits
     // one marker per media item in the order they appear in the content
@@ -112,7 +118,7 @@ fn collect_message_media(
         };
         media.push(MediaInput {
             kind,
-            uri: resolve_media_uri(kind, data, remote)?,
+            uri: resolve_media_uri(kind, data, remote, fetched)?,
         });
         image_pad_counts.push(0);
     }
@@ -128,6 +134,7 @@ fn resolve_media_uri(
     kind: MediaKind,
     data: &ImageData,
     remote: &super::remote_image::RemoteImagePolicy,
+    fetched: &mut usize,
 ) -> Result<String, Response> {
     let noun = match kind {
         MediaKind::Image => "image",
@@ -159,7 +166,20 @@ fn resolve_media_uri(
                 MediaKind::Video => super::remote_image::RemoteMediaKind::Video,
             };
             match super::remote_image::fetch_media_as_data_uri(url, remote, remote_kind) {
-                Ok(data_uri) => Ok(data_uri),
+                Ok(data_uri) => {
+                    *fetched += data_uri.len();
+                    if *fetched > REMOTE_FETCH_TOTAL_MAX {
+                        return Err(openai_error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "this request's media URLs fetch more than {} MiB, the \
+                                 per-request limit; send fewer or smaller media",
+                                REMOTE_FETCH_TOTAL_MAX >> 20
+                            ),
+                        ));
+                    }
+                    Ok(data_uri)
+                }
                 Err(why) => {
                     // The reason is surfaced rather than flattened to "could
                     // not fetch": the operator turned this on deliberately,
@@ -176,6 +196,8 @@ fn resolve_media_uri(
     }
 }
 
+/// [`build_msg_entries_admitted`] without vision bounds (tests).
+#[cfg(test)]
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn build_msg_entries(
     vision_config: Option<&VisionConfig>,
@@ -214,6 +236,14 @@ pub(super) fn build_msg_entries_admitted(
     preserve_developer_role: bool,
     admit: super::vision_admit::AdmitCtx<'_>,
 ) -> Result<BuildOut, Response> {
+    // The item count is checked before any media is fetched or read.
+    let parts = || input.iter().flat_map(|m| &m.content);
+    let n_media = parts()
+        .filter(|p| matches!(p, ContentPart::Image(_) | ContentPart::Video(_)))
+        .count();
+    let has_video = parts().any(|p| matches!(p, ContentPart::Video(_)));
+    let admission = super::vision_admit::Admission::begin(admit, n_media, has_video)?;
+    let mut fetched = 0usize;
     let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut media: Vec<MediaInput> = Vec::new();
     let mut image_pad_counts: Vec<usize> = Vec::new();
@@ -306,7 +336,13 @@ pub(super) fn build_msg_entries_admitted(
                 media: m.media_kinds(),
                 reasoning_content: None,
             });
-            collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+            collect_message_media(
+                m,
+                &mut media,
+                &mut image_pad_counts,
+                remote_images,
+                &mut fetched,
+            )?;
             continue;
         }
 
@@ -353,7 +389,13 @@ pub(super) fn build_msg_entries_admitted(
                 None
             },
         });
-        collect_message_media(m, &mut media, &mut image_pad_counts, remote_images)?;
+        collect_message_media(
+            m,
+            &mut media,
+            &mut image_pad_counts,
+            remote_images,
+            &mut fetched,
+        )?;
     }
 
     // P1-6 (2026-07-09): duplicate-error observation masking
@@ -444,76 +486,15 @@ pub(super) fn build_msg_entries_admitted(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
-        let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
-        let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
-        let image_error =
-            |e| openai_error_response(StatusCode::BAD_REQUEST, format!("Image decode error: {e}"));
-        for (idx, input) in media.iter().enumerate() {
-            let (item, video_timestamps) = match input.kind {
-                MediaKind::Image => {
-                    // Sized from the header, admitted, and only then decoded.
-                    let probed = spark_model::vision_preprocess::probe_image(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                    )
-                    .map_err(image_error)?;
-                    let charge = admission.charge(probed.pad_count(vcfg.spatial_merge_size))?;
-                    let (pixels, grid_h, grid_w) = probed.preprocess(vcfg).map_err(image_error)?;
-                    let item = spark_model::VisionItem::image(pixels, grid_h, grid_w);
-                    (charge.attach(item), Vec::new())
-                }
-                MediaKind::Video => {
-                    match spark_model::video_preprocess::preprocess_video(
-                        &input.uri,
-                        vcfg,
-                        vision_max_pixels,
-                        video.fps,
-                        video.ffmpeg,
-                    ) {
-                        Ok(v) => {
-                            // A video is bounded by its own decode budget and
-                            // charged once decoded (no header probe).
-                            let timestamps = v.timestamps.clone();
-                            let item = spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w);
-                            let charge =
-                                admission.charge(item.pad_count(vcfg.spatial_merge_size))?;
-                            (charge.attach(item), timestamps)
-                        }
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Video decode error: {e:#}"),
-                            ));
-                        }
-                    }
-                }
-            };
-            image_pad_counts[idx] = item.pad_count(vcfg.spatial_merge_size);
-            if vcfg.is_glm5_next {
-                vision_placeholders.push(glm5_vision::placeholder(
-                    input.kind,
-                    &item,
-                    image_pad_counts[idx],
-                    video_timestamps,
-                )?);
-            }
-            if input.kind == MediaKind::Video {
-                // Logged at the media index, not a video ordinal: the index
-                // is what lines the clip up with its pad run and its
-                // encoder rows.
-                tracing::info!(
-                    "Video (media item {}): {} temporal groups, {}x{} patches, {} vision tokens",
-                    idx,
-                    item.t_len(),
-                    item.grid_h,
-                    item.grid_w,
-                    image_pad_counts[idx],
-                );
-            }
-            image_pixels.push(item);
-        }
-        admission.finish()?;
+        image_pixels = media::preprocess_media(
+            &media,
+            vcfg,
+            vision_max_pixels,
+            video,
+            admission,
+            &mut image_pad_counts,
+            &mut vision_placeholders,
+        )?;
     }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with

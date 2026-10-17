@@ -51,8 +51,12 @@ impl VisionItem {
     }
 
     /// The item, holding `permit` until its last copy drops.
-    pub fn holding(mut self, permit: crate::vision_budget::VisionRowPermit) -> Self {
-        self.held = crate::vision_budget::HeldRows(Some(std::sync::Arc::new(permit)));
+    /// Several items of one request may share one permit.
+    pub fn holding(
+        mut self,
+        permit: std::sync::Arc<crate::vision_budget::VisionRowPermit>,
+    ) -> Self {
+        self.held = crate::vision_budget::HeldRows(Some(permit));
         self
     }
 
