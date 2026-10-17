@@ -101,6 +101,9 @@ pub struct VisionEncoder {
     pub out_hidden_size: usize,    // 2048
     pub intermediate_size: usize,  // 4304
     pub p_max: usize,              // 6400 (80×80 patches for 1280×1280 image)
+    /// Merged rows `buf_out` holds: one prefill chunk's items
+    /// (`crate::vision_limits::window_rows`), at least `p_max`.
+    pub out_rows: usize,
     // num_grid_per_side = sqrt(num_position_embeddings) = 48 for Qwen3-VL/3.6.
     pub num_grid_per_side: usize,
     // pre-allocated scratch buffers
@@ -110,7 +113,7 @@ pub struct VisionEncoder {
     pub buf_wide: DevicePtr,          // [p_max × 4304] bf16 — QKV/MLP scratch
     pub buf_merge_in: DevicePtr,      // [p_max/4 × 4608] bf16
     pub buf_merge_fc1: DevicePtr,     // [p_max/4 × 4608] bf16
-    pub buf_out: DevicePtr,           // [p_max × 2048] bf16 — final output
+    pub buf_out: DevicePtr,           // [out_rows × 2048] bf16 — final output
     pub buf_pos_resampled: DevicePtr, // [p_max × 1152] bf16 — per-image interp pos_embed
     pub buf_rope_cos: DevicePtr,      // [p_max × head_dim] bf16 — per-image rotary cos
     pub buf_rope_sin: DevicePtr,      // [p_max × head_dim] bf16 — per-image rotary sin
@@ -135,6 +138,10 @@ mod glm_oracle_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_attention_gpu_tests.rs"]
 mod glm_attention_gpu_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/qwen_passes_gpu_tests.rs"]
+mod qwen_passes_gpu_tests;
 
 #[cfg(test)]
 mod receive_only_tests {
