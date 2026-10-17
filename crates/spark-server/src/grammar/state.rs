@@ -75,6 +75,9 @@ pub struct GrammarState {
     /// response_format (`GrammarSpec::ToolCallOrJson`), whose matcher must
     /// see it; `None` elsewhere.
     native_opener: Option<u32>,
+    /// A tool-call-or-JSON union's answer (JSON) branch first-token mask: the
+    /// branch is chosen by mass at the first output token (`grammar::branch`).
+    answer_start: Option<Box<[i32]>>,
 }
 
 impl GrammarState {
@@ -137,6 +140,7 @@ impl GrammarState {
             strict: false,
             opens_in_thinking: false,
             native_opener: None,
+            answer_start: None,
         })
     }
 
@@ -172,6 +176,33 @@ impl GrammarState {
     /// grammar's first output token (the native tool opener).
     pub fn opens_output(&self, tok: u32) -> bool {
         self.native_opener == Some(tok)
+    }
+
+    /// Register a union's answer-branch first-token mask (`answer_start`).
+    #[must_use]
+    pub fn with_answer_start(mut self, answer_start: Box<[i32]>) -> Self {
+        self.answer_start = Some(answer_start);
+        self
+    }
+
+    /// A union's first output token is still to choose its branch.
+    pub fn branch_pending(&self) -> bool {
+        self.answer_start.is_some()
+            && self.matcher.num_history_steps() == 0
+            && !self.matcher.is_terminated()
+    }
+
+    /// At a pending branch, restrict this position's mask to the branch the
+    /// model prefers by mass over `logits`, the position's logits before the
+    /// mask (`grammar::branch`). Call before the mask is applied; a no-op
+    /// anywhere else.
+    pub fn choose_branch(&mut self, logits: &[f32]) {
+        if !self.branch_pending() || !self.fill_bitmask() {
+            return;
+        }
+        let answer = self.answer_start.as_deref().unwrap_or_default();
+        let tool = super::branch::prefers_tool(logits, &self.bitmask_data, answer);
+        super::branch::restrict(&mut self.bitmask_data, answer, tool);
     }
 
     /// Whether this is a `response_format` grammar whose output must conform.
