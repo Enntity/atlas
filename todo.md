@@ -15,7 +15,139 @@ relative to the durable root `/home/colum/Workspace/atlas-exl3-validation-202610
 Completed items are removed from the active lists below. Their evidence is
 listed under "Completed — evidence pointers", and their history is in git.
 
-## Objective
+## Current goal (set 2026-10-16): upstream PR readiness
+
+`sparkglm/installable-20260924` was rebased onto `Enntity/atlas`
+`spark-shared` on 2026-10-16 (33 topic commits + one fmt commit on
+`a9464810`; old history in `backup/sparkglm-pre-rebase-20261016`; details
+in continue.md "Rebase onto spark-shared"). The goal now is a PR to
+upstream that is **complete enough to function correctly**: it builds,
+serves GLM-5.3-Flash EXL3 on two Sparks with correct output, does not
+break upstream's paths, and passes upstream CI. Performance targets and
+the M1–M5 qualification below are **deferred**; they are not PR blockers.
+Benchmarks in this section are correctness checks: compare outputs, not
+tok/s. Record each run's binary build commit, both binary hashes and the
+run directory, as the rules below require.
+
+### PR-1. Build on GB10 (blocker)
+- [ ] **Repair the EXL3 kernel target.** `kernels/gb10/glm-5.3-flash-exl3/exl3/`
+  has 22 broken symlinks into `kernels/gb10/deepseek-v4-flash/nvfp4/`
+  (upstream moved those GLM sources to `kernels/gb10/glm-5.3-flash/nvfp4/`),
+  and lacks the modules `kda`, `glm_indexer`, `glm_vision_encoder` and
+  `mxfp8_gemv` that the shared GLM Rust path requests. Preferred fix
+  (upstream convention, as `qwen3.8-flash-next/exl3`): move the EXL3
+  modules to `kernels/gb10/glm-5.3-flash/exl3/` with `[build] base_quant =
+  "nvfp4"`, and drop the separate `glm-5.3-flash-exl3` target and its
+  symlinks. Keep routing/needles so EXL3 checkpoints select it. Check:
+  `find kernels -xtype l` is empty.
+- [ ] Move the EXL3 coop kernels (`exl3_coop_gemm*`, `exl3_moe*`, …) out of
+  `kernels/gb10/common/`. Right now they compile into every gb10 target.
+- [ ] nvcc build of `glm-5.3-flash` (nvfp4) and the EXL3 target in a builder
+  container. This is the first compile of `kda_fla_decode.cuh`,
+  `kda_fla_prep.cuh` and `exl3_dflash_capture.cu`. Also run `cargo build` for
+  the full server binary with kernels.
+
+### PR-2. Unit tests on a Spark (local test binaries cannot link without CUDA)
+- [ ] `cargo test -p spark-model --lib`, `-p spark-runtime --lib`,
+  `-p spark-server`, `-p atlas-core`, `-p atlas-kernels` on the rebased
+  branch, and the same suite on plain `enntity/spark-shared` on the same
+  host as the baseline. Every failure that is new relative to the
+  baseline is a PR-2 item.
+- [ ] Rebase-ported tests that have never run: `request_identity
+  idle_command cmd_words prefill_stream` (worker request-id wire,
+  `EP_CMD_REQUEST_ID = 0xFFFF_FFF9`), `stop_match choice_seed to_ir
+  responses decode_step` (stop strings, seeds, API), `exl3 glm5_next
+  native_head glm_exl3_teardown` (EXL3 model; these use upstream's
+  `prefill_stream_test_fixture`), `glm_sparse_decode` (fp8 serial reader
+  admission), `sample_step_seed_tests`, `small_m_gemm` (`ATLAS_DFLASH_BF16_TC`).
+
+### PR-3. Functional benchmarks on the EXL3 service (correctness)
+Prerequisite: PR-1 binary installed on both Sparks; host lock; inspect both
+hosts first (continue.md §3).
+- [ ] **Boot + launch smoke:** TP=2/EP=1 with
+  `scripts/start-glm53-exl3-tp2.sh` profile limits, then
+  `tests/exl3_validation/launch_smoke.py` 5/5, with coherent transcripts.
+- [ ] **Greedy regression vs the pre-rebase binary:** `ab_full.sh` exact
+  stack on `ab_prose_long` (continue.md §0 command). Pre-rebase hash prefix:
+  `80b1eb5fadf8`. A match is the strongest single correctness check. A
+  mismatch is not automatically a bug, because upstream changed shared GLM
+  code, but you must locate the first divergent token and explain it.
+  Repeat with graphs off (`ATLAS_NO_DECODE_GRAPHS=1`, etc.) to separate graph issues.
+- [ ] **Q3 behavior slice:** `tests/exl3_validation/q3_behavior_suite.py`
+  focused slice (pre-rebase: 15/15 on `ee5eaf0f`). This covers streaming,
+  stop strings / `stop_token_ids` / `include_stop_str_in_output` /
+  `min_tokens`, seeds (same seed gives the same output; grammar first token),
+  tool calls, JSON schema with thinking on/off, Anthropic stop_reason, the
+  Responses API and n>1.
+- [ ] **Q4 small corpus** (`tests/exl3_validation/q4/`, tuning split) as an
+  answer-sanity check. Report scores; thresholds are not a PR gate.
+- [ ] **Function-calling sanity:** `spark benchmark run bfcl-subset --url
+  http://127.0.0.1:8000 --model <checkpoint>` on the EXL3 service. This is
+  informational: record the overall/normalized score and look for
+  formatting/parsing failures, not a target.
+- [ ] **F4 / DFlash on upstream's drafter:** with greedy decoding, k=3
+  speculative output must equal serial output (same `output_sha256`) on
+  `bridges_200` and `ab_prose_long`. Record acceptance/tau for information.
+  The old drafter's numbers in `docs/design/f4-phase1-dflash2-exl3.md` are
+  void.
+- [ ] Prefix cache and fat-MoE prefill on/off give the same output (761-token
+  prompt case from "Now").
+
+### PR-4. Upstream non-regression (our changes touch shared GLM code)
+- [ ] GLM-5.3-Flash **NVFP4** (upstream's target, dual-Spark EP=2 lane): boot
+  with the PR binary and with an upstream `spark-shared` binary. Greedy
+  outputs must be identical on the same workload. Shared code touched:
+  `glm5_kda/*`, `qwen3_attention/*` (EXL3 guards, `hc_post_site`),
+  `FfnComponent` (now `layers/ffn_component.rs`), sparse decode admission,
+  `request_id` in `ForwardContext`, and the worker request-identity packet.
+- [ ] qwen4_exp EXL3 (upstream's EXL3 path): build plus its existing EXL3
+  tests. Our `ensure_not_exl3` / vocab-cap / TP2 preflight changes are
+  scoped to `glm5_next`.
+
+### PR-5. Correctness follow-ups from the rebase
+- [ ] F4 spec lane vs upstream's thinking-loop watchdog: `advance_thinking`
+  can arm `force_end_thinking` partway through a committed speculative block,
+  and `ThinkBudgetState::plain_emission_len` does not model it. Fix this in
+  the model-side truncation, or disable speculation while the watchdog is
+  armed.
+- [ ] Tool-call grammars: upstream (60fe1e6a) still masks the first token
+  of a tool grammar while thinking is open. Ours paused it. Keep upstream's
+  behavior unless the Q3 slice shows a failure (one-line change in
+  `GrammarState::masks_first_token`).
+- [ ] The EXL3 vocab head now errors on a masked verify. Confirm that no
+  served configuration reaches that path (grammar + F4).
+- [ ] `ATLAS_DFLASH_BF16_TC` only takes effect when `small_m_gemv` is on.
+  Document this or decouple it.
+
+### PR-6. CI gates (upstream `.github/workflows`)
+- [ ] `cargo fmt --all -- --check`: clean as of `f0300e43`.
+- [ ] Clippy with CI's toolchain and flags. Note that upstream itself fails
+  `cargo +stable clippy --workspace --tests` locally (atlas-plugin,
+  spark-runtime gguf), so compare against upstream on the same toolchain and
+  fix only our new lints (e.g. `load_progress.rs:120`, `atlas-kernels/build.rs:584`).
+- [ ] 500-line cap: split `glm_exl3_dflash.rs` (1214),
+  `glm5_exl3_ffn/moe/coop.rs` (1003), `weights/exl3/native/coop.rs` (637),
+  `glm5_exl3_mhc.rs` (599), `glm5_exl3_ffn/load_tests.rs` (579),
+  `glm5_kda/upstream.rs` (542) and `dflash_head/product_policy.rs` (505).
+  None of these are on the allow-list or were over at upstream.
+- [ ] `scripts/check-license-headers.sh` and typos. Also check the dead
+  `lz4_decompress_to` warning in `atlas-codecs` (CI denies warnings).
+
+### PR-7. Packaging the PR
+- [ ] Decide what stays out of the upstream PR: the root-level working notes
+  (`todo.md`, `continue.md`, `CODE_REVIEW_*`, `q2-diagnostic.md`,
+  `decisions.md`, `assumptions.md`, `prefill-*.md`, `p13-*`), validation
+  evidence docs, `tests/exl3_validation/` harnesses, the
+  `atlas-kv-cache-server`/`atlas-codecs` crates and the KV-codec plans
+  (unrelated to GLM EXL3; propose them separately), and the F4 config stub.
+- [ ] Curate the commits into reviewable units on a branch off the latest
+  `spark-shared` (the 33 topic commits are the starting point).
+- [ ] Write a PR description: scope (native GLM-5.3-Flash EXL3, TP=2/EP=1),
+  flags and defaults, the tests and functional benchmarks above with run
+  IDs, known limits (unqualified numerics vs the reference, perf not tuned),
+  and credit/licensing for the vendored exllamav3 code (MIT).
+
+## Objective (long-term track, deferred behind the PR goal)
 
 Serve `MikeRoz/GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3` on the native Atlas
 EXL3 path across both Sparks (TP=2 / EP=1) as a **qualified,
@@ -83,6 +215,10 @@ Rules that apply throughout:
 ## Now
 
 ### Review fixes in the working tree (2026-10-16)
+
+Pre-rebase evidence: these binaries and runs predate the rebase onto
+`spark-shared`. They do not validate the rebased branch; PR-3 re-runs the
+relevant checks.
 
 - Implemented: F4 structural-token boundaries now defer to serial processing,
   with pre-verify state restoration when the first pick needs a processor;

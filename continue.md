@@ -5,7 +5,15 @@ to resume safely, and where the evidence is. The work itself (roadmap,
 active batch, backlog) is in **[todo.md](todo.md)**. This file does not
 duplicate it.
 
+**Current goal (2026-10-16): upstream PR readiness.** The branch was
+rebased onto `Enntity/atlas` `spark-shared`. The work list is todo.md
+"Current goal" (PR-1…PR-7): make the branch build, serve correctly and pass
+upstream CI. Speed is not a goal. Read "Rebase onto spark-shared" below
+first; most hashes, binaries and timings elsewhere in this file predate the
+rebase.
+
 **Read order on restart:**
+0. "Rebase onto spark-shared (2026-10-16)" below, then todo.md "Current goal".
 1. This file, sections 1–3.
 2. [todo.md](todo.md) "Roadmap" and "Now", then the
    [completed v2 qualification report](docs/design/exl3-statistical-gate-v2-qualification-20261014.md).
@@ -21,6 +29,68 @@ duplicate it.
 The latest review and its disposition table are in
 [CODE_REVIEW_2026-10-12.md](CODE_REVIEW_2026-10-12.md). Superseded narrative
 is in git history.
+
+## Rebase onto spark-shared (2026-10-16)
+
+**What happened.**
+- `sparkglm/installable-20260924` now sits on `enntity/spark-shared` @
+  `a9464810`, force-pushed to `origin` (`volfco/atlas`). The old tip
+  `ef2f5bfc` is kept as `backup/sparkglm-pre-rebase-20261016` (local only;
+  the old remote tip was `172ce45a`).
+- Upstream already carried Reiner's and Jason's GLM work up to `3a6de55f`
+  (Jason's forward-port: `0212abfa`, `9cf82b87`, `c8cb6a0e`). Only colum's
+  `3a6de55f..ef2f5bfc` moved, as 33 topic squashes (one per first-parent
+  range or merge) plus `f0300e43` (cargo fmt). Every topic message lists its
+  original commits and the conflict decisions ("Rebase notes").
+- Each topic commit passes `cargo +stable check --workspace --tests`
+  (`ATLAS_SKIP_BUILD=1 ATLAS_NO_RDMA=1 CUDARC_CUDA_VERSION=13000`).
+  Nothing was compiled with nvcc, and no unit test was run (test binaries
+  cannot link without CUDA locally).
+- Silent-loss sweep against the backup: every `ATLAS_*` knob we added is
+  still present. Missing files and tests are all explained (merged into
+  upstream's versions, renamed, or covered by upstream).
+
+**Upstream changes that shaped the port** (decisions are in the topic commit messages):
+- Upstream deleted GLM native MTP, the paired C2–C8 system, `.so` bridges,
+  KDA flash prefill, `multi_seq/pair.rs`, our `dflash_head/dflash2.rs`
+  drafter and `sample_step_checked_scalar.rs`. Our edits that only plumbed
+  fields through that code were dropped. The Q3 seed fixes were re-ported
+  into `scheduler/sample_step.rs`.
+- Upstream re-split large files for the 500-line cap. Where both sides split
+  the same file, upstream's layout won and our changes went into it (e.g.
+  `glm5_kda/init.rs`, `forward_attention_entry.rs`/`_qkv.rs`,
+  `emit_step/cancel.rs`, `lifecycle/`).
+- Upstream has its own DFlash2 drafter. The F4 EXL3 path now drives it;
+  `profile_tail_ms` was rewritten in `dflash_head/profile_tail.rs`.
+- Upstream has an independent EXL3 path (qwen4_exp: `quant_format/exl3.rs`,
+  `weight_map/exl3/`, `kernels/gb10/qwen3.8-flash-next/exl3` composed via
+  `[build] base_quant`). Ours coexists; the GLM-specific gates are scoped to
+  `glm5_next`.
+- Upstream moved GLM kernels to `kernels/gb10/glm-5.3-flash/nvfp4/`. This
+  broke our EXL3 kernel target's symlinks (todo PR-1, the build blocker).
+
+**Behavior changes vs the pre-rebase branch:**
+- `EP_CMD_REQUEST_ID` is `0xFFFF_FFF9` (upstream took `0xFFFF_FFF8`).
+  Both ranks need the same binary.
+- Anthropic streaming reports `stop_reason: "error"` on an engine abort.
+- Tool-call grammars still mask the first token while thinking is open
+  (upstream 60fe1e6a); `response_format` grammars pause.
+- Masked verify on the EXL3 vocab head errors instead of ignoring the mask.
+- The MTP bootstrap seed fix was dropped: upstream already seeds that draw
+  through `verify_pick_with_pipeline`.
+- Sparse decode admits the fp8_g128 serial reader on upstream's MTP-free
+  `BuildPolicy` (it gained a `speculative` field).
+- The GDN wy3 rewrite and MLA WMMA GEMV are absent, as set aside by `34d94f34`.
+
+**What is now stale in this file:**
+- The binaries in §0 and §8 were built pre-rebase.
+- The exact-stack hash `80b1eb5fadf8` and all F4 tau/tok/s figures are
+  pre-rebase. Use them as comparison points (todo PR-3), not as current
+  state.
+
+**Repo config set during the rebase:** `rerere.enabled=true`,
+`merge.conflictStyle=zdiff3`. The redundant local branch
+`rebase/spark-shared-20261016` can be deleted.
 
 ## 0. Start here — follow-up workers
 
@@ -223,6 +293,8 @@ newly qualified release image.
 
 ## 1. Status at a glance (2026-10-16)
 
+**Everything in this table predates the 2026-10-16 rebase onto `spark-shared`.** The rebased branch is unbuilt with nvcc and untested on GPU; see todo.md PR-1…PR-3.
+
 | Area | Status | Pointer |
 |---|---|---|
 | Boot and generation (TP=2/EP=1, native EXL3) | Works; 5/5 launch smoke; production containers **stopped** | §4 |
@@ -411,8 +483,9 @@ newly qualified release image.
 ## 4. Production profile (preserved, currently stopped)
 
 - Repository: `/home/colum/Workspace/RustroverProjects/atlas`.
-- Branch: `sparkglm/installable-20260924` (original roadmap review was
-  against `11671adf`; current HEAD moves — use `git log`).
+- Branch: `sparkglm/installable-20260924`, rebased onto `spark-shared`
+  2026-10-16 (pre-rebase history: `backup/sparkglm-pre-rebase-20261016`;
+  the original roadmap review was against `11671adf`).
 - Model: `MikeRoz/GLM-5.3-Flash-Uncensored-4.05bpw-h6-exl3`.
 - Checkpoint revision: `dda99c7e935920fa6e235ce410e6f806e1c02720`.
 - Last recorded serving containers: `glm53-exl3-atlas-0` on spark0 and
