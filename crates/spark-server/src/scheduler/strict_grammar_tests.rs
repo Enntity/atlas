@@ -15,6 +15,8 @@ use crate::scheduler::{
 mod decode;
 #[path = "strict_grammar_tests/tool_or_json.rs"]
 mod tool_or_json;
+#[path = "strict_grammar_tests/tool_or_json_branch.rs"]
+mod tool_or_json_branch;
 
 const EOS: u32 = crate::scheduler::test_support::GRAMMAR_EOS;
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,
