@@ -40,7 +40,7 @@ fn lmhead_tgemm_enabled() -> bool {
     std::env::var("ATLAS_NO_LMHEAD_TGEMM").ok().as_deref() != Some("1")
 }
 
-/// Q5 (todo.md): whether this target's TP sums must stay on the pinned 2-rank
+/// Q5: whether this target's TP sums must stay on the pinned 2-rank
 /// send/recv all-reduce, which is armed solely by
 /// [`install_tp_add_kernel`].
 ///
@@ -515,7 +515,7 @@ impl TransformerModel {
         // collectives) and provide the bf16_add kernel for the 2-rank
         // send/recv fast path — which GLM-5.3 EXL3 requires: a missing
         // `bf16_add_inplace` there fails startup rather than demoting every
-        // TP sum to an unpinned `ncclAllReduce` (Q5, todo.md).
+        // TP sum to an unpinned `ncclAllReduce` (Q5).
         //   - moe_output: EP MoE reduce + ALL GDN HeadParallel SSM out_proj
         //     reduces (decode `ssm_forward`, batched decode, multi-seq
         //     batched, prefill, prefill phase-3 all write out_proj into

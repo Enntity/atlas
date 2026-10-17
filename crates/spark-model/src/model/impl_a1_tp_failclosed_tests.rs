@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Q5 (todo.md): fail closed on the TP all-reduce fallback.
+//! Q5: fail closed on the TP all-reduce fallback.
 //!
 //! Covers the decision gate and the kernel resolution itself through
 //! `MockGpuBackend` (`fail_next_kernel`) and a recording comm stub, so the
