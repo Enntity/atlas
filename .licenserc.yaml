@@ -13,4 +13,7 @@ header:
     # Vendored llama.cpp/ggml CUDA MMQ sources (MIT-licensed upstream);
     # third-party material keeps its original license — never stamp AGPL here.
     - 'kernels/gb10/qwen3.6-27b/nvfp4/q4k_vendor/**'
+    # Vendored exllamav3 (exllamav3_ext) CUDA headers, MIT-licensed upstream;
+    # they carry their own SPDX MIT line and original notice.
+    - 'kernels/gb10/glm-5.3-flash/exl3/exllamav3_*.cuh'
   comment: on-failure
