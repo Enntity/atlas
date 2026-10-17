@@ -168,6 +168,8 @@ mod forward_prefill_phase;
 mod forward_prefill_q38;
 mod forward_prefill_route;
 mod forward_prefill_routed;
+mod prefill_row_bound;
+pub(crate) use prefill_row_bound::take_offset_read_wait;
 mod forward_prefill_router;
 mod forward_rows;
 mod forward_token_major;

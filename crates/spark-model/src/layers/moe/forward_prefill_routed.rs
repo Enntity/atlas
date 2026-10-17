@@ -69,7 +69,11 @@ impl MoeLayer {
         // token) to prevent silent truncation. An opt-in load-factor cap lets
         // Holo experiments trade that safety margin for fewer empty expert
         // tiles after validating the router histogram.
-        let worst_case_m_tiles = (num_tokens * top_k as usize).div_ceil(64).max(1) as u32;
+        let worst_case_m_tiles = prefill_row_bound::worst_case_m_tiles(
+            num_tokens,
+            top_k as usize,
+            prefill_row_bound::enabled(),
+        );
         // Default-on for NVFP4 experts ONLY; opt-in ("=1") everywhere else.
         //
         // Reads the REAL expert offsets instead of the worst-case bound above, so it
@@ -109,8 +113,10 @@ impl MoeLayer {
             num_tokens.div_ceil(64) as u32
         } else if exact_tiles {
             let mut offsets = vec![0u8; (ne + 1) * 4];
+            let read = prefill_row_bound::OffsetRead::start();
             ctx.gpu
                 .copy_d2h_on_stream(expert_offsets, &mut offsets, stream)?;
+            read.finish();
             let eoff: Vec<i32> = offsets
                 .chunks_exact(4)
                 .map(|raw| i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
