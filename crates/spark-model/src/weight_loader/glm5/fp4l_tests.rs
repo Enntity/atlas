@@ -378,3 +378,29 @@ fn lm_head_is_bf16_or_expanded_mxfp8_and_nothing_else() {
         assert_eq!(gpu.launch_count(), 0);
     }
 }
+
+/// `ATLAS_GLM_HC_BF16` reads `hc_*_fn` through the store's BF16 pointer
+/// (`components::load_hc`); FP4-Local keeps `fn` BF16 and only widens
+/// base/scale to F32, which `load_hc_f32` reads natively. So the BF16 mHC
+/// kernels keep their input on both releases.
+#[test]
+fn hc_fn_stays_bf16_and_base_scale_are_bf16_or_f32() {
+    let gpu = MockGpuBackend::new();
+    let config = fp4l_config();
+    for headers in [FP4L_HEADERS, NVFP4_HEADERS] {
+        let store = build(&gpu, uploaded(headers));
+        for layer in 0..config.num_hidden_layers {
+            let lp = config.layer_prefix(layer);
+            for site in ["attn", "ffn"] {
+                assert_eq!(
+                    dtype(&store, &format!("{lp}.hc_{site}_fn")),
+                    WeightDtype::BF16
+                );
+                for part in ["base", "scale"] {
+                    let d = dtype(&store, &format!("{lp}.hc_{site}_{part}"));
+                    assert!(matches!(d, WeightDtype::BF16 | WeightDtype::FP32), "{d:?}");
+                }
+            }
+        }
+    }
+}
