@@ -6,8 +6,7 @@ production obligations) are the authority for semantics; this file is the
 implementation contract only and never relaxes the parent. Purpose: implement every
 CPU-only piece now so the next GPU windows execute runs instead of growing
 code. **No GPU work happens under this spec.** Assumptions/constraints are
-folded here (2026-10-12 "validation-campaign logging convention"; no
-separate `assumptions.md` for this batch).
+folded here (2026-10-12 "validation-campaign logging convention").
 
 ## Deliverables
 

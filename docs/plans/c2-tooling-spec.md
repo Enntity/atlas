@@ -5,8 +5,7 @@ Parent contract: [q2-norm-causality-plan.md](q2-norm-causality-plan.md)
 This file is the implementation contract only; it never relaxes the parent.
 Decisions: operator decisions of 2026-10-12 (C2 batch). Assumptions and
 constraints (A1–A13) live in the section below — folded here per the
-2026-10-12 "validation-campaign logging convention" decision (no separate
-`assumptions.md`). No GPU work happens under this spec (hosts are the
+2026-10-12 "validation-campaign logging convention" decision. No GPU work happens under this spec (hosts are the
 constraint); everything here is CPU-verifiable.
 
 ## Deliverables
