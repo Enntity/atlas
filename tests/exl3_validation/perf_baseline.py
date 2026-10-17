@@ -22,6 +22,12 @@ Measurement discipline (.claude/skills/measurement-discipline/SKILL.md):
   fingerprint is labelled ``fingerprinted``; this is not model qualification.
 * Initial server/cache state is explicit. ``cold_start`` is null when the
   initial state is unknown, and ``first_request`` records request order alone.
+
+``--save-output`` also asks the server for ``return_token_ids`` and stores
+the full reasoning and content text plus every chunk's text and token IDs
+(``output_chunks``), so two runs whose ``output_sha256`` differ can be
+compared token by token. The hash covers text only, so it is unchanged by
+the flag.
 """
 
 import argparse
@@ -162,7 +168,7 @@ def build_prompt(class_doc, approx_tokens):
     return text
 
 
-def build_body(model, workload, class_doc, prompt):
+def build_body(model, workload, class_doc, prompt, save_output=False):
     body = {}
     body.update(class_doc.get("request_extra") or {})
     body.update(workload.get("request_extra") or {})
@@ -175,6 +181,10 @@ def build_body(model, workload, class_doc, prompt):
         "stream": True,
         "stream_options": {"include_usage": True},
     })
+    if save_output:
+        # Token IDs ride on the text chunks (and the final chunk); they do
+        # not change sampling or the text, so output_sha256 is unaffected.
+        body["return_token_ids"] = True
     return body
 
 
@@ -190,7 +200,7 @@ def fetch_models(endpoint, timeout):
         return [], f"{type(exc).__name__}: {exc}"
 
 
-def stream_chat(endpoint, body, timeout):
+def stream_chat(endpoint, body, timeout, save_output=False):
     """POST one streaming chat request and collect arrival timings.
 
     Returns a dict with raw timing fields plus ``error`` (None on success).
@@ -206,6 +216,7 @@ def stream_chat(endpoint, body, timeout):
     chunk_offsets = []
     token_offsets = []
     output_text = []
+    output_chunks = []
     ttft = None
     first_output = None
     finish_reason = None
@@ -259,6 +270,18 @@ def stream_chat(endpoint, body, timeout):
                 for key in ("reasoning_content", "content"):
                     if isinstance(delta.get(key), str):
                         output_text.append(key[0] + delta[key])
+                if save_output and choices:
+                    ids = choices[0].get("token_ids") or []
+                    kinds = "".join(k[0] for k in ("reasoning_content", "content")
+                                    if isinstance(delta.get(k), str))
+                    if ids or kinds or choices[0].get("finish_reason"):
+                        output_chunks.append({
+                            "kind": kinds,
+                            "text": "".join(delta[k] for k in ("reasoning_content", "content")
+                                            if isinstance(delta.get(k), str)),
+                            "token_ids": ids,
+                            "finish_reason": choices[0].get("finish_reason"),
+                        })
                 if has_output:
                     if first_output is None:
                         first_output = off
@@ -295,6 +318,13 @@ def stream_chat(endpoint, body, timeout):
         tpot = decode_span / (completion - 1)
     gaps = [token_offsets[i + 1] - token_offsets[i]
             for i in range(len(token_offsets) - 1)]
+    saved = {}
+    if save_output and error is None:
+        saved = {
+            "output_reasoning": "".join(t[1:] for t in output_text if t[0] == "r"),
+            "output_content": "".join(t[1:] for t in output_text if t[0] == "c"),
+            "output_chunks": output_chunks,
+        }
     return {
         "error": error,
         "output_sha256": hashlib.sha256("\x00".join(output_text).encode()).hexdigest() if error is None else None,
@@ -313,15 +343,17 @@ def stream_chat(endpoint, body, timeout):
         "e2e_s": round6(e2e),
         "usage": usage,
         "finish_reason": finish_reason,
+        **saved,
     }
 
 
 def run_one(endpoint, model, workload, class_doc, prompt, timeout,
-            client_id, cold_start, repeat_index, first_request, provenance_status):
+            client_id, cold_start, repeat_index, first_request, provenance_status,
+            save_output=False):
     res = stream_chat(endpoint,
-                      build_body(model, workload, class_doc, prompt),
-                      timeout)
-    return {
+                      build_body(model, workload, class_doc, prompt, save_output),
+                      timeout, save_output)
+    rec = {
         "provenance_status": provenance_status,
         "workload": workload["name"],
         "prompt_class": workload["prompt_class"],
@@ -362,6 +394,10 @@ def run_one(endpoint, model, workload, class_doc, prompt, timeout,
         "output_head": res.get("output_head"),
         "error": res["error"],
     }
+    for key in ("output_reasoning", "output_content", "output_chunks"):
+        if key in res:
+            rec[key] = res[key]
+    return rec
 
 
 def summarize(records):
@@ -418,6 +454,9 @@ def main(argv=None):
     ap.add_argument("--timeout", type=float, default=1200.0)
     ap.add_argument("--workload", action="append",
                     help="run only this workload name (repeatable)")
+    ap.add_argument("--save-output", action="store_true",
+                    help="request return_token_ids and store full text and "
+                         "per-chunk token IDs in each raw record")
     args = ap.parse_args(argv)
     if args.concurrency < 1:
         ap.error("--concurrency must be >= 1")
@@ -476,7 +515,7 @@ def main(argv=None):
                     rec = run_one(args.endpoint, args.model, wl, classes[wl["prompt_class"]],
                                   prompts[wl["name"]], args.timeout,
                                   client_id, cold, rep, first_request,
-                                  provenance_status)
+                                  provenance_status, args.save_output)
                 except Exception as exc:  # noqa: BLE001 - never drop queued work
                     rec = {"provenance_status": provenance_status,
                            "workload": wl["name"],

@@ -167,6 +167,8 @@ def main():
                     help='source commit of the mounted binary, required with --binary')
     ap.add_argument('--cpuset', help='docker --cpuset-cpus for both ranks')
     ap.add_argument('--capture', action='store_true', help='dump per-step logits under /home/colum/atlas-dev/capture/<run>')
+    ap.add_argument('--save-output', action='store_true',
+                    help='store full output text and per-chunk token IDs in raw.jsonl')
     ap.add_argument('--profile', choices=sorted(PROFILES), default=DEFAULT_PROFILE,
                     help='model and serve layout (default: the EXL3 TP2 descriptors)')
     ap.add_argument('--print-argv', action='store_true',
@@ -192,7 +194,7 @@ def main():
     meta = {'label': args.label, 'profile': args.profile, 'image': args.image,
             'env_overrides': args.env, 'argv': argvs,
             'binary': args.binary, 'binary_source_commit': args.binary_source_commit,
-            'capture': capture,
+            'capture': capture, 'save_output': args.save_output,
             'utc': stamp, 'classification': 'unqualified-uninstrumented'}
     created, tunnel = [], None
     try:
@@ -241,6 +243,8 @@ def main():
                '--unqualified', '--fingerprint', str(run/'fingerprint.json')]
         for w in args.workload or []:
             cmd += ['--workload', w]
+        if args.save_output:
+            cmd += ['--save-output']
         (run/'fingerprint.json').write_text(json.dumps({
             'image_id': meta['image_id_r0'], 'source_commit': args.binary_source_commit,
             'binary': args.binary,

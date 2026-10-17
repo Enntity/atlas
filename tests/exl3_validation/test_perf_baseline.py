@@ -130,7 +130,7 @@ def full_fingerprint():
 
 def run_harness(out_dir, server, fingerprint="complete", unqualified=False,
                 concurrency=1, workloads_doc=None, model="fake-model",
-                initial_state="unknown"):
+                initial_state="unknown", extra_argv=()):
     out_dir = Path(out_dir)
     run_dir = out_dir / f"run-{len(list(out_dir.glob('run-*')))}"
     run_dir.mkdir()
@@ -154,6 +154,7 @@ def run_harness(out_dir, server, fingerprint="complete", unqualified=False,
         argv += ["--fingerprint", str(fp_path)]
     if unqualified:
         argv += ["--unqualified"]
+    argv += list(extra_argv)
     code = perf_baseline.main(argv)
     raw_path = run_dir / "raw.jsonl"
     records = [json.loads(line) for line in raw_path.read_text().splitlines()] \
@@ -236,6 +237,32 @@ class HarnessRunTests(unittest.TestCase):
         self.assertEqual(wl["finish_reasons"], {"stop": 3})
         self.assertEqual(wl["n"], 3)
         self.assertEqual(wl["n_ok"], 3)
+
+    def test_save_output_keeps_full_text_and_token_ids(self):
+        def with_ids(chunk, ids):
+            chunk["choices"][0]["token_ids"] = ids
+            return chunk
+        script = [{"delay": 0.0, "chunk": with_ids(reasoning_chunk("think "), [1, 2])},
+                  {"delay": 0.0, "chunk": with_ids(content_chunk("a" * 300), [3])},
+                  {"delay": 0.0, "chunk": with_ids(content_chunk("b" * 300), [4, 5])},
+                  {"delay": 0.0, "chunk": with_ids(content_chunk("", finish="stop"), [6])},
+                  {"delay": 0.0, "chunk": usage_chunk(FAKE_USAGE)}]
+        _, plain, _ = run_harness(self.dir, self.start_server(script))
+        server = self.start_server(script)
+        code, saved, _ = run_harness(self.dir, server, extra_argv=["--save-output"])
+        self.assertEqual(code, 0)
+        self.assertIs(server.httpd.requests[0]["return_token_ids"], True)
+        self.assertNotIn("output_content", plain[0])
+        rec = saved[0]
+        # The hash covers text only: the flag must not move it.
+        self.assertEqual(rec["output_sha256"], plain[0]["output_sha256"])
+        self.assertEqual(rec["output_reasoning"], "think ")
+        self.assertEqual(rec["output_content"], "a" * 300 + "b" * 300)
+        self.assertEqual(len(rec["output_head"]), 400)
+        self.assertEqual([c["token_ids"] for c in rec["output_chunks"]],
+                         [[1, 2], [3], [4, 5], [6]])
+        self.assertEqual([c["kind"] for c in rec["output_chunks"]], ["r", "c", "c", "c"])
+        self.assertEqual(rec["output_chunks"][-1]["finish_reason"], "stop")
 
     def test_reasoning_ttft_is_first_content_token(self):
         usage = dict(FAKE_USAGE, completion_tokens=6)
