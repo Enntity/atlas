@@ -434,6 +434,7 @@ pub(super) fn continue_in_progress_prefills(
                     model,
                     p,
                     idx,
+                    active,
                     prefill_stream,
                     prefill_event,
                     sched,

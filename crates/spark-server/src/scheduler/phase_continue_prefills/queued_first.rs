@@ -5,29 +5,34 @@
 //! run once the prompt is the head of the queue.
 //!
 //! It is the chunk `start_chunked_prefill` would have run inline, at the
-//! length the admission computed: the same command to the worker (its prompt
-//! length and every token, so both ranks repeat one prefix-cache lookup), the
-//! same `prefill_chunk` from position 0, the same first-chunk normalization
-//! and the same failure handling (the request fails; a refused chunk is not
-//! retried, as at admission). Its setup reached the worker at admission;
-//! this sends the chunk command right before the head runs the chunk, so the
-//! worker runs the prompts' chunks in the head's order. Never the two-phase
-//! prefill, which sends the worker nothing.
+//! length the admission computed, sent and run as every later chunk is
+//! (`prefill_preempt::prefill_chunk_with_preemption` from position 0): the
+//! same command words to the worker (its prompt length and every token, so
+//! both ranks repeat one prefix-cache lookup) and the same KV preemption on
+//! an agreed refusal, since by the time it runs it competes with decoding
+//! sequences exactly as a later chunk does; a final refusal fails only its
+//! request. Then the first-chunk normalization. Its setup reached the worker
+//! at admission; this sends the chunk command right before the head runs
+//! the chunk, so the worker runs the prompts' chunks in the head's order.
+//! Never the two-phase prefill, which sends the worker nothing.
 
 use spark_model::traits::Model;
 use spark_runtime::gpu::DevicePtr;
 
-use super::super::prefill_a_step::send_first_chunk;
+use super::super::prefill_preempt::prefill_chunk_with_preemption;
 use super::super::sample_first_token;
-use super::super::types::{PrefillInProgress, ResponseSink};
+use super::super::types::{ActiveSeq, PrefillInProgress, ResponseSink};
 
 /// Run `p`'s queued first chunk, if it has one; `completed` gets `(idx,
 /// first token)` when it was the whole prompt, `(idx, None)` when it failed.
 /// Returns false, having done nothing, for a prompt with no queued chunk.
+/// `active` holds the preemption victims.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     model: &dyn Model,
     p: &mut PrefillInProgress,
     idx: usize,
+    active: &mut Vec<ActiveSeq>,
     prefill_stream: u64,
     prefill_event: u64,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
@@ -43,14 +48,16 @@ pub(super) fn run(
         p.request_start.elapsed().as_secs_f64() * 1e3,
     );
     let logits = (|| -> anyhow::Result<DevicePtr> {
-        send_first_chunk(model, &p.seq, chunk_len, &p.prompt_tokens)?;
-        let logits = model.prefill_chunk(
+        let logits = prefill_chunk_with_preemption(
+            model,
             &p.prompt_tokens,
             &mut p.seq,
+            p.disable_mtp,
             0,
             chunk_len,
             is_last,
             prefill_stream,
+            active,
         )?;
         super::super::prefill_normalization::initial(model, &p.seq)?;
         Ok(logits)
@@ -65,8 +72,12 @@ pub(super) fn run(
         }
     };
     p.chunk_offset = chunk_len;
-    let _ = model.record_event(prefill_event, prefill_stream);
-    let _ = model.stream_wait_event(model.default_stream(), prefill_event);
+    if let Err(e) = model.record_event(prefill_event, prefill_stream) {
+        tracing::warn!("Queued prefill record_event: {e:#}");
+    }
+    if let Err(e) = model.stream_wait_event(model.default_stream(), prefill_event) {
+        tracing::warn!("Queued prefill stream_wait_event: {e:#}");
+    }
     if is_last {
         match sample_first_token(
             model,
