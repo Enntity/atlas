@@ -243,7 +243,18 @@ fn native_exl3_never_uses_legacy_quantization_targets() {
         assert!(!quant_pair_compatible(quant, "exl3"));
         assert!(!quant_pair_compatible("exl3", quant));
     }
+    // The preset carries no quantization block upstream; declare exl3 the way
+    // the config parser would (EXL3 fields are not read by canonicalization).
     let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
-    config.quantization_config.as_mut().unwrap().quant_method = "exl3".into();
+    config.quantization_config = Some(atlas_core::config::QuantizationConfig {
+        quant_method: "exl3".into(),
+        quant_algo: String::new(),
+        format: String::new(),
+        ignore_modules: Vec::new(),
+        weight_block_size: Vec::new(),
+        group_size: 0,
+        quantized_layers: Default::default(),
+        exl3: None,
+    });
     assert_eq!(canonicalize_model_quant(&config), "exl3");
 }
