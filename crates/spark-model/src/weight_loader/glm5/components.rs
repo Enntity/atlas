@@ -288,6 +288,19 @@ fn load_moe(
         // remain transposed-only to avoid hybrid layout's memory cost.
         layer.transpose_for_prefill_unified_keep_shared(gpu, config)?;
     }
+    // ATLAS_GLM_FP4L_SHARED_FP8: the checkpoint's FP8 block shared expert
+    // replaces the NVFP4 copies just built (and the deferred FP8 cache).
+    if let Some(native) = super::shared_native::shared_native_twins(
+        crate::layers::glm_native::NativePolicy::from_env(),
+        store,
+        &shared,
+        config,
+        gpu,
+    )? && let Err(e) = layer.install_shared_native(gpu, native)
+    {
+        native.free(gpu)?;
+        return Err(e);
+    }
     // The factory installs optional shared FP8 caches only after all target,
     // MTP and head loading has released replaced checkpoint allocations.
     Ok(FfnComponent::Moe(layer))

@@ -203,6 +203,7 @@ pub(crate) use route_fuse::route_fuse_requested;
 mod router_prefill_bn32;
 mod shared_fp8_cache_bytes;
 mod shared_m16;
+pub(crate) mod shared_native;
 pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
