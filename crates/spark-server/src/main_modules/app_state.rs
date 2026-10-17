@@ -60,6 +60,9 @@ pub struct AppState {
     /// Vision rows a request may carry, checked at admission
     /// (`spark_model::vision_limits`). `None` for a text-only model.
     pub vision_limits: Option<spark_model::vision_limits::VisionRowLimits>,
+    /// Vision rows whose pixels all requests may hold at once
+    /// (`spark_model::vision_budget`). `None`: unbounded, or a text model.
+    pub vision_budget: Option<std::sync::Arc<spark_model::vision_budget::VisionRowBudget>>,
     /// Whether (and how) to fetch `image_url` parts carrying an http(s) URL.
     /// Default-disabled; see `api::chat::remote_image` for why this one
     /// capability is opt-in rather than default-ON with a kill-switch.

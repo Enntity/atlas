@@ -114,10 +114,10 @@ pub(crate) fn validate_state(
 
     if state.deferred {
         ensure!(
-            state.rows <= bounds.request.max(bounds.window),
+            state.rows <= bounds.request,
             "vision row count {} exceeds the per-request bound {}",
             state.rows,
-            bounds.request.max(bounds.window)
+            bounds.request
         );
     } else {
         ensure!(

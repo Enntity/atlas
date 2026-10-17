@@ -111,7 +111,7 @@ pub(crate) fn prepare_chat_prompt(
         image_pixels,
         image_pad_counts,
         vision_placeholders,
-    } = msg_entry::build_msg_entries(
+    } = msg_entry::build_msg_entries_admitted(
         state.vision_config.as_ref(),
         state.vision_max_pixels,
         &state.remote_image_policy,
@@ -123,10 +123,14 @@ pub(crate) fn prepare_chat_prompt(
         tools_active,
         &state.chat,
         state.tokenizer.uses_deepseek_v4_encoding(),
+        // A request the engine cannot serve is refused while its media are
+        // read, with a 400, rather than failing at prefill start where
+        // clients retry it forever (`vision_admit`).
+        vision_admit::AdmitCtx {
+            limits: state.vision_limits.as_ref(),
+            budget: state.vision_budget.as_ref(),
+        },
     )?;
-    // A request the engine cannot serve is refused here, with a 400, rather
-    // than failing at prefill start where clients retry it forever.
-    vision_admit::check(state.vision_limits.as_ref(), &image_pad_counts)?;
     // A call that keeps returning the same result gets a notice on its
     // latest result and one turn of deeper thinking, instead of having
     // `<tool_call>` masked (see `loop_detect::check_loops`).

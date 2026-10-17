@@ -176,7 +176,7 @@ fn resolve_media_uri(
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn build_msg_entries(
     vision_config: Option<&VisionConfig>,
     vision_max_pixels: Option<usize>,
@@ -186,6 +186,33 @@ pub(super) fn build_msg_entries(
     tools_active: bool,
     levers: &super::levers::ChatLevers,
     preserve_developer_role: bool,
+) -> Result<BuildOut, Response> {
+    build_msg_entries_admitted(
+        vision_config,
+        vision_max_pixels,
+        remote_images,
+        video,
+        input,
+        tools_active,
+        levers,
+        preserve_developer_role,
+        super::vision_admit::AdmitCtx::default(),
+    )
+}
+
+/// [`build_msg_entries`] under the server's vision bounds: each item is sized
+/// from its header and admitted (`vision_admit`) before it is decoded.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub(super) fn build_msg_entries_admitted(
+    vision_config: Option<&VisionConfig>,
+    vision_max_pixels: Option<usize>,
+    remote_images: &super::remote_image::RemoteImagePolicy,
+    video: &VideoDecode<'_>,
+    input: &[Message],
+    tools_active: bool,
+    levers: &super::levers::ChatLevers,
+    preserve_developer_role: bool,
+    admit: super::vision_admit::AdmitCtx<'_>,
 ) -> Result<BuildOut, Response> {
     let mut messages: Vec<MsgEntry> = Vec::with_capacity(input.len());
     let mut media: Vec<MediaInput> = Vec::new();
@@ -417,25 +444,24 @@ pub(super) fn build_msg_entries(
                 "this model does not accept image or video input (no vision config)".to_string(),
             ));
         };
+        let has_video = media.iter().any(|m| m.kind == MediaKind::Video);
+        let mut admission = super::vision_admit::Admission::begin(admit, media.len(), has_video)?;
+        let image_error =
+            |e| openai_error_response(StatusCode::BAD_REQUEST, format!("Image decode error: {e}"));
         for (idx, input) in media.iter().enumerate() {
             let (item, video_timestamps) = match input.kind {
                 MediaKind::Image => {
-                    match spark_model::vision_preprocess::preprocess_image_with_max_pixels(
+                    // Sized from the header, admitted, and only then decoded.
+                    let probed = spark_model::vision_preprocess::probe_image(
                         &input.uri,
                         vcfg,
                         vision_max_pixels,
-                    ) {
-                        Ok((pixels, grid_h, grid_w)) => (
-                            spark_model::VisionItem::image(pixels, grid_h, grid_w),
-                            Vec::new(),
-                        ),
-                        Err(e) => {
-                            return Err(openai_error_response(
-                                StatusCode::BAD_REQUEST,
-                                format!("Image decode error: {e}"),
-                            ));
-                        }
-                    }
+                    )
+                    .map_err(image_error)?;
+                    let charge = admission.charge(probed.pad_count(vcfg.spatial_merge_size))?;
+                    let (pixels, grid_h, grid_w) = probed.preprocess(vcfg).map_err(image_error)?;
+                    let item = spark_model::VisionItem::image(pixels, grid_h, grid_w);
+                    (charge.attach(item), Vec::new())
                 }
                 MediaKind::Video => {
                     match spark_model::video_preprocess::preprocess_video(
@@ -446,11 +472,13 @@ pub(super) fn build_msg_entries(
                         video.ffmpeg,
                     ) {
                         Ok(v) => {
+                            // A video is bounded by its own decode budget and
+                            // charged once decoded (no header probe).
                             let timestamps = v.timestamps.clone();
-                            (
-                                spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w),
-                                timestamps,
-                            )
+                            let item = spark_model::VisionItem::video(v.groups, v.grid_h, v.grid_w);
+                            let charge =
+                                admission.charge(item.pad_count(vcfg.spatial_merge_size))?;
+                            (charge.attach(item), timestamps)
                         }
                         Err(e) => {
                             return Err(openai_error_response(
@@ -485,6 +513,7 @@ pub(super) fn build_msg_entries(
             }
             image_pixels.push(item);
         }
+        admission.finish()?;
     }
 
     // BW1 bash-wandering watchdog: if the agent has run many tool calls with

@@ -839,8 +839,16 @@ pub(crate) fn load_model(
 
     let scheduler_model = model;
     // Read before the scheduler takes the model: the API's admission check
-    // needs the encoder's output window (`spark_model::vision_limits`).
-    let vision_window_rows = scheduler_model.vision_window_rows();
+    // needs the encoder's output window (`spark_model::vision_limits`). A
+    // model whose tower did not load (window 0) serves text only, and the
+    // API refuses media as it does for a text model.
+    let (vision_window_rows, vision_request_bound) = scheduler_model.vision_row_limits();
+    let vision_config = config.vision.clone().filter(|_| vision_window_rows > 0);
+    if config.vision.is_some() && vision_config.is_none() {
+        tracing::warn!(
+            "vision config present but no vision tower loaded: image and video input is refused"
+        );
+    }
     let scheduler_eos = eos_tokens;
     // EP gate. v1 single-sequence worker protocol required max_batch_size=1
     // because each cmd targeted one slot and the head's per-token broadcast
@@ -1265,16 +1273,23 @@ pub(crate) fn load_model(
             ptx_set.behavior.disable_cwd_hint_injection,
             ptx_set.behavior.enable_stream_loop_guards,
         ),
-        vision_config: config.vision.clone(),
         vision_max_pixels,
-        vision_limits: config.vision.as_ref().map(|_| {
+        vision_limits: vision_config.as_ref().map(|_| {
             spark_model::vision_limits::VisionRowLimits::resolve(
                 vision_window_rows,
                 max_batch_tokens,
                 args.vision_max_request_rows,
-                args.max_seq_len,
+                vision_request_bound,
+                args.vision_max_inflight_rows,
             )
         }),
+        vision_budget: vision_config
+            .as_ref()
+            .filter(|_| args.vision_max_inflight_rows > 0)
+            .map(|_| {
+                spark_model::vision_budget::VisionRowBudget::new(args.vision_max_inflight_rows)
+            }),
+        vision_config,
         remote_image_policy,
         video_ffmpeg,
         video_fps: args.video_fps,

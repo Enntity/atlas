@@ -18,14 +18,19 @@ use crate::traits::SequenceState;
 impl TransformerModel {
     /// The row bounds both ranks apply to the vision wire state. Derived from
     /// the shared configuration only (encoder geometry, `max_batch_tokens`,
-    /// `max_seq_len`), so the head and the worker agree.
+    /// `max_seq_len`; `startup_parity` checks the vision pixel bound), so the
+    /// head and the worker agree.
+    ///
+    /// The native GLM tower keeps a deferred request inside its window: the
+    /// per-chunk encode past its 16384-row output is not yet measured on GLM
+    /// (follow-up: size `GLM_MAX_OUTPUT_ROWS` like the Qwen window).
     pub(crate) fn vision_row_bounds(&self) -> VisionRowBounds {
+        let ve = self.vision_encoder.as_ref();
+        let window = ve.map_or(0, |ve| ve.output_rows());
+        let glm = ve.is_some_and(|ve| ve.glm.is_some());
         VisionRowBounds {
-            window: self
-                .vision_encoder
-                .as_ref()
-                .map_or(0, |ve| ve.output_rows()),
-            request: self.config.max_seq_len,
+            window,
+            request: if glm { window } else { self.config.max_seq_len },
         }
     }
 

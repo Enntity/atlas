@@ -19,15 +19,19 @@
 //!   token, so the context bounds it; the operator bounds it further because
 //!   rank 0 holds the request's preprocessed pixels (f32, 24 KiB per merged
 //!   row on the Qwen tower) from admission until its prefill ends.
-//! - **items** — the rank-to-rank protocol's item limit.
+//! - **items** — the rank-to-rank protocol's item limit, applied on every
+//!   world size (a single rank refuses a 1025-item request too, so a request
+//!   does not pass on one deployment and fail on another).
 //!
 //! [`VisionRowLimits::check`] rejects a request that one of them would fail
 //! after admission, so the client gets a 400 it can act on instead of a
-//! prefill error it retries forever.
+//! prefill error it retries forever. [`VisionRowLimits::check_running`] applies
+//! the per-item and running-total bounds while the items are still being
+//! sized from their headers, before their pixels are decoded.
+//! [`crate::vision_budget`] bounds the pixels held across requests.
 
-/// Items one request may carry: the rank-to-rank protocol's limit
-/// (`model::vision_transport::VISION_MAX_GRID_ITEMS`).
-pub const MAX_VISION_ITEMS: usize = 1024;
+/// Items one request may carry: the rank-to-rank protocol's limit.
+pub const MAX_VISION_ITEMS: usize = crate::model::vision_transport::VISION_MAX_GRID_ITEMS;
 
 /// Merged rows the encoder output buffer must hold so that any prefill chunk
 /// of at most `chunk_tokens` tokens can encode every item it touches.
@@ -82,37 +86,83 @@ pub struct VisionRowLimits {
     pub request_rows: usize,
 }
 
+/// "1 image", "3 images", or "3 images or videos" once a video is present.
+fn items_noun(n: usize, has_video: bool) -> String {
+    match (n, has_video) {
+        (1, false) => "1 image".into(),
+        (1, true) => "1 video".into(),
+        (n, false) => format!("{n} images"),
+        (n, true) => format!("{n} images or videos"),
+    }
+}
+
 impl VisionRowLimits {
     /// The limits a server applies: the encoder's window, its longest prefill
-    /// chunk, and the operator's per-request rows (`0` = unset) capped by the
-    /// context, since every row is a prompt token.
+    /// chunk, and the rows one request may carry: the operator's per-request
+    /// rows (`0` = unset), capped by `request_bound` (the engine's own bound:
+    /// the context, since every row is a prompt token, or the window where the
+    /// engine does not chunk vision rows across encodes) and by the in-flight
+    /// budget (`0` = none), which a larger request could never acquire.
     pub fn resolve(
         window_rows: usize,
         chunk_tokens: usize,
         request_rows: usize,
-        max_seq_len: usize,
+        request_bound: usize,
+        inflight_rows: usize,
     ) -> Self {
-        let request_rows = match request_rows {
-            0 => max_seq_len,
-            n => n.min(max_seq_len),
+        let mut rows = match request_rows {
+            0 => request_bound,
+            n => n.min(request_bound),
         };
+        if inflight_rows > 0 {
+            rows = rows.min(inflight_rows);
+        }
         Self {
             window_rows,
             chunk_tokens,
-            request_rows,
+            request_rows: rows,
         }
+    }
+
+    /// The bounds that hold item by item, for item `index` (0-based) of
+    /// `n_items` carrying `rows`, with `total` rows counted so far including
+    /// it: refused as soon as one fails, before the rest are decoded.
+    pub fn check_running(
+        &self,
+        index: usize,
+        n_items: usize,
+        rows: usize,
+        total: usize,
+        has_video: bool,
+    ) -> Result<(), String> {
+        if rows > self.window_rows {
+            return Err(format!(
+                "vision input too large: item {} of {} needs {rows} vision tokens, more than \
+                 the encoder's {}-row window; send a smaller image or a shorter video",
+                index + 1,
+                items_noun(n_items, has_video),
+                self.window_rows
+            ));
+        }
+        if total > self.request_rows {
+            return Err(format!(
+                "vision input too large: the first {} of {} already need {total} vision \
+                 tokens, more than the {} this server accepts per request; send fewer or \
+                 smaller images",
+                index + 1,
+                items_noun(n_items, has_video),
+                self.request_rows
+            ));
+        }
+        Ok(())
     }
 
     /// Why a request whose items carry `item_rows` (prompt order) cannot be
     /// served, or `Ok`. The message names counts and limits only, never
     /// request content.
-    pub fn check(&self, item_rows: &[usize]) -> Result<(), String> {
+    pub fn check(&self, item_rows: &[usize], has_video: bool) -> Result<(), String> {
         let n = item_rows.len();
-        let items = if n == 1 {
-            "1 image".to_string()
-        } else {
-            format!("{n} images")
-        };
+        let items = items_noun(n, has_video);
         if n > MAX_VISION_ITEMS {
             return Err(format!(
                 "vision input too large: the request has {items}, more than the \
