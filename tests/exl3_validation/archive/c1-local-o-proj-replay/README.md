@@ -1,7 +1,7 @@
 # ARCHIVED — C1 local o_proj BF16 common-space replay (do not use)
 
 Archived 2026-10-12 by operator decision (C1 re-scoped to "close from native
-captures", see `decisions.md`). Full pre-removal tree: git tag
+captures"). Full pre-removal tree: git tag
 `archive/c1-bf16-o-proj-replay-20261012` (at `4e00b222`).
 
 ## Contents

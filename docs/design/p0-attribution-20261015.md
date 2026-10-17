@@ -11,7 +11,7 @@ repeats with independent timing, then targets) stays open.
 - **Image:** `atlas-exl3-validation:src-4ee96c12b44c-rust1.97.1`, ID
   `sha256:82173ea631a8c78e4fb565f0e23bc6d55f94a43090dbfb27c850f8cc1e6b41d9`,
   asserted on both ranks. This is the worker-binding image (`f099ac58`) with
-  a full neutrality proof. See decisions.md 2026-10-15 for the re-pin.
+  a full neutrality proof. The re-pin was an operator decision on 2026-10-15.
 - **Serve profile:** the collector-only rank descriptors
   (`$EV/statistical-gate-20261011/collector-only-profile/cand-rank{0,1}-create-command.json`).
   The image token is replaced and the logits observer env/mount removed.

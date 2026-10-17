@@ -44,7 +44,7 @@ binding obligations.
 
 The broad code-path audit is historical. Its short-live-latent, missing-config
 and head-padding claims were already corrected in
-[the reconciliation log](../../q2-diagnostic.md#2026-10-12--vllm-report-reconciliation-after-independent-review).
+the 2026-10-12 reconciliation after independent review.
 This review agrees with those corrections. Luna's initial source-unavailable
 statement was withdrawn after locating `SRC`; its generic context-cache
 upconversion observation is not the selected SM120 execution path and is not

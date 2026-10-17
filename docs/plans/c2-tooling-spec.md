@@ -3,7 +3,7 @@
 Parent contract: [q2-norm-causality-plan.md](q2-norm-causality-plan.md)
 §"Experiment C2" is the authority for semantics, scoring rules and controls.
 This file is the implementation contract only; it never relaxes the parent.
-Decisions: `decisions.md` (2026-10-12 C2 batch entries). Assumptions and
+Decisions: operator decisions of 2026-10-12 (C2 batch). Assumptions and
 constraints (A1–A13) live in the section below — folded here per the
 2026-10-12 "validation-campaign logging convention" decision (no separate
 `assumptions.md`). No GPU work happens under this spec (hosts are the

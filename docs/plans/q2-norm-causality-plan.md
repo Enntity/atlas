@@ -44,7 +44,7 @@ numerical policy for every model.
   (`fixtures/`, `common/`, `replay-ptx/`).
 - Code-path audit gap list G1–G9 and discrepancies D1–D5:
   `q2-codepath-audit-20261012/comparison-report.md` §4–§5, corrected by
-  `q2-diagnostic.md` "vLLM report reconciliation after independent review".
+  the 2026-10-12 reconciliation after independent review.
   The archived report is preserved; its missing-config, disputed-head-padding,
   never-replayed and short-live-latent claims are superseded there.
   The operator-requested Luna source review and parent reconciliation are in
@@ -75,7 +75,7 @@ numerical policy for every model.
 
 ## Experiment C1 — local o_proj before TP: CLOSED from native captures
 
-Operator decision 2026-10-12 (decisions.md "C1 re-scoped"). Answers come
+Operator decision 2026-10-12 ("C1 re-scoped"). Answers come
 from the native pre-reduce captures under `q2-c1-execution-20261012/` and
 `q2-c1-binding-2026013/` (sic). See `ERRATUM-20261012.md` there.
 
@@ -131,7 +131,7 @@ from the native pre-reduce captures under `q2-c1-execution-20261012/` and
   is byte-deterministic; if either varies, report the variation and retain
   causality as unresolved until it is controlled. Preserve every attempt.
 - The 2048-token long-suite slice required an explicit operator scope
-  extension; **granted 2026-10-12** (see decisions.md). It is authorized here
+  extension; **granted 2026-10-12**. It is authorized here
   subject to every other constraint in this plan.
 - **First C2 measurement (discharges the C1 flag):** B's layer-0 local
   (pre-reduce) o_proj output must be byte-identical to the reference's
@@ -193,7 +193,7 @@ for each affected replay, not work deferred until all numerical experiments:
    occupancy anew for other layers/long contexts before choosing thin or fat
    activation arithmetic. Atomic-order repeat probes remain separate.
 4. **G1 — layers 4–44 hidden-state bisection captures** on both engines
-   (operator scope extension granted 2026-10-12; see decisions.md).
+   (operator scope extension granted 2026-10-12).
 5. **G5 — effective cache/attention-path equivalence.** Reference `auto`
    resolves to `fp8_ds_mla`; candidate `fp8_g128` was selected to match that
    format (registered gate addendum). Different flag names do not establish
@@ -202,7 +202,7 @@ for each affected replay, not work deferred until all numerical experiments:
    and QDQ placement for the short failing cases too; the merged report's
    live-BF16-latent assumption is superseded. Extend cache round-trip tracing
    to the 2048-token long suite under the operator scope extension granted
-  2026-10-12 (see decisions.md).
+  2026-10-12.
 6. **G6/G7 — mHC ≤16-row path-branch capture at a representative layer;
    MLA/indexer replay.** Checkpoint `index_topk=2048`, `index_kpool=4` and
    NoPE are recovered. Installed selector drops one selected pool in its

@@ -9,7 +9,7 @@ outcome are recorded in the
 [qualification report](exl3-statistical-gate-v2-qualification-20261014.md)
 and [verification report](exl3-statistical-gate-v2-verification-20261012.md).**
 Authored 2026-10-12 from reference-side data only, before any collection it
-governs. Operator decision: `decisions.md` 2026-10-12 ("full v2
+governs. Operator decision 2026-10-12 ("full v2
 pre-registration authorized"). The v1 rule
 ([exl3-statistical-gate.md](exl3-statistical-gate.md)) is untouched and stays
 the historical registered rule. Calibration evidence and script:
@@ -545,7 +545,7 @@ Verify unchanged T against the archived reference-only calibration. Recheck
 H4 calibration with the edge-case definitions and archive any differences;
 the old calibration alone does not validate the amended implementation.
 These checks and evaluator review/freeze precede qualification collection.
-Operator collection authorisation is recorded in `decisions.md` (2026-10-12).
+Operator collection authorisation was given on 2026-10-12.
 
 ## Historical notes
 
@@ -555,7 +555,7 @@ recorded a FAIL verdict, and the v1 held-out control failed for 3 of 5
 fresh reference draws (context only; no v1 candidate number is used
 anywhere in this document). Direct comparability between the v1 and v2
 verdicts is **surrendered by explicit operator choice**
-(`decisions.md`, 2026-10-12): v2 is a different registered rule with a
+(operator decision, 2026-10-12): v2 is a different registered rule with a
 different reference set, and no v2 verdict is a re-evaluation of the v1
 verdict. The redesign repairs the control, not the verdict.
 
