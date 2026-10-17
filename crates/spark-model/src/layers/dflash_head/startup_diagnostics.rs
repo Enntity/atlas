@@ -56,6 +56,11 @@ pub struct DsparkDiagnostics {
     /// `ATLAS_DFLASH_FIRST_APPEND=legacy|none|own|zero`. Strict, unlike the
     /// probes above: the factory resolves it with `FirstAppend::for_head`.
     pub first_append: super::FirstAppend,
+    /// Keep every drafter projection BF16: no load-time FP8 / MXFP8 /
+    /// NVFP4 twins regardless of the environment. Not an env probe: set by
+    /// the native EXL3 draft-only observer so its acceptance is measured
+    /// against the reference's BF16 drafter.
+    pub bf16_weights_only: bool,
 }
 
 impl Default for DsparkDiagnostics {
@@ -82,6 +87,7 @@ impl Default for DsparkDiagnostics {
             option_b_diag: false,
             draft_conf: false,
             first_append: super::FirstAppend::Legacy,
+            bf16_weights_only: false,
         }
     }
 }
@@ -123,6 +129,7 @@ impl DsparkDiagnostics {
             option_b_diag: one("ATLAS_DFLASH_OPTION_B_DIAG"),
             draft_conf: one("ATLAS_DFLASH_CONF_WIDTH") || one("ATLAS_DFLASH_CONF_LOG"),
             first_append: super::FirstAppend::Legacy,
+            bf16_weights_only: false,
         }
     }
 }

@@ -310,7 +310,7 @@ pub fn load(
     startup.draft_cap_override = None;
     startup.option_b_no_ctx = false;
     let weights_mode = drafter_weights_mode()?;
-    startup.bf16_weights_only = weights_mode == "bf16";
+    startup.diagnostics.bf16_weights_only = weights_mode == "bf16";
     let gamma = k + 1;
     let mut head = BlockDiffusionDraftHead::from_weights(
         weights,
