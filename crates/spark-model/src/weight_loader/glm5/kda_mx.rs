@@ -105,9 +105,10 @@ impl KdaMx {
 /// checkpoint tensor must be exactly `[n, k]` and the twin this rank's
 /// `[n/tp, k]` (q/k/v) or `[n, k/tp]` (o), or the GEMV would read past it.
 /// The twin's slice is the matching slice of the checkpoint tensor, as
-/// `mxfp8_load` cuts it, and the same rows the BF16 TP shard keeps. `m_max`
-/// bounds the W8A8 row buckets tuned at load. Synchronizes the default
-/// stream; frees what it allocated on any error.
+/// `mxfp8_load` cuts it, and the same rows the BF16 TP shard keeps. The W8A8
+/// operand runs the pinned kernel (`MxW8a8::pinned`), so nothing is tuned at
+/// load. Synchronizes the default stream; frees what it allocated on any
+/// error.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn kda_twin(
     policy: KdaMxPolicy,
@@ -117,7 +118,6 @@ pub(super) fn kda_twin(
     kind: TpShardKind,
     tp_rank: usize,
     tp_size: usize,
-    m_max: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<Option<KdaMx>> {
     if !policy.any() {
@@ -162,9 +162,11 @@ pub(super) fn kda_twin(
         bail!("{stem}: MXFP8 twin [{tn}, {tk}] is not this rank's {local:?}");
     }
     let w8a8 = if policy.w8a8_prefill {
-        // Reads the twin's E4M3 bytes in place, untiled.
-        match MxW8a8::from_twin(gpu, &twin, local, m_max, stream) {
-            Ok(w) => Some(w),
+        // Reads the twin's E4M3 bytes in place, untiled, on the pinned
+        // kernel (one per shape, never retuned: chunk- and history-invariant
+        // prefill), so no row bucket is tuned at load.
+        match MxW8a8::from_twin(gpu, &twin, local, 0, stream) {
+            Ok(w) => Some(w.pinned()),
             Err(e) => {
                 free_twin(twin)?;
                 return Err(e.context(format!("{stem}: MXFP8 W8A8 operand")));

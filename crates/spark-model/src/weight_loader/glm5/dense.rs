@@ -81,7 +81,7 @@ pub(super) fn load_projection(
 /// (`ATLAS_GLM_FP4L_DENSE_MXFP8`, `layers::dense_ffn_native`): the whole
 /// (replicated) gate / up `[inter, h]` and down `[h, inter]` copied from the
 /// checkpoint's bytes, with W8A8 operands over them when prefill runs W8A8
-/// (row buckets tuned to `m_max`). `None` when the switch is off or the
+/// (on the pinned kernel: chunk- and history-invariant rows). `None` when the switch is off or the
 /// checkpoint ships them in another format (logged once). Frees what it built
 /// on error. Synchronizes the default stream.
 pub(super) fn native_dense(
@@ -89,7 +89,6 @@ pub(super) fn native_dense(
     store: &WeightStore,
     prefix: &str,
     [h, inter]: [usize; 2],
-    m_max: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<Option<crate::layers::dense_ffn::DenseNative>> {
     use crate::layers::ops::{Fp8bPrefill, MxW8a8};
@@ -130,7 +129,8 @@ pub(super) fn native_dense(
             let (twin, _, _) = mxfp8_rows_twin(gpu, &[(raw, &[raw.n][..])], 0, 1, stream)?;
             twins.push(twin);
             if w8a8 {
-                operands.push(MxW8a8::from_twin(gpu, &twin, shape, m_max, stream)?);
+                // The pinned kernel (as KDA's): no row bucket tuned at load.
+                operands.push(MxW8a8::from_twin(gpu, &twin, shape, 0, stream)?.pinned());
             }
         }
         Ok(())

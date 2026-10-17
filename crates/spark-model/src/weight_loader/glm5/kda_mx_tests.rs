@@ -67,7 +67,6 @@ fn each_ranks_twin_is_its_slice_of_the_checkpoint_bytes() {
             TpShardKind::ColumnParallel,
             rank,
             2,
-            0,
             &gpu,
         )
         .unwrap()
@@ -92,7 +91,6 @@ fn each_ranks_twin_is_its_slice_of_the_checkpoint_bytes() {
             TpShardKind::RowParallel,
             rank,
             2,
-            0,
             &gpu,
         )
         .unwrap()
@@ -128,7 +126,6 @@ fn off_or_not_mxfp8_builds_nothing() {
             TpShardKind::ColumnParallel,
             0,
             2,
-            0,
             &gpu
         )
         .unwrap()
@@ -157,7 +154,6 @@ fn off_or_not_mxfp8_builds_nothing() {
                 TpShardKind::RowParallel,
                 0,
                 2,
-                0,
                 &gpu
             )
             .unwrap()
@@ -169,20 +165,7 @@ fn off_or_not_mxfp8_builds_nothing() {
         allocs + 1,
         "only the BF16 fixture allocated"
     );
-    assert!(
-        kda_twin(
-            on,
-            &st,
-            "s",
-            [64, 128],
-            TpShardKind::Replicated,
-            0,
-            2,
-            0,
-            &gpu
-        )
-        .is_err()
-    );
+    assert!(kda_twin(on, &st, "s", [64, 128], TpShardKind::Replicated, 0, 2, &gpu).is_err());
 }
 
 /// W8A8 reads the twin's E4M3 bytes in place (no copy) with its own tiled
@@ -207,7 +190,6 @@ fn w8a8_shares_the_twin_bytes_and_serves_all_only_with_decode() {
             TpShardKind::ColumnParallel,
             1,
             2,
-            0,
             &gpu,
         )
         .unwrap()
@@ -239,17 +221,7 @@ fn a_checkpoint_tensor_of_other_dims_than_the_config_is_refused() {
         w8a8_prefill: true,
     };
     for dims in [[128, 128], [64, 64], [32, 128]] {
-        let r = kda_twin(
-            on,
-            &st,
-            "s",
-            dims,
-            TpShardKind::ColumnParallel,
-            0,
-            2,
-            0,
-            &gpu,
-        );
+        let r = kda_twin(on, &st, "s", dims, TpShardKind::ColumnParallel, 0, 2, &gpu);
         assert!(r.is_err(), "{dims:?}");
     }
     assert_eq!(gpu.alloc_count(), allocs);
@@ -274,7 +246,6 @@ fn freeing_a_twin_returns_everything_it_allocated() {
             TpShardKind::RowParallel,
             1,
             2,
-            0,
             &gpu,
         )
         .unwrap()
@@ -309,7 +280,6 @@ fn freeing_a_separate_decode_copy_returns_both_byte_buffers() {
         TpShardKind::ColumnParallel,
         0,
         2,
-        0,
         &gpu,
     )
     .unwrap()

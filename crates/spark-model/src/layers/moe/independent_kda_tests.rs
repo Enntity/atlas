@@ -135,6 +135,7 @@ pub(super) fn mixed_kda_twins_are_refused() {
     let gpu = Gpu::new();
     let (_, mixed) = kda_layer(&gpu, 0, false, |w| {
         w.o_proj.w8a8 = Some(crate::layers::ops::MxW8a8 {
+            pinned: false,
             data: DevicePtr(0x100),
             sf: DevicePtr(0x200),
             n: 4096,

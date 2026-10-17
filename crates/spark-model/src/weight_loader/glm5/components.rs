@@ -103,7 +103,6 @@ fn load_dense_ffn(
         store,
         &p,
         [h, inter],
-        config.max_batch_tokens,
         gpu,
     )? {
         let weights = DenseFfnWeights {
@@ -391,7 +390,6 @@ pub(super) fn load_kda_weights(
             kind,
             dims.tp_rank,
             dims.tp_size,
-            config.max_batch_tokens,
             gpu,
         )?
         .unwrap_or_default();

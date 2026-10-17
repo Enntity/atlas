@@ -46,7 +46,15 @@ pub struct MxW8a8 {
     pub sf: DevicePtr,
     pub n: usize,
     pub k: usize,
+    /// Every GEMM runs the one pinned in-order kernel of `(n, k)`
+    /// ([`Self::pinned`]), not the tuned per-bucket pick.
+    pub pinned: bool,
 }
+
+/// Rows per GEMM on the pinned kernel: the tallest height `mx_algo::pinned`
+/// checks it takes (taller passes run in chunks of it; the kernel computes
+/// each row alone, so the bytes are the same).
+pub const MX_PINNED_MAX_ROWS: usize = 8192;
 
 impl MxW8a8 {
     /// The W8A8 operand of an untiled `[n, k]` `twin`, its row buckets
@@ -81,7 +89,21 @@ impl MxW8a8 {
             sf,
             n,
             k,
+            pinned: false,
         })
+    }
+
+    /// This operand on the pinned kernel at every row count: one in-order
+    /// cuBLASLt kernel per `(n, k)` chosen once without timing and never
+    /// retuned (`fp8_gemm_act_weight_t_mx_pinned`), so a row's bytes do not
+    /// depend on the pass height, the chunking or which heights ran first
+    /// (the tuned pick of an unswept shape is retuned when it refuses a
+    /// height). The GLM FP4-Local native paths (KDA, dense MLP) run pinned.
+    pub fn pinned(self) -> Self {
+        Self {
+            pinned: true,
+            ..self
+        }
     }
 
     /// Bytes this operand allocated (the tiled scales).
@@ -96,15 +118,28 @@ impl MxW8a8 {
 
     /// `out[m, n]` (BF16, contiguous) `= act[m, k] x self^T`.
     pub fn gemm(&self, act: MxAct, out: DevicePtr, m: usize, stream: u64) -> Result<()> {
-        // A packed prefill (`glm_packed_scope`): one kernel for every row
-        // count, chosen without timing, so a prompt's rows do not depend on
-        // the pass height or on which heights were tuned first.
-        let gemm = if crate::layers::glm_packed_scope::active() {
-            spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx_pinned
-        } else {
-            spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx
-        };
-        gemm(
+        // A pinned operand, or a packed prefill (`glm_packed_scope`): one
+        // kernel for every row count, chosen without timing, so a prompt's
+        // rows do not depend on the pass height or on which heights were
+        // tuned first; passes taller than the heights it was checked at run
+        // in chunks.
+        if self.pinned || crate::layers::glm_packed_scope::active() {
+            for row0 in (0..m).step_by(MX_PINNED_MAX_ROWS) {
+                let rows = (m - row0).min(MX_PINNED_MAX_ROWS);
+                let a = act.rows_from(row0, self.k)?;
+                spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx_pinned(
+                    a.q.0,
+                    a.sf.0,
+                    self.data.0,
+                    self.sf.0,
+                    out.offset(row0 * self.n * 2).0,
+                    [rows as u32, self.n as u32, self.k as u32],
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx(
             act.q.0,
             act.sf.0,
             self.data.0,

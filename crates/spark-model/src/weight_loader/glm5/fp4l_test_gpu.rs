@@ -521,7 +521,6 @@ fn kda_mxfp8_decode_twins_are_checkpoint_bytes_and_row_invariant() -> Result<()>
                 kind,
                 rank,
                 2,
-                0,
                 gpu,
             )?
             .and_then(|m| m.decode)
@@ -638,7 +637,6 @@ fn kda_w8a8_prefill_is_row_invariant_on_the_checkpoint_twin() -> Result<()> {
         crate::tp_shard::TpShardKind::ColumnParallel,
         0,
         2,
-        M,
         gpu,
     )?
     .context("twin")?;

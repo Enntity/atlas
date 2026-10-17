@@ -84,7 +84,7 @@ fn twins_are_the_checkpoint_bytes_with_w8a8_operands_over_them() {
     let gpu = MockGpuBackend::new();
     let (st, values) = store(&gpu, false, 128);
     // m_max 0: the mock has no cuBLASLt to tune buckets with.
-    let native = native_dense(ON, &st, P, SHAPE, 0, &gpu).unwrap().unwrap();
+    let native = native_dense(ON, &st, P, SHAPE, &gpu).unwrap().unwrap();
     for (twin, want) in [native.gate, native.up, native.down].iter().zip(&values) {
         assert_eq!(&read(&gpu, twin.data, want.len()), want);
         assert!(!twin.tiled);
@@ -102,17 +102,13 @@ fn off_or_another_format_builds_nothing() {
     let gpu = MockGpuBackend::new();
     let (st, _) = store(&gpu, false, 128);
     assert!(
-        native_dense(NativePolicy::default(), &st, P, SHAPE, 0, &gpu)
+        native_dense(NativePolicy::default(), &st, P, SHAPE, &gpu)
             .unwrap()
             .is_none()
     );
     let (bf16, _) = store(&gpu, true, 128);
     let live = gpu.alloc_count();
-    assert!(
-        native_dense(ON, &bf16, P, SHAPE, 0, &gpu)
-            .unwrap()
-            .is_none()
-    );
+    assert!(native_dense(ON, &bf16, P, SHAPE, &gpu).unwrap().is_none());
     assert_eq!(gpu.alloc_count(), live);
 }
 
@@ -121,6 +117,6 @@ fn a_shape_the_config_does_not_expect_frees_what_was_built() {
     let gpu = MockGpuBackend::new();
     let (st, _) = store(&gpu, false, 96);
     let live = gpu.alloc_count();
-    assert!(native_dense(ON, &st, P, SHAPE, 0, &gpu).is_err());
+    assert!(native_dense(ON, &st, P, SHAPE, &gpu).is_err());
     assert_eq!(gpu.alloc_count(), live);
 }
