@@ -146,6 +146,25 @@ pub(super) fn row_masks(
         let Some(&draft) = drafts.get(r) else {
             break Ok(());
         };
+        // The row after a `</think>` would pick a union's branch token, which
+        // only host logits choose (`ActiveSeq::grammar_branch_pending`): the
+        // verify ends at the `</think>` position. As the only draft, it gives
+        // way to a dead `<think>` its row refuses, so that row's pick is the
+        // step's one token.
+        if thinking && think_end == Some(draft) && gs.branch_pending() {
+            match (r, think_start) {
+                (0, Some(dead_token)) => {
+                    let w = &mut masks[row_at + dead_token as usize / 32];
+                    *w &= !(1u32 << (dead_token % 32));
+                    kept.push(dead_token);
+                    masks.extend_from_within(row_at..);
+                    dead = true;
+                    break Ok(());
+                }
+                (0, None) => {}
+                _ => break Ok(()),
+            }
+        }
         let row = &masks[row_at..];
         let mut d = draft;
         if !allowed(row, d, vocab) {
