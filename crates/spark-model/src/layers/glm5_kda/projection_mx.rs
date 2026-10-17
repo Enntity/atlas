@@ -22,6 +22,13 @@ use super::{Glm5KdaLayer, Glm5Projection};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
+/// `ATLAS_GLM_FP4L_KDA_QKV_FUSE` (default on; `0` runs Q, K, V as three
+/// launches, for A/B: the bytes are the same either way).
+fn qkv_fuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_FP4L_KDA_QKV_FUSE").as_deref() != Ok("0"))
+}
+
 impl Glm5KdaLayer {
     /// `output[m, n] = input[m, k] · W^T` on `weight`'s MXFP8 twin; `false`,
     /// nothing launched, when it has none.
@@ -93,6 +100,58 @@ impl Glm5KdaLayer {
             ops::mx_quant_rows(ctx.gpu, self.mx_quant_k, input, act, 0..m, k, stream)?;
         }
         w.gemm(act, output, m, stream)?;
+        Ok(true)
+    }
+
+    /// Q, K and V of `m` decode / verify rows in one `mxfp8_gemv_tc*_multi`
+    /// launch (32 rows a launch) into the planes of `projected`
+    /// (`plane_bytes` apart, rows `p` apart): each CTA runs the body of its
+    /// projection's own tier, so every output word equals the three separate
+    /// launches'. `false` without twins, or with `ATLAS_GLM_FP4L_KDA_QKV_FUSE=0`.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::layers::glm5_kda) fn try_project_qkv_mxfp8(
+        &self,
+        normed: DevicePtr,
+        projected: DevicePtr,
+        plane_bytes: usize,
+        m: u32,
+        p: usize,
+        h: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let w = &self.weights;
+        let (Some(q), Some(k), Some(v)) = (
+            w.q_proj.mxfp8.as_ref(),
+            w.k_proj.mxfp8.as_ref(),
+            w.v_proj.mxfp8.as_ref(),
+        ) else {
+            return Ok(false);
+        };
+        let kernels = ops::native_kernels(ctx.gpu);
+        if !qkv_fuse_enabled() || q.tiled != k.tiled || q.tiled != v.tiled {
+            return Ok(false);
+        }
+        ensure!(
+            kernels.mx_multi.complete(q.tiled) && plane_bytes >= m as usize * p * 2,
+            "GLM KDA fused MXFP8 QKV: the mxfp8_gemv_tc*_multi tiers are missing \
+             (set ATLAS_GLM_FP4L_KDA_QKV_FUSE=0) or the planes overlap"
+        );
+        let parts = [
+            ops::MxPart::mx(q, projected, p),
+            ops::MxPart::mx(k, projected.offset(plane_bytes), p),
+            ops::MxPart::mx(v, projected.offset(2 * plane_bytes), p),
+        ];
+        ops::mx_multi_rows(
+            ctx.gpu,
+            &kernels.mx_multi,
+            q.tiled,
+            normed,
+            &parts,
+            m as usize,
+            h as usize,
+            stream,
+        )?;
         Ok(true)
     }
 
