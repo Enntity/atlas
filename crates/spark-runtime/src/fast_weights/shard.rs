@@ -52,10 +52,18 @@ pub(super) fn load_shard_fast(
     // on GB10 is managed memory, i.e. Linux swap, i.e. a kernel freeze. They
     // are recorded with their on-disk location and served either by streaming
     // per-table quantize-on-load or straight off NVMe by the row cache.
+    //
+    // Under expert TP a CSF-compressed scale's COMPONENTS are deferred (see
+    // `should_defer_tensor`), to be decoded one matrix at a time by
+    // `with_deferred_slice`; the assembler still checks them by shape.
     let mut deferred_here: Vec<(String, crate::weights::DeferredTensor)> = Vec::new();
+    let mut csf_deferred: Vec<(String, Vec<usize>, usize)> = Vec::new();
     #[allow(clippy::items_after_statements)]
     tensors.retain(|t| {
         if crate::weights::is_ngram_table(&t.name) || (!skip_fn(&t.name) && defer_fn(&t.name)) {
+            if csf_part(&t.name).is_some() {
+                csf_deferred.push((t.name.clone(), t.shape.clone(), t.len));
+            }
             deferred_here.push((
                 t.name.clone(),
                 crate::weights::DeferredTensor {
@@ -69,6 +77,14 @@ pub(super) fn load_shard_fast(
         }
         !skip_fn(&t.name)
     });
+    for (name, shape, len) in &csf_deferred {
+        csf.defer(name, shape, *len)?;
+    }
+    // A deferred plain scale is still a plain scale: one that is also
+    // CSF-compressed is refused whichever form arrives first.
+    for (name, _) in deferred_here.iter().filter(|(n, _)| csf_part(n).is_none()) {
+        csf.note_plain(name)?;
+    }
     if !deferred_here.is_empty() {
         tracing::info!(
             "Deferred {} tensor(s) in {} — served from disk, not uploaded",
@@ -143,13 +159,6 @@ pub(super) fn load_shard_fast(
         // `weight_scale` is uploaded.
         if csf_part(&meta.name).is_some() {
             if let Some(scale) = csf.offer(&meta.name, &meta.shape, raw)? {
-                anyhow::ensure!(
-                    !defer_fn(&scale.name),
-                    "{} is CSF-compressed but expert TP defers it to be read from \
-                     disk as a slice; decode-then-slice is not implemented, so \
-                     expert TP cannot serve this checkpoint",
-                    scale.name
-                );
                 let ptr = upload(gpu, &scale.name, &scale.bytes, offload_logged)?;
                 out.insert(
                     scale.name,

@@ -562,4 +562,4 @@ mod teardown_tests;
 
 #[cfg(test)]
 #[path = "weights/csf_load_tests.rs"]
-mod csf_load_tests;
+pub(crate) mod csf_load_tests;

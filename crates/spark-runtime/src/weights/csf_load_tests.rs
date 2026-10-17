@@ -25,9 +25,9 @@ const DOWN_W: &str = "model.language_model.layers.0.mlp.experts.1.down_proj.weig
 const GATE_W_SHAPE: [usize; 2] = [640, 1280];
 const DOWN_W_SHAPE: [usize; 2] = [2560, 320];
 
-struct Dir(PathBuf);
+pub(crate) struct Dir(pub(crate) PathBuf);
 impl Dir {
-    fn new(tag: &str) -> Self {
+    pub(crate) fn new(tag: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("atlas-csf-{tag}-{}-{n}", std::process::id()));
@@ -63,9 +63,9 @@ fn golden_sha(tag: &str) -> String {
         .to_string()
 }
 
-type T<'a> = (&'a str, &'a str, Vec<usize>, Vec<u8>);
+pub(crate) type T<'a> = (&'a str, &'a str, Vec<usize>, Vec<u8>);
 
-fn write_shard(path: &Path, tensors: &[T<'_>]) {
+pub(crate) fn write_shard(path: &Path, tensors: &[T<'_>]) {
     let mut header = serde_json::Map::new();
     let mut off = 0usize;
     for (name, dtype, shape, bytes) in tensors {

@@ -78,20 +78,22 @@ pub struct Csf32Parts<'a> {
 /// else; the offset count must agree with it ([`Geometry::decode`]) and the
 /// packed weight pins it (`CsfAssembler::finish`).
 pub fn shape(parts: &Csf32Parts<'_>) -> Result<[usize; 2]> {
-    let rows = parts.bases.len();
+    shape_of(parts.bases.len(), parts.codes.len())
+}
+
+/// [`shape`] from the component lengths alone: `rows` bases, `code_bytes`
+/// code bytes (what a header gives for deferred components).
+pub(crate) fn shape_of(rows: usize, code_bytes: usize) -> Result<[usize; 2]> {
     ensure!(
         rows > 0 && rows.is_multiple_of(BLOCK_ROWS),
         "csf32: {rows} row bases — R must be a positive multiple of {BLOCK_ROWS}"
     );
-    let fields = parts
-        .codes
-        .len()
+    let fields = code_bytes
         .checked_mul(2)
         .context("csf32: code stream length overflows")?;
     ensure!(
         fields > 0 && fields.is_multiple_of(rows),
-        "csf32: {} code bytes is not R * C / 2 for R = {rows}",
-        parts.codes.len()
+        "csf32: {code_bytes} code bytes is not R * C / 2 for R = {rows}"
     );
     Ok([rows, fields / rows])
 }

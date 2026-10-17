@@ -24,9 +24,12 @@ use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod deferred_slice;
 mod direct_io;
 mod header;
 mod shard;
+
+pub use deferred_slice::{SliceAxis, decode_deferred_csf_scale, with_deferred_slice};
 
 use header::resolve_shards;
 use shard::load_shard_fast;
@@ -394,7 +397,12 @@ mod expert_filter_tests {
         loader.expert_tp = true;
         loader.rank0_only_expert_prefix = Some(".layers.45.".into());
         let p = "model.language_model.layers.44.mlp.experts.1.gate_proj";
-        for suffix in ["weight", "weight_scale"] {
+        for suffix in [
+            "weight",
+            "weight_scale",
+            "weight_scale.csf32_codes",
+            "weight_scale.nvfp4_csf_fixed",
+        ] {
             let name = format!("{p}.{suffix}");
             assert!(!loader.should_skip_tensor(&name));
             assert!(loader.should_defer_tensor(&name));

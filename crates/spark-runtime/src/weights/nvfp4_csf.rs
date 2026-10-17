@@ -45,7 +45,7 @@ use super::nvfp4_csf32::{CSF32_ELEM_BYTES, CSF32_SUFFIXES};
 
 #[path = "nvfp4_csf_assembler.rs"]
 mod assembler;
-pub use assembler::{CsfAssembler, DecodedScale};
+pub use assembler::{CsfAssembler, DecodedScale, decode_parts};
 
 /// Suffix of the fixed stream.
 pub const CSF_FIXED_SUFFIX: &str = ".nvfp4_csf_fixed";
@@ -78,7 +78,7 @@ impl CsfEncoding {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Slab => "CSF",
             Self::Blocks32 => "csf_32x2_v1",
@@ -136,12 +136,19 @@ impl CsfPart {
     }
 
     /// Bytes per element.
-    fn elem_bytes(self) -> usize {
+    pub fn elem_bytes(self) -> usize {
         match self.encoding() {
             CsfEncoding::Slab => [1, 4][self.slot()],
             CsfEncoding::Blocks32 => CSF32_ELEM_BYTES[self.slot()],
         }
     }
+}
+
+/// The component suffixes and parts of `encoding`, in slot order.
+pub fn parts_of(encoding: CsfEncoding) -> impl Iterator<Item = (&'static str, CsfPart)> {
+    PARTS
+        .into_iter()
+        .filter(move |(_, p)| p.encoding() == encoding)
 }
 
 /// `Some((decoded_name, part))` when `name` is a component of a compressed
