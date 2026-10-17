@@ -72,7 +72,7 @@ fn the_store_round_trips_glm_windows_on_the_device() -> Result<()> {
     anyhow::ensure!(store.save(gpu, key, src, ws, cut, ROW, WINDOW, stream)?);
     // The next turn (45,600 tokens) wants [43552, 44976).
     let want = 43_552usize;
-    let lo = store.restore(gpu, key, cut, want, out, stream)?;
+    let lo = store.restore(gpu, key, cut, want, ROW, out, stream)?;
     anyhow::ensure!(lo == Some(want), "{lo:?}");
     gpu.synchronize(stream)?;
     let mut got = vec![0u8; (cut - want) * ROW];
@@ -81,7 +81,7 @@ fn the_store_round_trips_glm_windows_on_the_device() -> Result<()> {
     anyhow::ensure!(got == rows[from..from + got.len()], "restored rows differ");
     anyhow::ensure!(
         store
-            .restore(gpu, key, cut + 16, want, out, stream)?
+            .restore(gpu, key, cut + 16, want, ROW, out, stream)?
             .is_none()
     );
     store.free(gpu);

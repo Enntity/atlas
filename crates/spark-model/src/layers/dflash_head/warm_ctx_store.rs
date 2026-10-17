@@ -161,6 +161,9 @@ impl WarmCtxStore {
                     .min_by_key(|&i| inner.entries[i].map_or(0, |e| e.used))
                     .unwrap_or(0)
             });
+        // Unregistered until the copy is enqueued: a failed enqueue must not
+        // leave the previous entry naming a half-written window.
+        inner.entries[slot] = None;
         let window_bytes = window_rows * row_bytes;
         gpu.copy_d2d_async(
             src,
@@ -179,19 +182,22 @@ impl WarmCtxStore {
     }
 
     /// Copy the stored rows `[max(lo, want_lo), end)` of the entry for `key`
-    /// that ends at `end` to `dst`. Returns that first position (`end` when
-    /// the entry holds nothing at or above `want_lo`), or `None` on a miss.
+    /// that ends at `end` to `dst` (rows of `row_bytes`). Returns that first
+    /// position (`end` when the entry holds nothing at or above `want_lo`),
+    /// or `None` on a miss.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore(
         &self,
         gpu: &dyn GpuBackend,
         key: StoreKey,
         end: usize,
         want_lo: usize,
+        row_bytes: usize,
         dst: DevicePtr,
         stream: u64,
     ) -> Result<Option<usize>> {
         let mut inner = self.inner.lock();
-        let Some(slab) = inner.slab else {
+        let Some(slab) = inner.slab.filter(|_| inner.row_bytes == row_bytes) else {
             return Ok(None);
         };
         let Some(slot) = inner
@@ -203,7 +209,7 @@ impl WarmCtxStore {
         };
         inner.tick += 1;
         let tick = inner.tick;
-        let (row_bytes, window_bytes) = (inner.row_bytes, inner.window_rows * inner.row_bytes);
+        let window_bytes = inner.window_rows * row_bytes;
         let entry = inner.entries[slot].as_mut().expect("found above");
         entry.used = tick;
         let entry_lo = entry.lo;
@@ -263,7 +269,8 @@ impl DflashProposerState {
         let restored = match key_tokens.and_then(|t| t.get(..skip)) {
             Some(prefix) => {
                 let key = store_key(adapter_id, prefix);
-                store.restore(gpu, key, skip, want_lo, self.ctx_hidden_acc, stream)?
+                let (acc, row) = (self.ctx_hidden_acc, self.ctx_slot_bytes);
+                store.restore(gpu, key, skip, want_lo, row, acc, stream)?
             }
             None => None,
         };
