@@ -150,3 +150,43 @@ fn every_tower_keys_its_vision_prompts_for_the_prefix_cache() {
         "the prompt is cacheable"
     );
 }
+
+#[test]
+fn a_chunk_over_the_output_window_fails_alone_before_any_launch() {
+    // Every rank derives a chunk's rows from the same grids, so a chunk that
+    // would overrun `buf_out` must fail request-locally on each of them
+    // before the encode, the stream drain or any collective — never as an
+    // out-of-bounds write on one rank and a hang on the other.
+    for (tp, rank) in [(1, 0), (2, 0), (2, 1)] {
+        let (mut f, _) = staged();
+        let mut f2 = Fixture::new(tp, 1, rank);
+        f2.model.vision_encoder = f.model.vision_encoder.take();
+        let window = f2.model.vision_encoder.as_ref().unwrap().output_rows();
+        let side = 130; // 16900 rows past the GLM tower's 16384-row window
+        assert!(side * side > window);
+        f2.seq.vision.grids = vec![(1, side, side)];
+        f2.seq.vision.hashes = vec![1];
+        if rank == 0 {
+            f2.seq.vision.items = std::mem::take(&mut f.seq.vision.items);
+        }
+        f2.seq.vision.deferred = true;
+        f2.seq.prefix_lookup_applied = true;
+        let tokens: Vec<u32> = [1, 2]
+            .into_iter()
+            .chain(std::iter::repeat_n(PAD, side * side))
+            .chain([3])
+            .collect();
+        f2.order();
+        let err = f2
+            .model
+            .vision_encode_chunk_items(&mut f2.seq, &tokens, 0, tokens.len(), CALLER)
+            .unwrap_err();
+        assert!(
+            crate::request_local::is_request_local(&err),
+            "tp={tp} rank={rank}: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("output window"), "{err:#}");
+        assert!(f2.order().is_empty(), "tp={tp} rank={rank}: nothing ran");
+        assert_eq!(f2.seq.vision.rows_encoded, 0);
+    }
+}

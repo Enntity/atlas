@@ -33,6 +33,17 @@ const VISION_MAX_GRID_CELLS: usize = 1 << 24;
 const VISION_BF16_BYTES: usize = 2;
 const VISION_MAX_PAYLOAD_BYTES: usize = 1 << 30;
 
+/// The row bounds a rank applies to a received state. `window` is the
+/// encoder output buffer (`VisionEncoder::output_rows`): rows that arrive in
+/// one payload land there. `request` bounds a deferred state, whose rows only
+/// describe the grids — each chunk's encode later sends at most `window` of
+/// them — so it is the context (`max_seq_len`), not the buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VisionRowBounds {
+    pub window: usize,
+    pub request: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VisionWireState {
     pub rows: usize,
@@ -45,7 +56,10 @@ pub(crate) struct VisionWireState {
 }
 
 /// Parse and validate the fixed-width state header received over the u32 wire.
-pub(crate) fn parse_state_header(words: &[u32], max_rows: usize) -> Result<VisionWireState> {
+pub(crate) fn parse_state_header(
+    words: &[u32],
+    bounds: VisionRowBounds,
+) -> Result<VisionWireState> {
     ensure!(
         words.len() == VISION_HEADER_WORDS,
         "vision state header must contain {} words, got {}",
@@ -65,12 +79,15 @@ pub(crate) fn parse_state_header(words: &[u32], max_rows: usize) -> Result<Visio
             other => anyhow::bail!("vision state deferred flag must be 0 or 1, got {other}"),
         },
     };
-    validate_state(&state, max_rows)
+    validate_state(&state, bounds)
 }
 
 /// Validate a state assembled by the rank-0 scheduler before it is put on the
 /// wire. `rows == 0` is the explicit text request representation.
-pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result<VisionWireState> {
+pub(crate) fn validate_state(
+    state: &VisionWireState,
+    bounds: VisionRowBounds,
+) -> Result<VisionWireState> {
     ensure!(
         state.grid_count <= VISION_MAX_GRID_ITEMS,
         "vision grid count {} exceeds protocol limit {}",
@@ -91,16 +108,25 @@ pub(crate) fn validate_state(state: &VisionWireState, max_rows: usize) -> Result
     }
 
     ensure!(
-        max_rows > 0,
+        bounds.window > 0,
         "vision state received but this rank has no vision encoder capacity"
     );
 
-    ensure!(
-        state.rows <= max_rows,
-        "vision row count {} exceeds encoder capacity {}",
-        state.rows,
-        max_rows
-    );
+    if state.deferred {
+        ensure!(
+            state.rows <= bounds.request.max(bounds.window),
+            "vision row count {} exceeds the per-request bound {}",
+            state.rows,
+            bounds.request.max(bounds.window)
+        );
+    } else {
+        ensure!(
+            state.rows <= bounds.window,
+            "vision row count {} exceeds the encoder output window {}",
+            state.rows,
+            bounds.window
+        );
+    }
     ensure!(
         state.grid_count > 0,
         "non-empty vision state has no grid metadata"
@@ -222,9 +248,13 @@ pub(crate) fn parse_grid_words(
 pub(crate) fn payload_bytes(
     state: &VisionWireState,
     hidden_size: usize,
-    max_rows: usize,
+    bounds: VisionRowBounds,
 ) -> Result<usize> {
-    validate_state(state, max_rows)?;
+    validate_state(state, bounds)?;
+    ensure!(
+        !state.deferred,
+        "a deferred vision state carries no payload"
+    );
     ensure!(
         hidden_size > 0 && hidden_size <= 65_536,
         "vision hidden size {} is outside the BF16 wire limit",
@@ -263,6 +293,11 @@ pub(crate) fn pad_rows_before_chunk(
 mod tests {
     use super::*;
 
+    const B16: VisionRowBounds = VisionRowBounds {
+        window: 16,
+        request: 16,
+    };
+
     fn legacy(rows: u32, grids: u32) -> VisionWireState {
         VisionWireState {
             rows: rows as usize,
@@ -283,7 +318,7 @@ mod tests {
     #[test]
     fn accepts_legacy_and_co_dispatched_ranges() {
         assert_eq!(
-            parse_state_header(&[8, 1, 0, 0, 0, 8, 0], 16).unwrap(),
+            parse_state_header(&[8, 1, 0, 0, 0, 8, 0], B16).unwrap(),
             legacy(8, 1)
         );
         let packed = VisionWireState {
@@ -295,8 +330,8 @@ mod tests {
             slice_rows: 4,
             deferred: false,
         };
-        assert_eq!(validate_state(&packed, 16).unwrap(), packed);
-        let deferred = parse_state_header(&[8, 1, 0, 0, 0, 8, 1], 16).unwrap();
+        assert_eq!(validate_state(&packed, B16).unwrap(), packed);
+        let deferred = parse_state_header(&[8, 1, 0, 0, 0, 8, 1], B16).unwrap();
         assert!(deferred.deferred);
         assert!(
             validate_state(
@@ -304,7 +339,7 @@ mod tests {
                     deferred: true,
                     ..packed
                 },
-                16
+                B16
             )
             .is_err(),
             "a co-dispatched slice is never deferred"
@@ -313,10 +348,10 @@ mod tests {
 
     #[test]
     fn rejects_unbounded_or_inconsistent_state() {
-        assert!(parse_state_header(&[17, 1, 0, 0, 0, 17, 0], 16).is_err());
-        assert!(parse_state_header(&[0, 1, 0, 0, 0, 0, 0], 16).is_err());
-        assert!(parse_state_header(&[0, 0, 0, 0, 0, 0, 1], 16).is_err());
-        assert!(parse_state_header(&[8, 1, 0, 0, 0, 8, 2], 16).is_err());
+        assert!(parse_state_header(&[17, 1, 0, 0, 0, 17, 0], B16).is_err());
+        assert!(parse_state_header(&[0, 1, 0, 0, 0, 0, 0], B16).is_err());
+        assert!(parse_state_header(&[0, 0, 0, 0, 0, 0, 1], B16).is_err());
+        assert!(parse_state_header(&[8, 1, 0, 0, 0, 8, 2], B16).is_err());
         assert!(
             validate_state(
                 &VisionWireState {
@@ -328,7 +363,7 @@ mod tests {
                     slice_rows: 2,
                     deferred: false,
                 },
-                16,
+                B16,
             )
             .is_err()
         );
@@ -361,8 +396,8 @@ mod tests {
             "the worker decodes the head's grids and content hashes exactly"
         );
         assert!(grid_words(&[(1, 2, 2)], &[]).is_err());
-        assert_eq!(payload_bytes(&state, 2048, 16).unwrap(), 12 * 2048 * 2);
-        assert!(payload_bytes(&state, 0, 16).is_err());
+        assert_eq!(payload_bytes(&state, 2048, B16).unwrap(), 12 * 2048 * 2);
+        assert!(payload_bytes(&state, 0, B16).is_err());
     }
 
     #[test]
@@ -371,5 +406,33 @@ mod tests {
         assert_eq!(pad_rows_before_chunk(&tokens, 4, 11, 12), 2);
         assert_eq!(pad_rows_before_chunk(&tokens, 6, 11, 12), 4);
         assert_eq!(pad_rows_before_chunk(&tokens, 99, 11, 12), 4);
+    }
+
+    #[test]
+    fn a_deferred_state_is_bounded_by_the_request_not_the_window() {
+        // Issue #180: a deferred header carries the rows its grids describe;
+        // each chunk's encode later sends at most the window. 16680 rows
+        // against a 16384-row window must pass on both ranks.
+        let bounds = VisionRowBounds {
+            window: 16_384,
+            request: 262_144,
+        };
+        let deferred = parse_state_header(&[16_680, 5, 0, 0, 0, 16_680, 1], bounds).unwrap();
+        assert!(deferred.deferred && deferred.rows == 16_680);
+        assert!(
+            payload_bytes(&deferred, 2048, bounds).is_err(),
+            "a deferred state has no payload to size"
+        );
+        // Rows that arrive in one payload still land in the window.
+        assert!(parse_state_header(&[16_680, 5, 0, 0, 0, 16_680, 0], bounds).is_err());
+        assert!(parse_state_header(&[16_384, 4, 0, 0, 0, 16_384, 0], bounds).is_ok());
+        // The context still bounds a deferred request.
+        assert!(parse_state_header(&[262_145, 1, 0, 0, 0, 262_145, 1], bounds).is_err());
+        // No encoder: nothing is accepted, deferred or not.
+        let none = VisionRowBounds {
+            window: 0,
+            request: 262_144,
+        };
+        assert!(parse_state_header(&[8, 1, 0, 0, 0, 8, 1], none).is_err());
     }
 }

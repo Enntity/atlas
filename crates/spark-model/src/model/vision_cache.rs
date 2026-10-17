@@ -332,6 +332,15 @@ impl TransformerModel {
                 t * h * w
             })
             .sum();
+        // Every rank derives `rows` from the same grids, so every rank fails
+        // here alike, before the encode and any collective. The API admits
+        // only requests whose every chunk fits (`vision_limits`).
+        if rows > ve.output_rows() {
+            return Err(request_local(format!(
+                "vision chunk needs {rows} rows, the encoder output window holds {}",
+                ve.output_rows()
+            )));
+        }
         // `buf_out` is shared: the previous chunk's splice (this or another
         // sequence's) copies out of it on the prefill `stream`, while the
         // encoder and the broadcast write it on the default stream.
@@ -374,11 +383,6 @@ impl TransformerModel {
         }
         self.gpu.synchronize(self.gpu.default_stream())?;
         if rows > 0 && self.multi_rank_protocol_active() {
-            if rows > ve.output_rows() {
-                return Err(request_local(
-                    "deferred vision rows exceed encoder capacity",
-                ));
-            }
             let comm = self
                 .comm
                 .as_ref()
