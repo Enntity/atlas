@@ -5,6 +5,7 @@ mod flash_prefill;
 mod forward_attention;
 mod forward_attention_entry;
 mod forward_attention_qkv;
+mod forward_attention_side;
 mod forward_ffn;
 mod forward_recurrent;
 mod forward_recurrent_owners;
