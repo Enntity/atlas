@@ -187,6 +187,31 @@ pub fn mxfp8_cols_twin(
     finish(gpu, twin, copy()).map(|t| (t, n, lk))
 }
 
+/// Rows `[first, first + rows)` of `raw` as one twin `[rows, k]`: a
+/// contiguous slice of values and of scales (each row carries its own), e.g.
+/// one rank's vocabulary half of an MXFP8 `lm_head`. Synchronizes `stream`.
+pub fn mxfp8_row_range_twin(
+    gpu: &dyn GpuBackend,
+    raw: RawMxfp8,
+    first: usize,
+    rows: usize,
+    stream: u64,
+) -> Result<Mxfp8Weight> {
+    ensure!(
+        rows > 0 && first.checked_add(rows).is_some_and(|end| end <= raw.n),
+        "mxfp8_row_range_twin: rows [{first}, {first}+{rows}) of n={}",
+        raw.n
+    );
+    let (k, g) = (raw.k, raw.k / MXFP8_BLOCK);
+    let twin = Mxfp8Weight::alloc(gpu, rows, k)?;
+    let copy = || -> Result<()> {
+        gpu.copy_d2d_async(raw.data.offset(first * k), twin.data, rows * k, stream)?;
+        gpu.copy_d2d_async(raw.scales.offset(first * g), twin.scales, rows * g, stream)?;
+        gpu.synchronize(stream)
+    };
+    finish(gpu, twin, copy())
+}
+
 /// The twin, or its buffers freed and the copy's error.
 fn finish(gpu: &dyn GpuBackend, twin: Mxfp8Weight, copied: Result<()>) -> Result<Mxfp8Weight> {
     if let Err(e) = copied {
