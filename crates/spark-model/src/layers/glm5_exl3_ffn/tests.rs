@@ -362,7 +362,11 @@ fn actual_component_prefill_has_one_tp_sum_and_preflight_rejects_missing_comm() 
             .forward_prefill(arena.norm_output(), 3, &ctx, 77)
             .unwrap();
         assert_eq!(gpu.launch_count() - launches, if routed { 14 } else { 10 });
-        assert_eq!(gpu.sync_count() - syncs, if routed { 26 } else { 10 });
+        // One synchronized pair per timed stage. Routed: the cooperative
+        // gate|up attempt is its own stage (`gate_up_projection`) and is timed
+        // even when it declines (no coop kernels here) before the separate
+        // gate/up projections run.
+        assert_eq!(gpu.sync_count() - syncs, if routed { 28 } else { 10 });
         assert_eq!(comm.0.lock().unwrap().len(), reductions + 1);
         assert_eq!((gpu.d2h_blocking_count(), gpu.d2h_async_count()), reads);
         let syncs = gpu.sync_count();
