@@ -92,6 +92,10 @@ impl DenseFfnLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // ATLAS_GLM_FP4L_DENSE_MXFP8: every row count (`dense_ffn_native.rs`).
+        if self.try_native(input, rows, ctx, stream)? {
+            return Ok(true);
+        }
         if ctx.config.model_type != "glm5_next"
             || !crate::layers::canonical_verify::enabled()
             || !(1..=crate::layers::canonical_verify::MAX_ROWS as usize).contains(&rows)

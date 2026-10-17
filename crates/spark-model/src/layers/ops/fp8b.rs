@@ -83,6 +83,8 @@ impl MxTiers {
 /// target lacks them: every caller checks before routing to them).
 #[derive(Debug, Clone, Copy)]
 pub struct NativeKernels {
+    /// `mxfp8_gemv_tc{8,16,32}[_tiled]`.
+    pub mx: MxTiers,
     /// `fp8b_gemv_tc{8,16,32}[_tiled]`.
     pub fp8b: MxTiers,
     /// `fp8b_gemv_tc{8,16,32}_multi[_tiled]`.
@@ -99,6 +101,8 @@ pub struct NativeKernels {
     pub w8a8_gemm: KernelHandle,
     /// `w8a16_gemm_pipelined` (exact W8A16 prefill GEMM).
     pub w8a16_gemm: KernelHandle,
+    /// `mxfp8_quant_act_bf16` (MXFP8 W8A8 prefill activations).
+    pub mx_quant: KernelHandle,
 }
 
 /// [`NativeKernels`] for this process's target.
@@ -107,6 +111,7 @@ pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
     *K.get_or_init(|| {
         let t = |m: &str, f: &str| crate::layers::try_kernel(gpu, m, f);
         NativeKernels {
+            mx: MxTiers::resolve(gpu, "mxfp8_gemv", ""),
             fp8b: MxTiers::resolve(gpu, "fp8b_gemv", ""),
             fp8b_multi: MxTiers::resolve(gpu, "fp8b_gemv", "_multi"),
             fp8b_ld: ["8", "16", "32"].map(|r| t(MX_GEMV_MODULE, &format!("fp8b_gemv_tc{r}_ld"))),
@@ -115,6 +120,7 @@ pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
             act_quant: t("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
             w8a8_gemm: t("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
             w8a16_gemm: t("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
+            mx_quant: t(super::MXFP8_ACT_MODULE, super::MX_QUANT_KERNEL),
         }
     })
 }
