@@ -475,18 +475,23 @@ pub(super) fn strict_refusal(tok: u32, at: usize) -> String {
 /// prompt leaves the model inside `<think>`), and failing to arm one is
 /// reported to the client on `sink` as an invalid request (HTTP 400 when
 /// blocking) and returned as `Err`: its output must never come back
-/// unconstrained as if it were valid.
+/// unconstrained as if it were valid. One with a tool branch also learns the
+/// `native_opener` that can end reasoning as its first output token
+/// (`first_token_thinking::native_opener`).
 pub fn compile_grammar_state(
     engine: &mut Option<GrammarEngine>,
     grammar_spec: &Option<GrammarSpec>,
     eos_tokens: &[u32],
     opens_in_thinking: bool,
+    native_opener: Option<u32>,
     sink: &mut ResponseSink,
 ) -> Result<Option<GrammarState>> {
     let Some(spec) = grammar_spec.as_ref() else {
         return Ok(None);
     };
     let strict = spec.is_response_format();
+    let native_opener =
+        native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
     let compiled = match engine.as_mut() {
         // Backstop: nothing a client sends may unwind the scheduler thread.
         Some(engine) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -497,7 +502,10 @@ pub fn compile_grammar_state(
         None => Ok(None),
     };
     match compiled {
-        Ok(state) if strict => Ok(state.map(|s| s.strict_output(opens_in_thinking))),
+        Ok(state) if strict => Ok(state.map(|s| {
+            s.strict_output(opens_in_thinking)
+                .with_native_opener(native_opener)
+        })),
         Ok(state) => Ok(state),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
         // client, not a retryable 500. A tool grammar too large to compile is
