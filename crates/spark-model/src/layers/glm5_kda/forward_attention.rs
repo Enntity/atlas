@@ -94,6 +94,7 @@ impl Glm5KdaLayer {
             projected,
             plane_bytes,
             m,
+            decode,
             verify_proj,
             capture_verify_intermediates,
             &mut profile_timer,

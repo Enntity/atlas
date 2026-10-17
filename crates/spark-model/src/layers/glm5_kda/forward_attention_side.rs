@@ -16,6 +16,7 @@ impl Glm5KdaLayer {
         projected: DevicePtr,
         plane_bytes: usize,
         m: u32,
+        decode: bool,
         verify_proj: bool,
         capture_verify_intermediates: bool,
         profile_timer: &mut Option<std::time::Instant>,
@@ -101,22 +102,28 @@ impl Glm5KdaLayer {
             && self.dense_gemm_pipelined_k.0 != 0
             && self.dense_gemm_pipelined_triple_n_k.0 != 0
         {
-            // The three pipelined launches `project_dense` would make, in one grid.
-            ops::dense_gemm_pipelined_triple_n(
-                ctx.gpu,
-                self.dense_gemm_pipelined_triple_n_k,
-                normed,
-                [
-                    &self.weights.b_proj,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                ],
-                [beta, fa, ga],
-                m,
-                [self.heads as u32, self.dim as u32],
-                h,
-                stream,
-            )?;
+            // The three pipelined launches `project_dense` would make, in one
+            // grid, or their bytes from one GEMM over the packed weights.
+            if decode
+                || ctx.graph_capture
+                || !self.side_proj_packed(normed, [beta, fa, ga], m, ctx, stream)?
+            {
+                ops::dense_gemm_pipelined_triple_n(
+                    ctx.gpu,
+                    self.dense_gemm_pipelined_triple_n_k,
+                    normed,
+                    [
+                        &self.weights.b_proj,
+                        &self.weights.f_a_proj,
+                        &self.weights.g_a_proj,
+                    ],
+                    [beta, fa, ga],
+                    m,
+                    [self.heads as u32, self.dim as u32],
+                    h,
+                    stream,
+                )?;
+            }
             profile::step(ctx, stream, profile_timer, "beta_f_a_g_a")?;
         } else {
             if verify_proj {
@@ -295,5 +302,43 @@ impl Glm5KdaLayer {
         }
         profile::step(ctx, stream, profile_timer, "g_a_f_b_g_b")?;
         Ok((beta, g1, g2))
+    }
+
+    /// `ATLAS_GLM_KDA_SIDE_PROJ_LT`: b / f_a / g_a as one CUTLASS GEMM over
+    /// the weights the loader stored back to back, staged in
+    /// `ssm_deinterleaved` (g1 / g2 are written only after). `false`: off,
+    /// not packed, or CUTLASS declined; nothing launched.
+    fn side_proj_packed(
+        &self,
+        normed: DevicePtr,
+        outputs: [DevicePtr; 3],
+        m: u32,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        let w = &self.weights;
+        let row = self.hidden_size * 2;
+        if !crate::layers::kda_side_proj_lt_enabled()
+            || w.f_a_proj.weight != w.b_proj.weight.offset(self.heads * row)
+            || w.g_a_proj.weight != w.f_a_proj.weight.offset(self.dim * row)
+        {
+            return Ok(false);
+        }
+        let scratch = ctx.buffers.ssm_deinterleaved();
+        ensure!(
+            m as usize * (self.heads + 2 * self.dim) * 2 <= ctx.buffers.sizes().ssm_deinterleaved,
+            "GLM KDA packed side projections: {m} rows overflow the staging scratch"
+        );
+        ops::dense_gemm_packed_triple_n(
+            ctx.gpu,
+            normed,
+            w.b_proj.weight,
+            scratch,
+            outputs,
+            m,
+            [self.heads as u32, self.dim as u32],
+            self.hidden_size as u32,
+            stream,
+        )
     }
 }

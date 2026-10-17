@@ -72,7 +72,8 @@ pub use dflash_head::{
 };
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
 pub(crate) use glm5_kda::{
-    kda_batched_ffn_enabled, kda_multi_seq_enabled, verify_fused_tp_hc_enabled,
+    kda_batched_ffn_enabled, kda_multi_seq_enabled, kda_side_proj_lt_enabled,
+    verify_fused_tp_hc_enabled,
 };
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{

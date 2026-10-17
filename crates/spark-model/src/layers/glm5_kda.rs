@@ -41,6 +41,14 @@ pub(crate) fn kda_batched_ffn_enabled() -> bool {
     std::env::var("ATLAS_GLM_KDA_BATCHED_FFN").ok().as_deref() == Some("1")
 }
 
+/// `ATLAS_GLM_KDA_SIDE_PROJ_LT=1`: the loader stores b / f_a / g_a back to
+/// back (`weight_loader::glm5::kda_side_pack`) and prefill projects them as one
+/// CUTLASS GEMM (`ops::dense_gemm_packed_triple_n`), the triple's bytes.
+pub(crate) fn kda_side_proj_lt_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_SIDE_PROJ_LT").ok().as_deref() == Some("1"))
+}
+
 fn verify_batched_conv_snapshot_enabled() -> bool {
     std::env::var("ATLAS_GLM_K5_BATCHED_CONV_SNAPSHOT")
         .ok()
