@@ -60,11 +60,12 @@ pub fn deep_floor(num_drafts: usize) -> usize {
 /// needs a quarter of them to have drafted the deepest position.
 pub fn decision_window() -> u16 {
     static N: OnceLock<u16> = OnceLock::new();
-    *N.get_or_init(|| {
-        env_usize("ATLAS_MTP_DEEP_WINDOW")
-            .unwrap_or(48)
-            .clamp(4, 1024) as u16
-    })
+    *N.get_or_init(|| window_from(env_usize("ATLAS_MTP_DEEP_WINDOW")))
+}
+
+/// [`decision_window`] from the parsed variable.
+fn window_from(v: Option<usize>) -> u16 {
+    v.unwrap_or(48).clamp(4, 1024) as u16
 }
 
 /// The ceiling a request starts at (`ATLAS_MTP_DEEP_START`; unset = the
@@ -130,6 +131,14 @@ pub fn row_budget(n: usize, max_rows: usize, cap: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_decision_window_defaults_to_48_and_stays_in_bounds() {
+        assert_eq!(window_from(None), 48);
+        assert_eq!(window_from(Some(16)), 16);
+        assert_eq!(window_from(Some(1)), 4);
+        assert_eq!(window_from(Some(1 << 20)), 1024);
+    }
 
     #[test]
     fn the_ceiling_goes_deep_only_under_the_lever_and_inside_the_width() {
