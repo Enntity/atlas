@@ -7,7 +7,7 @@
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
-use super::super::{HcSiteWeights, HcWeights, Qwen3AttentionLayer};
+use super::super::{HcNorm, HcSeam, HcSiteWeights, HcWeights, Qwen3AttentionLayer};
 use crate::layer::ForwardContext;
 use crate::layers::ops;
 
@@ -30,23 +30,25 @@ impl Qwen3AttentionLayer {
     }
 
     /// One HC pre site of the prefill (GLM's own prefill mix, else the
-    /// generic site).
+    /// generic site). Returns whether `norm` (GLM only) was written too.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_pre_prefill_site(
         &self,
         site: &HcSiteWeights,
         hc: &HcWeights,
         hidden: DevicePtr,
         n: u32,
+        norm: Option<HcNorm>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let h = ctx.config.hidden_size;
         let eps = ctx.config.rms_norm_eps as f32;
         let hc_streams = ctx.buffers.hc_streams();
         let post = ctx.buffers.hc_post();
         let comb = ctx.buffers.hc_comb();
         if ctx.config.model_type == "glm5_next" {
-            self.hc_pre_prefill(site, hc, hidden, n, ctx, stream)?;
+            return self.hc_pre_prefill(site, hc, hidden, n, norm, ctx, stream);
         } else {
             ops::hc_pre_site(
                 ctx.gpu,
@@ -64,11 +66,28 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// Whether the attention site's post ran fused with the FFN site's
-    /// pre-mix (GLM only, never under diagnostics).
+    /// `ATLAS_GLM_HC_PREFILL_FUSE2`: the GLM vanilla block input norm
+    /// (`weight` into `out`) for a pre site's finalizer to write.
+    pub(super) fn hc_prefill_norm(
+        &self,
+        weight: &crate::weight_map::DenseWeight,
+        out: DevicePtr,
+        ctx: &ForwardContext,
+    ) -> Option<HcNorm> {
+        (ctx.config.model_type == "glm5_next"
+            && self.norm_vanilla
+            && super::super::hc_prefill_fuse2_enabled())
+        .then_some(HcNorm {
+            weight: weight.weight,
+            out,
+        })
+    }
+
+    /// What ran of the attention site's post fused with the FFN site's
+    /// pre-mix (and `norm`; GLM only, never under diagnostics).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hc_post_pre_prefill_seam(
         &self,
@@ -77,14 +96,14 @@ impl Qwen3AttentionLayer {
         hidden: DevicePtr,
         n: u32,
         diag_this: bool,
+        norm: Option<HcNorm>,
         ctx: &ForwardContext,
         stream: u64,
-    ) -> Result<bool> {
+    ) -> Result<HcSeam> {
         let hc_mult = hc.hc_mult as u32;
         // GLM: this site's post fused with the FFN site's pre-mix.
-        let seam = ctx.config.model_type == "glm5_next"
-            && !diag_this
-            && super::super::hc_post_pre_prefill_fused(
+        let glm = if ctx.config.model_type == "glm5_next" && !diag_this {
+            super::super::hc_post_pre_prefill_fused(
                 &hc.ffn,
                 Some(attn_out),
                 hidden,
@@ -92,28 +111,34 @@ impl Qwen3AttentionLayer {
                 hc_mult,
                 hc.sinkhorn_iters as u32,
                 hc.hc_eps,
+                norm,
                 ctx,
                 stream,
-            )?;
+            )?
+        } else {
+            HcSeam::Skipped
+        };
+        if glm.ran() {
+            return Ok(glm);
+        }
         // qwen4_exp (ATLAS_QWEN4EXP_PREFILL_HC): the same seam on the low-rank
         // collapse, bit-identical to the separate post and pre.
-        let seam = seam
-            || (!diag_this
-                && ops::qwen4exp_prefill_hc::hc_post_pre_seam(
-                    ctx.gpu,
-                    hc,
-                    &hc.ffn,
-                    attn_out,
-                    ctx.buffers.hc_streams(),
-                    hidden,
-                    ctx.buffers.hc_post(),
-                    ctx.buffers.hc_lowrank_scratch(),
-                    n,
-                    ctx.config.hidden_size as u32,
-                    ctx.config.rms_norm_eps as f32,
-                    stream,
-                )?);
-        Ok(seam)
+        let seam = !diag_this
+            && ops::qwen4exp_prefill_hc::hc_post_pre_seam(
+                ctx.gpu,
+                hc,
+                &hc.ffn,
+                attn_out,
+                ctx.buffers.hc_streams(),
+                hidden,
+                ctx.buffers.hc_post(),
+                ctx.buffers.hc_lowrank_scratch(),
+                n,
+                ctx.config.hidden_size as u32,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
+        Ok(if seam { HcSeam::Ran } else { HcSeam::Skipped })
     }
 
     /// Whether this prefill chunk takes the paged (GLM sparse) attention arm.

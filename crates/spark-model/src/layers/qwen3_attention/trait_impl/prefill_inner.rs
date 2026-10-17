@@ -605,6 +605,12 @@ impl Qwen3AttentionLayer {
 
         // ── Attention sublayer ── (with the previous layer's deferred post
         // fused in, ATLAS_QWEN4EXP_PREFILL_HC)
+        let normed = ctx.buffers.norm_output();
+        let block_norm = ops::HcVariant::of(hc).applies_block_input_norm() && !diag_this;
+        let attn_norm = block_norm
+            .then(|| self.hc_prefill_norm(&self.input_norm, local(normed), ctx))
+            .flatten();
+        let mut attn_normed = false;
         if !ops::qwen4exp_prefill_seam::pre_with_pending(
             ctx.gpu,
             self.hc_post_k,
@@ -619,7 +625,8 @@ impl Qwen3AttentionLayer {
             eps,
             stream,
         )? {
-            self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
+            attn_normed =
+                self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, attn_norm, ctx, stream)?;
         }
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
@@ -649,19 +656,20 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        let normed = ctx.buffers.norm_output();
         if ops::HcVariant::of(hc).applies_block_input_norm() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                hidden,
-                &self.input_norm,
-                local(normed),
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            if !attn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    hidden,
+                    &self.input_norm,
+                    local(normed),
+                    n,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
             if let Some(sp) = sp {
                 sp.all_gather(normed, h, ctx, stream)?;
             }
@@ -811,9 +819,22 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        let seam =
-            self.hc_post_pre_prefill_seam(hc, local(attn_out), hidden, n, diag_this, ctx, stream)?;
-        if !seam {
+        let normed2 = ctx.buffers.norm_output();
+        let ffn_norm = block_norm
+            .then(|| self.hc_prefill_norm(&self.post_attn_norm, local(normed2), ctx))
+            .flatten();
+        let seam = self.hc_post_pre_prefill_seam(
+            hc,
+            local(attn_out),
+            hidden,
+            n,
+            diag_this,
+            ffn_norm,
+            ctx,
+            stream,
+        )?;
+        let mut ffn_normed = seam.normed();
+        if !seam.ran() {
             ops::hc_post_site(
                 ctx.gpu,
                 self.hc_post_k,
@@ -860,10 +881,10 @@ impl Qwen3AttentionLayer {
         );
 
         // ── FFN sublayer ──
-        if seam {
+        if seam.ran() {
             // The fused seam already wrote the FFN input and post/comb.
         } else {
-            self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ctx, stream)?;
+            ffn_normed = self.hc_pre_prefill_site(&hc.ffn, hc, hidden, n, ffn_norm, ctx, stream)?;
         }
         if diag_this {
             super::diag_norm(
@@ -889,19 +910,20 @@ impl Qwen3AttentionLayer {
             );
         }
 
-        let normed2 = ctx.buffers.norm_output();
         if ops::HcVariant::of(hc).applies_block_input_norm() {
-            ops::rms_norm(
-                ctx.gpu,
-                self.rms_norm_w_k,
-                hidden,
-                &self.post_attn_norm,
-                local(normed2),
-                n,
-                h as u32,
-                eps,
-                stream,
-            )?;
+            if !ffn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_w_k,
+                    hidden,
+                    &self.post_attn_norm,
+                    local(normed2),
+                    n,
+                    h as u32,
+                    eps,
+                    stream,
+                )?;
+            }
             if let Some(sp) = sp {
                 sp.all_gather(normed2, h, ctx, stream)?;
             }

@@ -50,7 +50,9 @@ pub use innerq_driver::InnerQDriver;
 pub use glm_sparse_graphs_policy::{
     glm_c1_decode_graph_vetoed, glm_multi_seq_sparse_graphs_enabled,
 };
-pub(crate) use hc_prefill::{hc_post_pre_prefill_fused, hc_pre_prefill_mix};
+pub(crate) use hc_prefill::{
+    HcNorm, HcSeam, hc_post_pre_prefill_fused, hc_pre_prefill_mix, hc_prefill_fuse2_enabled,
+};
 pub(crate) use prefill::{index_split_words, write_floor_legacy};
 pub(crate) use trait_impl::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,

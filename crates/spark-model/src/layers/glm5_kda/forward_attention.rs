@@ -48,7 +48,26 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
+        // ATLAS_GLM_HC_PREFILL_FUSE2: a prefill's pre-site finalizers also
+        // write the block input norms.
+        let normed = ctx.buffers.norm_output();
+        let fuse_norm = |weight: &DenseWeight| {
+            (!decode
+                && !capture_verify_intermediates
+                && crate::layers::qwen3_attention::hc_prefill_fuse2_enabled())
+            .then_some(crate::layers::qwen3_attention::HcNorm {
+                weight: weight.weight,
+                out: local(normed),
+            })
+        };
+        let attn_normed = self.hc_pre(
+            &self.hc.attn,
+            hidden,
+            m_hc,
+            fuse_norm(&self.input_norm),
+            ctx,
+            stream,
+        )?;
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let (det_rows, row) = (
@@ -56,18 +75,19 @@ impl Glm5KdaLayer {
             h as usize * bf16,
         );
         det.tap("in", hidden, det_rows, row);
-        let normed = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.input_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
+        if !attn_normed {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                hidden,
+                &self.input_norm,
+                local(normed),
+                m_hc,
+                h,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
+        }
         if let Some(sp) = sp {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
         }
@@ -180,7 +200,7 @@ impl Glm5KdaLayer {
         if !fused_tp_hc {
             det.tap("attn_red", local(normed), det_rows, row);
         }
-        let mut seam = false;
+        let mut seam = crate::layers::qwen3_attention::HcSeam::Skipped;
         if fused_tp_hc {
             ops::hc_post_bf16_add(
                 ctx.gpu,
@@ -205,29 +225,40 @@ impl Glm5KdaLayer {
                 self.hc.hc_mult as u32,
                 self.hc.sinkhorn_iters as u32,
                 self.hc.hc_eps,
+                fuse_norm(&self.post_attn_norm),
                 ctx,
                 stream,
             )?;
-            if !seam {
+            if !seam.ran() {
                 self.hc_post(local(normed), m_hc, ctx, stream)?;
             }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
-        if !seam {
-            self.hc_pre(&self.hc.ffn, hidden, m_hc, ctx, stream)?;
+        let ffn_normed = match seam.ran() {
+            true => seam.normed(),
+            false => self.hc_pre(
+                &self.hc.ffn,
+                hidden,
+                m_hc,
+                fuse_norm(&self.post_attn_norm),
+                ctx,
+                stream,
+            )?,
+        };
+        if !ffn_normed {
+            ops::rms_norm(
+                ctx.gpu,
+                self.rms_norm_k,
+                hidden,
+                &self.post_attn_norm,
+                local(normed),
+                m_hc,
+                h,
+                ctx.config.rms_norm_eps as f32,
+                stream,
+            )?;
         }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.post_attn_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
         // The routed MoE needs every row; a dense FFN runs only the local ones.
         if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
             sp.all_gather(normed, self.hidden_size, ctx, stream)?;
