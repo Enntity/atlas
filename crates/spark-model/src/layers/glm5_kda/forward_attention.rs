@@ -104,8 +104,9 @@ impl Glm5KdaLayer {
         det.tap("x_g", g1, (0, tokens), 2 * p * bf16);
 
         let core_out = recurrent(projected, g1, beta)?;
-        profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
-        profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
+        // Pack, convolution and recurrence (single-sequence prefill also logs
+        // them as `core.*` sub-steps).
+        profile::step(ctx, stream, &mut profile_timer, "core")?;
         let gated = projected;
         ops::kda_sigmoid_gated_norm(
             ctx.gpu,
