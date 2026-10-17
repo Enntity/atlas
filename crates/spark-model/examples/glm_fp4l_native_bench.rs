@@ -16,7 +16,9 @@
 //!   [4096 x 12288] -> `mxfp8_gemv_tc*_multi` + `mxfp8_gemv_tc*`.
 //!
 //! Weights cycle over enough copies (>= 256 MiB) that every launch streams them
-//! from DRAM, like a decode step. Each line prints the group's us per call
+//! from DRAM, like a decode step: a call reading several weights takes a
+//! disjoint set of copies (copy 3c + i for the i-th of three), so nothing it
+//! reads is still in L2 from the call before. Each line prints the group's us per call
 //! (best of `REPS` batches), the bytes it reads and the GB/s; the floor column
 //! is a device-to-device copy of the same bytes (read + write, so its GB/s is
 //! 2 x bytes / time), a rough stream roofline.
@@ -277,6 +279,16 @@ fn main() -> Result<()> {
     let dense_gu = Weight::new(g, &mut rng, 12288, 4096)?;
     let dense_down = Weight::new(g, &mut rng, 4096, 12288)?;
 
+    // A chunk-tiled copy set of the KDA weight (values + scales relaid).
+    let kda_tiled: Vec<Mxfp8Weight> = {
+        let fresh = Weight::new(g, &mut rng, 4096, 4096)?;
+        let mut set = fresh.mx;
+        for w in set.iter_mut() {
+            ops::mxfp8_tile_in_place(g, w, 4096, 4096, 0)?;
+        }
+        set
+    };
+
     let floor = |w: &Weight, bytes: usize| -> Result<f64> {
         let copies = w.mx.len();
         time(g, reps, copies, &|c| {
@@ -291,7 +303,7 @@ fn main() -> Result<()> {
         let copies = kda.mx.len();
         let nv = time(g, reps, copies, &|c| {
             for i in 0..3 {
-                nv_tc(g, tc8, kda.nv[(c + i) % copies], x, outs[i], m, n, 4096)?;
+                nv_tc(g, tc8, kda.nv[(3 * c + i) % copies], x, outs[i], m, n, 4096)?;
             }
             Ok(())
         })?;
@@ -301,7 +313,7 @@ fn main() -> Result<()> {
                 ops::mxfp8_gemv_rows(
                     g,
                     &nk.mx.row_major,
-                    &kda.mx[(c + i) % copies],
+                    &kda.mx[(3 * c + i) % copies],
                     x,
                     outs[i],
                     m,
@@ -316,11 +328,35 @@ fn main() -> Result<()> {
         line("qkv MXFP8 x3", m, mx3, 3 * kda.mx_bytes());
         let fused = time(g, reps, copies, &|c| {
             let parts: Vec<MxPart> = (0..3)
-                .map(|i| MxPart::mx(&kda.mx[(c + i) % copies], outs[i], n))
+                .map(|i| MxPart::mx(&kda.mx[(3 * c + i) % copies], outs[i], n))
                 .collect();
             ops::mx_multi_rows(g, &nk.mx_multi, false, x, &parts, m, 4096, 0)
         })?;
         line("qkv MXFP8 fused (native)", m, fused, 3 * kda.mx_bytes());
+        // Attribution arms on the same shape and the same tier body:
+        // FP8 block scales (one f32 per 128 x 128, broadcast) instead of
+        // UE8M0 per 32 (two scattered byte loads per lane per chunk) ...
+        let fb = time(g, reps, copies, &|c| {
+            let parts: Vec<MxPart> = (0..3)
+                .map(|i| MxPart::fp8b(&kda.fp8b[(3 * c + i) % copies], outs[i], n))
+                .collect();
+            ops::mx_multi_rows(g, &nk.fp8b_multi, false, x, &parts, m, 4096, 0)
+        })?;
+        line(
+            "qkv FP8 block fused (scales only)",
+            m,
+            fb,
+            3 * kda.fp8b_bytes(),
+        );
+        // ... and the chunk-tiled MXFP8 layout (ATLAS_GLM_FP4L_KDA_TILED_TWIN).
+        let tiled = time(g, reps, kda_tiled.len(), &|c| {
+            let copies = kda_tiled.len();
+            let parts: Vec<MxPart> = (0..3)
+                .map(|i| MxPart::mx(&kda_tiled[(3 * c + i) % copies], outs[i], n))
+                .collect();
+            ops::mx_multi_rows(g, &nk.mx_multi, true, x, &parts, m, 4096, 0)
+        })?;
+        line("qkv MXFP8 fused tiled", m, tiled, 3 * kda.mx_bytes());
         let o_nv = time(g, reps, copies, &|c| {
             nv_tc(g, tc8, kda.nv[c], x, outs[0], m, n, 4096)
         })?;
@@ -460,13 +496,13 @@ fn main() -> Result<()> {
     for m in ROWS {
         let copies = sh_gu.nv.len().min(sh_down.nv.len());
         let nv = time(g, reps, copies, &|c| {
-            let (gw, gs) = sh_gu.nv[c];
+            let (gw, gs) = sh_gu.nv[2 * c % copies];
             let half = (gw.offset(1024 * 4096 / 2), gs.offset(1024 * 4096 / 16));
             nv_tc(g, tc8, half, x, outs[0], m, 1024, 4096)?;
             nv_tc(
                 g,
                 tc8,
-                sh_gu.nv[(c + 1) % copies],
+                sh_gu.nv[(2 * c + 1) % copies],
                 x,
                 outs[1],
                 m,
@@ -495,8 +531,8 @@ fn main() -> Result<()> {
                 tiled: false,
             };
             let parts = [
-                MxPart::fp8b(&rows(&sh_gu.fp8b[c]), outs[0], 1024),
-                MxPart::fp8b(&rows(&sh_gu.fp8b[(c + 1) % copies]), outs[1], 1024),
+                MxPart::fp8b(&rows(&sh_gu.fp8b[2 * c % copies]), outs[0], 1024),
+                MxPart::fp8b(&rows(&sh_gu.fp8b[(2 * c + 1) % copies]), outs[1], 1024),
             ];
             ops::mx_multi_rows(g, &nk.fp8b_multi, false, x, &parts, m, 4096, 0)?;
             let d = &sh_down.fp8b[c];
@@ -524,11 +560,20 @@ fn main() -> Result<()> {
     for m in ROWS {
         let copies = dense_gu.nv.len().min(dense_down.nv.len());
         let nv = time(g, reps, copies, &|c| {
-            nv_tc(g, tc8, dense_gu.nv[c], x, outs[0], m, 12288, 4096)?;
             nv_tc(
                 g,
                 tc8,
-                dense_gu.nv[(c + 1) % copies],
+                dense_gu.nv[2 * c % copies],
+                x,
+                outs[0],
+                m,
+                12288,
+                4096,
+            )?;
+            nv_tc(
+                g,
+                tc8,
+                dense_gu.nv[(2 * c + 1) % copies],
                 x,
                 outs[1],
                 m,
@@ -545,8 +590,8 @@ fn main() -> Result<()> {
         );
         let mx = time(g, reps, copies, &|c| {
             let parts = [
-                MxPart::mx(&dense_gu.mx[c], outs[0], 12288),
-                MxPart::mx(&dense_gu.mx[(c + 1) % copies], outs[1], 12288),
+                MxPart::mx(&dense_gu.mx[2 * c % copies], outs[0], 12288),
+                MxPart::mx(&dense_gu.mx[(2 * c + 1) % copies], outs[1], 12288),
             ];
             ops::mx_multi_rows(g, &nk.mx_multi, false, x, &parts, m, 4096, 0)?;
             ops::mxfp8_gemv_rows(

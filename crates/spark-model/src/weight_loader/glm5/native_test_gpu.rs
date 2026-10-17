@@ -344,7 +344,32 @@ fn shared_expert_layer_3_fp8_twins_full_and_split() -> Result<()> {
             );
         }
     }
-    // Split down: rank partials (K-slices of the same twin) sum to the full.
+    // The serve-time split (`run_shared_native_split`), rank by rank:
+    // gate / up on the rank's row slices of the twins equal those rows of the
+    // full projections bit for bit (same CTA bodies over the same rows), and
+    // down's K-slice tier (`fp8b_gemv_tc*_ld`) is within 1e-2 of an f64
+    // reference of the rank's partial, built from the checkpoint's bytes.
+    let (dw, ds, _, _) = host_fp8b(&host, &stems[2])?;
+    let act_host = bf16s(gpu, act, 32 * inter)?;
+    let full_gate = {
+        ops::fp8b_gemv_rows(
+            gpu,
+            &nk.fp8b,
+            &native.gate,
+            x,
+            o[0],
+            32,
+            inter,
+            h,
+            inter,
+            stream,
+        )?;
+        ops::fp8b_gemv_rows(
+            gpu, &nk.fp8b, &native.up, x, o[1], 32, inter, h, inter, stream,
+        )?;
+        gpu.synchronize(stream)?;
+        [bf16s(gpu, o[0], 32 * inter)?, bf16s(gpu, o[1], 32 * inter)?]
+    };
     let full = rows_invariant(gpu, o[0], h, &[1, 4, 32], &|m| {
         ops::fp8b_gemv_rows(
             gpu,
@@ -359,19 +384,47 @@ fn shared_expert_layer_3_fp8_twins_full_and_split() -> Result<()> {
             stream,
         )
     })?;
+    let half = inter / 2;
+    let down_ref = |row: usize, c0: usize, k: usize, ncol: usize| -> f64 {
+        (0..k)
+            .map(|j| {
+                f(act_host[row * inter + c0 + j]) as f64
+                    * fp8_e4m3_to_f32(dw[ncol * inter + c0 + j]) as f64
+                    * ds[(ncol / 128) * (inter / 128) + (c0 + j) / 128] as f64
+            })
+            .sum()
+    };
     let mut partial = vec![vec![0f32; 32 * h]; 2];
     for (rank, part) in partial.iter_mut().enumerate() {
         let split = native.split(rank, h, inter);
-        // This rank's half of the activation columns.
-        let (_, act_half) = {
-            let all = bf16s(gpu, act, 32 * inter)?;
-            let half: Vec<u8> = (0..32)
-                .flat_map(|r| all[r * inter + rank * 1024..r * inter + rank * 1024 + 1024].to_vec())
+        let c0 = rank * half;
+        // gate / up row slices == rows [c0, c0 + half) of the full outputs.
+        let parts = [
+            MxPart::fp8b(&split.gate, o[2], half),
+            MxPart::fp8b(&split.up, o[3], half),
+        ];
+        ops::mx_multi_rows(gpu, &nk.fp8b_multi, false, x, &parts, 32, h, stream)?;
+        gpu.synchronize(stream)?;
+        for (i, out) in [o[2], o[3]].into_iter().enumerate() {
+            let got = bf16s(gpu, out, 32 * half)?;
+            let want: Vec<u16> = (0..32)
+                .flat_map(|r| full_gate[i][r * inter + c0..r * inter + c0 + half].to_vec())
+                .collect();
+            ensure!(
+                got == want,
+                "rank {rank}: split {} rows != the full projection's",
+                ["gate", "up"][i]
+            );
+        }
+        // down's K-slice on this rank's activation columns.
+        let act_half = {
+            let half_bytes: Vec<u8> = (0..32)
+                .flat_map(|r| act_host[r * inter + c0..r * inter + c0 + half].to_vec())
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
-            let d = gpu.alloc(half.len())?;
-            gpu.copy_h2d(&half, d)?;
-            ((), d)
+            let d = gpu.alloc(half_bytes.len())?;
+            gpu.copy_h2d(&half_bytes, d)?;
+            d
         };
         let got = rows_invariant(gpu, o[1], h, &[1, 4, 32], &|m| {
             ops::fp8b_gemv_ld_rows(
@@ -383,18 +436,42 @@ fn shared_expert_layer_3_fp8_twins_full_and_split() -> Result<()> {
                 o[1],
                 m,
                 h,
-                1024,
+                half,
                 inter,
                 stream,
             )
         })?;
+        let mut worst = 0f64;
+        for row in 0..4 {
+            for ncol in 0..h {
+                let y = down_ref(row, c0, half, ncol);
+                let mag: f64 = (0..half)
+                    .map(|j| {
+                        (f(act_host[row * inter + c0 + j]) as f64
+                            * fp8_e4m3_to_f32(dw[ncol * inter + c0 + j]) as f64
+                            * ds[(ncol / 128) * (inter / 128) + (c0 + j) / 128] as f64)
+                            .abs()
+                    })
+                    .sum();
+                worst = worst.max((f(got[row * h + ncol]) as f64 - y).abs() / mag.max(1e-30));
+            }
+        }
+        ensure!(
+            worst < 1e-2,
+            "rank {rank}: split down vs f64 reference {worst:.3e}"
+        );
+        eprintln!("rank {rank}: split gate/up == full rows, split down within {worst:.2e} of f64");
         *part = got.iter().map(|&b| f(b)).collect();
         gpu.free(act_half)?;
     }
+    // The two partials sum to the full down within their own rounding: each
+    // is a BF16 word, so the bound scales with |p0| + |p1|, not with the
+    // (possibly cancelled) sum.
     let mut worst = 0f32;
     for i in 0..32 * h {
-        let sum = partial[0][i] + partial[1][i];
-        worst = worst.max((sum - f(full[i])).abs() / f(full[i]).abs().max(1e-2));
+        let (p0, p1) = (partial[0][i], partial[1][i]);
+        let bound = p0.abs() + p1.abs() + f(full[i]).abs() + 1e-6;
+        worst = worst.max((p0 + p1 - f(full[i])).abs() / bound);
     }
     ensure!(worst < 2e-2, "split partials vs full down: {worst}");
     eprintln!("shared: twins == checkpoint, fused == singles, split sum within {worst:.2e}");
