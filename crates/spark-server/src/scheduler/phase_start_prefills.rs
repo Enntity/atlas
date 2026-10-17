@@ -11,6 +11,7 @@ use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
 mod initial_budget;
+mod queue_first;
 mod queue_order;
 
 #[allow(clippy::too_many_arguments)]
@@ -273,6 +274,16 @@ pub(super) fn start_new_requests(
             let defer = want_codispatch
                 || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels())
                 || (multi_burst && multi_eligible(&req));
+            // ATLAS_PREFILL_QUEUE_FIRST_CHUNK: behind a prefill in flight,
+            // wait for the chunk's turn (`queue_first`).
+            let first_chunk = queue_first::first_chunk(
+                defer,
+                sched.levers.prefill_queue_first_chunk,
+                model.is_ep(),
+                !prefilling.is_empty(),
+                req.has_image_pixels(),
+                req.num_beams() > 1,
+            );
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -308,7 +319,7 @@ pub(super) fn start_new_requests(
                 prefill_event,
                 grammar_engine,
                 spontaneous_think_budget,
-                defer,
+                first_chunk,
                 vision_slice,
                 precomputed_beam_hyp,
                 pc_plant,
@@ -337,6 +348,12 @@ pub(super) fn start_new_requests(
                         .collect();
                     let left = p.prompt_tokens.len() - p.chunk_offset;
                     let at = queue_order::position(&queued, left, sched.levers.prefill_srpt);
+                    if p.queued_first_chunk.is_some() {
+                        tracing::info!(
+                            "Prefill queued for its first chunk at {at} of {} in flight",
+                            queued.len(),
+                        );
+                    }
                     prefilling.insert(at, p);
                 }
                 Ok(StartPrefillResult::Finished) => {} // EOS on first token
