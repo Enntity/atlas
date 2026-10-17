@@ -24,8 +24,8 @@ Measurement discipline (.claude/skills/measurement-discipline/SKILL.md):
   initial state is unknown, and ``first_request`` records request order alone.
 
 ``--save-output`` also asks the server for ``return_token_ids`` and stores
-the full reasoning and content text plus every chunk's text and token IDs
-(``output_chunks``), so two runs whose ``output_sha256`` differ can be
+the full reasoning and content text plus every chunk's text, token IDs and
+(when the workload requests them) logprobs (``output_chunks``), so two runs whose ``output_sha256`` differ can be
 compared token by token. The hash covers text only, so it is unchanged by
 the flag.
 """
@@ -281,6 +281,9 @@ def stream_chat(endpoint, body, timeout, save_output=False):
                                             if isinstance(delta.get(k), str)),
                             "token_ids": ids,
                             "finish_reason": choices[0].get("finish_reason"),
+                            # Present only when the workload asks for logprobs.
+                            **({"logprobs": choices[0]["logprobs"]}
+                               if choices[0].get("logprobs") is not None else {}),
                         })
                 if has_output:
                     if first_output is None:

@@ -263,6 +263,19 @@ class HarnessRunTests(unittest.TestCase):
                          [[1, 2], [3], [4, 5], [6]])
         self.assertEqual([c["kind"] for c in rec["output_chunks"]], ["r", "c", "c", "c"])
         self.assertEqual(rec["output_chunks"][-1]["finish_reason"], "stop")
+        self.assertNotIn("logprobs", rec["output_chunks"][0])
+
+    def test_save_output_keeps_chunk_logprobs_when_present(self):
+        lp = {"content": [{"token": "a", "logprob": -0.1,
+                           "top_logprobs": [{"token": "a", "logprob": -0.1}]}]}
+        chunk = content_chunk("a", finish="stop")
+        chunk["choices"][0]["logprobs"] = lp
+        script = [{"delay": 0.0, "chunk": chunk},
+                  {"delay": 0.0, "chunk": usage_chunk(FAKE_USAGE)}]
+        code, recs, _ = run_harness(self.dir, self.start_server(script),
+                                    extra_argv=["--save-output"])
+        self.assertEqual(code, 0)
+        self.assertEqual(recs[0]["output_chunks"][0]["logprobs"], lp)
 
     def test_reasoning_ttft_is_first_content_token(self):
         usage = dict(FAKE_USAGE, completion_tokens=6)
