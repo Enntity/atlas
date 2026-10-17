@@ -66,6 +66,15 @@ fn check(counts: &[usize], gaps: &[usize], computed_from: usize, chunks: &[(usiz
         // `vision_encode_chunk_items`).
         let from = if ci == 0 { computed_from } else { s };
         let items = items_in_range(&first, &last, computed_from, from, e);
+        // A chunk with no computed placeholder encodes nothing.
+        let lo = from.max(computed_from);
+        if !(lo..e).any(|p| truth[p].is_some()) {
+            assert!(
+                items.is_empty(),
+                "chunk [{s},{e}) encodes {items:?}: {}",
+                ctx()
+            );
+        }
         let (a, rows) = encode_window(counts, &items, rows_base, skip_rows);
         if rows > 0 {
             (rows_base, pending, window) = (a, rows, items);

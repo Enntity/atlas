@@ -113,3 +113,14 @@ fn a_wholly_cached_item_ending_inside_a_later_chunk_is_not_encoded() {
     assert_eq!(items_in_range(&first, &last, 3, 2, 8), vec![1]);
     assert_eq!(items_in_range(&first, &last, 2, 2, 8), vec![0, 1]);
 }
+
+#[test]
+fn a_chunk_wholly_in_the_cache_encodes_nothing() {
+    // Item 0 (4 rows) at 2..6 straddles computed_from 4; item 1 at 7..9.
+    // The chunk [0, 4) computes nothing: encoding item 0 there and again in
+    // the chunk that computes its tail cost a whole re-encode (~20 s per
+    // 2048^2 image).
+    let (first, last) = (vec![2, 7], vec![5, 8]);
+    assert!(items_in_range(&first, &last, 4, 0, 4).is_empty());
+    assert_eq!(items_in_range(&first, &last, 4, 4, 9), vec![0, 1]);
+}

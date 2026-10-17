@@ -456,12 +456,12 @@ impl Fixture {
     pub fn events(&self) -> Vec<Event> {
         self.record.events.lock().clone()
     }
-    /// The [`Order`] calls since the previous call.
     /// Idle receives of rank 0's word so far (worker side).
     #[allow(dead_code)]
     pub fn idle_receives(&self) -> u32 {
         self.record.idle_receives.load(Ordering::Relaxed)
     }
+    /// The [`Order`] calls since the previous call.
     pub fn order(&self) -> Vec<Order> {
         std::mem::take(&mut *self.record.order.lock())
     }

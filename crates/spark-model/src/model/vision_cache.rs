@@ -77,8 +77,15 @@ pub(crate) fn encode_window(
 ) -> (usize, usize) {
     let a = items
         .first()
-        .map_or(rows_base, |&first| counts[..first].iter().sum())
-        .saturating_sub(skip_rows);
+        .map_or(rows_base.saturating_sub(skip_rows), |&first| {
+            let before: usize = counts[..first].iter().sum();
+            // An encoded item is never one the cache covers wholly.
+            debug_assert!(
+                before >= skip_rows,
+                "item {first} starts inside the skipped rows"
+            );
+            before - skip_rows.min(before)
+        });
     (a, items.iter().map(|&i| counts[i]).sum())
 }
 
@@ -352,12 +359,20 @@ impl TransformerModel {
         if rows > 0 && stream != default {
             self.gpu.synchronize(stream)?;
         }
-        // The head alone holds pixels: a worker (receive-only for vision)
-        // skips the encode and takes the rows from the broadcast below.
-        let encoded = if !items.is_empty() && rows > 0 && !seq.vision.items.is_empty() {
-            self.vision_encode_on_head(seq, items, rows)
-        } else {
+        // The head (rank 0, or the only rank) alone holds pixels: a worker
+        // (receive-only for vision) skips the encode and takes the rows from
+        // the broadcast below. A head without pixels for rows it must encode
+        // fails through the agreement below rather than leave the splice
+        // reading whatever `buf_out` held.
+        let head = self.comm.as_ref().is_none_or(|c| c.rank() == 0);
+        let encoded = if rows == 0 || !head {
             Ok(())
+        } else if seq.vision.items.is_empty() {
+            Err(anyhow::anyhow!(
+                "the head holds no pixels for {rows} vision rows"
+            ))
+        } else {
+            self.vision_encode_on_head(seq, items, rows)
         };
         // A head-only failure is agreed before the payload broadcast, which
         // the worker is about to enter: both ranks then fail the request at

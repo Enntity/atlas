@@ -258,3 +258,36 @@ fn a_chunk_over_a_cached_head_splices_without_rows() {
         "no skip, no rows: still refused"
     );
 }
+
+#[test]
+fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
+    // The head was told apart from a worker by holding pixels, so a head
+    // whose items were gone skipped the encode and spliced whatever
+    // `buf_out` held. It is told apart by rank now, and fails request-locally
+    // (through the agreement on a multi-rank world).
+    for tp in [1, 2] {
+        let mut f = Fixture::new(tp, 1, 0);
+        let tower = VisionEncoder::new_glm(
+            Some(test_tower::weights()),
+            &test_tower::config(),
+            f.model.gpu.as_ref(),
+        )
+        .unwrap();
+        f.model.vision_encoder = Some(tower);
+        let (_, tokens) = staged();
+        f.seq.vision.grids = vec![(1, 8, 8)];
+        f.seq.vision.hashes = vec![1];
+        f.seq.vision.deferred = true;
+        f.seq.prefix_lookup_applied = true;
+        let err = f
+            .model
+            .vision_encode_chunk_items(&mut f.seq, &tokens, 0, tokens.len(), CALLER)
+            .unwrap_err();
+        assert!(
+            crate::request_local::is_request_local(&err),
+            "tp={tp}: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("no pixels"), "tp={tp}: {err:#}");
+        assert_eq!(f.seq.vision.rows_encoded, 0);
+    }
+}
