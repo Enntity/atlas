@@ -6,6 +6,7 @@ mod components;
 mod dense;
 mod expert_tp;
 mod fp4l;
+pub(crate) use fp4l::release_expanded;
 mod kda_mx;
 mod layers;
 mod mla_twins;

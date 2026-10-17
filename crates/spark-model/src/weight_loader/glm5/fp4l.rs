@@ -15,7 +15,10 @@
 //!
 //! Everything else (routed experts, embeddings, kv_b/indexer, KDA b/f/g,
 //! hc fn) keeps its format; hc base/scale went F32 and `load_hc_f32` reads
-//! F32 natively. Routed-expert CSF scales are decoded before this loader runs.
+//! F32 natively. Routed experts' CSF-compressed scales are decoded to plain
+//! E4M3 by `spark_runtime`: under expert TP (production) per rank slice, from
+//! the deferred components, in `expert_tp::read_slice` (`with_deferred_slice`);
+//! otherwise at upload.
 //!
 //! Each projection loads through the same arm production runs on the NVFP4
 //! release, fed an exact or nearest BF16 copy of the checkpoint's bytes:
@@ -79,7 +82,7 @@ pub(super) fn decoder_expanded_stems(lp: &str, kind: LayerType, dense_ffn: bool)
 /// as the ViT does), a U8 `.weight` with `.weight_scale` + `.weight_scale_2`.
 /// BF16/F32 stems are the derived weight themselves and stay. Idempotent.
 /// Returns the bytes freed.
-pub(super) fn release_expanded(
+pub(crate) fn release_expanded(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     stem: &str,
