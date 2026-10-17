@@ -202,6 +202,19 @@ impl Glm5KdaLayer {
             ),
             hc_contract_k: gpu.kernel("hyper_connection", &hc_name("hc_contract"))?,
         };
+        // One activation-scratch lane per layer: W8A8's MXFP8 image (and the
+        // fused K=5 QKV / LT FP8 NVFP4 lanes) is shared Q -> K -> V through
+        // `project_hot_cast`'s cast flag, and a null NVFP4 copy is only safe
+        // when every projection has the twins that replace it.
+        let w = &layer.weights;
+        let projections = [&w.q_proj, &w.k_proj, &w.v_proj, &w.o_proj];
+        ensure!(
+            projections
+                .iter()
+                .all(|p| p.mxfp8.is_some() == w.q_proj.mxfp8.is_some()
+                    && p.w8a8.is_some() == w.q_proj.w8a8.is_some()),
+            "GLM KDA layer {layer_idx}: q/k/v/o disagree on MXFP8 decode / W8A8 prefill twins"
+        );
         ensure!(
             !layer.has_mxfp8_projections() || layer.mxfp8_gemv_k.iter().all(|k| k.0 != 0),
             "GLM KDA layer {layer_idx}: MXFP8 q/k/v/o twins need the mxfp8_gemv tiers"
