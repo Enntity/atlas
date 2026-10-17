@@ -69,6 +69,12 @@ pub struct GrammarState {
     /// The strict grammar's response opens inside `<think>`, so the first
     /// sampled token is reasoning and must not be masked or consumed.
     opens_in_thinking: bool,
+    /// GLM's native tool opener, which ends reasoning without a `</think>`
+    /// (`first_token_thinking::apply_native_tool_boundary`) and is itself the
+    /// first output token. Set for a grammar with a tool branch beside its
+    /// response_format (`GrammarSpec::ToolCallOrJson`), whose matcher must
+    /// see it; `None` elsewhere.
+    native_opener: Option<u32>,
 }
 
 impl GrammarState {
@@ -130,6 +136,7 @@ impl GrammarState {
             bitmask_fill_result: false,
             strict: false,
             opens_in_thinking: false,
+            native_opener: None,
         })
     }
 
@@ -154,6 +161,19 @@ impl GrammarState {
         self
     }
 
+    /// Register the native tool opener (see the `native_opener` field).
+    #[must_use]
+    pub fn with_native_opener(mut self, native_opener: Option<u32>) -> Self {
+        self.native_opener = native_opener;
+        self
+    }
+
+    /// Whether `tok`, emitted inside `<think>`, ends the reasoning and is the
+    /// grammar's first output token (the native tool opener).
+    pub fn opens_output(&self, tok: u32) -> bool {
+        self.native_opener == Some(tok)
+    }
+
     /// Whether this is a `response_format` grammar whose output must conform.
     pub fn is_strict(&self) -> bool {
         self.strict
@@ -163,7 +183,8 @@ impl GrammarState {
     /// only for a strict grammar whose response opens inside `<think>`: that
     /// token is reasoning, and the grammar starts after `</think>` as on every
     /// other path. Tool grammars keep masking it (GLM can open a tool call
-    /// as its first token, which implicitly ends thinking).
+    /// as its first token, which implicitly ends thinking); a strict union
+    /// with a tool branch consumes that opener instead (`opens_output`).
     pub fn masks_first_token(&self) -> bool {
         !(self.strict && self.opens_in_thinking)
     }

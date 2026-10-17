@@ -14,7 +14,9 @@
 //! The walk is rolled back afterwards: only `emit_token` advances the matcher,
 //! with the tokens the verify actually emits. Rows before a `</think>` are
 //! unconstrained and never fed to the matcher; the row after it starts from
-//! the matcher's untouched start state (#44297).
+//! the matcher's untouched start state (#44297). GLM's native tool opener
+//! also ends the reasoning, but as the matcher's first token
+//! (`GrammarState::opens_output`, a tool-call-or-JSON union).
 //!
 //! DFlash proposes a whole block at once, so its drafts cannot be masked per
 //! position; they are proposed unmasked (`mtp_grammar_mask_for`: a draft-0
@@ -160,12 +162,18 @@ pub(super) fn row_masks(
                 None => d = 0,
             }
         }
-        if thinking {
+        if thinking && !gs.opens_output(d) {
             thinking = think_end != Some(d);
-        } else if !gs.accept_token(d) {
-            break Err(anyhow::anyhow!(
-                "grammar refused draft {d} that its own mask allows"
-            ));
+        } else {
+            // A native tool opener ends the reasoning as the first output
+            // token, as `first_token_thinking::apply_native_tool_boundary`
+            // does at the emit.
+            thinking = false;
+            if !gs.accept_token(d) {
+                break Err(anyhow::anyhow!(
+                    "grammar refused draft {d} that its own mask allows"
+                ));
+            }
         }
         kept.push(d);
     };
