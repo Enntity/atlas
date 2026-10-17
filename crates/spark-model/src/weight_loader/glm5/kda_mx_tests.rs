@@ -10,22 +10,6 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::weights::{WeightDtype, WeightTensor};
 use std::collections::HashMap;
 
-#[test]
-fn the_switches_are_explicit_zero_or_one() {
-    assert_eq!(
-        KdaMxPolicy::parse(None, None).unwrap(),
-        KdaMxPolicy::default()
-    );
-    let both = KdaMxPolicy::parse(Some("1"), Some("1")).unwrap();
-    assert!(both.decode && both.w8a8_prefill);
-    let decode = KdaMxPolicy::parse(Some("1"), Some("0")).unwrap();
-    assert!(decode.decode && !decode.w8a8_prefill);
-    for bad in ["", "true", "2", "on"] {
-        assert!(KdaMxPolicy::parse(Some(bad), None).is_err(), "{bad:?}");
-        assert!(KdaMxPolicy::parse(None, Some(bad)).is_err(), "{bad:?}");
-    }
-}
-
 fn upload(gpu: &MockGpuBackend, bytes: &[u8]) -> DevicePtr {
     let p = gpu.alloc(bytes.len()).unwrap();
     gpu.copy_h2d(bytes, p).unwrap();
@@ -75,11 +59,21 @@ fn each_ranks_twin_is_its_slice_of_the_checkpoint_bytes() {
         let gpu = MockGpuBackend::new();
         let (st, w, s) = store(&gpu);
         // q/k/v: column-parallel, the rank's half of the rows.
-        let twin = kda_twin(on, &st, "s", TpShardKind::ColumnParallel, rank, 2, 0, &gpu)
-            .unwrap()
-            .unwrap()
-            .decode
-            .unwrap();
+        let twin = kda_twin(
+            on,
+            &st,
+            "s",
+            [64, 128],
+            TpShardKind::ColumnParallel,
+            rank,
+            2,
+            0,
+            &gpu,
+        )
+        .unwrap()
+        .unwrap()
+        .decode
+        .unwrap();
         let rows = rank * n / 2..(rank + 1) * n / 2;
         assert_eq!(
             read(&gpu, twin.data, n / 2 * k),
@@ -90,11 +84,21 @@ fn each_ranks_twin_is_its_slice_of_the_checkpoint_bytes() {
             s[rows.start * k / 32..rows.end * k / 32]
         );
         // o: row-parallel, the rank's half of every row's K (whole scale blocks).
-        let twin = kda_twin(on, &st, "s", TpShardKind::RowParallel, rank, 2, 0, &gpu)
-            .unwrap()
-            .unwrap()
-            .decode
-            .unwrap();
+        let twin = kda_twin(
+            on,
+            &st,
+            "s",
+            [64, 128],
+            TpShardKind::RowParallel,
+            rank,
+            2,
+            0,
+            &gpu,
+        )
+        .unwrap()
+        .unwrap()
+        .decode
+        .unwrap();
         let (lk, g) = (k / 2, k / 32 / 2);
         let want_w: Vec<u8> = (0..n)
             .flat_map(|r| w[r * k + rank * lk..r * k + (rank + 1) * lk].to_vec())
@@ -116,9 +120,19 @@ fn off_or_not_mxfp8_builds_nothing() {
     let allocs = gpu.alloc_count();
     let off = KdaMxPolicy::default();
     assert!(
-        kda_twin(off, &st, "s", TpShardKind::ColumnParallel, 0, 2, 0, &gpu)
-            .unwrap()
-            .is_none()
+        kda_twin(
+            off,
+            &st,
+            "s",
+            [64, 128],
+            TpShardKind::ColumnParallel,
+            0,
+            2,
+            0,
+            &gpu
+        )
+        .unwrap()
+        .is_none()
     );
     let on = KdaMxPolicy {
         decode: true,
@@ -135,9 +149,19 @@ fn off_or_not_mxfp8_builds_nothing() {
     )]));
     for (store, stem) in [(&bf16, "b"), (&st, "absent")] {
         assert!(
-            kda_twin(on, store, stem, TpShardKind::RowParallel, 0, 2, 0, &gpu)
-                .unwrap()
-                .is_none()
+            kda_twin(
+                on,
+                store,
+                stem,
+                [64, 128],
+                TpShardKind::RowParallel,
+                0,
+                2,
+                0,
+                &gpu
+            )
+            .unwrap()
+            .is_none()
         );
     }
     assert_eq!(
@@ -145,7 +169,20 @@ fn off_or_not_mxfp8_builds_nothing() {
         allocs + 1,
         "only the BF16 fixture allocated"
     );
-    assert!(kda_twin(on, &st, "s", TpShardKind::Replicated, 0, 2, 0, &gpu).is_err());
+    assert!(
+        kda_twin(
+            on,
+            &st,
+            "s",
+            [64, 128],
+            TpShardKind::Replicated,
+            0,
+            2,
+            0,
+            &gpu
+        )
+        .is_err()
+    );
 }
 
 /// W8A8 reads the twin's E4M3 bytes in place (no copy) with its own tiled
@@ -162,9 +199,19 @@ fn w8a8_shares_the_twin_bytes_and_serves_all_only_with_decode() {
             w8a8_prefill: true,
         };
         // m_max 0: no cuBLASLt tuning at load (the mock has none).
-        let mx = kda_twin(policy, &st, "s", TpShardKind::ColumnParallel, 1, 2, 0, &gpu)
-            .unwrap()
-            .unwrap();
+        let mx = kda_twin(
+            policy,
+            &st,
+            "s",
+            [64, 128],
+            TpShardKind::ColumnParallel,
+            1,
+            2,
+            0,
+            &gpu,
+        )
+        .unwrap()
+        .unwrap();
         let op = mx.w8a8.as_ref().unwrap();
         assert_eq!((op.n, op.k), (n / 2, k));
         assert_eq!(read(&gpu, op.data, n / 2 * k), w[n / 2 * k..]);
@@ -177,5 +224,68 @@ fn w8a8_shares_the_twin_bytes_and_serves_all_only_with_decode() {
             }
             None => assert!(!decode),
         }
+    }
+}
+
+/// A config whose KDA dims disagree with the checkpoint tensor is refused
+/// before any twin is cut (the GEMV would read past it), and leaks nothing.
+#[test]
+fn a_checkpoint_tensor_of_other_dims_than_the_config_is_refused() {
+    let gpu = MockGpuBackend::new();
+    let (st, _, _) = store(&gpu);
+    let allocs = gpu.alloc_count();
+    let on = KdaMxPolicy {
+        decode: true,
+        w8a8_prefill: true,
+    };
+    for dims in [[128, 128], [64, 64], [32, 128]] {
+        let r = kda_twin(
+            on,
+            &st,
+            "s",
+            dims,
+            TpShardKind::ColumnParallel,
+            0,
+            2,
+            0,
+            &gpu,
+        );
+        assert!(r.is_err(), "{dims:?}");
+    }
+    assert_eq!(gpu.alloc_count(), allocs);
+}
+
+/// `KdaMx::free` returns every allocation `kda_twin` made, in each mode.
+#[test]
+fn freeing_a_twin_returns_everything_it_allocated() {
+    for (decode, w8a8_prefill) in [(true, false), (false, true), (true, true)] {
+        let gpu = MockGpuBackend::new();
+        let (st, _, _) = store(&gpu);
+        let allocs = gpu.alloc_count();
+        let policy = KdaMxPolicy {
+            decode,
+            w8a8_prefill,
+        };
+        let mx = kda_twin(
+            policy,
+            &st,
+            "s",
+            [64, 128],
+            TpShardKind::RowParallel,
+            1,
+            2,
+            0,
+            &gpu,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(gpu.alloc_count() > allocs);
+        mx.free(&gpu).unwrap();
+        assert_eq!(
+            gpu.alloc_count(),
+            allocs,
+            "decode {decode} w8a8 {w8a8_prefill}"
+        );
+        assert_eq!(gpu.invalid_free_count(), 0);
     }
 }

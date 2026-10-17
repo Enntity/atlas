@@ -10,7 +10,7 @@ use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::layers::{DenseFfnLayer, FfnComponent, Glm5KdaWeights, Glm5Projection, MoeLayer};
 use crate::tp_shard::{TpGdnDims, TpShardKind, shard_dense_bf16, shard_gdn_value_vector};
 use crate::weight_map::{
-    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto,
+    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, QuantizedWeight, dense_auto,
     quantize_to_nvfp4, quantized_any,
 };
 
@@ -297,7 +297,7 @@ fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
-fn env_flag(name: &str) -> bool {
+pub(super) fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -331,7 +331,7 @@ pub(super) fn load_kda_weights(
             )?;
             source.replaced(local, local_n * local_k * 2, gpu)
         };
-    let mx_policy = super::kda_mx::KdaMxPolicy::from_env()?;
+    let mx_policy = super::kda_mx::KdaMxPolicy::from_env();
     let load_hot = |name: &str,
                     n: usize,
                     k: usize,
@@ -344,6 +344,7 @@ pub(super) fn load_kda_weights(
             mx_policy,
             store,
             &format!("{p}.{name}"),
+            [n, k],
             kind,
             dims.tp_rank,
             dims.tp_size,
@@ -361,36 +362,47 @@ pub(super) fn load_kda_weights(
                 w8a8: mx.w8a8,
             });
         }
-        let dense = load_tp_dense(name, n, k, kind)?;
-        let local_n = if kind == TpShardKind::ColumnParallel {
-            n / dims.tp_size
-        } else {
-            n
+        let nvfp4 = || -> Result<(QuantizedWeight, Option<QuantizedWeight>)> {
+            let dense = load_tp_dense(name, n, k, kind)?;
+            let local_n = if kind == TpShardKind::ColumnParallel {
+                n / dims.tp_size
+            } else {
+                n
+            };
+            let local_k = if kind == TpShardKind::RowParallel {
+                k / dims.tp_size
+            } else {
+                k
+            };
+            let decode_nvfp4 = quantize_to_nvfp4(
+                &dense.dense,
+                local_n,
+                local_k,
+                gpu,
+                qctx.absmax_k,
+                qctx.quantize_k,
+                qctx.stream,
+            )?;
+            // Quantization synchronizes internally, so the checkpoint-native BF16
+            // source is no longer needed. Releasing it keeps the safe 92% memory
+            // budget viable on GB10 instead of retaining two projection copies.
+            dense.release(gpu)?;
+            // W8A8 serves every prefill row, so no transposed prefill twin.
+            let prefill_nvfp4_t = (transpose_prefill && mx.w8a8.is_none())
+                .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
+                .transpose()?;
+            Ok((decode_nvfp4, prefill_nvfp4_t))
         };
-        let local_k = if kind == TpShardKind::RowParallel {
-            k / dims.tp_size
-        } else {
-            k
+        let (nvfp4, prefill_nvfp4_t) = match nvfp4() {
+            Ok(built) => built,
+            Err(e) => {
+                // Do not leave the MXFP8 twin behind a failed load.
+                mx.free(gpu)?;
+                return Err(e);
+            }
         };
-        let decode_nvfp4 = quantize_to_nvfp4(
-            &dense.dense,
-            local_n,
-            local_k,
-            gpu,
-            qctx.absmax_k,
-            qctx.quantize_k,
-            qctx.stream,
-        )?;
-        // Quantization synchronizes internally, so the checkpoint-native BF16
-        // source is no longer needed. Releasing it keeps the safe 92% memory
-        // budget viable on GB10 instead of retaining two projection copies.
-        dense.release(gpu)?;
-        // W8A8 serves every prefill row, so no transposed prefill twin.
-        let prefill_nvfp4_t = (transpose_prefill && mx.w8a8.is_none())
-            .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
-            .transpose()?;
         Ok(Glm5Projection {
-            nvfp4: decode_nvfp4,
+            nvfp4,
             prefill_nvfp4_t,
             mxfp8: mx.decode,
             w8a8: mx.w8a8,

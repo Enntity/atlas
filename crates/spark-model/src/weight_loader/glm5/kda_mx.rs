@@ -24,9 +24,10 @@
 //! the W8A8 scale image (~1.06 B/param, below production's NVFP4 decode +
 //! transposed prefill twins at ~1.1) and the load skips the BF16 expansion.
 //!
-//! On a checkpoint that does not ship the projection MXFP8 both are inert.
+//! On a checkpoint that does not ship the projection MXFP8 both are ignored
+//! (logged once).
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
@@ -34,35 +35,27 @@ use crate::layers::ops::MxW8a8;
 use crate::tp_shard::TpShardKind;
 use crate::weight_map::{Mxfp8Weight, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8};
 
-/// The switch(es), as set (each `0`/unset or `1`; anything else refused).
+/// The switches, read like the loader's other flags (`components::env_flag`:
+/// `1` or `true` is on, anything else off).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct KdaMxPolicy {
     pub decode: bool,
     pub w8a8_prefill: bool,
 }
 
-fn flag(name: &str, value: Option<&str>) -> Result<bool> {
-    match value {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(other) => bail!("{name} must be 0 or 1, got {other:?}"),
-    }
-}
-
 impl KdaMxPolicy {
     pub(super) const DECODE: &'static str = "ATLAS_GLM_FP4L_KDA_MXFP8_DECODE";
     pub(super) const W8A8: &'static str = "ATLAS_GLM_FP4L_KDA_W8A8_PREFILL";
 
-    pub(super) fn parse(decode: Option<&str>, w8a8: Option<&str>) -> Result<Self> {
-        Ok(Self {
-            decode: flag(Self::DECODE, decode)?,
-            w8a8_prefill: flag(Self::W8A8, w8a8)?,
-        })
+    pub(super) fn from_env() -> Self {
+        Self {
+            decode: super::components::env_flag(Self::DECODE),
+            w8a8_prefill: super::components::env_flag(Self::W8A8),
+        }
     }
 
-    pub(super) fn from_env() -> Result<Self> {
-        let var = |name| std::env::var(name).ok();
-        Self::parse(var(Self::DECODE).as_deref(), var(Self::W8A8).as_deref())
+    fn any(self) -> bool {
+        self.decode || self.w8a8_prefill
     }
 }
 
@@ -81,52 +74,103 @@ impl KdaMx {
     pub(super) fn serves_all(&self) -> bool {
         self.decode.is_some() && self.w8a8.is_some()
     }
+
+    /// Free what [`kda_twin`] allocated (the error path of a projection
+    /// load that fails after it). The W8A8 operand owns only its scale
+    /// image; its E4M3 bytes are the twin's, or (W8A8 alone) its own to free.
+    pub(super) fn free(self, gpu: &dyn GpuBackend) -> Result<()> {
+        if let Some(w) = self.w8a8 {
+            if self.decode.is_none() {
+                gpu.free(w.data)?;
+            }
+            w.free(gpu)?;
+        }
+        if let Some(t) = self.decode {
+            gpu.free(t.data)?;
+            gpu.free(t.scales)?;
+        }
+        Ok(())
+    }
 }
 
-/// This rank's MXFP8 twin of KDA projection `stem` (full `[n, k]`, sharded by
-/// `kind`) under `policy`, cut from the checkpoint's bytes; `None` when the
-/// policy is off or the checkpoint ships `stem` in another format. The twin's
-/// row (column) slice is the matching slice of the checkpoint tensor, as
-/// `mxfp8_load` cuts it, and the same rows the BF16 TP shard keeps.
-/// `m_max` bounds the W8A8 row buckets tuned at load. Synchronizes the
-/// default stream.
+/// This rank's MXFP8 twin of KDA projection `stem`, whose full shape the
+/// config says is `[n, k]`, sharded by `kind`, under `policy`, cut from the
+/// checkpoint's bytes; `None` when the policy is off or the checkpoint ships
+/// `stem` in another format (logged once: the switch is ignored there). The
+/// checkpoint tensor must be exactly `[n, k]` and the twin this rank's
+/// `[n/tp, k]` (q/k/v) or `[n, k/tp]` (o), or the GEMV would read past it.
+/// The twin's slice is the matching slice of the checkpoint tensor, as
+/// `mxfp8_load` cuts it, and the same rows the BF16 TP shard keeps. `m_max`
+/// bounds the W8A8 row buckets tuned at load. Synchronizes the default
+/// stream; frees what it allocated on any error.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn kda_twin(
     policy: KdaMxPolicy,
     store: &WeightStore,
     stem: &str,
+    [n, k]: [usize; 2],
     kind: TpShardKind,
     tp_rank: usize,
     tp_size: usize,
     m_max: usize,
     gpu: &dyn GpuBackend,
 ) -> Result<Option<KdaMx>> {
-    if !policy.decode && !policy.w8a8_prefill {
+    if !policy.any() {
         return Ok(None);
     }
     let Some(raw) = raw_mxfp8(store, stem)? else {
+        static IGNORED: std::sync::Once = std::sync::Once::new();
+        IGNORED.call_once(|| {
+            tracing::warn!(
+                "{} / {} set, but {stem} is not MXFP8 in this checkpoint: \
+                 KDA projections keep their NVFP4 twins",
+                KdaMxPolicy::DECODE,
+                KdaMxPolicy::W8A8
+            )
+        });
         return Ok(None);
     };
+    ensure!(
+        [raw.n, raw.k] == [n, k] && tp_size > 0 && tp_rank < tp_size,
+        "{stem}: checkpoint MXFP8 [{}, {}] is not the config's [{n}, {k}] (tp {tp_rank}/{tp_size})",
+        raw.n,
+        raw.k
+    );
     let stream = gpu.default_stream();
-    let (mut twin, n, k) = match kind {
+    let (mut twin, tn, tk) = match kind {
         TpShardKind::ColumnParallel => {
             mxfp8_rows_twin(gpu, &[(raw, &[raw.n][..])], tp_rank, tp_size, stream)?
         }
         TpShardKind::RowParallel => mxfp8_cols_twin(gpu, raw, tp_rank, tp_size, stream)?,
         TpShardKind::Replicated => bail!("{stem}: KDA projections are TP-sharded"),
     };
+    let free_twin = |twin: Mxfp8Weight| -> Result<()> {
+        gpu.free(twin.data)?;
+        gpu.free(twin.scales)
+    };
+    let local = match kind {
+        TpShardKind::ColumnParallel => [n / tp_size, k],
+        _ => [n, k / tp_size],
+    };
+    if [tn, tk] != local {
+        free_twin(twin)?;
+        bail!("{stem}: MXFP8 twin [{tn}, {tk}] is not this rank's {local:?}");
+    }
     let w8a8 = if policy.w8a8_prefill {
         // Reads the twin's E4M3 bytes in place, untiled.
-        match MxW8a8::from_twin(gpu, &twin, [n, k], m_max, stream) {
+        match MxW8a8::from_twin(gpu, &twin, local, m_max, stream) {
             Ok(w) => Some(w),
             Err(e) => {
-                gpu.free(twin.data)?;
-                gpu.free(twin.scales)?;
+                free_twin(twin)?;
                 return Err(e.context(format!("{stem}: MXFP8 W8A8 operand")));
             }
         }
     } else {
-        crate::layers::ops::mxfp8_tile_if_requested(gpu, &mut twin, n, k, stream)?;
+        if let Err(e) = crate::layers::ops::mxfp8_tile_if_requested(gpu, &mut twin, tn, tk, stream)
+        {
+            free_twin(twin)?;
+            return Err(e.context(format!("{stem}: MXFP8 twin tiling")));
+        }
         None
     };
     if !policy.decode {

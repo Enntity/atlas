@@ -512,9 +512,20 @@ fn kda_mxfp8_decode_twins_are_checkpoint_bytes_and_row_invariant() -> Result<()>
             (&stems[0], crate::tp_shard::TpShardKind::ColumnParallel),
             (&stems[1], crate::tp_shard::TpShardKind::RowParallel),
         ] {
-            let twin = kda_twin(policy, &store, stem, kind, rank, 2, 0, gpu)?
-                .and_then(|m| m.decode)
-                .context("twin")?;
+            let shape = store.get(&format!("{stem}.weight"))?.shape.clone();
+            let twin = kda_twin(
+                policy,
+                &store,
+                stem,
+                [shape[0], shape[1]],
+                kind,
+                rank,
+                2,
+                0,
+                gpu,
+            )?
+            .and_then(|m| m.decode)
+            .context("twin")?;
             ensure!(
                 !twin.tiled,
                 "ATLAS_GLM_MXFP8_TILED must be unset for the byte check"
@@ -623,6 +634,7 @@ fn kda_w8a8_prefill_is_row_invariant_on_the_checkpoint_twin() -> Result<()> {
         policy,
         &store,
         &stem,
+        [8192, 4096],
         crate::tp_shard::TpShardKind::ColumnParallel,
         0,
         2,
