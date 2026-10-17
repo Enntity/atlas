@@ -102,6 +102,13 @@ pub(crate) fn dequant_fp8_blockscaled_to_bf16(
         );
         let (sn, sk) = block_scale_grid(&s.shape)
             .with_context(|| format!("{prefix}: block scale shape {:?}", s.shape))?;
+        // A zero (or wider-than-weight) grid would divide by zero here or
+        // hand the kernel a zero block.
+        ensure!(
+            (1..=n).contains(&sn) && (1..=k).contains(&sk),
+            "{prefix}: block scale grid {:?} for weight [{n}, {k}]",
+            s.shape
+        );
         ensure!(
             s.shape.len() == 2 || (n.is_multiple_of(sn) && k.is_multiple_of(sk)),
             "{prefix}: 4-D block scale {:?} does not tile weight [{n}, {k}]",
@@ -316,6 +323,9 @@ pub(crate) fn dense_auto(
     let w = store.get(name)?;
     match w.dtype {
         WeightDtype::BF16 => Ok(DenseWeight { weight: w.ptr }),
+        // Truncates (`f32_to_bf16_trunc`, the high half of each f32). A loader
+        // that needs round-to-nearest-even reads F32 through
+        // `dense_f32_as_bf16` instead (GLM norms: `glm5::fp4l::norm_bf16`).
         WeightDtype::FP32 => dense_f32_safe(store, name, gpu),
         WeightDtype::FP8E4M3 => {
             // Derive prefix: "foo.q_proj.weight" -> "foo.q_proj".

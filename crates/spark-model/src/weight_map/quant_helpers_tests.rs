@@ -153,3 +153,22 @@ fn a_4d_block_scale_that_does_not_tile_the_weight_is_refused() {
     assert!(format!("{err:#}").contains("does not tile"), "{err:#}");
     assert!(gpu.launches_snapshot().is_empty());
 }
+
+#[test]
+fn an_empty_or_oversized_block_scale_grid_is_refused_not_divided_by() {
+    for grid in [
+        vec![0, 4],
+        vec![2, 0],
+        vec![0, 1, 4, 1],
+        vec![512, 4],
+        vec![2, 1024],
+    ] {
+        let gpu = MockGpuBackend::new();
+        let store = fp8_block_store(&gpu, 256, 512, grid.clone());
+        assert!(
+            dense_auto(&store, "l.o_proj.weight", &gpu).is_err(),
+            "{grid:?}"
+        );
+        assert!(gpu.launches_snapshot().is_empty());
+    }
+}
