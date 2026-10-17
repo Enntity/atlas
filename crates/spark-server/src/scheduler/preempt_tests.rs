@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 mod chunk_retry;
 mod kv_refusal;
 mod min_tokens_ban;
+mod packed_prefill;
 mod resume;
 mod shared_prefix_admit;
 mod victim_policy;
@@ -64,7 +65,15 @@ struct PreemptStubModel {
     /// Shared-prefix admission: `pc_inflight_min_tokens`, and a multi-rank
     /// world with 16-token blocks when set.
     inflight_min: Option<usize>,
+    /// Packed prefill: `(rows, prompts)` per pass when set; prompts holding
+    /// `PACKED_HIT` count as having restorable cache state.
+    packed: Option<(usize, usize)>,
+    /// Prompts of every `prefill_packed` call.
+    packed_calls: Mutex<Vec<Vec<Vec<u32>>>>,
 }
+
+/// A token that marks a prompt as a prefix-cache hit for the packed stub.
+const PACKED_HIT: u32 = 999_999;
 
 impl PreemptStubModel {
     fn failing(n: usize) -> Self {
@@ -121,6 +130,27 @@ impl Model for PreemptStubModel {
             }
         );
         Ok(DevicePtr::NULL)
+    }
+    fn packed_prefill_admits(&self, prompt: &[u32], _adapter_id: u64) -> bool {
+        self.packed.is_some() && !prompt.contains(&PACKED_HIT)
+    }
+    fn packed_prefill_capacity(&self) -> (usize, usize) {
+        self.packed.unwrap_or((0, 0))
+    }
+    fn prefill_packed(
+        &self,
+        prompts: &[&[u32]],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<DevicePtr>> {
+        self.packed_calls
+            .lock()
+            .unwrap()
+            .push(prompts.iter().map(|p| p.to_vec()).collect());
+        for (p, s) in prompts.iter().zip(seqs.iter_mut()) {
+            s.tokens.extend_from_slice(p);
+            (s.seq_len, s.prompt_len) = (p.len(), p.len());
+        }
+        Ok(vec![DevicePtr::NULL; prompts.len()])
     }
     fn ep_broadcast_cmd(&self, word: u32) -> Result<()> {
         self.wire.lock().unwrap().push(word);

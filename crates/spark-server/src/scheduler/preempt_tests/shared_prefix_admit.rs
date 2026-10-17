@@ -124,6 +124,7 @@ fn a_new_leader_sends_its_plant_before_the_first_chunk() {
         &mut None,
         0,
         false,
+        false,
         None,
         None,
         Some(SHARED),

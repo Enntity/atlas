@@ -28,6 +28,10 @@ pub fn start_chunked_prefill(
     // streams batch into one `run_batched_prefill_step` forward. Vision is
     // excluded upstream (PrefillInProgress carries no pixel state).
     defer: bool,
+    // Packed prefill (`ATLAS_GLM_PACKED_PREFILL`, with `defer`): the per-request
+    // preamble only; the packed pass (`phase_start_prefills::packed`) carries
+    // the prompt to the worker instead of a chunk command.
+    packed: bool,
     // Vision co-dispatch: when Some, this request's images were already encoded
     // (batched with other requests) into the shared buf_out; skip the per-request
     // encode and instead set the per-stream slice base around the chunk-0 splice.
@@ -308,6 +312,9 @@ pub fn start_chunked_prefill(
                 0,
             )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
+            if packed {
+                return Ok(());
+            }
             model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
             model.ep_broadcast_cmd(chunk_len as u32)?;
             model.ep_broadcast_cmd(0)?; // chunk_start

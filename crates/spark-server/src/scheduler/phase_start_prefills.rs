@@ -11,6 +11,7 @@ use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
 mod initial_budget;
+mod packed;
 mod queue_order;
 
 #[allow(clippy::too_many_arguments)]
@@ -250,11 +251,26 @@ pub(super) fn start_new_requests(
         }
     }
 
+    // Packed multi-prompt prefill (`packed`, ATLAS_GLM_PACKED_PREFILL=1):
+    // which of this tick's prompts join it. Off, `packed_prefill_capacity`
+    // is (0, 0) and nothing below changes.
+    let pack_caps = model.packed_prefill_capacity();
+    let packable: Vec<bool> = new_reqs
+        .iter()
+        .zip(&pc_plants)
+        .map(|(req, plant)| {
+            chunked && pack_caps.1 > 0 && packed::eligible(model, req, plant.is_some(), pack_caps.0)
+        })
+        .collect();
+    let mut packed_ps: Vec<PrefillInProgress> = Vec::new();
+
     for (req_idx, (req, pc_plant)) in new_reqs.into_iter().zip(pc_plants).enumerate() {
         let precomputed_beam_hyp = beam_hyps[req_idx].take();
         if chunked {
-            let defer =
-                want_codispatch || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
+            let pack = packable[req_idx];
+            let defer = pack
+                || want_codispatch
+                || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -291,6 +307,7 @@ pub(super) fn start_new_requests(
                 grammar_engine,
                 spontaneous_think_budget,
                 defer,
+                pack,
                 vision_slice,
                 precomputed_beam_hyp,
                 pc_plant,
@@ -303,6 +320,7 @@ pub(super) fn start_new_requests(
                     );
                     active.push(a);
                 }
+                Ok(StartPrefillResult::InProgress(p)) if pack => packed_ps.push(p),
                 Ok(StartPrefillResult::InProgress(p)) => {
                     tracing::info!(
                         "Prefill chunk 0/{}: {}/{} tokens",
@@ -356,6 +374,16 @@ pub(super) fn start_new_requests(
             }
         }
     }
+    packed::run(
+        model,
+        sched,
+        packed_ps,
+        think_end_token,
+        think_start_token,
+        tool_call_start_token,
+        tool_call_end_token,
+        active,
+    );
 }
 
 /// Group beam requests by adapter — the model's single global LoRA gate forces

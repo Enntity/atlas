@@ -70,8 +70,8 @@ fn start_request(req: InferenceRequest, budget: usize) -> StartPrefillResult {
     let model = PreemptStubModel::default();
     let sched = SchedCtx::for_test();
     start_chunked_prefill(
-        &sched, None, None, None, None, &model, req, EOS, budget, 0, 0, &mut None, 0, false, None,
-        None, None,
+        &sched, None, None, None, None, &model, req, EOS, budget, 0, 0, &mut None, 0, false, false,
+        None, None, None,
     )
     .expect("prefill starts")
 }
