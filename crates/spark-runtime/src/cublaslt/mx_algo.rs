@@ -267,6 +267,46 @@ pub(super) fn select(
     }))
 }
 
+/// Row counts a [`pinned`] kernel must take: a packed GLM prefill's passes
+/// (`spark-model` `glm_packed_scope`), one prompt of 2 rows up to a full
+/// arena.
+const PINNED_ROWS: [u32; 5] = [1, 30, 64, 4096, 8192];
+static PINNED: Mutex<Vec<((u32, u32), Algo)>> = Mutex::new(Vec::new());
+
+/// ONE in-order kernel for `n x k` at every row count, chosen without timing
+/// and never retuned: the heuristic's first in-order candidate (asked at
+/// 4096 rows) that takes every [`PINNED_ROWS`] height. Under one in-order
+/// kernel every output is one FP32 accumulation over K in order, so a row's
+/// bytes do not depend on the pass height; unlike [`select`], which tunes by
+/// timing per row bucket (swept shapes) and retunes a key whose kernel
+/// refuses a height, the choice cannot move with the pass mix or history.
+pub(super) fn pinned(ctx: &Ctx, n: u32, k: u32, ops: Operands) -> Result<Algo> {
+    if let Some(a) = PINNED.lock().unwrap().iter().find(|e| e.0 == (n, k)) {
+        return Ok(a.1);
+    }
+    let reference = Problem::with(4096, n, k, ops)?;
+    let heights = PINNED_ROWS
+        .iter()
+        .map(|&m| Problem::with(m, n, k, ops))
+        .collect::<Result<Vec<_>>>()?;
+    let algo = candidates(ctx, &reference, true)?
+        .into_iter()
+        .find(|a| in_order(a) && heights.iter().all(|p| takes(ctx, p, a)))
+        .ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt MXFP8 {n}x{k}: no in-order kernel takes every packed height")
+        })?;
+    tracing::info!(
+        "cuBLASLt MXFP8 {n}x{k}: packed prefill pinned to {} at every row count",
+        description(&algo)
+    );
+    let mut pinned = PINNED.lock().unwrap();
+    if let Some(e) = pinned.iter().find(|e| e.0 == (n, k)) {
+        return Ok(e.1);
+    }
+    pinned.push(((n, k), algo));
+    Ok(algo)
+}
+
 /// Cache `tuned` under `key` and return it, unless the entry already there
 /// (another thread tuned the same key meanwhile) also serves the problem:
 /// then that entry, so every caller of a key runs the one kernel it holds.

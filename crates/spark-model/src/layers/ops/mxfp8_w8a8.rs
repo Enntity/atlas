@@ -96,7 +96,15 @@ impl MxW8a8 {
 
     /// `out[m, n]` (BF16, contiguous) `= act[m, k] x self^T`.
     pub fn gemm(&self, act: MxAct, out: DevicePtr, m: usize, stream: u64) -> Result<()> {
-        spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx(
+        // A packed prefill (`glm_packed_scope`): one kernel for every row
+        // count, chosen without timing, so a prompt's rows do not depend on
+        // the pass height or on which heights were tuned first.
+        let gemm = if crate::layers::glm_packed_scope::active() {
+            spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx_pinned
+        } else {
+            spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx
+        };
+        gemm(
             act.q.0,
             act.sf.0,
             self.data.0,

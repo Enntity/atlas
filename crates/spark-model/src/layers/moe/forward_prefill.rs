@@ -225,8 +225,11 @@ impl MoeLayer {
             Some(sp) if !sp.full_shared => (sp.local(input, h as usize), sp.rows as u32),
             _ => (input, n),
         };
+        // Not in a packed prefill (`glm_packed_scope`): a choice made from the
+        // pass height, kept off so a lone prompt and a pack run alike.
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
+            && !crate::layers::glm_packed_scope::active()
             && num_tokens > 64
             && !ctx.graph_capture
             && !ctx.profile

@@ -18,7 +18,8 @@ mod fp8_tensorwise;
 pub use fp8_tensorwise::fp8_gemm_act_weight_t_tensorwise;
 mod grouped;
 pub use fp8::{
-    fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_mx, fp8_gemm_act_weight_t_rowwise,
+    fp8_gemm_act_weight_t_blkscaled, fp8_gemm_act_weight_t_mx, fp8_gemm_act_weight_t_mx_pinned,
+    fp8_gemm_act_weight_t_rowwise,
 };
 mod mx_algo;
 pub use grouped::bf16_grouped_gemm_act_weight_t;

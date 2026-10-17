@@ -323,6 +323,34 @@ pub fn fp8_gemm_act_weight_t_mx(
     super::mx_algo::matmul(ctx, &p, &algo, ptrs, stream)
 }
 
+/// [`fp8_gemm_act_weight_t_mx`] on ONE kernel for every row count, chosen
+/// once without timing (`mx_algo::pinned`): what a packed GLM prefill runs,
+/// so a prompt's rows get the same bytes alone and packed.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_mx_pinned(
+    act_fp8: u64,
+    act_sf: u64,
+    weight_fp8: u64,
+    weight_sf: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        m > 0 && n > 0 && k > 0 && k.is_multiple_of(32),
+        "cuBLASLt MXFP8: {m}x{n}x{k} (K % 32 != 0 or an empty dimension)"
+    );
+    let ctx = ctx()?;
+    let ops = super::fixed_algo::Operands::Mxfp8 { weight_sf, act_sf };
+    let p = super::fixed_algo::Problem::with(m, n, k, ops)?;
+    let algo = super::mx_algo::pinned(ctx, n, k, ops)?;
+    anyhow::ensure!(
+        super::mx_algo::takes(ctx, &p, &algo),
+        "cuBLASLt MXFP8 {m}x{n}x{k}: the pinned kernel refuses {m} rows"
+    );
+    super::mx_algo::matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)
+}
+
 /// [`fp8_gemm_act_weight_t_mx`] on the heuristic's `index`-th candidate for
 /// exactly these `m` rows (tests and benches: the tuned pick is not
 /// consulted or cached); `in_order_only` asks the heuristic for no-split-K

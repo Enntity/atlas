@@ -469,5 +469,84 @@ fn mxfp8_gemm_is_correct_and_every_in_order_kernel_gives_the_same_rows() -> Resu
     Ok(())
 }
 
+/// A packed GLM prefill (`glm_packed_scope`) runs the W8A8 projections on
+/// the pinned kernel (`fp8_gemm_act_weight_t_mx_pinned`): a prompt's rows
+/// must be the same bytes alone and inside a pack. The 98-row pack holding
+/// a 30-row prompt is the C1-vs-C4 case seen on hardware. Also reports
+/// whether the tuned entry (`fp8_gemm_act_weight_t_mx`) agrees across those
+/// heights, which it need not on an unswept shape.
+///
+/// ```text
+/// cargo test --release -p spark-model --lib mxfp8_gemm_pinned -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "needs a GB10 GPU, cuBLASLt with MXFP8 and the mxfp8_act_quant kernels"]
+fn mxfp8_gemm_pinned_rows_match_alone_inside_a_pack() -> Result<()> {
+    let gpu = backend()?;
+    let stream = gpu.default_stream();
+    let mut rng = Rng(0x9ac_ed);
+    const PACK: [(usize, usize); 3] = [(0, 30), (30, 40), (70, 28)];
+    const TOTAL: usize = 98;
+    for s in shapes()?.iter().filter(|s| s.label.contains("glm")) {
+        let (n, k) = (s.n, s.k);
+        let o = operands(gpu, s, TOTAL, &mut rng)?;
+        for (name, gemm) in [
+            (
+                "pinned",
+                cublaslt::fp8_gemm_act_weight_t_mx_pinned
+                    as fn(u64, u64, u64, u64, u64, [u32; 3], u64) -> anyhow::Result<()>,
+            ),
+            ("tuned", cublaslt::fp8_gemm_act_weight_t_mx),
+        ] {
+            let packed = gpu.alloc(TOTAL * n * 2)?;
+            let (q, sf) = quantized(gpu, &o, k, 0, TOTAL)?;
+            gemm(
+                q.0,
+                sf.0,
+                o.w.0,
+                o.w_sf.0,
+                packed.0,
+                [TOTAL as u32, n as u32, k as u32],
+                stream,
+            )?;
+            let packed_bytes = down(gpu, packed, TOTAL * n * 2)?;
+            let mut same = true;
+            for (r0, m) in PACK {
+                let alone = gpu.alloc(m * n * 2)?;
+                let (aq, asf) = quantized(gpu, &o, k, r0, m)?;
+                gemm(
+                    aq.0,
+                    asf.0,
+                    o.w.0,
+                    o.w_sf.0,
+                    alone.0,
+                    [m as u32, n as u32, k as u32],
+                    stream,
+                )?;
+                let alone_bytes = down(gpu, alone, m * n * 2)?;
+                let ok = alone_bytes[..] == packed_bytes[r0 * n * 2..(r0 + m) * n * 2];
+                println!(
+                    "{} {name}: {m} rows at {r0} of {TOTAL}: {}",
+                    s.label,
+                    if ok { "same" } else { "DIFFERS" }
+                );
+                same &= ok;
+                for p in [alone, aq, asf] {
+                    gpu.free(p)?;
+                }
+            }
+            anyhow::ensure!(
+                same || name != "pinned",
+                "{}: the pinned kernel gives a prompt other rows alone than packed",
+                s.label
+            );
+            for p in [packed, q, sf] {
+                gpu.free(p)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[path = "mxfp8_gemm_bench_gpu.rs"]
 pub(super) mod bench;
