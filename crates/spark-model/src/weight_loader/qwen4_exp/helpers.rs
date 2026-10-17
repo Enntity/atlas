@@ -64,3 +64,29 @@ pub(super) fn embed_prefix(config: &ModelConfig) -> String {
 pub(super) fn mixer_prefix(config: &ModelConfig) -> String {
     format!("{}.hyper_connection_mixer", embed_prefix(config))
 }
+
+/// A drafter-only precision switch (`ATLAS_QWEN4EXP_MTP_BF16_*`) is `1`.
+fn mtp_env_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
+
+/// The config the MTP drafter is built with: the TP=1 view (`mtp.rs`), and
+/// with `ATLAS_QWEN4EXP_MTP_BF16_ATTN=1` its Q/K/V/O kept at the checkpoint's
+/// BF16 (the `--attn-proj-dtype bf16` arms); the target keeps its own. The
+/// shared expert cannot follow: `ExpertWeight` is NVFP4.
+pub(super) fn mtp_drafter_config(config: &ModelConfig) -> ModelConfig {
+    let mut config = config.tp1_view();
+    config.attn_proj_bf16 |= mtp_env_on("ATLAS_QWEN4EXP_MTP_BF16_ATTN");
+    config
+}
+
+/// The drafter router's NVFP4 copy from `quantize`, or none with
+/// `ATLAS_QWEN4EXP_MTP_BF16_ROUTER=1` (BF16, as TensorFold's; the target's
+/// router is untouched). Drafts only, never output.
+pub(super) fn mtp_router_nvfp4<T>(quantize: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    if mtp_env_on("ATLAS_QWEN4EXP_MTP_BF16_ROUTER") {
+        Ok(None)
+    } else {
+        quantize().map(Some)
+    }
+}

@@ -275,13 +275,15 @@ impl Qwen4ExpMtpHead {
                 moe_row_adapter: DevicePtr::NULL,
             };
             let written = self.module.body.decode_rows_kv_only(
-                ctx.buffers.hidden_states(),
-                ctx.buffers.residual(),
-                n,
+                crate::layer::KvRows {
+                    hidden: ctx.buffers.hidden_states(),
+                    residual: ctx.buffers.residual(),
+                    n,
+                    seq_lens: &kv_rows,
+                    stream,
+                },
                 kv,
-                &kv_rows,
                 &self.body_ctx(ctx, meta),
-                stream,
             )?;
             anyhow::ensure!(
                 written,

@@ -93,6 +93,24 @@ impl TransformerModel {
         )
     }
 
+    /// [`Self::try_mtp_prefill_capture`] of a single-sequence chunk, and for
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL` the final highway rows this rank holds of
+    /// it ([`Self::note_mtp_prompt_rows`]): of a chunk split by the
+    /// sequence-parallel prefill (`sp`), rank 0's half at row 0.
+    pub(super) fn mtp_prefill_capture_rows(
+        &self,
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        proc_count: usize,
+        sp: Option<crate::layers::glm_sp::SpRows>,
+        stream: u64,
+    ) -> Result<()> {
+        self.try_mtp_prefill_capture(seq, chunk_start, proc_count, stream)?;
+        let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
+        self.note_mtp_prompt_rows(seq, chunk_start, held, 0);
+        Ok(())
+    }
+
     /// [`Self::try_mtp_prefill_capture`] with an explicit SOURCE pointer.
     ///
     /// The mixed forward lays out `[decode rows | prefill rows]`, so its

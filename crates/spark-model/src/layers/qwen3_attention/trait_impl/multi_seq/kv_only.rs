@@ -13,11 +13,10 @@
 //! a full decode would add change nothing it keeps.
 
 use anyhow::Result;
-use spark_runtime::gpu::DevicePtr;
 use spark_runtime::kv_cache::PagedKvCache;
 
 use super::ctx::MultiSeqCtx;
-use crate::layer::ForwardContext;
+use crate::layer::{ForwardContext, KvRows};
 use crate::layers::ops;
 use crate::layers::qwen3_attention::Qwen3AttentionLayer;
 use crate::model::qwen4exp_step_copies::copy_rows;
@@ -25,17 +24,19 @@ use crate::model::qwen4exp_step_copies::copy_rows;
 impl Qwen3AttentionLayer {
     /// `Ok(false)`: not a middle mHC layer with plain attention (no MLA,
     /// indexer or adapter), or no metadata — the caller decodes in full.
-    #[allow(clippy::too_many_arguments)]
     pub(in crate::layers::qwen3_attention) fn decode_rows_kv_only_inner(
         &self,
-        hidden: DevicePtr,
-        residual: DevicePtr,
-        n: usize,
+        rows: KvRows<'_>,
         kv_cache: &mut PagedKvCache,
-        seq_lens: &[usize],
         ctx: &ForwardContext,
-        stream: u64,
     ) -> Result<bool> {
+        let KvRows {
+            hidden,
+            residual,
+            n,
+            seq_lens,
+            stream,
+        } = rows;
         let Some(hc) = self.hc.as_ref() else {
             return Ok(false);
         };
