@@ -222,3 +222,17 @@ jobs:
             echo "::error::expected the EXL3 arity pins to run and pass"
             exit 1
           }
+
+      - name: Compile the GLM-5.3-Flash EXL3 target
+        env:
+          # Native GLM-5.3-Flash EXL3 (`kernels/gb10/glm-5.3-flash/exl3/`,
+          # composed on `nvfp4/` via `base_quant`). Neither the all-models
+          # build (default quant) nor the qwen EXL3 step compiles it.
+          ATLAS_TARGET_MODEL: glm-5.3-flash
+          ATLAS_TARGET_QUANT: exl3
+          CUDARC_CUDA_VERSION: "13000"
+          PATH_CUDA: /usr/local/cuda/bin
+        run: |
+          set -euo pipefail
+          export PATH="$PATH_CUDA:$PATH"
+          cargo build -p atlas-kernels
