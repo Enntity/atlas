@@ -33,7 +33,8 @@ fn a_huge_declared_image_is_sized_from_its_header_without_decoding() {
 #[test]
 fn a_header_past_the_decoder_limits_is_refused_at_the_probe() {
     assert!(probe_image(&header_only_png(20_000, 100), &qwen_config(), Q38).is_err());
-    // 16384^2 RGBA16 decodes to 2 GiB whatever it is resized to afterwards.
+    // 16384^2 RGBA16 decodes to 2 GiB whatever it is resized to afterwards:
+    // past the 640 MiB limit.
     let err = probe_image(
         &header_only_png_typed(16_384, 16_384, 16, 6),
         &qwen_config(),
@@ -147,4 +148,48 @@ fn a_probe_that_disagrees_with_its_decode_is_refused() {
         format!("{err:#}").contains("disagrees with its header"),
         "{err:#}"
     );
+}
+
+#[test]
+fn a_108mp_phone_photo_is_admitted_and_resized_to_the_encoder() {
+    // 12000x9000 RGB decodes to 309 MiB: past the large-decode mark, inside
+    // the 640 MiB limit. It is sized, not refused, and fits one batch; a
+    // 200 MP 16320x12240 (571 MiB) too.
+    for (w, h) in [(12_000u32, 9000u32), (16_320, 12_240)] {
+        let probed = probe_image(&header_only_png(w, h), &qwen_config(), Q38).unwrap();
+        assert!(probed.decoded_bytes > DECODE_LARGE, "{w}x{h}");
+        assert!(
+            probed.patches() <= 16_384 && probed.patches() > 15_000,
+            "{probed:?}"
+        );
+    }
+}
+
+#[test]
+fn the_large_decode_gate_holds_at_most_two() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static GATE: Gate = Gate::new(|| 2);
+    static NOW: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..8 {
+            s.spawn(|| {
+                for _ in 0..5 {
+                    let _slot = GATE.acquire();
+                    let n = NOW.fetch_add(1, Ordering::SeqCst) + 1;
+                    PEAK.fetch_max(n, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    NOW.fetch_sub(1, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    let peak = PEAK.load(Ordering::SeqCst);
+    assert!((1..=2).contains(&peak), "peak {peak}");
+    // A large decode takes the large gate and a slot; a small one only a
+    // slot. One at a time: a single-core host has one slot.
+    let big = decode_slot(DECODE_LARGE + 1);
+    assert!(big._large.is_some());
+    drop(big);
+    assert!(decode_slot(DECODE_LARGE)._large.is_none());
 }

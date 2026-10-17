@@ -19,6 +19,8 @@ pub struct ProbedImage {
     pub(super) max_pixels: Option<usize>,
     /// Target (H, W) in pixels of the oriented image, as the decode sizes it.
     pub(super) target: (u32, u32),
+    /// The decoded buffer's bytes (native color type), from the header.
+    pub(super) decoded_bytes: u64,
     /// Patch grid the decode will produce.
     pub grid_h: usize,
     pub grid_w: usize,
@@ -76,7 +78,8 @@ pub fn probe_image(
         w > 0 && h > 0 && w <= DECODE_MAX_SIDE && h <= DECODE_MAX_SIDE,
         "image dimensions {w}x{h} are outside 1..={DECODE_MAX_SIDE}"
     );
-    check_decode_size(decoder.total_bytes())?;
+    let decoded_bytes = decoder.total_bytes();
+    check_decode_size(decoded_bytes)?;
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
@@ -92,43 +95,86 @@ pub fn probe_image(
         fmt,
         max_pixels,
         target: (th, tw),
+        decoded_bytes,
         grid_h: th as usize / vcfg.patch_size,
         grid_w: tw as usize / vcfg.patch_size,
     })
 }
 
-/// Decodes running at once, server-wide: each holds a decoded image (up to
-/// [`DECODE_MAX_ALLOC`]) and its f32 patches, and the request path runs on a
-/// blocking pool of hundreds of threads. min(cores, 8).
-fn decode_slots() -> usize {
+/// A counting gate: at most `limit()` holders at once; acquiring waits.
+pub(super) struct Gate {
+    busy: std::sync::Mutex<usize>,
+    free: std::sync::Condvar,
+    limit: fn() -> usize,
+}
+
+/// One holder of a [`Gate`], released on drop.
+pub(super) struct GateSlot(&'static Gate);
+
+impl Gate {
+    pub(super) const fn new(limit: fn() -> usize) -> Self {
+        Self {
+            busy: std::sync::Mutex::new(0),
+            free: std::sync::Condvar::new(),
+            limit,
+        }
+    }
+
+    pub(super) fn acquire(&'static self) -> GateSlot {
+        let limit = (self.limit)();
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while *busy >= limit {
+            busy = self.free.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy += 1;
+        GateSlot(self)
+    }
+}
+
+impl Drop for GateSlot {
+    fn drop(&mut self) {
+        *self.0.busy.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.free.notify_one();
+    }
+}
+
+/// Decodes running at once, server-wide (the request path runs on a blocking
+/// pool of hundreds of threads): min(cores, 8), and of those at most 2 past
+/// [`DECODE_LARGE`]. Each holds its decoded buffer, an RGB8 copy of at most
+/// the same size, and its f32 patches (at most 96 MiB: 16384 patches x
+/// 6 KiB). Worst-case transient host memory for decodes: decoded buffers
+/// 2 x 640 + 6 x 192 MiB = 2.4 GiB, twice that with the RGB8 copies, plus
+/// 8 x 96 MiB of patches: about 5.5 GiB (an EXIF rotation adds one more copy
+/// of the image being rotated).
+static DECODES: Gate = Gate::new(|| {
     std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .min(8)
+});
+static LARGE_DECODES: Gate = Gate::new(|| 2);
+
+/// The slots one image's decode and patching holds, released on drop.
+pub(super) struct DecodeSlot {
+    _large: Option<GateSlot>,
+    _any: GateSlot,
 }
 
-static DECODES: (std::sync::Mutex<usize>, std::sync::Condvar) =
-    (std::sync::Mutex::new(0), std::sync::Condvar::new());
-
-/// A decode slot, held for one image's decode and patching; waits for one.
-pub(super) struct DecodeSlot(());
-
-pub(super) fn decode_slot() -> DecodeSlot {
-    let (lock, cv) = &DECODES;
-    let limit = decode_slots();
-    let mut busy = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while *busy >= limit {
-        busy = cv.wait(busy).unwrap_or_else(|e| e.into_inner());
+/// Take a decode slot, and the large-decode gate first for an image whose
+/// decoded buffer exceeds [`DECODE_LARGE`] (a large decode never holds a
+/// small slot while it waits for the large gate).
+pub(super) fn decode_slot(decoded_bytes: u64) -> DecodeSlot {
+    let large = (decoded_bytes > DECODE_LARGE).then(|| LARGE_DECODES.acquire());
+    DecodeSlot {
+        _large: large,
+        _any: DECODES.acquire(),
     }
-    *busy += 1;
-    DecodeSlot(())
 }
 
-impl Drop for DecodeSlot {
-    fn drop(&mut self) {
-        let (lock, cv) = &DECODES;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
-        cv.notify_one();
-    }
+/// Run a decode the probe cannot size (a video, before admission) as a large
+/// decode: under both gates, so it does not add to the worst case above.
+pub fn decode_gated<T>(decode: impl FnOnce() -> T) -> T {
+    let _slot = decode_slot(u64::MAX);
+    decode()
 }
 
 #[cfg(test)]

@@ -58,13 +58,17 @@ pub(super) fn preprocess_media(
                 Sized::Still(probed)
             }
             MediaKind::Video => {
-                let v = spark_model::video_preprocess::preprocess_video(
-                    &input.uri,
-                    vcfg,
-                    vision_max_pixels,
-                    video.fps,
-                    video.ffmpeg,
-                )
+                // Decoded before admission (no header probe): under the
+                // large-decode gate, so videos cannot add to the decode peak.
+                let v = spark_model::vision_preprocess::decode_gated(|| {
+                    spark_model::video_preprocess::preprocess_video(
+                        &input.uri,
+                        vcfg,
+                        vision_max_pixels,
+                        video.fps,
+                        video.ffmpeg,
+                    )
+                })
                 .map_err(|e| {
                     openai_error_response(
                         StatusCode::BAD_REQUEST,
