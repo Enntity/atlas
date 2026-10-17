@@ -212,11 +212,36 @@ pub fn mxfp8_tile_in_place(
     k: usize,
     stream: u64,
 ) -> Result<()> {
+    ensure!(!w.tiled, "mxfp8_tile16: the twin is already tiled");
+    tile_in_place(gpu, w.data, Some(w.scales), n, k, stream)?;
+    w.tiled = true;
+    Ok(())
+}
+
+/// [`mxfp8_tile_in_place`] of the values alone (an FP8 block twin, whose f32
+/// grid the `_tiled` FP8 block tiers read row-major).
+pub fn mx_tile_values_in_place(
+    gpu: &dyn GpuBackend,
+    data: DevicePtr,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    tile_in_place(gpu, data, None, n, k, stream)
+}
+
+fn tile_in_place(
+    gpu: &dyn GpuBackend,
+    data: DevicePtr,
+    scales: Option<DevicePtr>,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
     let kernel = tiled_kernels(gpu).1;
     ensure!(
-        !w.tiled && n > 0 && n.is_multiple_of(16) && k > 0 && k.is_multiple_of(64),
-        "mxfp8_tile16: n={n} k={k} tiled={}",
-        w.tiled
+        n > 0 && n.is_multiple_of(16) && k > 0 && k.is_multiple_of(64),
+        "mxfp8_tile16: n={n} k={k}"
     );
     ensure!(
         kernel.0 != 0,
@@ -226,16 +251,29 @@ pub fn mxfp8_tile_in_place(
     let tiles = n / 16;
     let batch = (TILE_STAGE_BYTES / tile_w).clamp(1, tiles);
     let stage_w = gpu.alloc(batch * tile_w)?;
-    let stage_s = gpu.alloc(batch * tile_s)?;
+    let stage_s = match scales {
+        Some(_) => match gpu.alloc(batch * tile_s) {
+            Ok(p) => p,
+            Err(e) => {
+                gpu.free(stage_w)?;
+                return Err(e);
+            }
+        },
+        None => DevicePtr::NULL,
+    };
     let run = || -> Result<()> {
         for first in (0..tiles).step_by(batch) {
             let count = batch.min(tiles - first);
-            let (dw, ds) = (
-                w.data.offset(first * tile_w),
-                w.scales.offset(first * tile_s),
-            );
+            let dw = data.offset(first * tile_w);
             gpu.copy_d2d_async(dw, stage_w, count * tile_w, stream)?;
-            gpu.copy_d2d_async(ds, stage_s, count * tile_s, stream)?;
+            let ds = match scales {
+                Some(s) => {
+                    let ds = s.offset(first * tile_s);
+                    gpu.copy_d2d_async(ds, stage_s, count * tile_s, stream)?;
+                    ds
+                }
+                None => DevicePtr::NULL,
+            };
             let threads = (count * (k / 64) * 32) as u32;
             KernelLaunch::new(gpu, kernel)
                 .grid([div_ceil(threads, 256), 1, 1])
@@ -254,10 +292,10 @@ pub fn mxfp8_tile_in_place(
     };
     let done = run();
     gpu.free(stage_w)?;
-    gpu.free(stage_s)?;
-    done?;
-    w.tiled = true;
-    Ok(())
+    if scales.is_some() {
+        gpu.free(stage_s)?;
+    }
+    done
 }
 
 /// [`mxfp8_tile_in_place`] under `ATLAS_GLM_MXFP8_TILED=1` for a twin served

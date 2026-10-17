@@ -27,6 +27,8 @@ mod dispatch_config;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/fp8b.rs"]
+mod fp8b;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
 #[path = "ops/mxfp8_act.rs"]
@@ -282,6 +284,7 @@ pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
+pub use fp8b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_dense_router::*;

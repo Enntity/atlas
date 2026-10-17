@@ -1,0 +1,487 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Native FP8 block (E4M3 + f32 per 128 x 128 block, ModelOpt `FP8_PB_WO`)
+//! and MXFP8 projections on the checkpoint's own bytes: the row-invariant
+//! small-row GEMV tiers, their multi-projection launches, and the prefill
+//! GEMMs.
+//!
+//! Small rows (1..=32 a launch, any count chunked): `fp8b_gemv_tc{8,16,32}`
+//! (`mxfp8_gemv.cu`, B128) read the E4M3 values unscaled into the BF16 MMA
+//! (exact) and scale each warp's 64-value FP32 partial by its block's f32.
+//! The weights are never rounded. Like the MXFP8 tiers, every 8-row
+//! activation tile keeps its own accumulators and the eight K-split warps sum
+//! in one fixed order, so a row's output bits do not depend on how many rows
+//! share the launch: a 1-row decode, a k-row DFlash verify and a
+//! multi-sequence batch agree bit for bit.
+//!
+//! `*_multi` launches run up to three projections of the same rows (KDA
+//! q/k/v, MLA q_a + kv_a, an FFN's gate + up) as one grid, each CTA the body
+//! of its own projection's tier: the same output words, one launch.
+//!
+//! Prefill (more rows than a verify block), three ways ([`Fp8bPrefill`]):
+//! - `W8a8` (NVIDIA's / vLLM's FP8_BLOCK_SCALES recipe: activations quantized
+//!   per token and 128 values to E4M3 with an f32 scale, then the block FP8
+//!   GEMM `fp8_gemm_t_blockscaled`, FP32 epilogue);
+//! - `W8a16` (exact weights on BF16 activations: `w8a16_gemm_pipelined`, the
+//!   same two-level FP32 accumulation as the GEMV tiers);
+//! - `Bf16` (production's: the BF16 copy, one rounding of e4m3 x scale).
+//!
+//! All three are row-invariant (each output word depends only on its own row).
+
+use anyhow::{Result, ensure};
+use spark_runtime::buffers::BufferArena;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
+
+use super::{MXFP8_MAX_ROWS, mxfp8_tier};
+use crate::weight_map::{FP8_BLOCK, Fp8BlockWeight, Mxfp8Weight};
+
+/// Kernel module of every tier here.
+pub const MX_GEMV_MODULE: &str = "mxfp8_gemv";
+
+/// Row-major and tiled tiers (8/16/32 rows) of one weight format.
+#[derive(Debug, Clone, Copy)]
+pub struct MxTiers {
+    pub row_major: [KernelHandle; 3],
+    pub tiled: [KernelHandle; 3],
+}
+
+impl Default for MxTiers {
+    fn default() -> Self {
+        Self {
+            row_major: [KernelHandle(0); 3],
+            tiled: [KernelHandle(0); 3],
+        }
+    }
+}
+
+impl MxTiers {
+    fn resolve(gpu: &dyn GpuBackend, stem: &str, suffix: &str) -> Self {
+        let k = |t: &str, tiled: &str| {
+            crate::layers::try_kernel(gpu, MX_GEMV_MODULE, &format!("{stem}_tc{t}{suffix}{tiled}"))
+        };
+        Self {
+            row_major: ["8", "16", "32"].map(|t| k(t, "")),
+            tiled: ["8", "16", "32"].map(|t| k(t, "_tiled")),
+        }
+    }
+
+    /// The tier for `m` rows (1..=32) of a twin `tiled` or not; zero when the
+    /// target lacks it.
+    pub fn kernel(&self, tiled: bool, m: u32) -> KernelHandle {
+        let tiers = if tiled { &self.tiled } else { &self.row_major };
+        tiers[mxfp8_tier(m)]
+    }
+
+    /// Whether every tier of the layout is present.
+    pub fn complete(&self, tiled: bool) -> bool {
+        let tiers = if tiled { &self.tiled } else { &self.row_major };
+        tiers.iter().all(|k| k.0 != 0)
+    }
+}
+
+/// The native kernels, resolved once per process (zero handles when the
+/// target lacks them: every caller checks before routing to them).
+#[derive(Debug, Clone, Copy)]
+pub struct NativeKernels {
+    /// `fp8b_gemv_tc{8,16,32}[_tiled]`.
+    pub fp8b: MxTiers,
+    /// `fp8b_gemv_tc{8,16,32}_multi[_tiled]`.
+    pub fp8b_multi: MxTiers,
+    /// `fp8b_gemv_tc{8,16,32}_ld` (a K-slice of a wider row-major weight).
+    pub fp8b_ld: [KernelHandle; 3],
+    /// `mxfp8_to_bf16` (exact transient expansion for prefill).
+    pub mx_expand: KernelHandle,
+    /// `mxfp8_gemv_tc{8,16,32}_multi[_tiled]`.
+    pub mx_multi: MxTiers,
+    /// `per_token_group_quant_fp8` (W8A8 prefill activations).
+    pub act_quant: KernelHandle,
+    /// `fp8_gemm_t_blockscaled` (W8A8 prefill GEMM).
+    pub w8a8_gemm: KernelHandle,
+    /// `w8a16_gemm_pipelined` (exact W8A16 prefill GEMM).
+    pub w8a16_gemm: KernelHandle,
+}
+
+/// [`NativeKernels`] for this process's target.
+pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
+    static K: std::sync::OnceLock<NativeKernels> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let t = |m: &str, f: &str| crate::layers::try_kernel(gpu, m, f);
+        NativeKernels {
+            fp8b: MxTiers::resolve(gpu, "fp8b_gemv", ""),
+            fp8b_multi: MxTiers::resolve(gpu, "fp8b_gemv", "_multi"),
+            fp8b_ld: ["8", "16", "32"].map(|r| t(MX_GEMV_MODULE, &format!("fp8b_gemv_tc{r}_ld"))),
+            mx_expand: t(MX_GEMV_MODULE, "mxfp8_to_bf16"),
+            mx_multi: MxTiers::resolve(gpu, "mxfp8_gemv", "_multi"),
+            act_quant: t("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
+            w8a8_gemm: t("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
+            w8a16_gemm: t("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
+        }
+    })
+}
+
+/// `output[r, n] = input[r, k] · W^T` for `rows` rows of FP8 block twin `w`
+/// (`[n, k]`, both multiples of 128), output row `r` at `output + r *
+/// out_stride` elements, in launches of up to 32 rows on `tiers`.
+/// Row-invariant (see the module doc).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8b_gemv_rows(
+    gpu: &dyn GpuBackend,
+    tiers: &MxTiers,
+    w: &Fp8BlockWeight,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    n: usize,
+    k: usize,
+    out_stride: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        out_stride >= n && n.is_multiple_of(16) && k.is_multiple_of(FP8_BLOCK),
+        "fp8b_gemv_rows: n={n} k={k} out_stride={out_stride}"
+    );
+    for first in (0..rows).step_by(MXFP8_MAX_ROWS) {
+        let m = (rows - first).min(MXFP8_MAX_ROWS) as u32;
+        let kernel = tiers.kernel(w.tiled, m);
+        ensure!(
+            kernel.0 != 0,
+            "fp8b_gemv_rows: no kernel for {m} rows (tiled={})",
+            w.tiled
+        );
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(n as u32, 16), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input.offset(first * k * 2))
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(output.offset(first * out_stride * 2))
+            .arg_u32(m)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(out_stride as u32)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
+/// [`fp8b_gemv_rows`] on a K-slice of a wider row-major FP8 block weight:
+/// `data` at the slice's first value, `scales` at its first grid column, rows
+/// `ldw` values apart (`k` and the slice's start on the 128 grid).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8b_gemv_ld_rows(
+    gpu: &dyn GpuBackend,
+    tiers: &[KernelHandle; 3],
+    data: DevicePtr,
+    scales: DevicePtr,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    n: usize,
+    k: usize,
+    ldw: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        n.is_multiple_of(16)
+            && k.is_multiple_of(FP8_BLOCK)
+            && ldw >= k
+            && ldw.is_multiple_of(FP8_BLOCK),
+        "fp8b_gemv_ld_rows: n={n} k={k} ldw={ldw}"
+    );
+    for first in (0..rows).step_by(MXFP8_MAX_ROWS) {
+        let m = (rows - first).min(MXFP8_MAX_ROWS) as u32;
+        let kernel = tiers[mxfp8_tier(m)];
+        ensure!(kernel.0 != 0, "fp8b_gemv_ld_rows: no kernel for {m} rows");
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(n as u32, 16), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input.offset(first * k * 2))
+            .arg_ptr(data)
+            .arg_ptr(scales)
+            .arg_ptr(output.offset(first * n * 2))
+            .arg_u32(m)
+            .arg_u32(n as u32)
+            .arg_u32(k as u32)
+            .arg_u32(n as u32)
+            .arg_u32(ldw as u32)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
+/// The exact BF16 expansion of an untiled MXFP8 `[n, k]` twin into `out`
+/// (`n * k * 2` bytes): `mxfp8_to_bf16`.
+pub fn mxfp8_expand_bf16(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    w: &Mxfp8Weight,
+    out: DevicePtr,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        kernel.0 != 0 && !w.tiled && (n * k).is_multiple_of(8) && k.is_multiple_of(32),
+        "mxfp8_to_bf16: [{n}, {k}] (tiled={}, kernel {})",
+        w.tiled,
+        kernel.0
+    );
+    let count8 = (n * k / 8) as u64;
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(count8 as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(w.data)
+        .arg_ptr(w.scales)
+        .arg_ptr(out)
+        .arg_u64(count8)
+        .launch(stream)
+}
+
+/// One projection of a multi-projection launch: its weight's values and
+/// scales (MXFP8 E8M0 bytes or an FP8 block f32 grid), its output (rows `n`
+/// apart) and `n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MxPart {
+    pub data: DevicePtr,
+    pub scales: DevicePtr,
+    pub out: DevicePtr,
+    pub n: usize,
+}
+
+impl MxPart {
+    pub fn mx(w: &Mxfp8Weight, out: DevicePtr, n: usize) -> Self {
+        Self {
+            data: w.data,
+            scales: w.scales,
+            out,
+            n,
+        }
+    }
+
+    pub fn fp8b(w: &Fp8BlockWeight, out: DevicePtr, n: usize) -> Self {
+        Self {
+            data: w.data,
+            scales: w.scales,
+            out,
+            n,
+        }
+    }
+}
+
+/// `parts[i].out[r] = input[r] · W_i^T` for 1..=3 projections of the same
+/// `rows` rows (`[rows, k]`, contiguous) in one launch per 32 rows, on the
+/// `_multi` `tiers` of their format (all parts tiled or all not, as `tiled`
+/// says). Each output word is the one its own single-projection tier writes.
+#[allow(clippy::too_many_arguments)]
+pub fn mx_multi_rows(
+    gpu: &dyn GpuBackend,
+    tiers: &MxTiers,
+    tiled: bool,
+    input: DevicePtr,
+    parts: &[MxPart],
+    rows: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        (1..=3).contains(&parts.len())
+            && k.is_multiple_of(64)
+            && parts.iter().all(|p| p.n > 0 && p.n.is_multiple_of(16)),
+        "mx_multi_rows: {} parts, k={k}",
+        parts.len()
+    );
+    let tiles: u32 = parts.iter().map(|p| div_ceil(p.n as u32, 16)).sum();
+    let none = MxPart {
+        data: DevicePtr::NULL,
+        scales: DevicePtr::NULL,
+        out: DevicePtr::NULL,
+        n: 0,
+    };
+    let part = |i: usize| parts.get(i).copied().unwrap_or(none);
+    for first in (0..rows).step_by(MXFP8_MAX_ROWS) {
+        let m = (rows - first).min(MXFP8_MAX_ROWS) as u32;
+        let kernel = tiers.kernel(tiled, m);
+        ensure!(
+            kernel.0 != 0,
+            "mx_multi_rows: no kernel for {m} rows (tiled={tiled})"
+        );
+        let mut launch = KernelLaunch::new(gpu, kernel)
+            .grid([tiles, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input.offset(first * k * 2));
+        for i in 0..3 {
+            let p = part(i);
+            let out = if p.n == 0 {
+                p.out
+            } else {
+                p.out.offset(first * p.n * 2)
+            };
+            launch = launch
+                .arg_ptr(p.data)
+                .arg_ptr(p.scales)
+                .arg_ptr(out)
+                .arg_u32(p.n as u32);
+        }
+        launch.arg_u32(m).arg_u32(k as u32).launch(stream)?;
+    }
+    Ok(())
+}
+
+/// How FP8 block projections run prefill (more rows than one GEMV launch
+/// serves), from `ATLAS_GLM_FP4L_FP8_PREFILL` (`w8a8` default, `w8a16`, `bf16`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8bPrefill {
+    /// Activations per token and 128 values to E4M3 + f32, block FP8 GEMM
+    /// (NVIDIA's vLLM recipe for `FP8_PB_WO` / FP8_BLOCK_SCALES).
+    W8a8,
+    /// Exact weights on BF16 activations (`w8a16_gemm_pipelined`).
+    W8a16,
+    /// The BF16 copy (production's numerics; keeps the BF16 copy resident).
+    Bf16,
+}
+
+impl Fp8bPrefill {
+    pub const VAR: &'static str = "ATLAS_GLM_FP4L_FP8_PREFILL";
+
+    pub fn parse(value: Option<&str>) -> Result<Self> {
+        Ok(match value {
+            None | Some("") | Some("w8a8") => Self::W8a8,
+            Some("w8a16") => Self::W8a16,
+            Some("bf16") => Self::Bf16,
+            Some(other) => {
+                anyhow::bail!("{} must be w8a8, w8a16 or bf16, got {other:?}", Self::VAR)
+            }
+        })
+    }
+
+    /// The switch as set (read once).
+    pub fn from_env() -> Result<Self> {
+        static V: std::sync::OnceLock<std::result::Result<Fp8bPrefill, String>> =
+            std::sync::OnceLock::new();
+        V.get_or_init(|| {
+            Self::parse(std::env::var(Self::VAR).ok().as_deref()).map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+    }
+
+    /// Whether this mode still reads the projection's BF16 copy.
+    pub fn needs_bf16(self) -> bool {
+        self == Self::Bf16
+    }
+}
+
+/// Rows per W8A8 GEMM so a `[rows, k]` E4M3 image and its `[rows, k/128]`
+/// f32 scales fit the arena's FP8 activation scratch (a multiple of 64, the
+/// GEMM's row tile; the GEMM is row-invariant, so chunking changes nothing).
+fn w8a8_chunk_rows(buffers: &BufferArena, k: usize) -> usize {
+    let q = buffers.fp8_act_bytes() / k;
+    let s = buffers.sizes().fp8_act_scale / (k / FP8_BLOCK * 4);
+    (q.min(s) / 64) * 64
+}
+
+/// `output[m, n] = input[m, k] · W^T` for prefill on FP8 block twin `w`
+/// (untiled), `mode` W8A8 or W8A16 (`Bf16` is the caller's BF16 GEMM).
+#[allow(clippy::too_many_arguments)]
+pub fn fp8b_prefill_gemm(
+    gpu: &dyn GpuBackend,
+    kernels: &NativeKernels,
+    buffers: &BufferArena,
+    mode: Fp8bPrefill,
+    w: &Fp8BlockWeight,
+    input: DevicePtr,
+    output: DevicePtr,
+    m: usize,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        !w.tiled && n.is_multiple_of(FP8_BLOCK) && k.is_multiple_of(FP8_BLOCK),
+        "fp8b_prefill_gemm: [{n}, {k}] (tiled={})",
+        w.tiled
+    );
+    match mode {
+        Fp8bPrefill::W8a16 => {
+            ensure!(kernels.w8a16_gemm.0 != 0, "w8a16_gemm_pipelined is missing");
+            super::w8a16_gemm_pipelined(
+                gpu,
+                kernels.w8a16_gemm,
+                input,
+                w.data,
+                w.scales,
+                output,
+                m as u32,
+                n as u32,
+                k as u32,
+                stream,
+            )
+        }
+        Fp8bPrefill::W8a8 => {
+            ensure!(
+                kernels.act_quant.0 != 0 && kernels.w8a8_gemm.0 != 0,
+                "per_token_group_quant_fp8 / fp8_gemm_t_blockscaled are missing"
+            );
+            let chunk = w8a8_chunk_rows(buffers, k);
+            ensure!(
+                chunk > 0,
+                "FP8 W8A8 prefill: the arena's FP8 scratch holds no 64-row [_, {k}] tile"
+            );
+            let (act, act_scale) = (buffers.fp8_act(), buffers.fp8_act_scale());
+            for first in (0..m).step_by(chunk) {
+                let rows = (m - first).min(chunk) as u32;
+                super::per_token_group_quant_fp8(
+                    gpu,
+                    kernels.act_quant,
+                    input.offset(first * k * 2),
+                    act,
+                    act_scale,
+                    rows,
+                    k as u32,
+                    stream,
+                )?;
+                super::fp8_gemm_t_blockscaled(
+                    gpu,
+                    kernels.w8a8_gemm,
+                    act,
+                    act_scale,
+                    w.data,
+                    w.scales,
+                    output.offset(first * n * 2),
+                    rows,
+                    n as u32,
+                    k as u32,
+                    stream,
+                )?;
+            }
+            Ok(())
+        }
+        Fp8bPrefill::Bf16 => anyhow::bail!("fp8b_prefill_gemm: BF16 prefill is the caller's"),
+    }
+}
+
+/// Rewrite FP8 block twin `w` (`[n, k]`, `n % 16 == 0`, `k % 64 == 0`) in
+/// place into `mxfp8_tile16`'s value tiling (the grid stays row-major) under
+/// `ATLAS_GLM_MXFP8_TILED=1`; a no-op otherwise. Load time: synchronizes.
+pub fn fp8b_tile_if_requested(
+    gpu: &dyn GpuBackend,
+    w: &mut Fp8BlockWeight,
+    n: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    if !super::mxfp8_tiled_requested()? || w.tiled {
+        return Ok(());
+    }
+    ensure!(
+        native_kernels(gpu).fp8b.complete(true),
+        "ATLAS_GLM_MXFP8_TILED=1 but the fp8b_gemv_tc*_tiled tiers are missing"
+    );
+    super::mx_tile_values_in_place(gpu, w.data, n, k, stream)?;
+    w.tiled = true;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "fp8b_tests.rs"]
+mod tests;

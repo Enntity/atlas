@@ -21,6 +21,12 @@
 //     mxfp8_tile16, where each warp's chunk is one contiguous KiB instead of
 //     sixteen 64-byte row pieces K bytes apart (ATLAS_GLM_MXFP8_TILED).
 //
+//   fp8b_gemv_tc{8,16,32}[_tiled]: the same on FP8 block weights (E4M3 +
+//     f32 per 128x128 block, ModelOpt FP8_PB_WO): unscaled E4M3 operands,
+//     each chunk's FP32 partial times its block scale (exact weights).
+//
+//   *_multi[_tiled]: up to three projections of the same rows in one launch.
+//
 //   mxfp8_gemv_tc{8,16}_grouped: the same per head h = blockIdx.z for
 //     per-head weights (GLM absorbed W_uk / W_uv): A[:, h*K..] (row stride
 //     lda) times head h of W [G, N, K] / S [G, N, K/32] into C[:, h*N..].
@@ -74,7 +80,10 @@ struct MxChunk {
 
 // Chunk `ch` of the lane's rows: values at w{0,1}p + ch * wstep (16 bytes each)
 // and scales at s{0,1}p[ch * sstep]; activations at k = kb = ch * 64 + 16c.
-template <int NT>
+// B128: s0p is the f32 scale of the CTA's 128-row block at K block 0 (one
+// row of the [N/128, K/128] grid); chunk ch's scale is its (ch / 2)-th word,
+// read by every lane into t.s0 (as bits).
+template <int NT, bool B128 = false>
 __device__ __forceinline__ void mx_load(
     MxChunk<NT>& t, const unsigned char* w0p, const unsigned char* w1p,
     const unsigned char* s0p, const unsigned char* s1p, unsigned int wstep, unsigned int sstep,
@@ -87,8 +96,14 @@ __device__ __forceinline__ void mx_load(
     for (int i = 0; i < NT; i++) { t.x[i][0] = z; t.x[i][1] = z; }
     if (kb >= K) return;
     const unsigned long long wo = (unsigned long long)ch * wstep, so = (unsigned long long)ch * sstep;
-    if (v0) { t.w0 = *(const uint4*)(w0p + wo); t.s0 = s0p[so]; }
-    if (v1) { t.w1 = *(const uint4*)(w1p + wo); t.s1 = s1p[so]; }
+    if constexpr (B128) {
+        if (v0) t.w0 = *(const uint4*)(w0p + wo);
+        if (v1) t.w1 = *(const uint4*)(w1p + wo);
+        t.s0 = reinterpret_cast<const unsigned int*>(s0p)[ch >> 1];
+    } else {
+        if (v0) { t.w0 = *(const uint4*)(w0p + wo); t.s0 = s0p[so]; }
+        if (v1) { t.w1 = *(const uint4*)(w1p + wo); t.s1 = s1p[so]; }
+    }
     #pragma unroll
     for (int i = 0; i < NT; i++) {
         const unsigned int row = 8u * i + g;
@@ -107,11 +122,32 @@ __device__ __forceinline__ __nv_bfloat162 mx_scale(unsigned int s) {
     return __halves2bfloat162(v, v);
 }
 
+// One m16n8k16 BF16 MMA step into `acc` (FP32).
+__device__ __forceinline__ void mx_mma(float (&acc)[4], const unsigned int (&a)[4],
+                                       unsigned int b0, unsigned int b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
 // The body for weight-row tile `cta` (rows 16 * cta ..): the plain tiers'
 // CTA `blockIdx.x`, or a CTA of a launch that runs other work beside it
-// (glm_mla_fuse.cu). TILED reads W / S in the chunk-tiled layout of
-// `mxfp8_tile16` (same values into the same MMAs: bit-identical).
-template <int NT, bool TILED = false>
+// (glm_mla_fuse.cu, the multi-projection launches below). TILED reads W / S
+// in the chunk-tiled layout of `mxfp8_tile16` (same values into the same
+// MMAs: bit-identical).
+//
+// B128 (FP8 block weights, ModelOpt FP8_PB_WO / DeepSeek block FP8): W is
+// E4M3 [N, K] as before (or its `mxfp8_tile16` value tiling), S an f32
+// [N/128, K/128] grid (row-major, never tiled), N % 16 == 0 and K % 128 ==
+// 0. The E4M3 values enter the MMA unscaled (exact in BF16); each warp's
+// 64-value chunk accumulates into its own FP32 partial, which is multiplied
+// by the chunk's block scale (both of a CTA's 16 rows share one 128-row
+// block) and added to the running sum. No weight is ever rounded; the same
+// warp / tile / reduction order as the MX tiers keeps each row's bits
+// independent of how many rows share the launch.
+template <int NT, bool TILED = false, bool B128 = false>
 __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
@@ -122,7 +158,8 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     unsigned int K,
     unsigned int lda,
     unsigned int out_stride,
-    unsigned int cta
+    unsigned int cta,
+    unsigned int ldw = 0u
 ) {
     // E4M3 byte -> BF16 bits (exact).
     __shared__ unsigned short s_e4m3[256];
@@ -156,12 +193,22 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
         wstep = 1024u;
         sstep = 32u;
     } else {
-        w0p = W + (unsigned long long)(v0 ? r0 : 0u) * K + 16u * c;
-        w1p = W + (unsigned long long)(v1 ? r1 : 0u) * K + 16u * c;
+        // `ldw` (B128 row-major only): values between weight rows when W is a
+        // K-slice of a wider weight (0: K).
+        const unsigned long long rs = (B128 && ldw != 0u) ? ldw : K;
+        w0p = W + (unsigned long long)(v0 ? r0 : 0u) * rs + 16u * c;
+        w1p = W + (unsigned long long)(v1 ? r1 : 0u) * rs + 16u * c;
         s0p = S + (unsigned long long)(v0 ? r0 : 0u) * blocks + (c >> 1);
         s1p = S + (unsigned long long)(v1 ? r1 : 0u) * blocks + (c >> 1);
         wstep = 64u;
         sstep = 2u;
+    }
+    if constexpr (B128) {
+        // The grid row of this CTA's 128-row block (rows 16 cta .. 16 cta + 15),
+        // `ldw / 128` scales apart for a K-slice.
+        const unsigned long long gs = ((!TILED && ldw != 0u) ? ldw : K) / 128u;
+        s0p = S + (unsigned long long)(cta / 8u) * gs * 4u;
+        s1p = s0p;
     }
 
     float acc[NT][4];
@@ -170,44 +217,55 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     MxChunk<NT> cur, nxt;
     unsigned int ch = warp;
     if (ch < chunks)
-        mx_load<NT>(cur, w0p, w1p, s0p, s1p, wstep, sstep, A, g, M, K, lda, ch,
-                    ch * 64u + 16u * c, v0, v1);
+        mx_load<NT, B128>(cur, w0p, w1p, s0p, s1p, wstep, sstep, A, g, M, K, lda, ch,
+                          ch * 64u + 16u * c, v0, v1);
     for (; ch < chunks; ch += MX_WARPS) {
         const unsigned int next = ch + MX_WARPS;
         if (next < chunks)
-            mx_load<NT>(nxt, w0p, w1p, s0p, s1p, wstep, sstep, A, g, M, K, lda, next,
-                        next * 64u + 16u * c, v0, v1);
-        const __nv_bfloat162 sc0 = mx_scale(cur.s0), sc1 = mx_scale(cur.s1);
+            mx_load<NT, B128>(nxt, w0p, w1p, s0p, s1p, wstep, sstep, A, g, M, K, lda, next,
+                              next * 64u + 16u * c, v0, v1);
         const unsigned int wb0[4] = {cur.w0.x, cur.w0.y, cur.w0.z, cur.w0.w};
         const unsigned int wb1[4] = {cur.w1.x, cur.w1.y, cur.w1.z, cur.w1.w};
+        // E4M3 bytes -> a BF16 pair, times the E8M0 scale (MX) or as is (B128).
+        const __nv_bfloat162 sc0 = mx_scale(cur.s0), sc1 = mx_scale(cur.s1);
+        auto pair = [&](unsigned int lo, unsigned int hi, __nv_bfloat162 sc) {
+            __nv_bfloat162 v = __halves2bfloat162(__ushort_as_bfloat16(s_e4m3[lo]),
+                                                  __ushort_as_bfloat16(s_e4m3[hi]));
+            if constexpr (!B128) v = __hmul2(v, sc);
+            return *reinterpret_cast<unsigned int*>(&v);
+        };
+        float part[NT][4];
+        if constexpr (B128) {
+            #pragma unroll
+            for (int i = 0; i < NT; i++) part[i][0] = part[i][1] = part[i][2] = part[i][3] = 0.0f;
+        }
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             // Values 4j..4j+3 of each row's 16-value run = bytes 4j..4j+3 = word j.
             const unsigned int x0 = wb0[j], x1 = wb1[j];
-            unsigned int a[4];
-            __nv_bfloat162 v;
-            v = __hmul2(__halves2bfloat162(__ushort_as_bfloat16(s_e4m3[x0 & 0xFFu]),
-                                           __ushort_as_bfloat16(s_e4m3[(x0 >> 8) & 0xFFu])), sc0);
-            a[0] = *reinterpret_cast<unsigned int*>(&v);
-            v = __hmul2(__halves2bfloat162(__ushort_as_bfloat16(s_e4m3[x1 & 0xFFu]),
-                                           __ushort_as_bfloat16(s_e4m3[(x1 >> 8) & 0xFFu])), sc1);
-            a[1] = *reinterpret_cast<unsigned int*>(&v);
-            v = __hmul2(__halves2bfloat162(__ushort_as_bfloat16(s_e4m3[(x0 >> 16) & 0xFFu]),
-                                           __ushort_as_bfloat16(s_e4m3[x0 >> 24])), sc0);
-            a[2] = *reinterpret_cast<unsigned int*>(&v);
-            v = __hmul2(__halves2bfloat162(__ushort_as_bfloat16(s_e4m3[(x1 >> 16) & 0xFFu]),
-                                           __ushort_as_bfloat16(s_e4m3[x1 >> 24])), sc1);
-            a[3] = *reinterpret_cast<unsigned int*>(&v);
+            const unsigned int a[4] = {
+                pair(x0 & 0xFFu, (x0 >> 8) & 0xFFu, sc0),
+                pair(x1 & 0xFFu, (x1 >> 8) & 0xFFu, sc1),
+                pair((x0 >> 16) & 0xFFu, x0 >> 24, sc0),
+                pair((x1 >> 16) & 0xFFu, x1 >> 24, sc1),
+            };
             #pragma unroll
             for (int i = 0; i < NT; i++) {
                 const uint4 lo = cur.x[i][0], hi = cur.x[i][1];
                 const unsigned int xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-                asm volatile(
-                    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                    : "+f"(acc[i][0]), "+f"(acc[i][1]), "+f"(acc[i][2]), "+f"(acc[i][3])
-                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                      "r"(xw[2 * j]), "r"(xw[2 * j + 1]));
+                if constexpr (B128) {
+                    mx_mma(part[i], a, xw[2 * j], xw[2 * j + 1]);
+                } else {
+                    mx_mma(acc[i], a, xw[2 * j], xw[2 * j + 1]);
+                }
+            }
+        }
+        if constexpr (B128) {
+            const float sc = __uint_as_float(cur.s0);
+            #pragma unroll
+            for (int i = 0; i < NT; i++) {
+                #pragma unroll
+                for (int q = 0; q < 4; q++) acc[i][q] += part[i][q] * sc;
             }
         }
         cur = nxt;
@@ -234,12 +292,42 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     }
 }
 
-template <int NT, bool TILED = false>
+template <int NT, bool TILED = false, bool B128 = false>
 __device__ __forceinline__ void mxfp8_gemv_tc_impl(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C, unsigned int M,
     unsigned int N, unsigned int K, unsigned int lda, unsigned int out_stride) {
-    mxfp8_gemv_tc_cta<NT, TILED>(A, W, S, C, M, N, K, lda, out_stride, blockIdx.x);
+    mxfp8_gemv_tc_cta<NT, TILED, B128>(A, W, S, C, M, N, K, lda, out_stride, blockIdx.x);
+}
+
+// Up to three projections of the same activation rows in one launch (KDA
+// q/k/v, MLA q_a + kv_a, an FFN's gate + up): CTAs [0, t0) run projection 0's
+// tiles, then projection 1's, then 2's (t_i = ceil(N_i / 16); N_i = 0 skips
+// one). Each CTA runs the single-projection body for its tile, so every
+// output word is the one its own `_tc{8,16,32}` launch writes. C_i rows are
+// N_i apart.
+template <int NT, bool TILED, bool B128>
+__device__ __forceinline__ void mx_multi_impl(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* W0, const unsigned char* S0, __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* W1, const unsigned char* S1, __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* W2, const unsigned char* S2, __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K
+) {
+    const unsigned int t0 = (N0 + 15u) / 16u, t1 = (N1 + 15u) / 16u;
+    unsigned int b = blockIdx.x;
+    const unsigned char *W = W0, *S = S0;
+    __nv_bfloat16* C = C0;
+    unsigned int N = N0;
+    if (b >= t0) {
+        b -= t0;
+        W = W1; S = S1; C = C1; N = N1;
+        if (b >= t1) {
+            b -= t1;
+            W = W2; S = S2; C = C2; N = N2;
+        }
+    }
+    mxfp8_gemv_tc_cta<NT, TILED, B128>(A, W, S, C, M, N, K, K, N, b);
 }
 
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8(
@@ -323,7 +411,8 @@ extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc32
 }
 
 // Row-major MXFP8 W [N, K] / S [N, K/32] -> the chunk-tiled twin the
-// `_tiled` tiers read (N % 16 == 0, K % 64 == 0): within each 16-row tile,
+// `_tiled` tiers read (N % 16 == 0, K % 64 == 0; S and St null for an FP8
+// block twin's values alone): within each 16-row tile,
 // chunk ch (K values 64ch..64ch+63) is 1 KiB, lane l = 4g + c's 32 bytes at
 // (ch * 32 + l) * 32: values 64ch + 16c.. of row g then of row g + 8; its
 // scales are 32 bytes at ch * 32 (row r's two blocks at 2r, 2r + 1). Tiles
@@ -345,9 +434,98 @@ extern "C" __global__ void mxfp8_tile16(
     uint4* out = (uint4*)(Wt + i * 32u);
     out[0] = *(const uint4*)(W + r0 * K + kb);
     out[1] = *(const uint4*)(W + (r0 + 8u) * K + kb);
+    // No scales (S null): an FP8 block twin, whose f32 grid stays row-major.
+    if (S == nullptr) return;
     const unsigned long long blocks = K / MX_BLOCK, row = tile * 16u + lane / 2u;
     St[tc * 32u + lane] = S[row * blocks + 2u * ch + (lane & 1u)];
 }
+
+// FP8 block weights (B128 above): E4M3 [N, K] + f32 [N/128, K/128], up to
+// 8/16/32 rows; `_tiled` on `mxfp8_tile16`'s value tiling (S row-major).
+#define FP8B_TIER(name, NT, TILED)                                                        \
+    extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) name(               \
+        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,         \
+        const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,               \
+        unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {        \
+        mxfp8_gemv_tc_impl<NT, TILED, true>(A, W, S, C, M, N, K, K, out_stride);          \
+    }
+FP8B_TIER(fp8b_gemv_tc8, 1, false)
+FP8B_TIER(fp8b_gemv_tc16, 2, false)
+FP8B_TIER(fp8b_gemv_tc32, 4, false)
+FP8B_TIER(fp8b_gemv_tc8_tiled, 1, true)
+FP8B_TIER(fp8b_gemv_tc16_tiled, 2, true)
+FP8B_TIER(fp8b_gemv_tc32_tiled, 4, true)
+#undef FP8B_TIER
+
+// A K-slice of a wider FP8 block weight (row-major): W at the slice's first
+// value, S at its first grid column, rows `ldw` values apart (grid rows
+// ldw / 128 scales apart; the slice starts and ends on the 128 grid). The
+// shared expert's down projection under ATLAS_GLM_SHARED_TP_SPLIT.
+#define FP8B_LD_TIER(name, NT)                                                            \
+    extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) name(               \
+        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,         \
+        const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,               \
+        unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,          \
+        unsigned int ldw) {                                                               \
+        mxfp8_gemv_tc_cta<NT, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x, \
+                                           ldw);                                          \
+    }
+FP8B_LD_TIER(fp8b_gemv_tc8_ld, 1)
+FP8B_LD_TIER(fp8b_gemv_tc16_ld, 2)
+FP8B_LD_TIER(fp8b_gemv_tc32_ld, 4)
+#undef FP8B_LD_TIER
+
+// Exact MXFP8 -> BF16 expansion of a row-major W [N, K] / S [N, K/32]:
+// every E4M3 value times a power of two in range is a BF16 value, so this is
+// the checkpoint's math (a transient prefill operand). Eight values a
+// thread; `count8` = N * K / 8.
+extern "C" __global__ void mxfp8_to_bf16(
+    const uint2* __restrict__ W, const unsigned char* __restrict__ S,
+    uint4* __restrict__ out, unsigned long long count8
+) {
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count8) return;
+    const uint2 v = W[i];
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&v);
+    const __nv_bfloat162 sc = mx_scale(S[i / 4u]);
+    unsigned int o[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        __nv_fp8_e4m3 lo, hi;
+        lo.__x = b[2 * j];
+        hi.__x = b[2 * j + 1];
+        __nv_bfloat162 p = __halves2bfloat162(__float2bfloat16((float)lo), __float2bfloat16((float)hi));
+        p = __hmul2(p, sc);
+        o[j] = *reinterpret_cast<unsigned int*>(&p);
+    }
+    out[i] = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
+// The multi-projection launches (mx_multi_impl) for MXFP8 and FP8 block
+// weights, row-major and tiled. Grid: (sum ceil(N_i / 16), 1, 1).
+#define MX_MULTI(name, NT, TILED, B128)                                                   \
+    extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) name(               \
+        const __nv_bfloat16* __restrict__ A,                                              \
+        const unsigned char* W0, const unsigned char* S0, __nv_bfloat16* C0, unsigned int N0, \
+        const unsigned char* W1, const unsigned char* S1, __nv_bfloat16* C1, unsigned int N1, \
+        const unsigned char* W2, const unsigned char* S2, __nv_bfloat16* C2, unsigned int N2, \
+        unsigned int M, unsigned int K) {                                                 \
+        mx_multi_impl<NT, TILED, B128>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, \
+                                       M, K);                                             \
+    }
+MX_MULTI(mxfp8_gemv_tc8_multi, 1, false, false)
+MX_MULTI(mxfp8_gemv_tc16_multi, 2, false, false)
+MX_MULTI(mxfp8_gemv_tc32_multi, 4, false, false)
+MX_MULTI(mxfp8_gemv_tc8_multi_tiled, 1, true, false)
+MX_MULTI(mxfp8_gemv_tc16_multi_tiled, 2, true, false)
+MX_MULTI(mxfp8_gemv_tc32_multi_tiled, 4, true, false)
+MX_MULTI(fp8b_gemv_tc8_multi, 1, false, true)
+MX_MULTI(fp8b_gemv_tc16_multi, 2, false, true)
+MX_MULTI(fp8b_gemv_tc32_multi, 4, false, true)
+MX_MULTI(fp8b_gemv_tc8_multi_tiled, 1, true, true)
+MX_MULTI(fp8b_gemv_tc16_multi_tiled, 2, true, true)
+MX_MULTI(fp8b_gemv_tc32_multi_tiled, 4, true, true)
+#undef MX_MULTI
 
 template <int NT>
 __device__ __forceinline__ void mxfp8_gemv_tc_grouped(
