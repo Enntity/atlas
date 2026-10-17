@@ -136,8 +136,8 @@ impl Glm5KdaLayer {
         );
         // ATLAS_KDA_FLA_GRAPH=1 admits capture of the single-row decode
         // kernels (fixed per-sequence state pointers); multi-row stays eager.
-        let decode_graph_ok = tokens == 1
-            && std::env::var("ATLAS_KDA_FLA_GRAPH").as_deref() == Ok("1");
+        let decode_graph_ok =
+            tokens == 1 && std::env::var("ATLAS_KDA_FLA_GRAPH").as_deref() == Ok("1");
         ensure!(
             !ctx.graph_capture || decode_graph_ok,
             "KDA FLA core is not qualified for graph capture"
