@@ -21,6 +21,7 @@ pub mod nemotron_moe;
 pub mod ngram_embed;
 pub mod ops;
 pub mod ple;
+pub(crate) mod prefill_profile;
 pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
