@@ -164,10 +164,6 @@ fn lz4_compress(b: &[u8]) -> Vec<u8> {
     lz4_flex::compress(b)
 }
 
-fn lz4_decompress_to(b: &[u8], out_len: usize) -> Option<Vec<u8>> {
-    Some(lz4_flex::decompress(b, out_len).unwrap_or_else(|_| vec![]))
-}
-
 fn lz4_decompress(b: &[u8]) -> Option<Vec<u8>> {
     Some(lz4_flex::decompress(b, b.len() * 4).unwrap_or_else(|_| b.to_vec()))
 }

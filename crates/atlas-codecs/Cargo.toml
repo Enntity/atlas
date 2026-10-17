@@ -11,10 +11,6 @@ zstd = { version = "0.13", default-features = false, features = ["zstdmt"] }
 
 [dev-dependencies]
 
-[profile.release]
-opt-level = 3
-lto = true
-
 [[bench]]
 name = "bench_codec"
 harness = false
