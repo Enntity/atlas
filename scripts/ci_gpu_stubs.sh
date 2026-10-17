@@ -31,6 +31,8 @@ int cuCtxGetCurrent(void **a) { (void)a; return 100; }
 int cuCtxSetCurrent(void *a) { (void)a; return 100; }
 int cuCtxGetDevice(int *a) { (void)a; return 100; }
 int cuCtxSynchronize(void) { return 100; }
+int cuCtxPushCurrent_v2(void *a) { (void)a; return 100; }
+int cuCtxPopCurrent_v2(void **a) { (void)a; return 100; }
 int cuDeviceGetAttribute(int *a, unsigned int b, int c) { (void)a; (void)b; (void)c; return 100; }
 /* Errors */
 int cuGetErrorName(int code, const char **out) { (void)code; (void)out; return 100; }
@@ -63,6 +65,15 @@ int cuLaunchKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
 }
 int cuLaunchKernelEx(const void *cfg, void *f, void **p, void **e) {
     (void)cfg; (void)f; (void)p; (void)e; return 100;
+}
+int cuLaunchCooperativeKernel(void *f, unsigned int gx, unsigned int gy, unsigned int gz,
+                              unsigned int bx, unsigned int by, unsigned int bz,
+                              unsigned int sm, void *s, void **p) {
+    (void)f; (void)gx; (void)gy; (void)gz; (void)bx; (void)by; (void)bz;
+    (void)sm; (void)s; (void)p; return 100;
+}
+int cuOccupancyMaxActiveBlocksPerMultiprocessor(int *n, void *f, int bs, unsigned long sm) {
+    (void)n; (void)f; (void)bs; (void)sm; return 100;
 }
 /* Events */
 int cuEventCreate(void **a, unsigned int b) { (void)a; (void)b; return 100; }
@@ -194,6 +205,7 @@ int cublasLtMatmulPreferenceDestroy(void){return 1;}
 int cublasLtMatmulPreferenceSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutCreate(void){return 1;}
 int cublasLtMatrixLayoutDestroy(void){return 1;}
+int cublasLtMatrixLayoutSetAttribute(void){return 1;}
 EOF
 cc -shared -fPIC -nostdlib -o /tmp/libcublasLt.so /tmp/libcublaslt_stub.c
 sudo install -m 0644 /tmp/libcublasLt.so "$DEST/libcublasLt.so"
