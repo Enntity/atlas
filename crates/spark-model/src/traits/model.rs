@@ -1169,7 +1169,7 @@ pub trait Model: Send + Sync {
     fn prepare_vision_embed(
         &self,
         _seq: &mut crate::traits::SequenceState,
-        _images: &[crate::VisionItem],
+        _images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         Ok(())
     }
@@ -1192,7 +1192,7 @@ pub trait Model: Send + Sync {
         seq: &mut crate::traits::SequenceState,
         images: Vec<crate::VisionItem>,
     ) -> Result<()> {
-        self.prepare_vision_embed(seq, &images)
+        self.prepare_vision_embed(seq, images)
     }
 
     /// Derive `seq`'s per-item post-merge grids and content hashes from

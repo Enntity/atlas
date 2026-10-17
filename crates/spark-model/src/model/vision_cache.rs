@@ -176,7 +176,7 @@ impl TransformerModel {
         images: Vec<VisionItem>,
     ) -> Result<()> {
         if self.vision_encoder.is_none() {
-            return self.prepare_vision_embed_dispatch(seq, &images);
+            return self.prepare_vision_embed_dispatch(seq, images);
         }
         let sms = self
             .config

@@ -102,6 +102,7 @@ mod verify_k4_batch_step;
 mod verify_k4_step;
 mod verify_k4_verdict;
 mod verify_pipeline_helper;
+mod vision_release;
 pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
@@ -664,6 +665,10 @@ pub fn run(
                 }
             }
         }
+
+        // Every finished prefill passed through `active`: its pixels (and
+        // their in-flight vision permits) are no longer needed.
+        vision_release::release_prefilled_pixels(&mut active);
 
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();
