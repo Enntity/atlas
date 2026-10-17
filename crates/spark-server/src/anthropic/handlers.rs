@@ -190,12 +190,27 @@ async fn openai_error_to_anthropic(resp: Response) -> Response {
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
         Err(e) => format!("Error body collect: {e}"),
     };
-    let error_type = if parts.status.is_client_error() {
-        "invalid_request_error"
-    } else {
-        "api_error"
-    };
-    anthropic_error(parts.status, error_type, message)
+    let mut resp = anthropic_error(parts.status, anthropic_error_type(parts.status), message);
+    // A deferral's `Retry-After` (a spent vision budget) tells the client when.
+    if let Some(after) = parts.headers.get(axum::http::header::RETRY_AFTER) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, after.clone());
+    }
+    resp
+}
+
+/// Anthropic's `error.type` for an HTTP status (its documented error kinds).
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        400..=499 => "invalid_request_error",
+        _ => "api_error",
+    }
 }
 
 #[cfg(test)]
@@ -215,5 +230,26 @@ mod tests {
         assert_eq!(v["type"], "error");
         assert_eq!(v["error"]["type"], "invalid_request_error");
         assert_eq!(v["error"]["message"], "too many images");
+    }
+
+    #[test]
+    fn each_status_maps_to_its_anthropic_error_type() {
+        for (status, kind) in [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (413, "request_too_large"),
+            (422, "invalid_request_error"),
+            (429, "rate_limit_error"),
+            (500, "api_error"),
+            (503, "overloaded_error"),
+        ] {
+            assert_eq!(
+                anthropic_error_type(StatusCode::from_u16(status).unwrap()),
+                kind,
+                "{status}"
+            );
+        }
     }
 }
