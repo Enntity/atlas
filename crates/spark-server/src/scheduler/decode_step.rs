@@ -207,13 +207,13 @@ impl ActiveSeq {
 /// pick is ordinary text. Leave such thinking steps to the canonical pipeline.
 /// Structural picks are separately stopped at the model's commit boundary.
 fn exl3_spec_processors_idle(a: &ActiveSeq, sched: &crate::scheduler::sched_ctx::SchedCtx) -> bool {
-    !sched.levers.adadec_diagnostic
-        && !(a.inside_thinking
-            && !sched.levers.disable_watchdogs
-            && sched.watchdog.confidence_early_stop)
-        // Unlimited thinking still has the serial hard override; avoid a
-        // speculative block crossing that otherwise untracked boundary.
-        && !(a.inside_thinking && a.thinking_budget.is_none())
+    let confidence_watch = a.inside_thinking
+        && !sched.levers.disable_watchdogs
+        && sched.watchdog.confidence_early_stop;
+    // Unlimited thinking still has the serial hard override; avoid a
+    // speculative block crossing that otherwise untracked boundary.
+    let unlimited_thinking = a.inside_thinking && a.thinking_budget.is_none();
+    !(sched.levers.adadec_diagnostic || confidence_watch || unlimited_thinking)
 }
 
 /// The F4 EXL3 speculative lane emits raw verify argmaxes, so it only takes
