@@ -14,7 +14,9 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense_auto, detect_nvfp4_varian
 
 pub struct Qwen35WeightLoader;
 
-fn vision_dense_auto(
+/// A vision linear `{prefix}.weight` as BF16: BF16 as stored, FP8 (MXFP8
+/// or block) and W4A16 NVFP4 expanded, F32 narrowed. Shared with the GLM ViT.
+pub(crate) fn vision_dense_auto(
     store: &WeightStore,
     prefix: &str,
     gpu: &dyn GpuBackend,

@@ -149,4 +149,4 @@ pub(super) fn lm_head_bf16(store: &WeightStore, gpu: &dyn GpuBackend) -> Result<
 
 #[cfg(test)]
 #[path = "fp4l_tests.rs"]
-mod tests;
+pub(super) mod tests;
