@@ -224,7 +224,7 @@ impl MoeLayer {
                 ops::fp8b_prefill_gemm(
                     ctx.gpu,
                     &kernels,
-                    ctx.buffers,
+                    ops::Fp8ActScratch::of(ctx.buffers),
                     mode,
                     w,
                     input,
@@ -262,7 +262,7 @@ impl MoeLayer {
             ops::fp8b_prefill_gemm(
                 ctx.gpu,
                 &kernels,
-                ctx.buffers,
+                ops::Fp8ActScratch::of(ctx.buffers),
                 native.gemm_mode(),
                 &native.down,
                 gate_out,

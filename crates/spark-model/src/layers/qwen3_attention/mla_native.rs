@@ -116,7 +116,7 @@ impl Qwen3AttentionLayer {
         ops::fp8b_prefill_gemm(
             ctx.gpu,
             &kernels,
-            ctx.buffers,
+            ops::Fp8ActScratch::of(ctx.buffers),
             mode,
             w,
             input,

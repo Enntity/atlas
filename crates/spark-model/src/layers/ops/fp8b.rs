@@ -377,13 +377,35 @@ impl Fp8bPrefill {
     }
 }
 
-/// Rows per W8A8 GEMM so a `[rows, k]` E4M3 image and its `[rows, k/128]`
-/// f32 scales fit the arena's FP8 activation scratch (a multiple of 64, the
-/// GEMM's row tile; the GEMM is row-invariant, so chunking changes nothing).
-fn w8a8_chunk_rows(buffers: &BufferArena, k: usize) -> usize {
-    let q = buffers.fp8_act_bytes() / k;
-    let s = buffers.sizes().fp8_act_scale / (k / FP8_BLOCK * 4);
-    (q.min(s) / 64) * 64
+/// The W8A8 prefill's activation scratch: an E4M3 image and its per-token
+/// per-128 f32 scales (the arena's `fp8_act` / `fp8_act_scale`).
+#[derive(Debug, Clone, Copy)]
+pub struct Fp8ActScratch {
+    pub act: DevicePtr,
+    pub act_bytes: usize,
+    pub scale: DevicePtr,
+    pub scale_bytes: usize,
+}
+
+impl Fp8ActScratch {
+    /// The arena's FP8 activation scratch.
+    pub fn of(buffers: &BufferArena) -> Self {
+        Self {
+            act: buffers.fp8_act(),
+            act_bytes: buffers.fp8_act_bytes(),
+            scale: buffers.fp8_act_scale(),
+            scale_bytes: buffers.sizes().fp8_act_scale,
+        }
+    }
+
+    /// Rows per W8A8 GEMM so a `[rows, k]` E4M3 image and its `[rows, k/128]`
+    /// f32 scales fit (a multiple of 64, the GEMM's row tile; the GEMM is
+    /// row-invariant, so chunking changes nothing).
+    fn chunk_rows(&self, k: usize) -> usize {
+        let q = self.act_bytes / k;
+        let s = self.scale_bytes / (k / FP8_BLOCK * 4);
+        (q.min(s) / 64) * 64
+    }
 }
 
 /// `output[m, n] = input[m, k] · W^T` for prefill on FP8 block twin `w`
@@ -392,7 +414,7 @@ fn w8a8_chunk_rows(buffers: &BufferArena, k: usize) -> usize {
 pub fn fp8b_prefill_gemm(
     gpu: &dyn GpuBackend,
     kernels: &NativeKernels,
-    buffers: &BufferArena,
+    scratch: Fp8ActScratch,
     mode: Fp8bPrefill,
     w: &Fp8BlockWeight,
     input: DevicePtr,
@@ -428,12 +450,12 @@ pub fn fp8b_prefill_gemm(
                 kernels.act_quant.0 != 0 && kernels.w8a8_gemm.0 != 0,
                 "per_token_group_quant_fp8 / fp8_gemm_t_blockscaled are missing"
             );
-            let chunk = w8a8_chunk_rows(buffers, k);
+            let chunk = scratch.chunk_rows(k);
             ensure!(
                 chunk > 0,
-                "FP8 W8A8 prefill: the arena's FP8 scratch holds no 64-row [_, {k}] tile"
+                "FP8 W8A8 prefill: the FP8 scratch holds no 64-row [_, {k}] tile"
             );
-            let (act, act_scale) = (buffers.fp8_act(), buffers.fp8_act_scale());
+            let (act, act_scale) = (scratch.act, scratch.scale);
             for first in (0..m).step_by(chunk) {
                 let rows = (m - first).min(chunk) as u32;
                 super::per_token_group_quant_fp8(
