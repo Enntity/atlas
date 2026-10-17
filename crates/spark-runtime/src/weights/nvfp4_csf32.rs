@@ -51,6 +51,8 @@ pub const CSF32_SUFFIXES: [&str; 5] = [
     ".csf32_offsets",
     ".csf32_exceptions",
 ];
+/// Element width of each component, in [`CSF32_SUFFIXES`] order.
+pub(crate) const CSF32_ELEM_BYTES: [usize; 5] = [1, 1, 4, 2, 2];
 
 /// Rows per block.
 const BLOCK_ROWS: usize = 32;

@@ -34,10 +34,18 @@
 //! resident-only codecs (`codec` 1/2, 8-row selector/mantissa planes) that are
 //! never serialized; a tensor named like a CSF part but shaped like neither is
 //! refused by the shape checks rather than guessed at. MXFP4 has no CSF form.
+//!
+//! The newer block encoding (`"csf_32x2_v1"`, five components per scale) is
+//! decoded by [`super::nvfp4_csf32`]; [`CsfAssembler`] gathers and decodes
+//! both, so a loader routes every part of either encoding through one place.
 
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+
+use super::nvfp4_csf32::{CSF32_ELEM_BYTES, CSF32_SUFFIXES};
+
+#[path = "nvfp4_csf_assembler.rs"]
+mod assembler;
+pub use assembler::{CsfAssembler, DecodedScale};
 
 /// Suffix of the fixed stream.
 pub const CSF_FIXED_SUFFIX: &str = ".nvfp4_csf_fixed";
@@ -53,30 +61,110 @@ const SLAB: usize = 16;
 /// The exception position field is 24 bits wide.
 const POSITION_BITS: u32 = 24;
 
-/// Which half of a CSF pair a tensor name is.
+/// How a compressed scale is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CsfPart {
-    Fixed,
-    Exceptions,
+pub enum CsfEncoding {
+    /// `"csf"`: a fixed stream and an exception stream (this module).
+    Slab,
+    /// `"csf_32x2_v1"`: five components ([`super::nvfp4_csf32`]).
+    Blocks32,
 }
 
-/// `Some((decoded_name, part))` when `name` is half of a CSF pair. The decoded
-/// name is the tensor the pair stands in for (`...weight_scale`).
-pub fn csf_part(name: &str) -> Option<(&str, CsfPart)> {
-    if let Some(base) = name.strip_suffix(CSF_FIXED_SUFFIX) {
-        Some((base, CsfPart::Fixed))
-    } else {
-        name.strip_suffix(CSF_EXCEPTIONS_SUFFIX)
-            .map(|base| (base, CsfPart::Exceptions))
+impl CsfEncoding {
+    fn part_count(self) -> usize {
+        match self {
+            Self::Slab => 2,
+            Self::Blocks32 => CSF32_SUFFIXES.len(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Slab => "CSF",
+            Self::Blocks32 => "csf_32x2_v1",
+        }
     }
 }
 
-/// The decoded size, in bytes, of a fixed stream of this shape — what the
-/// pair costs once uploaded. Used by the pre-flight estimate, which would
-/// otherwise count the 3.6 GB compressed and miss 3.9 GB of the 7.5 GB that
-/// lands on the device.
-pub fn decoded_len(fixed_shape: &[usize]) -> Option<usize> {
-    geometry(fixed_shape).ok().map(|(_, _, total)| total)
+/// Which component of a compressed scale a tensor name is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsfPart {
+    /// Slab: the U8 fixed stream.
+    Fixed,
+    /// Slab: the U32 exception words.
+    Exceptions,
+    /// `csf_32x2_v1`: U8 row bases.
+    Bases,
+    /// `csf_32x2_v1`: U8 packed 4-bit offsets.
+    Codes,
+    /// `csf_32x2_v1`: U32 page origins (bytes) in the exception arena.
+    PageBases,
+    /// `csf_32x2_v1`: U16 per-page record prefixes.
+    Offsets,
+    /// `csf_32x2_v1`: U16 exception records.
+    BlockExceptions,
+}
+
+/// Every component suffix with its part.
+const PARTS: [(&str, CsfPart); 7] = [
+    (CSF_FIXED_SUFFIX, CsfPart::Fixed),
+    (CSF_EXCEPTIONS_SUFFIX, CsfPart::Exceptions),
+    (CSF32_SUFFIXES[0], CsfPart::Bases),
+    (CSF32_SUFFIXES[1], CsfPart::Codes),
+    (CSF32_SUFFIXES[2], CsfPart::PageBases),
+    (CSF32_SUFFIXES[3], CsfPart::Offsets),
+    (CSF32_SUFFIXES[4], CsfPart::BlockExceptions),
+];
+
+impl CsfPart {
+    pub fn encoding(self) -> CsfEncoding {
+        match self {
+            Self::Fixed | Self::Exceptions => CsfEncoding::Slab,
+            _ => CsfEncoding::Blocks32,
+        }
+    }
+
+    /// Position among its encoding's parts.
+    fn slot(self) -> usize {
+        match self {
+            Self::Fixed | Self::Bases => 0,
+            Self::Exceptions | Self::Codes => 1,
+            Self::PageBases => 2,
+            Self::Offsets => 3,
+            Self::BlockExceptions => 4,
+        }
+    }
+
+    /// Bytes per element.
+    fn elem_bytes(self) -> usize {
+        match self.encoding() {
+            CsfEncoding::Slab => [1, 4][self.slot()],
+            CsfEncoding::Blocks32 => CSF32_ELEM_BYTES[self.slot()],
+        }
+    }
+}
+
+/// `Some((decoded_name, part))` when `name` is a component of a compressed
+/// scale, in either encoding. The decoded name is the tensor the components
+/// stand in for (`...weight_scale`).
+pub fn csf_part(name: &str) -> Option<(&str, CsfPart)> {
+    PARTS
+        .iter()
+        .find_map(|&(suffix, part)| name.strip_suffix(suffix).map(|base| (base, part)))
+}
+
+/// What a component of this shape costs once its scale is decoded and
+/// uploaded: the whole decoded matrix for the one part that sizes it (the
+/// slab fixed stream, or the `csf_32x2_v1` codes at two scales per byte), 0
+/// for the others. Used by the pre-flight estimate, which would otherwise
+/// count the 3.6 GB compressed and miss 3.9 GB of the 7.5 GB that lands on
+/// the device (Qwen FP4-Local). `None` for a shape whose size overflows.
+pub fn decoded_len(part: CsfPart, shape: &[usize]) -> Option<usize> {
+    match part {
+        CsfPart::Fixed => geometry(shape).ok().map(|(_, _, total)| total),
+        CsfPart::Codes => shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d)),
+        _ => Some(0),
+    }
 }
 
 /// `(rows, cols, rows * cols)` of the decoded matrix, from the fixed stream's
@@ -101,31 +189,6 @@ fn geometry(fixed_shape: &[usize]) -> Result<(usize, usize, usize)> {
         .checked_mul(cols)
         .with_context(|| format!("CSF fixed stream {fixed_shape:?}: decoded size overflows"))?;
     Ok((rows, cols, total))
-}
-
-/// Refuse a decoded `[rows, cols]` scale that is not the `[n, k/16]` E4M3
-/// matrix its packed NVFP4 weight `[n, k/2]` needs.
-fn check_against_weight(scale: &str, got: [usize; 2], weight: Option<&[usize]>) -> Result<()> {
-    let wname = scale
-        .strip_suffix("_scale")
-        .filter(|w| w.ends_with(".weight"))
-        .with_context(|| format!("CSF scale {scale} is not a `.weight_scale`"))?;
-    let Some(w) = weight else {
-        bail!("CSF scale {scale} decoded, but there is no `{wname}` for it to scale");
-    };
-    let want = match *w {
-        [n, k_packed] => k_packed
-            .checked_mul(2)
-            .filter(|k| k % 16 == 0)
-            .map(|k| [n, k / 16]),
-        _ => None,
-    };
-    ensure!(
-        want == Some(got),
-        "CSF scale {scale} decoded to {got:?}, but its weight `{wname}` {w:?} needs \
-         {want:?} ([n, k/2] packed NVFP4 -> [n, k/16])"
-    );
-    Ok(())
 }
 
 /// Decode one CSF pair to the E4M3 `[rows, cols]` scale matrix, as raw bytes.
@@ -221,161 +284,10 @@ pub(crate) fn check_decoded_scales(out: &[u8], cols: usize, what: &str) -> Resul
     Ok(())
 }
 
-/// One decoded `weight_scale`, ready to upload as FP8 E4M3.
-pub struct DecodedScale {
-    pub name: String,
-    pub shape: Vec<usize>,
-    pub bytes: Vec<u8>,
-}
-
-struct Part {
-    shape: Vec<usize>,
-    bytes: Vec<u8>,
-}
-
-/// Pairs CSF halves as a loader streams tensors past it, in any order and
-/// across shards, and decodes each pair once both halves have arrived.
-///
-/// The disk loaders (`SafetensorsLoader`, `FastSafetensorsLoader`) route CSF
-/// parts here instead of uploading them, so the store only ever sees the
-/// decoded `weight_scale`, and the U32 exception stream (a dtype the store
-/// does not carry) never reaches it. The RDMA weight tier, which copies
-/// tensors as they are, refuses CSF parts.
-///
-/// It is also the one place that knows which scales came from a pair, so the
-/// loaders report every plain tensor too ([`Self::note_plain`]): a scale both
-/// plain and CSF-compressed is refused whichever arrives first.
-#[derive(Default)]
-pub struct CsfAssembler {
-    pending: HashMap<String, (Option<Part>, Option<Part>)>,
-    /// Every scale decoded so far, with its `[rows, cols]`.
-    decoded: HashMap<String, [usize; 2]>,
-    /// Plain `.weight_scale` tensors the loader uploaded as they were.
-    plain_scales: HashSet<String>,
-    bytes_in: usize,
-    bytes_out: usize,
-    time: Duration,
-}
-
-impl CsfAssembler {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Hand over one CSF half. Returns the decoded scale when this completes a
-    /// pair, `None` while its partner is still to come.
-    pub fn offer(
-        &mut self,
-        name: &str,
-        shape: &[usize],
-        bytes: &[u8],
-    ) -> Result<Option<DecodedScale>> {
-        let (base, part) =
-            csf_part(name).with_context(|| format!("{name} is not a CSF stream tensor"))?;
-        let elem: usize = match part {
-            CsfPart::Fixed => 1,
-            CsfPart::Exceptions => 4,
-        };
-        // The byte length against the header shape pins the dtype (U8 vs U32)
-        // without trusting the dtype string: a stream with the other width
-        // cannot satisfy both.
-        let want = shape
-            .iter()
-            .try_fold(elem, |n, &d| n.checked_mul(d))
-            .with_context(|| format!("{name}: shape {shape:?} overflows"))?;
-        ensure!(
-            want == bytes.len(),
-            "{name}: {} bytes for shape {shape:?} — expected {want} ({})",
-            bytes.len(),
-            if elem == 1 { "U8" } else { "U32" },
-        );
-        ensure!(
-            !self.plain_scales.contains(base),
-            "{base} is in the checkpoint both plain and CSF-compressed"
-        );
-        let slot = self.pending.entry(base.to_string()).or_default();
-        let held = match part {
-            CsfPart::Fixed => &mut slot.0,
-            CsfPart::Exceptions => &mut slot.1,
-        };
-        ensure!(held.is_none(), "{name} appears twice");
-        *held = Some(Part {
-            shape: shape.to_vec(),
-            bytes: bytes.to_vec(),
-        });
-        if slot.0.is_none() || slot.1.is_none() {
-            return Ok(None);
-        }
-        let Some((Some(fixed), Some(exc))) = self.pending.remove(base) else {
-            unreachable!("both halves were just checked present")
-        };
-        let t = Instant::now();
-        let (out, [rows, cols]) = decode_nvfp4_csf(&fixed.bytes, &fixed.shape, &exc.bytes)
-            .with_context(|| format!("decoding CSF scale {base}"))?;
-        self.time += t.elapsed();
-        self.decoded.insert(base.to_string(), [rows, cols]);
-        self.bytes_in += fixed.bytes.len() + exc.bytes.len();
-        self.bytes_out += out.len();
-        Ok(Some(DecodedScale {
-            name: base.to_string(),
-            shape: vec![rows, cols],
-            bytes: out,
-        }))
-    }
-
-    /// Report a tensor the loader uploaded as it was (not a CSF half).
-    /// Refuses a scale the assembler already decoded from a pair, and
-    /// remembers a plain `weight_scale` so a later pair for it is refused.
-    pub fn note_plain(&mut self, name: &str) -> Result<()> {
-        ensure!(
-            !self.decoded.contains_key(name),
-            "{name} is in the checkpoint both plain and CSF-compressed"
-        );
-        if name.ends_with(".weight_scale") {
-            self.plain_scales.insert(name.to_string());
-        }
-        Ok(())
-    }
-
-    /// Refuse a load that left a half without its partner, or decoded a scale
-    /// that is not the `[n, k/16]` its packed weight `[n, k/2]` needs
-    /// (`weight_shape` looks a loaded or deferred tensor's shape up by name),
-    /// and log what the decode cost. A lone half means a scale the model will
-    /// look for and not find — or worse, find stale — so it is an error, not a
-    /// warning.
-    ///
-    /// The shape check runs here, at the end of the load and before any store
-    /// exists, rather than before each upload: a pair and its weight can sit
-    /// in different shards, in either order.
-    pub fn finish(self, weight_shape: impl Fn(&str) -> Option<Vec<usize>>) -> Result<()> {
-        if !self.pending.is_empty() {
-            let mut names: Vec<_> = self.pending.keys().take(4).cloned().collect();
-            names.sort();
-            bail!(
-                "{} CSF scale stream(s) without a partner, e.g. {names:?} — the \
-                 checkpoint is incomplete or a skip filter split a pair",
-                self.pending.len()
-            );
-        }
-        for (name, &got) in &self.decoded {
-            let w = name.strip_suffix("_scale").and_then(&weight_shape);
-            check_against_weight(name, got, w.as_deref())?;
-        }
-        if !self.decoded.is_empty() {
-            let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
-            tracing::info!(
-                "Decoded {} CSF NVFP4 scale matrices: {:.2} GiB compressed -> {:.2} GiB E4M3 \
-                 in {:.2} s on the load thread",
-                self.decoded.len(),
-                gib(self.bytes_in),
-                gib(self.bytes_out),
-                self.time.as_secs_f64(),
-            );
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 #[path = "nvfp4_csf_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "csf_checkpoint_tests.rs"]
+mod checkpoint_tests;

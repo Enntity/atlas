@@ -265,3 +265,155 @@ fn a_scale_both_plain_and_csf_refuses_the_load() {
     );
     both_refuse(&dir.0, "both plain and CSF");
 }
+
+// ---- csf_32x2_v1 --------------------------------------------------------------
+
+const C32_DOWN: &str = "model.language_model.layers.3.mlp.experts.0.down_proj.weight_scale";
+const C32_SYN: &str = "model.language_model.layers.3.mlp.experts.1.up_proj.weight_scale";
+
+fn csf32_file(name: &str) -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_data/nvfp4_csf32")
+            .join(name),
+    )
+    .unwrap()
+}
+
+/// A tensor with an owned name: `(name, dtype, shape, bytes)`.
+type Owned = (String, &'static str, Vec<usize>, Vec<u8>);
+
+/// Two shards under `tensors/`: a real GLM down_proj scale ([4096, 128]) and
+/// the synthetic odd-`C` one ([160, 133]), each scale's five components
+/// alternating between the shards, the weights in the shard opposite their
+/// first component. `drop` leaves one component of the down scale out.
+fn csf32_checkpoint(dir: &Path, drop: Option<&str>) -> Vec<PathBuf> {
+    let comps = [
+        ("bases", "U8", 1),
+        ("codes", "U8", 1),
+        ("page_bases", "U32", 4),
+        ("offsets", "U16", 2),
+        ("exceptions", "U16", 2),
+    ];
+    let mut owned: [Vec<Owned>; 2] = Default::default();
+    for (scale, tag, w_shape) in [
+        (C32_DOWN, "l3_e0_down", [4096, 1024]),
+        (C32_SYN, "syn_160x133", [160, 1064]),
+    ] {
+        for (i, (part, dtype, elem)) in comps.into_iter().enumerate() {
+            if scale == C32_DOWN && drop == Some(part) {
+                continue;
+            }
+            let bytes = csf32_file(&format!("{tag}.{part}.bin"));
+            let shape = vec![bytes.len() / elem];
+            owned[i % 2].push((format!("{scale}.csf32_{part}"), dtype, shape, bytes));
+        }
+        let w = scale.strip_suffix("_scale").unwrap().to_string();
+        owned[1].push((w, "U8", w_shape.to_vec(), vec![3; w_shape[0] * w_shape[1]]));
+    }
+    let mut map = serde_json::Map::new();
+    let mut paths = Vec::new();
+    for (s, tensors) in ["a", "b"].iter().zip(&owned) {
+        let shard = format!("tensors/{s}.safetensors");
+        let t: Vec<T<'_>> = tensors
+            .iter()
+            .map(|(n, d, sh, b)| (n.as_str(), *d, sh.clone(), b.clone()))
+            .collect();
+        write_shard(&dir.join(&shard), &t);
+        for (n, ..) in tensors {
+            map.insert(n.clone(), shard.clone().into());
+        }
+        paths.push(dir.join(&shard));
+    }
+    std::fs::write(
+        dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({ "weight_map": map })).unwrap(),
+    )
+    .unwrap();
+    paths
+}
+
+fn csf32_golden_sha(tag: &str) -> String {
+    let doc: serde_json::Value = serde_json::from_slice(&csf32_file("golden.json")).unwrap();
+    doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["tag"] == tag)
+        .unwrap()["decoded_sha256"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn check_csf32(store: &WeightStore, gpu: &MockGpuBackend, which: &str) {
+    for (name, tag, shape) in [
+        (C32_DOWN, "l3_e0_down", [4096, 128]),
+        (C32_SYN, "syn_160x133", [160, 133]),
+    ] {
+        let t = store.get(name).unwrap_or_else(|e| panic!("{which}: {e}"));
+        assert_eq!(t.dtype, WeightDtype::FP8E4M3, "{which}: {name}");
+        assert_eq!(t.shape, shape.to_vec(), "{which}: {name}");
+        let sha: String = Sha256::digest(gpu.read_alloc(t.ptr).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(sha, csf32_golden_sha(tag), "{which}: {name} decoded wrong");
+    }
+    assert!(
+        store.names().all(|n| nvfp4_csf::csf_part(n).is_none()),
+        "{which}: a CSF component reached the store"
+    );
+    assert_eq!(store.len(), 4, "{which}: two scales + two weights");
+}
+
+/// The GLM layout: five components per scale, split across shards, U16 and
+/// U32 dtypes the store never carries. Both loaders present each scale as
+/// the plain F8_E4M3 `weight_scale` the reference decodes it to, and the
+/// pre-flight counts it at its decoded size.
+#[test]
+fn both_loaders_decode_csf32_scales_split_across_shards() {
+    let dir = Dir::new("c32");
+    let shards = csf32_checkpoint(&dir.0, None);
+
+    let gpu = MockGpuBackend::new();
+    let store = SafetensorsLoader::new().load(&dir.0, &gpu, 0).unwrap();
+    check_csf32(&store, &gpu, "mmap");
+
+    let gpu = MockGpuBackend::new();
+    let mut fast = FastSafetensorsLoader::new();
+    fast.try_direct_io = false;
+    let store = fast.load(&dir.0, &gpu, 0).unwrap();
+    check_csf32(&store, &gpu, "fast");
+
+    assert_eq!(
+        estimate_load_bytes(&shards, &|_| false).unwrap(),
+        4096 * 128 + 160 * 133 + 4096 * 1024 + 160 * 1064
+    );
+}
+
+/// A scale missing any one of its five components fails the load.
+#[test]
+fn a_csf32_scale_missing_a_component_refuses_the_load() {
+    for part in ["bases", "page_bases", "exceptions"] {
+        let dir = Dir::new("c32lone");
+        csf32_checkpoint(&dir.0, Some(part));
+        both_refuse(&dir.0, "without a partner");
+    }
+}
+
+/// Under EP the remote expert's five components are all skipped.
+#[test]
+fn ep_skips_every_component_of_a_remote_csf32_scale() {
+    let dir = Dir::new("c32ep");
+    csf32_checkpoint(&dir.0, None);
+    let gpu = MockGpuBackend::new();
+    let mut fast = FastSafetensorsLoader::with_ep(1, 2, 2);
+    fast.try_direct_io = false;
+    let store = fast.load(&dir.0, &gpu, 0).unwrap();
+    assert!(store.contains(C32_SYN) && !store.contains(C32_DOWN));
+    let store = SafetensorsLoader::with_ep(0, 2, 2)
+        .load(&dir.0, &gpu, 0)
+        .unwrap();
+    assert!(store.contains(C32_DOWN) && !store.contains(C32_SYN));
+}

@@ -119,7 +119,13 @@ fn golden_scales_decode_byte_identical_to_the_reference() {
         if g.tag.starts_with("syn_") {
             assert_eq!(out, synthetic(shape[0], shape[1]), "{}", g.tag);
         }
+        let codes_shape = [g.parts[1].len()];
+        assert_eq!(decoded_len_of_codes(&codes_shape), Some(out.len()));
     }
+}
+
+pub(crate) fn decoded_len_of_codes(shape: &[usize]) -> Option<usize> {
+    super::super::nvfp4_csf::decoded_len(super::super::nvfp4_csf::CsfPart::Codes, shape)
 }
 
 /// Decoding a mutated golden must not reproduce the reference: either it is

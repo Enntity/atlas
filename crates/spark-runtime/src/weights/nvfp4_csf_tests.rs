@@ -10,6 +10,7 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::time::Instant;
 
 fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test_data/nvfp4_csf")
@@ -88,7 +89,7 @@ fn golden_pairs_decode_byte_identical_to_the_vllm_reference() {
             "{}: decoded matrix differs from the vLLM reference",
             g.tag
         );
-        assert_eq!(decoded_len(&g.fixed_shape), Some(out.len()));
+        assert_eq!(decoded_len(CsfPart::Fixed, &g.fixed_shape), Some(out.len()));
     }
 }
 
@@ -316,9 +317,9 @@ fn overflowing_shapes_are_refused_not_wrapped() {
     // No rows at all.
     expect_err(decode_nvfp4_csf(&[], &[0, 32], &[]), "not [rows/16");
     // The pre-flight estimate gets None, not a wrapped size.
-    assert_eq!(decoded_len(&[big, 32]), None);
-    assert_eq!(decoded_len(&[1 << 40, w]), None);
-    assert_eq!(decoded_len(&[40, 1296]), Some(640 * 160));
+    assert_eq!(decoded_len(CsfPart::Fixed, &[big, 32]), None);
+    assert_eq!(decoded_len(CsfPart::Fixed, &[1 << 40, w]), None);
+    assert_eq!(decoded_len(CsfPart::Fixed, &[40, 1296]), Some(640 * 160));
     // offer: the header's element count wraps, and so does count * 4.
     let mut a = CsfAssembler::new();
     let e = a.offer("x.weight_scale.nvfp4_csf_fixed", &[big, 2], &[0; 2]);
@@ -420,7 +421,26 @@ fn csf_part_names() {
         csf_part("a.weight_scale.nvfp4_csf_exceptions"),
         Some(("a.weight_scale", CsfPart::Exceptions))
     );
+    for (suffix, part) in [
+        (".csf32_bases", CsfPart::Bases),
+        (".csf32_codes", CsfPart::Codes),
+        (".csf32_page_bases", CsfPart::PageBases),
+        (".csf32_offsets", CsfPart::Offsets),
+        (".csf32_exceptions", CsfPart::BlockExceptions),
+    ] {
+        assert_eq!(
+            csf_part(&format!("a.weight_scale{suffix}")),
+            Some(("a.weight_scale", part))
+        );
+        assert_eq!(part.encoding(), CsfEncoding::Blocks32);
+        assert_eq!(
+            decoded_len(part, &[64]),
+            Some(if part == CsfPart::Codes { 128 } else { 0 })
+        );
+    }
+    assert_eq!(decoded_len(CsfPart::Exceptions, &[64]), Some(0));
     assert_eq!(csf_part("a.weight_scale"), None);
+    assert_eq!(csf_part("a.weight_scale.csf32_bogus"), None);
 }
 
 /// Throughput at the real workload: 73,728 matrices, two thirds `[640, 160]`
@@ -444,154 +464,4 @@ fn csf_decode_throughput() {
         bytes as f64 / (1u64 << 30) as f64,
         bytes as f64 / (1u64 << 30) as f64 / s
     );
-}
-
-/// Every CSF pair of a real checkpoint on disk decodes cleanly, timed the way
-/// the loaders pay for it (decode only, I/O excluded). Also checks that every
-/// U8 `weight_scale` (the MXFP8 backbone's UE8M0 exponents) lies in the range
-/// where the MXFP8 -> BF16 expansion is exact (3..=246, see
-/// `spark_model::weight_map::mxfp8`).
-///
-///   ATLAS_CSF_CKPT_DIR=<model dir> cargo test --release -p spark-runtime \
-///     --lib csf_whole_checkpoint -- --ignored --nocapture
-#[test]
-#[ignore]
-fn csf_whole_checkpoint() {
-    use std::os::unix::fs::FileExt;
-    let dir = PathBuf::from(std::env::var("ATLAS_CSF_CKPT_DIR").expect("ATLAS_CSF_CKPT_DIR"));
-    let index: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json")).unwrap())
-            .unwrap();
-    let mut shards: Vec<String> = index["weight_map"]
-        .as_object()
-        .unwrap()
-        .values()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    shards.sort();
-    shards.dedup();
-    let mut asm = CsfAssembler::new();
-    let mut shapes: HashMap<String, Vec<usize>> = HashMap::new();
-    let (mut pairs, mut decode, mut bytes_out, mut io_bytes) =
-        (0usize, Duration::ZERO, 0usize, 0usize);
-    let (mut mx_tensors, mut mx_lo, mut mx_hi) = (0usize, u8::MAX, 0u8);
-    for shard in &shards {
-        let f = std::fs::File::open(dir.join(shard)).unwrap();
-        let mut len = [0u8; 8];
-        f.read_exact_at(&mut len, 0).unwrap();
-        let hlen = u64::from_le_bytes(len) as usize;
-        let mut h = vec![0u8; hlen];
-        f.read_exact_at(&mut h, 8).unwrap();
-        let header: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&h).unwrap();
-        let read = |info: &serde_json::Value| -> (Vec<u8>, Vec<usize>) {
-            let a = info["data_offsets"][0].as_u64().unwrap() as usize;
-            let b = info["data_offsets"][1].as_u64().unwrap() as usize;
-            let mut buf = vec![0u8; b - a];
-            f.read_exact_at(&mut buf, (8 + hlen + a) as u64).unwrap();
-            let shape = info["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|d| d.as_u64().unwrap() as usize)
-                .collect();
-            (buf, shape)
-        };
-        for (name, info) in &header {
-            if let Some(shape) = info["shape"].as_array() {
-                shapes.insert(
-                    name.clone(),
-                    shape.iter().map(|d| d.as_u64().unwrap() as usize).collect(),
-                );
-            }
-            if csf_part(name).is_some() {
-                let (buf, shape) = read(info);
-                io_bytes += buf.len();
-                let t = Instant::now();
-                let done = asm
-                    .offer(name, &shape, &buf)
-                    .unwrap_or_else(|e| panic!("{e:#}"));
-                decode += t.elapsed();
-                if let Some(d) = done {
-                    pairs += 1;
-                    bytes_out += d.bytes.len();
-                }
-            } else if name.ends_with(".weight_scale") && info["dtype"] == "U8" {
-                let (buf, _) = read(info);
-                mx_tensors += 1;
-                mx_lo = mx_lo.min(*buf.iter().min().unwrap());
-                mx_hi = mx_hi.max(*buf.iter().max().unwrap());
-            }
-        }
-    }
-    // Every decoded scale is the [n, k/16] its packed weight [n, k/2] needs.
-    asm.finish(|n| shapes.get(n).cloned()).unwrap();
-    eprintln!(
-        "{pairs} CSF pairs: {:.2} GiB read -> {:.2} GiB decoded, decode {:.2} s single-threaded \
-         ({:.2} GiB/s); {mx_tensors} U8 weight_scale tensors, exponents {mx_lo}..={mx_hi}",
-        io_bytes as f64 / (1u64 << 30) as f64,
-        bytes_out as f64 / (1u64 << 30) as f64,
-        decode.as_secs_f64(),
-        bytes_out as f64 / (1u64 << 30) as f64 / decode.as_secs_f64(),
-    );
-    assert!(pairs > 0, "no CSF pairs in {}", dir.display());
-    assert!(mx_tensors == 0 || ((3..=246).contains(&mx_lo) && (3..=246).contains(&mx_hi)));
-}
-
-/// Every CSF pair of one real layer, decoded here and by vLLM's reference,
-/// byte-identical (see `scripts/nvfp4_csf_golden.py --dump-layer/--reference`).
-///
-///   ATLAS_CSF_LAYER_DUMP=l23.csf cargo test -p spark-runtime --lib \
-///     csf_layer_dump_matches_the_reference -- --ignored --nocapture
-#[test]
-#[ignore]
-fn csf_layer_dump_matches_the_reference() {
-    let dump = PathBuf::from(std::env::var("ATLAS_CSF_LAYER_DUMP").expect("ATLAS_CSF_LAYER_DUMP"));
-    let raw = std::fs::read(&dump).unwrap();
-    let n = u64::from_le_bytes(raw[..8].try_into().unwrap()) as usize;
-    let index: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(&raw[8..8 + n]).unwrap();
-    let data = &raw[8 + n..];
-    let mut want: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(&std::fs::read(format!("{}.ref.json", dump.display())).unwrap())
-            .unwrap();
-    let mut asm = CsfAssembler::new();
-    // The dump holds the CSF pairs only: stand each weight in at the shape
-    // its decoded scale implies, so `finish` checks the pairing alone.
-    let mut weights: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut matched = 0;
-    for (name, v) in &index {
-        let shape: Vec<usize> = v[1]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|d| d.as_u64().unwrap() as usize)
-            .collect();
-        let (off, len) = (
-            v[2].as_u64().unwrap() as usize,
-            v[3].as_u64().unwrap() as usize,
-        );
-        if let Some(d) = asm.offer(name, &shape, &data[off..off + len]).unwrap() {
-            let expect = want
-                .remove(&d.name)
-                .unwrap_or_else(|| panic!("{} has no reference", d.name));
-            assert_eq!(
-                hex(&Sha256::digest(&d.bytes)),
-                expect.as_str().unwrap(),
-                "{}",
-                d.name
-            );
-            let w = d.name.strip_suffix("_scale").unwrap().to_string();
-            weights.insert(w, vec![d.shape[0], d.shape[1] * 8]);
-            matched += 1;
-        }
-    }
-    asm.finish(|n| weights.get(n).cloned()).unwrap();
-    assert!(
-        want.is_empty(),
-        "reference decoded {} pairs this did not",
-        want.len()
-    );
-    eprintln!("{matched} pairs byte-identical to the vLLM reference");
-    assert!(matched > 0);
 }

@@ -271,16 +271,12 @@ pub(crate) fn estimate_load_bytes(
             if skip_fn(&name) {
                 continue;
             }
-            // A CSF pair lands as its DECODED scale, 2.1x the compressed bytes
-            // on FP4-Local (3.6 GB on disk, 7.5 GB on device). Count the fixed
-            // stream at that size and the exceptions at zero.
-            match super::nvfp4_csf::csf_part(&name) {
-                Some((_, super::nvfp4_csf::CsfPart::Fixed)) => {
-                    total += super::nvfp4_csf::decoded_len(&shape).unwrap_or(0);
-                    continue;
-                }
-                Some((_, super::nvfp4_csf::CsfPart::Exceptions)) => continue,
-                None => {}
+            // A CSF scale lands DECODED, 2.1x the compressed bytes on Qwen
+            // FP4-Local (3.6 GB on disk, 7.5 GB on device). Count the one
+            // component that sizes it at that size and the others at zero.
+            if let Some((_, part)) = super::nvfp4_csf::csf_part(&name) {
+                total += super::nvfp4_csf::decoded_len(part, &shape).unwrap_or(0);
+                continue;
             }
             let numel: usize = shape.iter().product();
             let elem_bytes = match dtype {

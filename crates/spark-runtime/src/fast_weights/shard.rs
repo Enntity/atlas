@@ -138,8 +138,9 @@ pub(super) fn load_shard_fast(
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
-        // CSF-compressed NVFP4 scales: the halves are paired (possibly across
-        // shards) and only the decoded E4M3 `weight_scale` is uploaded.
+        // CSF-compressed NVFP4 scales (either encoding): the components are
+        // gathered (possibly across shards) and only the decoded E4M3
+        // `weight_scale` is uploaded.
         if csf_part(&meta.name).is_some() {
             if let Some(scale) = csf.offer(&meta.name, &meta.shape, raw)? {
                 anyhow::ensure!(
