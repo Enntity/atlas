@@ -43,6 +43,8 @@ pub const MX_GEMV_MODULE: &str = "mxfp8_gemv";
 pub struct MxTiers {
     pub row_major: [KernelHandle; 3],
     pub tiled: [KernelHandle; 3],
+    /// The family reads FP8 block scales (an f32 grid) rather than UE8M0.
+    pub fp8b_scales: bool,
 }
 
 impl Default for MxTiers {
@@ -50,6 +52,7 @@ impl Default for MxTiers {
         Self {
             row_major: [KernelHandle(0); 3],
             tiled: [KernelHandle(0); 3],
+            fp8b_scales: false,
         }
     }
 }
@@ -100,7 +103,11 @@ impl MxTiers {
     fn resolve(gpu: &dyn GpuBackend, stem: &str, suffix: &str) -> Self {
         let [row_major, tiled] = tier_names(stem, suffix)
             .map(|tier| tier.map(|f| crate::layers::try_kernel(gpu, MX_GEMV_MODULE, &f)));
-        Self { row_major, tiled }
+        Self {
+            row_major,
+            tiled,
+            fp8b_scales: stem == "fp8b_gemv",
+        }
     }
 
     /// The tier for `m` rows (1..=32) of a twin `tiled` or not; zero when the
@@ -217,8 +224,10 @@ pub fn fp8b_gemv_rows(
             "fp8b_gemv_rows: no kernel for {m} rows (tiled={})",
             w.tiled
         );
+        let grid = div_ceil(n as u32, 16);
+        let (rows, ctas) = super::native_touch(m, n as u32, k as u32, grid);
         KernelLaunch::new(gpu, kernel)
-            .grid([div_ceil(n as u32, 16), 1, 1])
+            .grid([grid, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(input.offset(first * k * 2))
             .arg_ptr(w.data)
@@ -228,9 +237,50 @@ pub fn fp8b_gemv_rows(
             .arg_u32(n as u32)
             .arg_u32(k as u32)
             .arg_u32(out_stride as u32)
+            .arg_u32(rows)
+            .arg_u32(ctas)
             .launch(stream)?;
     }
     Ok(())
+}
+
+/// [`super::mxfp8_gemv_rows`] through the `mxfp8_gemv_tc*_touch` twin (PDL
+/// entry plus the weight touch, `ATLAS_GLM_DECODE_GEMV_BATCH=1` under PDL) on
+/// a row-major twin for up to 16 rows, as production's verify tiers run; the
+/// plain tiers otherwise. Same body: the same output bits.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_gemv_rows_touched(
+    gpu: &dyn GpuBackend,
+    row_major: &[KernelHandle; 3],
+    w: &Mxfp8Weight,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    n: usize,
+    k: usize,
+    out_stride: usize,
+    stream: u64,
+) -> Result<()> {
+    if !w.tiled
+        && (1..=16).contains(&rows)
+        && let Some(touch) = super::gemv_touch(super::mxfp8_tc_twin(rows as u32))
+    {
+        return touch.mxfp8_tc(
+            gpu,
+            input,
+            w.data,
+            w.scales,
+            output,
+            rows as u32,
+            n as u32,
+            k as u32,
+            out_stride as u32,
+            stream,
+        );
+    }
+    super::mxfp8_gemv_rows(
+        gpu, row_major, w, input, output, rows, n, k, out_stride, stream,
+    )
 }
 
 /// [`fp8b_gemv_rows`] on a K-slice of a wider row-major FP8 block weight:
@@ -261,8 +311,10 @@ pub fn fp8b_gemv_ld_rows(
         let m = (rows - first).min(MXFP8_MAX_ROWS) as u32;
         let kernel = tiers[mxfp8_tier(m)];
         ensure!(kernel.0 != 0, "fp8b_gemv_ld_rows: no kernel for {m} rows");
+        let grid = div_ceil(n as u32, 16);
+        let (rows, ctas) = super::native_touch(m, n as u32, k as u32, grid);
         KernelLaunch::new(gpu, kernel)
-            .grid([div_ceil(n as u32, 16), 1, 1])
+            .grid([grid, 1, 1])
             .block([256, 1, 1])
             .arg_ptr(input.offset(first * k * 2))
             .arg_ptr(data)
@@ -273,6 +325,8 @@ pub fn fp8b_gemv_ld_rows(
             .arg_u32(k as u32)
             .arg_u32(n as u32)
             .arg_u32(ldw as u32)
+            .arg_u32(rows)
+            .arg_u32(ctas)
             .launch(stream)?;
     }
     Ok(())
@@ -391,7 +445,17 @@ pub fn mx_multi_rows(
                 .arg_ptr(out)
                 .arg_u32(p.n as u32);
         }
-        launch.arg_u32(m).arg_u32(k as u32).launch(stream)?;
+        // Touch geometry of the narrowest projection (MX rows carry K/32 scale
+        // bytes; the FP8 block grid is not touched).
+        let n_min = parts.iter().map(|p| p.n as u32).min().unwrap_or(0);
+        let row_bytes = if tiers.fp8b_scales { k } else { k + k / 32 } as u32;
+        let (rows, ctas) = super::native_touch(m, n_min, row_bytes, div_ceil(n_min, 16));
+        launch
+            .arg_u32(m)
+            .arg_u32(k as u32)
+            .arg_u32(rows)
+            .arg_u32(ctas)
+            .launch(stream)?;
     }
     Ok(())
 }

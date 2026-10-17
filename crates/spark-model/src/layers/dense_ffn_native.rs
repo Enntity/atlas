@@ -137,7 +137,7 @@ impl DenseFfnLayer {
             stream,
         )?;
         if gemv {
-            ops::mxfp8_gemv_rows(
+            ops::mxfp8_gemv_rows_touched(
                 ctx.gpu,
                 &kernels.mx.row_major,
                 &native.down,

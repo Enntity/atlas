@@ -52,7 +52,7 @@ impl Glm5KdaLayer {
             "GLM KDA MXFP8 decode: the mxfp8_gemv tiers are missing from the kernel target"
         );
         let (m, n, k) = (m as usize, n as usize, k as usize);
-        ops::mxfp8_gemv_rows(
+        ops::mxfp8_gemv_rows_touched(
             ctx.gpu,
             &self.mxfp8_gemv_k,
             twin,

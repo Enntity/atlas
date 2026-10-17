@@ -450,38 +450,89 @@ extern "C" __global__ void mxfp8_tile16(
 
 // FP8 block weights (B128 above): E4M3 [N, K] + f32 [N/128, K/128], up to
 // 8/16/32 rows; `_tiled` on `mxfp8_tile16`'s value tiling (S row-major).
-#define FP8B_TIER(name, NT, TILED)                                                        \
-    extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) name(               \
-        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,         \
-        const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,               \
-        unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {        \
-        mxfp8_gemv_tc_impl<NT, TILED, true>(A, W, S, C, M, N, K, K, out_stride);          \
-    }
-FP8B_TIER(fp8b_gemv_tc8, 1, false)
-FP8B_TIER(fp8b_gemv_tc16, 2, false)
-FP8B_TIER(fp8b_gemv_tc32, 4, false)
-FP8B_TIER(fp8b_gemv_tc8_tiled, 1, true)
-FP8B_TIER(fp8b_gemv_tc16_tiled, 2, true)
-FP8B_TIER(fp8b_gemv_tc32_tiled, 4, true)
-#undef FP8B_TIER
+// PDL-entered (ATLAS_PDL); the first `touch_ctas` CTAs ask the first
+// `touch_rows` weight rows into L2 during the wait (atlas_pdl_touch.cuh; the
+// f32 grid is a few KB and not touched). `touch_rows` 0: plain PDL entry.
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc8(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_impl<1, false, true>(A, W, S, C, M, N, K, K, out_stride);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc16(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_impl<2, false, true>(A, W, S, C, M, N, K, K, out_stride);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc32(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_impl<4, false, true>(A, W, S, C, M, N, K, K, out_stride);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc8_tiled(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_impl<1, true, true>(A, W, S, C, M, N, K, K, out_stride);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc16_tiled(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_impl<2, true, true>(A, W, S, C, M, N, K, K, out_stride);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc32_tiled(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, K}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_impl<4, true, true>(A, W, S, C, M, N, K, K, out_stride);
+}
+
 
 // A K-slice of a wider FP8 block weight (row-major): W at the slice's first
 // value, S at its first grid column, rows `ldw` values apart (grid rows
 // ldw / 128 scales apart; the slice starts and ends on the 128 grid). The
-// shared expert's down projection under ATLAS_GLM_SHARED_TP_SPLIT.
-#define FP8B_LD_TIER(name, NT)                                                            \
-    extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) name(               \
-        const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,         \
-        const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,               \
-        unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,          \
-        unsigned int ldw) {                                                               \
-        mxfp8_gemv_tc_cta<NT, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x, \
-                                           ldw);                                          \
-    }
-FP8B_LD_TIER(fp8b_gemv_tc8_ld, 1)
-FP8B_LD_TIER(fp8b_gemv_tc16_ld, 2)
-FP8B_LD_TIER(fp8b_gemv_tc32_ld, 4)
-#undef FP8B_LD_TIER
+// shared expert's down projection under ATLAS_GLM_SHARED_TP_SPLIT. PDL entry
+// and touch as the plain FP8 block tiers.
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc8_ld(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int ldw, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, ldw}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_cta<1, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x, ldw);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc16_ld(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int ldw, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, ldw}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_cta<2, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x, ldw);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc32_ld(
+    const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
+    const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
+    unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride,
+    unsigned int ldw, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch({W, K, ldw}, {S, 0u, 0u}, min(touch_rows, N), blockIdx.x, touch_ctas);
+    mxfp8_gemv_tc_cta<4, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x, ldw);
+}
+
 
 // Exact MXFP8 -> BF16 expansion of a row-major W [N, K] / S [N, K/32]:
 // every E4M3 value times a power of two in range is a BF16 value, so this is
@@ -511,29 +562,202 @@ extern "C" __global__ void mxfp8_to_bf16(
 
 // The multi-projection launches (mx_multi_impl) for MXFP8 and FP8 block
 // weights, row-major and tiled. Grid: (sum ceil(N_i / 16), 1, 1).
-#define MX_MULTI(name, NT, TILED, B128)                                                   \
-    extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) name(               \
-        const __nv_bfloat16* __restrict__ A,                                              \
-        const unsigned char* W0, const unsigned char* S0, __nv_bfloat16* C0, unsigned int N0, \
-        const unsigned char* W1, const unsigned char* S1, __nv_bfloat16* C1, unsigned int N1, \
-        const unsigned char* W2, const unsigned char* S2, __nv_bfloat16* C2, unsigned int N2, \
-        unsigned int M, unsigned int K) {                                                 \
-        mx_multi_impl<NT, TILED, B128>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, \
-                                       M, K);                                             \
-    }
-MX_MULTI(mxfp8_gemv_tc8_multi, 1, false, false)
-MX_MULTI(mxfp8_gemv_tc16_multi, 2, false, false)
-MX_MULTI(mxfp8_gemv_tc32_multi, 4, false, false)
-MX_MULTI(mxfp8_gemv_tc8_multi_tiled, 1, true, false)
-MX_MULTI(mxfp8_gemv_tc16_multi_tiled, 2, true, false)
-MX_MULTI(mxfp8_gemv_tc32_multi_tiled, 4, true, false)
-MX_MULTI(fp8b_gemv_tc8_multi, 1, false, true)
-MX_MULTI(fp8b_gemv_tc16_multi, 2, false, true)
-MX_MULTI(fp8b_gemv_tc32_multi, 4, false, true)
-MX_MULTI(fp8b_gemv_tc8_multi_tiled, 1, true, true)
-MX_MULTI(fp8b_gemv_tc16_multi_tiled, 2, true, true)
-MX_MULTI(fp8b_gemv_tc32_multi_tiled, 4, true, true)
-#undef MX_MULTI
+// PDL-entered; each projection's first `touch_ctas` CTAs ask its first
+// `touch_rows` rows (values, and MX scales) into L2 during the wait.
+
+// This CTA's (projection, CTA within it, touching CTAs of it) for
+// atlas_pdl_enter_touch_tri.
+struct MxMultiRole {
+    unsigned int sel, cta, ctas;
+};
+
+__device__ __forceinline__ MxMultiRole mx_multi_role(
+    unsigned int N0, unsigned int N1, unsigned int N2, unsigned int touch_ctas) {
+    const unsigned int t0 = (N0 + 15u) / 16u, t1 = (N1 + 15u) / 16u, t2 = (N2 + 15u) / 16u;
+    const unsigned int b = blockIdx.x;
+    if (b < t0) return {0u, b, min(touch_ctas, t0)};
+    if (b < t0 + t1) return {1u, b - t0, min(touch_ctas, t1)};
+    return {2u, b - t0 - t1, min(touch_ctas, t2)};
+}
+
+// Touch rows no projection lacks (absent projections, N = 0, have no CTAs).
+__device__ __forceinline__ unsigned int mx_multi_touch_rows(
+    unsigned int rows, unsigned int N0, unsigned int N1, unsigned int N2) {
+    if (N0 != 0u) rows = min(rows, N0);
+    if (N1 != 0u) rows = min(rows, N1);
+    if (N2 != 0u) rows = min(rows, N2);
+    return rows;
+}
+
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8_multi(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, K / 32u, K / 32u}, {W1, K, K}, {S1, K / 32u, K / 32u},
+                              {W2, K, K}, {S2, K / 32u, K / 32u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<1, false, false>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc16_multi(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, K / 32u, K / 32u}, {W1, K, K}, {S1, K / 32u, K / 32u},
+                              {W2, K, K}, {S2, K / 32u, K / 32u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<2, false, false>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc32_multi(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, K / 32u, K / 32u}, {W1, K, K}, {S1, K / 32u, K / 32u},
+                              {W2, K, K}, {S2, K / 32u, K / 32u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<4, false, false>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8_multi_tiled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, K / 32u, K / 32u}, {W1, K, K}, {S1, K / 32u, K / 32u},
+                              {W2, K, K}, {S2, K / 32u, K / 32u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<1, true, false>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc16_multi_tiled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, K / 32u, K / 32u}, {W1, K, K}, {S1, K / 32u, K / 32u},
+                              {W2, K, K}, {S2, K / 32u, K / 32u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<2, true, false>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc32_multi_tiled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, K / 32u, K / 32u}, {W1, K, K}, {S1, K / 32u, K / 32u},
+                              {W2, K, K}, {S2, K / 32u, K / 32u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<4, true, false>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc8_multi(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, 0u, 0u}, {W1, K, K}, {S1, 0u, 0u},
+                              {W2, K, K}, {S2, 0u, 0u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<1, false, true>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc16_multi(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, 0u, 0u}, {W1, K, K}, {S1, 0u, 0u},
+                              {W2, K, K}, {S2, 0u, 0u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<2, false, true>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc32_multi(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, 0u, 0u}, {W1, K, K}, {S1, 0u, 0u},
+                              {W2, K, K}, {S2, 0u, 0u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<4, false, true>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc8_multi_tiled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, 0u, 0u}, {W1, K, K}, {S1, 0u, 0u},
+                              {W2, K, K}, {S2, 0u, 0u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<1, true, true>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc16_multi_tiled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, 0u, 0u}, {W1, K, K}, {S1, 0u, 0u},
+                              {W2, K, K}, {S2, 0u, 0u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<2, true, true>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) fp8b_gemv_tc32_multi_tiled(
+    const __nv_bfloat16* __restrict__ A,
+    const unsigned char* __restrict__ W0, const unsigned char* __restrict__ S0,
+    __nv_bfloat16* C0, unsigned int N0,
+    const unsigned char* __restrict__ W1, const unsigned char* __restrict__ S1,
+    __nv_bfloat16* C1, unsigned int N1,
+    const unsigned char* __restrict__ W2, const unsigned char* __restrict__ S2,
+    __nv_bfloat16* C2, unsigned int N2,
+    unsigned int M, unsigned int K, unsigned int touch_rows, unsigned int touch_ctas) {
+    atlas_pdl_enter_touch_tri({W0, K, K}, {S0, 0u, 0u}, {W1, K, K}, {S1, 0u, 0u},
+                              {W2, K, K}, {S2, 0u, 0u}, mx_multi_touch_rows(touch_rows, N0, N1, N2),
+                              mx_multi_role(N0, N1, N2, touch_ctas));
+    mx_multi_impl<4, true, true>(A, W0, S0, C0, N0, W1, S1, C1, N1, W2, S2, C2, N2, M, K);
+}
+
 
 template <int NT>
 __device__ __forceinline__ void mxfp8_gemv_tc_grouped(

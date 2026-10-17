@@ -19,6 +19,7 @@ fn tiers() -> MxTiers {
     MxTiers {
         row_major: [KernelHandle(8), KernelHandle(16), KernelHandle(32)],
         tiled: [KernelHandle(108), KernelHandle(116), KernelHandle(132)],
+        fp8b_scales: true,
     }
 }
 
@@ -91,6 +92,9 @@ fn gemv_rows_chunk_at_32_on_the_layout_tier() {
                     u32a(256),
                     u32a(128),
                     u32a(256),
+                    // No touch (ATLAS_GLM_DECODE_GEMV_BATCH unset): plain PDL entry.
+                    u32a(0),
+                    u32a(0),
                 ]
             );
         }
@@ -165,6 +169,8 @@ fn multi_launch_packs_three_projections_into_one_grid() {
             u32a(0),
             u32a(9),
             u32a(4096),
+            u32a(0),
+            u32a(0),
         ]
     );
 }
