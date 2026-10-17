@@ -351,6 +351,42 @@ pub fn fp8_gemm_act_weight_t_mx_pinned(
     super::mx_algo::matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)
 }
 
+/// Block FP8 `out[m, n] = act[m, k] x weight[n, k]^T` (BF16) on ONE in-order
+/// cuBLASLt kernel per `(n, k)`, chosen once without timing and never retuned
+/// (`mx_algo::pinned`): the weight with its f32 `[n/128, k/128]` grid, the
+/// activation with per-token, per-128 f32 scales (`[m, k/128]`, as
+/// `per_token_group_quant_fp8` writes them). `m` must be a multiple of 16
+/// (the caller pads). Each output row is one in-order accumulation of its
+/// own inputs, so a row's bytes do not depend on the pass height. Errors
+/// rather than switching kernels when the pinned one refuses a height.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_blkscaled_pinned(
+    act_fp8: u64,
+    act_scale: u64,
+    weight_fp8: u64,
+    weight_block_scale: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    anyhow::ensure!(
+        m > 0 && m.is_multiple_of(16) && n > 0 && k > 0 && k.is_multiple_of(128),
+        "cuBLASLt block FP8: {m}x{n}x{k} (m % 16, k % 128 or an empty dimension)"
+    );
+    let ctx = ctx()?;
+    let ops = super::fixed_algo::Operands::Blk128 {
+        weight_sf: weight_block_scale,
+        act_sf: act_scale,
+    };
+    let p = super::fixed_algo::Problem::with(m, n, k, ops)?;
+    let algo = super::mx_algo::pinned(ctx, n, k, ops)?;
+    anyhow::ensure!(
+        super::mx_algo::takes(ctx, &p, &algo),
+        "cuBLASLt block FP8 {m}x{n}x{k}: the pinned kernel refuses {m} rows"
+    );
+    super::mx_algo::matmul(ctx, &p, &algo, [weight_fp8, act_fp8, out], stream)
+}
+
 /// [`fp8_gemm_act_weight_t_mx`] on the heuristic's `index`-th candidate for
 /// exactly these `m` rows (tests and benches: the tuned pick is not
 /// consulted or cached); `in_order_only` asks the heuristic for no-split-K

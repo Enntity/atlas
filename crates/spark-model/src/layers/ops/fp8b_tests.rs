@@ -393,3 +393,29 @@ fn every_native_kernel_lookup_is_declared_in_the_glm_target() {
     }
     assert!(missing.is_empty(), "not declared: {missing:#?}");
 }
+
+#[test]
+fn block_fp8_plan_leaves_padding_headroom_and_a_tail_slot() {
+    // An arena for 4096 rows of k = 8192 (GLM: max_proj_k = q heads x 256).
+    let scratch = Fp8ActScratch {
+        act: DevicePtr(0x1000_0000),
+        act_bytes: 4096 * 8192,
+        scale: DevicePtr(0x2000_0000),
+        scale_bytes: 4096 * (8192 / 128) * 4,
+    };
+    for (k, n) in [(4096, 1536), (8192, 4096), (1536, 8192), (2048, 4096)] {
+        let plan = scratch.blk_plan(k, n).unwrap();
+        assert!(plan.rows >= 16 && plan.rows.is_multiple_of(16), "{k} {n}");
+        let slot = (plan.tail_out.0 - scratch.act.0) as usize;
+        assert!(slot.is_multiple_of(256) && slot + 16 * n * 2 <= scratch.act_bytes);
+        // A pass plus its 16-row padding stays below the tail slot and in the
+        // scale scratch.
+        assert!((plan.rows + 16) * k <= slot);
+        assert!((plan.rows + 16) * (k / 128) * 4 <= scratch.scale_bytes);
+    }
+    let tiny = Fp8ActScratch {
+        act_bytes: 20 * 4096,
+        ..scratch
+    };
+    assert!(tiny.blk_plan(4096, 4096).is_err());
+}

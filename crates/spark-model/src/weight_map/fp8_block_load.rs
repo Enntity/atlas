@@ -7,7 +7,7 @@
 //! `[n, k]` plus `<prefix>.weight_scale` F32 `[n/128, 1, k/128, 1]` (or the
 //! plain 2-D `[n/128, k/128]`): one f32 multiplier per 128 x 128 block, the
 //! row-major grid the `fp8b_gemv_tc*` tiers and the block-FP8 GEMMs
-//! (`w8a16_gemm_pipelined`, `fp8_gemm_t_blockscaled`) read. So a twin is the
+//! (`w8a16_gemm_pipelined`, cuBLASLt block FP8) read. So a twin is the
 //! checkpoint's bytes, copied and sliced, never requantized or rounded.
 //!
 //! TP slices keep whole 128 x 128 blocks: a rank's row (column-parallel) or

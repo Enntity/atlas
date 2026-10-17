@@ -271,7 +271,12 @@ pub(super) fn select(
 /// (`spark-model` `glm_packed_scope`), one prompt of 2 rows up to a full
 /// arena.
 const PINNED_ROWS: [u32; 5] = [1, 30, 64, 4096, 8192];
-static PINNED: Mutex<Vec<((u32, u32), Algo)>> = Mutex::new(Vec::new());
+/// The block FP8 heights: cuBLASLt's VEC128 activation scales need a row
+/// count on the 16 grid, which the caller pads to.
+const PINNED_ROWS_BLK128: [u32; 5] = [16, 32, 64, 4096, 8192];
+/// `(n, k, operand kind)` of a pinned kernel.
+type PinKey = (u32, u32, u8);
+static PINNED: Mutex<Vec<(PinKey, Algo)>> = Mutex::new(Vec::new());
 
 /// ONE in-order kernel for `n x k` at every row count, chosen without timing
 /// and never retuned: the heuristic's first in-order candidate (asked at
@@ -281,11 +286,16 @@ static PINNED: Mutex<Vec<((u32, u32), Algo)>> = Mutex::new(Vec::new());
 /// timing per row bucket (swept shapes) and retunes a key whose kernel
 /// refuses a height, the choice cannot move with the pass mix or history.
 pub(super) fn pinned(ctx: &Ctx, n: u32, k: u32, ops: Operands) -> Result<Algo> {
-    if let Some(a) = PINNED.lock().unwrap().iter().find(|e| e.0 == (n, k)) {
+    let key = (n, k, ops.kind());
+    if let Some(a) = PINNED.lock().unwrap().iter().find(|e| e.0 == key) {
         return Ok(a.1);
     }
     let reference = Problem::with(4096, n, k, ops)?;
-    let heights = PINNED_ROWS
+    let rows: &[u32] = match ops {
+        Operands::Blk128 { .. } => &PINNED_ROWS_BLK128,
+        _ => &PINNED_ROWS,
+    };
+    let heights = rows
         .iter()
         .map(|&m| Problem::with(m, n, k, ops))
         .collect::<Result<Vec<_>>>()?;
@@ -293,17 +303,21 @@ pub(super) fn pinned(ctx: &Ctx, n: u32, k: u32, ops: Operands) -> Result<Algo> {
         .into_iter()
         .find(|a| in_order(a) && heights.iter().all(|p| takes(ctx, p, a)))
         .ok_or_else(|| {
-            anyhow::anyhow!("cuBLASLt MXFP8 {n}x{k}: no in-order kernel takes every packed height")
+            anyhow::anyhow!(
+                "cuBLASLt FP8 (kind {}) {n}x{k}: no in-order kernel takes every pinned height",
+                ops.kind()
+            )
         })?;
     tracing::info!(
-        "cuBLASLt MXFP8 {n}x{k}: packed prefill pinned to {} at every row count",
+        "cuBLASLt FP8 (kind {}) {n}x{k}: pinned to {} at every row count",
+        ops.kind(),
         description(&algo)
     );
     let mut pinned = PINNED.lock().unwrap();
-    if let Some(e) = pinned.iter().find(|e| e.0 == (n, k)) {
+    if let Some(e) = pinned.iter().find(|e| e.0 == key) {
         return Ok(e.1);
     }
-    pinned.push(((n, k), algo));
+    pinned.push((key, algo));
     Ok(algo)
 }
 

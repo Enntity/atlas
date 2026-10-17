@@ -19,8 +19,9 @@
 //!
 //! Prefill (more rows than a verify block), three ways ([`Fp8bPrefill`]):
 //! - `W8a8` (NVIDIA's / vLLM's FP8_BLOCK_SCALES recipe: activations quantized
-//!   per token and 128 values to E4M3 with an f32 scale, then the block FP8
-//!   GEMM `fp8_gemm_t_blockscaled`, FP32 epilogue);
+//!   per token and 128 values to E4M3 with an f32 scale, then cuBLASLt's block
+//!   FP8 GEMM on one pinned in-order kernel per shape,
+//!   `fp8_gemm_act_weight_t_blkscaled_pinned`: ~1.8x the BF16 GEMM's FLOPs);
 //! - `W8a16` (exact weights on BF16 activations: `w8a16_gemm_pipelined`, the
 //!   same two-level FP32 accumulation as the GEMV tiers);
 //! - `Bf16` (production's: the BF16 copy, one rounding of e4m3 x scale).
@@ -77,10 +78,9 @@ const TIER_FAMILIES: [(&str, &str); 4] = [
 ];
 
 /// The single kernels [`native_kernels`] resolves: (module, function).
-const SINGLE_KERNELS: [(&str, &str); 5] = [
+const SINGLE_KERNELS: [(&str, &str); 4] = [
     (MX_GEMV_MODULE, "mxfp8_to_bf16"),
     ("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
-    ("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
     ("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
     (super::MXFP8_ACT_MODULE, super::MX_QUANT_KERNEL),
 ];
@@ -142,8 +142,6 @@ pub struct NativeKernels {
     pub mx_multi: MxTiers,
     /// `per_token_group_quant_fp8` (W8A8 prefill activations).
     pub act_quant: KernelHandle,
-    /// `fp8_gemm_t_blockscaled` (W8A8 prefill GEMM).
-    pub w8a8_gemm: KernelHandle,
     /// `w8a16_gemm_pipelined` (exact W8A16 prefill GEMM).
     pub w8a16_gemm: KernelHandle,
     /// `mxfp8_quant_act_bf16` (MXFP8 W8A8 prefill activations).
@@ -156,7 +154,7 @@ pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
     *K.get_or_init(|| {
         let [mx, fp8b, fp8b_multi, mx_multi] =
             TIER_FAMILIES.map(|(stem, suffix)| MxTiers::resolve(gpu, stem, suffix));
-        let [mx_expand, act_quant, w8a8_gemm, w8a16_gemm, mx_quant] =
+        let [mx_expand, act_quant, w8a16_gemm, mx_quant] =
             SINGLE_KERNELS.map(|(m, f)| crate::layers::try_kernel(gpu, m, f));
         let k = NativeKernels {
             mx,
@@ -166,7 +164,6 @@ pub fn native_kernels(gpu: &dyn GpuBackend) -> NativeKernels {
             mx_expand,
             mx_multi,
             act_quant,
-            w8a8_gemm,
             w8a16_gemm,
             mx_quant,
         };
@@ -525,14 +522,34 @@ impl Fp8ActScratch {
         }
     }
 
-    /// Rows per W8A8 GEMM so a `[rows, k]` E4M3 image and its `[rows, k/128]`
-    /// f32 scales fit (a multiple of 64, the GEMM's row tile; the GEMM is
-    /// row-invariant, so chunking changes nothing).
-    fn chunk_rows(&self, k: usize) -> usize {
-        let q = self.act_bytes / k;
-        let s = self.scale_bytes / (k / FP8_BLOCK * 4);
-        (q.min(s) / 64) * 64
+    /// How a block FP8 W8A8 prefill of an `[n, k]` weight uses this scratch:
+    /// passes of `rows` (a multiple of 16) whose E4M3 image and scales fit
+    /// with 16 rows of padding headroom, and a `[16, n]` BF16 slot at the end
+    /// of the E4M3 region for a pass's padded tail.
+    pub fn blk_plan(&self, k: usize, n: usize) -> Result<BlkPlan> {
+        let slot = ((self.act_bytes.saturating_sub(16 * n * 2)) / 256) * 256;
+        let by_act = slot / k;
+        let by_scale = self.scale_bytes / (k / FP8_BLOCK * 4);
+        let rows = (by_act.min(by_scale).saturating_sub(16) / 16) * 16;
+        ensure!(
+            rows >= 16,
+            "block FP8 W8A8: the FP8 scratch ({} + {} B) holds no padded 16-row [_, {k}] pass \
+             beside a [16, {n}] tail",
+            self.act_bytes,
+            self.scale_bytes
+        );
+        Ok(BlkPlan {
+            rows,
+            tail_out: self.act.offset(slot),
+        })
     }
+}
+
+/// See [`Fp8ActScratch::blk_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlkPlan {
+    pub rows: usize,
+    pub tail_out: DevicePtr,
 }
 
 /// `output[m, n] = input[m, k] · W^T` for prefill on FP8 block twin `w`
@@ -574,40 +591,61 @@ pub fn fp8b_prefill_gemm(
         }
         Fp8bPrefill::W8a8 => {
             ensure!(
-                kernels.act_quant.0 != 0 && kernels.w8a8_gemm.0 != 0,
-                "per_token_group_quant_fp8 / fp8_gemm_t_blockscaled are missing"
+                kernels.act_quant.0 != 0,
+                "per_token_group_quant_fp8 is missing"
             );
-            let chunk = scratch.chunk_rows(k);
-            ensure!(
-                chunk > 0,
-                "FP8 W8A8 prefill: the FP8 scratch holds no 64-row [_, {k}] tile"
-            );
-            let (act, act_scale) = (scratch.act, scratch.scale);
-            for first in (0..m).step_by(chunk) {
-                let rows = (m - first).min(chunk) as u32;
+            let plan = scratch.blk_plan(k, n)?;
+            let (act, act_scale, kg4) = (scratch.act, scratch.scale, k / FP8_BLOCK * 4);
+            let gemm = |a: DevicePtr, sf: DevicePtr, out: DevicePtr, rows: usize| {
+                spark_runtime::cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned(
+                    a.0,
+                    sf.0,
+                    w.data.0,
+                    w.scales.0,
+                    out.0,
+                    [rows as u32, n as u32, k as u32],
+                    stream,
+                )
+            };
+            for first in (0..m).step_by(plan.rows) {
+                let rows = (m - first).min(plan.rows);
                 super::per_token_group_quant_fp8(
                     gpu,
                     kernels.act_quant,
                     input.offset(first * k * 2),
                     act,
                     act_scale,
-                    rows,
+                    rows as u32,
                     k as u32,
                     stream,
                 )?;
-                super::fp8_gemm_t_blockscaled(
-                    gpu,
-                    kernels.w8a8_gemm,
-                    act,
-                    act_scale,
-                    w.data,
-                    w.scales,
-                    output.offset(first * n * 2),
-                    rows,
-                    n as u32,
-                    k as u32,
-                    stream,
-                )?;
+                let main = rows / 16 * 16;
+                if main > 0 {
+                    gemm(act, act_scale, output.offset(first * n * 2), main)?;
+                }
+                let tail = rows - main;
+                if tail > 0 {
+                    // The last < 16 rows as one 16-row pass of the same
+                    // kernel: zero rows (E4M3 0, scale 0) pad it, its output
+                    // lands in the scratch's tail slot and its real rows are
+                    // copied out. Same kernel, row-independent: the same bytes
+                    // as inside a taller pass.
+                    let pad = main + 16 - rows;
+                    gpu.memset_async(act.offset(rows * k), 0, pad * k, stream)?;
+                    gpu.memset_async(act_scale.offset(rows * kg4), 0, pad * kg4, stream)?;
+                    gemm(
+                        act.offset(main * k),
+                        act_scale.offset(main * kg4),
+                        plan.tail_out,
+                        16,
+                    )?;
+                    gpu.copy_d2d_async(
+                        plan.tail_out,
+                        output.offset((first + main) * n * 2),
+                        tail * n * 2,
+                        stream,
+                    )?;
+                }
             }
             Ok(())
         }
