@@ -54,6 +54,10 @@ mod tests;
 
 pub use expert::*;
 pub(crate) use fp8_dequant::*;
+#[cfg(test)]
+#[path = "weight_map/test_checkpoint.rs"]
+pub(crate) mod test_checkpoint;
+
 pub use loaders_fp8::*;
 pub use loaders_mtp::*;
 pub use model_a::*;
