@@ -35,6 +35,10 @@ use crate::layers::ops::MxW8a8;
 use crate::tp_shard::TpShardKind;
 use crate::weight_map::{Mxfp8Weight, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8};
 
+/// Rows the pinned W8A8 kernel is timed at (a prefill pass's height:
+/// `ATLAS_GLM_PREFILL_4096`).
+pub(super) const PIN_REF_ROWS: usize = 4096;
+
 /// The switches, read like the loader's other flags (`components::env_flag`:
 /// `1` or `true` is on, anything else off).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -166,7 +170,7 @@ pub(super) fn kda_twin(
         // kernel (one per shape, never retuned: chunk- and history-invariant
         // prefill), so no row bucket is tuned at load.
         match MxW8a8::from_twin(gpu, &twin, local, 0, stream) {
-            Ok(w) => Some(w.pinned()),
+            Ok(w) => Some(w.pinned_timed(PIN_REF_ROWS, stream)),
             Err(e) => {
                 free_twin(twin)?;
                 return Err(e.context(format!("{stem}: MXFP8 W8A8 operand")));

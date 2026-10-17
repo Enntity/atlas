@@ -130,7 +130,10 @@ pub(super) fn native_dense(
             twins.push(twin);
             if w8a8 {
                 // The pinned kernel (as KDA's): no row bucket tuned at load.
-                operands.push(MxW8a8::from_twin(gpu, &twin, shape, 0, stream)?.pinned());
+                operands.push(
+                    MxW8a8::from_twin(gpu, &twin, shape, 0, stream)?
+                        .pinned_timed(super::kda_mx::PIN_REF_ROWS, stream),
+                );
             }
         }
         Ok(())

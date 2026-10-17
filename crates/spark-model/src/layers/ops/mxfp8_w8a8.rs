@@ -106,6 +106,28 @@ impl MxW8a8 {
         }
     }
 
+    /// [`Self::pinned`], picking the shape's pinned kernel now (load time) by
+    /// timing the eligible in-order candidates at `ref_m` rows
+    /// (`fp8_gemm_mx_pinned_prepare`: the fastest, as the tuned entry would
+    /// pick, kept for the run and logged). Where it cannot time (no cuBLASLt
+    /// on this host) the first GEMM pins the heuristic's first eligible
+    /// kernel instead, untimed; logged.
+    pub fn pinned_timed(self, ref_m: usize, stream: u64) -> Self {
+        if let Err(e) = spark_runtime::cublaslt::fp8_gemm_mx_pinned_prepare(
+            self.n as u32,
+            self.k as u32,
+            ref_m.max(1) as u32,
+            stream,
+        ) {
+            tracing::warn!(
+                "MXFP8 W8A8 {}x{}: no timed pin ({e:#}); the first GEMM pins untimed",
+                self.n,
+                self.k
+            );
+        }
+        self.pinned()
+    }
+
     /// Bytes this operand allocated (the tiled scales).
     pub fn owned_bytes(&self) -> usize {
         mx_lt_scale_bytes(self.n, self.k)

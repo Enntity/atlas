@@ -24,7 +24,7 @@ pub use fp8::{
 };
 mod mx_algo;
 pub use grouped::bf16_grouped_gemm_act_weight_t;
-pub use mx_algo::fp8_gemm_mx_prepare;
+pub use mx_algo::{fp8_gemm_mx_pinned_prepare, fp8_gemm_mx_prepare};
 // The MXFP8 kernel choice's introspection, for tests and benches only.
 #[cfg(any(test, feature = "test-utils"))]
 pub use fp8::fp8_gemm_act_weight_t_mx_candidate;
