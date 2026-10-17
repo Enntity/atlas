@@ -297,12 +297,11 @@ pub(crate) fn load_model(
     .into_iter()
     .flatten()
     .collect();
-    let ptx_set = atlas_kernels::ptx_for_config_quant(
+    let ptx_set = atlas_kernels::ptx_for_config(
         &config.model_type,
         config.hidden_size,
         &model_refs,
         args.kernel_target.as_deref(),
-        &canonicalize_model_quant(&config),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?
     .with_context(|| {

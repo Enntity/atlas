@@ -30,18 +30,19 @@ tok/s. Record each run's binary build commit, both binary hashes and the
 run directory, as the rules below require.
 
 ### PR-1. Build on GB10 (blocker)
-- [ ] **Repair the EXL3 kernel target.** `kernels/gb10/glm-5.3-flash-exl3/exl3/`
-  has 22 broken symlinks into `kernels/gb10/deepseek-v4-flash/nvfp4/`
-  (upstream moved those GLM sources to `kernels/gb10/glm-5.3-flash/nvfp4/`),
-  and lacks the modules `kda`, `glm_indexer`, `glm_vision_encoder` and
-  `mxfp8_gemv` that the shared GLM Rust path requests. Preferred fix
-  (upstream convention, as `qwen3.8-flash-next/exl3`): move the EXL3
-  modules to `kernels/gb10/glm-5.3-flash/exl3/` with `[build] base_quant =
-  "nvfp4"`, and drop the separate `glm-5.3-flash-exl3` target and its
-  symlinks. Keep routing/needles so EXL3 checkpoints select it. Check:
-  `find kernels -xtype l` is empty.
-- [ ] Move the EXL3 coop kernels (`exl3_coop_gemm*`, `exl3_moe*`, …) out of
-  `kernels/gb10/common/`. Right now they compile into every gb10 target.
+- [x] **Repair the EXL3 kernel target** (2026-10-16). The EXL3 modules now
+  live in `kernels/gb10/glm-5.3-flash/exl3/` (`[build] base_quant =
+  "nvfp4"`, plus `exl3_mhc` `--fmad=true`); the `glm-5.3-flash-exl3` target,
+  its symlinks and its MODEL.toml are gone, and an EXL3 checkpoint resolves
+  to `(glm-5.3-flash, exl3)` through upstream's `pick_quant_variant`.
+  `find kernels -xtype l` is empty. The exl3 build now uses upstream's GLM
+  copies of `w4a16_gemm`, `moe_w4a16_grouped_gemm`, `paged_decode_attn_nvfp4`,
+  `moe_silu_mul` and `ssm_state_norm` instead of the DeepSeek-V4 ones:
+  compare output hashes against the pre-rebase binary on GPU.
+- [x] EXL3-only kernels (`exl3*`, `exllamav3_*`, `kda_fla*`,
+  `glm_indexer_quant`) left `kernels/gb10/common/`; `glm_indexer_score.cuh`
+  moved to `glm-5.3-flash/nvfp4/` (the nvfp4 `glm_indexer.cu` could not
+  resolve it from common/).
 - [ ] nvcc build of `glm-5.3-flash` (nvfp4) and the EXL3 target in a builder
   container. This is the first compile of `kda_fla_decode.cuh`,
   `kda_fla_prep.cuh` and `exl3_dflash_capture.cu`. Also run `cargo build` for

@@ -6,7 +6,7 @@ verifies that the only mapped libcublas/libcublasLt objects are the pinned
 nvidia-cublas 13.1.1.3 pair installed at /opt/atlas/cublas-13.1.1.3 (classic
 libcublas.so.13 + libcublasLt.so.13), that nothing else named libcublas* is
 mapped (notably the CUDA-toolkit copy), and that both mapped files hash to the
-committed pins in docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256.
+committed pins in docker/gb10/glm-5.3-flash/exl3/cublas131.sha256.
 Fails closed on any deviation; "(deleted)" mappings always fail.
 
 Usage (host side; needs read access to /proc/<pid>/maps and /proc/<pid>/root):
@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 DEFAULT_PINS = (Path(__file__).resolve().parents[2]
-                / "docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256")
+                / "docker/gb10/glm-5.3-flash/exl3/cublas131.sha256")
 EXPECTED_CUBLAS = ("libcublas.so.13", "libcublasLt.so.13")
 DELETED_SUFFIX = " (deleted)"
 

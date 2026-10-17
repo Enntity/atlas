@@ -40,7 +40,7 @@ def gpu_checks():
     import cupy as cp
     if cp.cuda.runtime.getDeviceCount() < 1:
         raise RuntimeError("A real CUDA device is required")
-    common = Path(__file__).resolve().parents[2] / "kernels/gb10/common"
+    common = Path(__file__).resolve().parents[2] / "kernels/gb10/glm-5.3-flash/exl3"
     # Header resolution is explicit; compiler failure is not a skipped test.
     module = cp.RawModule(code=(common / "exl3_moe.cu").read_text(),
                           options=("--std=c++17", "-I" + str(common)))

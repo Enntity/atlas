@@ -11,7 +11,7 @@ modules (`kernels/gb10/common/KERNEL.toml`: `--fmad=false -DTQ_PLUS_SIGNS
 flock /tmp/atlas-bench.lock ~/.local/bin/spark1 '
   docker exec atlas-dev-builder bash -c "cd /build/tests/exl3_validation/coop_moe_bench &&
     nvcc -O3 -arch=sm_121f -std=c++17 --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr \
-         -I/build/kernels/gb10/glm-5.3-flash-exl3/exl3 -o /out/mb_fat fat_multirow_bench.cu" &&
+         -I/build/kernels/gb10/glm-5.3-flash/exl3 -o /out/mb_fat fat_multirow_bench.cu" &&
   ~/atlas-dev/bin/mb_fat'
 ```
 

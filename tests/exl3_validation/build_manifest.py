@@ -7,11 +7,11 @@ the SHA256 of every shipped binary, and the SHA256 of every compiled PTX module
 after proving each PTX blob is byte-embedded in both binaries (the same
 evidence layout the external attest-native-aux-classic131.py check uses).
 
-Usage (see the docker/gb10/glm-5.3-flash-exl3/exl3/Dockerfile header):
+Usage (see the docker/gb10/glm-5.3-flash/exl3/Dockerfile header):
 
     python3 build_manifest.py --release-dir /build/target/release \
         --fingerprint-dir /build/fingerprint \
-        --target-key gb10/glm-5.3-flash-exl3/exl3 \
+        --target-key gb10/glm-5.3-flash/exl3 \
         --git-sha <sha> --source-snapshot-sha256 <sha> \
         --out /build/fingerprint/build-manifest.json
 

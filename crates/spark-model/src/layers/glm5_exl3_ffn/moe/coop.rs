@@ -2,7 +2,7 @@
 //! `ATLAS_EXL3_COOP_MOE=1`: thin routed-expert projections (every route thin,
 //! i.e. rows <= thin_capacity; always true at decode) run the vendored
 //! exllamav3 cooperative GEMM core (`exl3_coop_moe_thin_b4_k32_n256` in
-//! kernels/gb10/common/exl3_coop_gemm.cu) in place of
+//! kernels/gb10/glm-5.3-flash/exl3/exl3_coop_gemm.cu) in place of
 //! `exl3_moe_mul1_matmul_precision_mma[_split]`. Same scratch in and out, same
 //! per-slot arithmetic (thin profile 32/256/8, F16-rounded running fold), so
 //! the existing output Hadamard and fixed-order combine are unchanged.

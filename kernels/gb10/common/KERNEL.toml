@@ -1,11 +1,6 @@
 [build]
 extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS", "--expt-relaxed-constexpr"]
 
-# Native mHC sigmoid libdevice arithmetic requires contraction.
-# Other EXL3 modules preserve the common --fmad=false policy.
-[build.module_nvcc_flags]
-exl3_mhc = ["--fmad=true"]
-
 # Kernels a model shadow may omit WITHOUT that being shadow drift.
 # Keyed by MODULE name (post-`[modules]` mapping) → list of entry points,
 # i.e. exactly the `module::kernel` strings the build warning and the startup
@@ -173,10 +168,3 @@ moe_expert_relu2_down_shared = "moe_relu2_fused"
 moe_topk_sigmoid = "moe_topk_sig"
 moe_topk_sqrtsoftplus = "moe_topk_sqrt"
 relu_squared = "relu2"
-exl3_linear_mma = "exl3_linear_mma"
-exl3_coop_gemm = "exl3_coop_gemm"
-exl3_mhc = "exl3_mhc"
-exl3_moe = "exl3_moe"
-exl3_moe_mma = "exl3_moe_mma"
-exl3_moe_precision = "exl3_moe_precision"
-exl3_shared = "exl3_shared"

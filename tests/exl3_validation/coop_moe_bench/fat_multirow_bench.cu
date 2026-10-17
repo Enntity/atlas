@@ -19,7 +19,7 @@
 // (kernels/gb10/common/KERNEL.toml): --fmad=false -DTQ_PLUS_SIGNS
 // --expt-relaxed-constexpr, arch from kernels/gb10/HARDWARE.toml (sm_121f):
 //   nvcc -O3 -arch=sm_121f --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr \
-//        -I<repo>/kernels/gb10/glm-5.3-flash-exl3/exl3 -o mb_fat fat_multirow_bench.cu
+//        -I<repo>/kernels/gb10/glm-5.3-flash/exl3 -o mb_fat fat_multirow_bench.cu
 // Env: ITERS (timed iterations, default 50), ROWS (default 128), TOPK (8),
 //      EXPERTS (288), THIN_CAP (32).
 #include <cstdio>

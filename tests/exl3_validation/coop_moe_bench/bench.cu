@@ -3,7 +3,7 @@
 // a read-only roofline, and a side-stream overlap probe (SIDE_MB=...).
 // Build in the builder container (no GPU), run on the Spark host:
 //   nvcc -O3 -arch=sm_121a --fmad=false --expt-relaxed-constexpr \
-//     -I<repo>/kernels/gb10/glm-5.3-flash-exl3/exl3 -o bench bench.cu
+//     -I<repo>/kernels/gb10/glm-5.3-flash/exl3 -o bench bench.cu
 // Env: ITERS, SLOTS, GRIDCAP, SIDE_MB, SIDE_GRID.
 // Decode geometry per rank: gate|up K4096->N1024 x2 projections, down
 // K1024->N4096, 8 slots, 4-bit mul1 trellis, thin profile 32x256 x 8 slices.

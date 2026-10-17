@@ -8,7 +8,7 @@ split.
 
 | Dir | Kernel(s) | Compares |
 |---|---|---|
-| `kda_decode/` | `kda_fla_recurrent_decode` (`kernels/gb10/common/kda_fla_decode.cuh`) | rows/warps/vector-I/O variants; 34 L2-cold state buffers |
+| `kda_decode/` | `kda_fla_recurrent_decode` (`kernels/gb10/glm-5.3-flash/exl3/kda_fla_decode.cuh`) | rows/warps/vector-I/O variants; 34 L2-cold state buffers |
 | `mhc_finish/` | `exl3_mhc_pre_partials` + `exl3_mhc_pre_norm_split`; `rbench.cu` = rounded site vs `exl3_mhc_pre_partials_rounded` | `v3.cuh` has `%globaltimer` stage markers; `v4.cuh` drops the residual writeback (timing only) |
 | `topk/` | `exl3_topk_sigmoid_par` | `orig.cuh` = the pre-`eeb2dc58` block-tree version; 2000 trials with forced ties |
 
@@ -22,7 +22,7 @@ flock /tmp/atlas-bench.lock ~/.local/bin/spark1 '
   cd ~/atlas-dev/src/tests/exl3_validation/microbench/mhc_finish &&
   docker exec atlas-dev-builder sh -c "cd /build/tests/exl3_validation/microbench/mhc_finish &&
     nvcc -O3 -arch=sm_121a -std=c++17 --fmad=true -DTQ_PLUS_SIGNS --expt-relaxed-constexpr \
-         -I/build/kernels/gb10/common -o /target/mb_mhc bench.cu" &&
+         -I/build/kernels/gb10/glm-5.3-flash/exl3 -o /target/mb_mhc bench.cu" &&
   ~/atlas-dev/target/mb_mhc'
 ```
 

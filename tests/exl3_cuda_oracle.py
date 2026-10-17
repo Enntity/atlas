@@ -110,8 +110,8 @@ def cpu_self_checks():
 def gpu_checks():
     import cupy as cp
 
-    source = (Path(__file__).resolve().parents[1] / "kernels/gb10/common/exl3.cu").read_text()
-    include = Path(__file__).resolve().parents[1] / "kernels/gb10/common"
+    source = (Path(__file__).resolve().parents[1] / "kernels/gb10/glm-5.3-flash/exl3/exl3.cu").read_text()
+    include = Path(__file__).resolve().parents[1] / "kernels/gb10/glm-5.3-flash/exl3"
     module = cp.RawModule(code=source, options=("--std=c++17", "-I" + str(include)))
     input_h = module.get_function("exl3_input_hadamard")
     input_h_f16 = module.get_function("exl3_input_hadamard_f16")

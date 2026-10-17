@@ -91,7 +91,7 @@ def main():
     xb = torch.tensor(x, device='cuda', dtype=torch.bfloat16)
     wb = torch.tensor(w, device='cuda', dtype=torch.bfloat16)
     actual = torch.nn.functional.linear(xb, wb).float().cpu().numpy()
-    common = Path(__file__).resolve().parents[2] / 'kernels/gb10/common'
+    common = Path(__file__).resolve().parents[2] / 'kernels/gb10/glm-5.3-flash/exl3'
     source = common / 'exl3_moe.cu'
     module = cp.RawModule(code=source.read_text(),
         options=('--std=c++17', '--fmad=false', '-I' + str(common)))

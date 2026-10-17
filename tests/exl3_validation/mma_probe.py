@@ -48,7 +48,7 @@ def main():
     parts, hashes, index_path = load_parts(args.checkpoint,args.expert_prefix,args.rank,reference)
     if hashes != old['selected_tensor_sha256']:
         raise ValueError('selected checkpoint payload differs from frozen reference stages')
-    common = Path(__file__).resolve().parents[2]/'kernels/gb10/common'
+    common = Path(__file__).resolve().parents[2]/'kernels/gb10/glm-5.3-flash/exl3'
     source = Path(__file__).with_suffix('.cu')
     header = common/'exl3_common.cuh'
     mma_header = common/'exl3_mma.cuh'

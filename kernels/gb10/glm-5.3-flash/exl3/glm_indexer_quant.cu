@@ -6,7 +6,7 @@
 #include <cuda_fp8.h>
 #include <math.h>
 #include "exl3_common.cuh"
-#include "glm_indexer_score.cuh"
+#include "../nvfp4/glm_indexer_score.cuh"
 
 namespace {
 __device__ __forceinline__ float glm_index_exp2_approx_ftz(float argument) {

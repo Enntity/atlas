@@ -8,7 +8,7 @@
 #        BLAS131_PAIR_DIR=/path/to/pair must name a directory holding
 #        libcublas.so.13, libcublasLt.so.13, package-binding-v1.json and
 #        dist-info/licenses/License.txt (the nvidia-cublas 13.1.1.3 pair;
-#        provenance and TODO in docker/gb10/glm-5.3-flash-exl3/exl3/Dockerfile).
+#        provenance and TODO in docker/gb10/glm-5.3-flash/exl3/Dockerfile).
 #
 # The git commit is derived from the worktree (dirty trees are rejected), so
 # the build manifest's git_commit binding is derived, not asserted.
@@ -46,7 +46,7 @@ runtime_image=$(awk '$1 == "FROM" && $NF != "builder" {print $2; exit}' docker/g
 # for the hashes; paths there are install-absolute, rewritten to be relative to
 # the pair directory and to blas131/. The pair is verified before and after
 # staging (the external recipe checked twice as well).
-pins=docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256
+pins=docker/gb10/glm-5.3-flash/exl3/cublas131.sha256
 install_dir=/opt/atlas/cublas-13.1.1.3
 rel_pins=$(mktemp)
 trap 'rm -f "$rel_pins"' EXIT
@@ -80,7 +80,7 @@ docker build --no-cache --progress=plain \
     --build-arg "ATLAS_BUILD_CPU=$build_cpu" \
     --build-arg "ATLAS_GIT_SHA=$source_commit" \
     --build-arg "ATLAS_SOURCE_SHA256=$snapshot_sha" \
-    -f docker/gb10/glm-5.3-flash-exl3/exl3/Dockerfile \
+    -f docker/gb10/glm-5.3-flash/exl3/Dockerfile \
     -t "$validation_image" .
 docker image inspect --format '{{.Id}} {{json .Config.Labels}}' "$validation_image"
 echo "build manifest: /usr/local/share/atlas/fingerprint/build-manifest.json in $validation_image"

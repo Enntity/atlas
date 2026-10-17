@@ -57,7 +57,7 @@ its local patches and runtime fingerprint before preparing an Atlas image.
 
 ## Isolated native image
 
-Use `docker/gb10/glm-5.3-flash-exl3/exl3/Dockerfile`. It requires explicit CUDA
+Use `docker/gb10/glm-5.3-flash/exl3/Dockerfile`. It requires explicit CUDA
 base images, toolchain, CPU affinity, commit and source snapshot hash. Derive the
 CUDA image arguments from the digest-pinned `docker/gb10/Dockerfile`.
 Use the installed stable release version explicitly, rather than an unrecorded
@@ -239,14 +239,14 @@ artifact directories and preserve failed attempts before changing source.
 
 ```bash
 python3 tests/exl3_validation/index_quant_oracle.py \
-  --native-source kernels/gb10/common/glm_indexer_quant.cu \
+  --native-source kernels/gb10/glm-5.3-flash/exl3/glm_indexer_quant.cu \
   --reference-source "$INSTALLED_KPOOL_SOURCE" \
   --reference-sha256 "$KPOOL_SOURCE_SHA256" \
   --reference-attention-sha256 "$ATTENTION_SOURCE_SHA256" \
   --out "$INDEX_COMPONENT_ARTIFACT_DIR"
 
 python3 tests/exl3_validation/dense_activation_oracle.py \
-  --native-source kernels/gb10/common/exl3.cu \
+  --native-source kernels/gb10/glm-5.3-flash/exl3/exl3.cu \
   --input-bin "$REFERENCE_L0_GATE_UP_BIN" \
   --input-sidecar "$REFERENCE_L0_GATE_UP_JSON" \
   --input-sha256 "$REFERENCE_L0_GATE_UP_SHA256" \

@@ -42,7 +42,7 @@ class BehaviorIORouter:
                Path(__file__).with_name('behavior_tools.py'),
                Path(__file__).with_name('behavior_robustness.py'),
                repo/'jinja-templates/openai/glm5_next.jinja',
-               repo/'kernels/gb10/glm-5.3-flash-exl3/MODEL.toml',
+               repo/'kernels/gb10/glm-5.3-flash/MODEL.toml',
                repo/'crates/spark-model/src/model/trait_impl/decode_a.rs',
                repo/'crates/spark-server/src/main_modules/serve_phases/preflight.rs']
         return {str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}

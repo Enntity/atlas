@@ -10,7 +10,7 @@ OUT=${OUT:-$(mktemp -d)}
 status=0
 for t in prep kkt wy state decode pipeline; do
   "$NVCC" -O3 -std=c++17 -gencode arch=compute_121f,code=compute_121f \
-    -I kernels/gb10/common -I tests/exl3_validation/kda_fla \
+    -I kernels/gb10/glm-5.3-flash/exl3 -I tests/exl3_validation/kda_fla \
     "tests/exl3_validation/kda_fla/test_${t}.cu" -o "$OUT/test_${t}"
   if "$OUT/test_${t}" > "$OUT/test_${t}.log" 2>&1; then
     echo "PASS test_${t}"

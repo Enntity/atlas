@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! Launch sequences for the EXL3 reference-policy (FLA bit-parity) KDA
-//! kernels in `kernels/gb10/common/kda_fla.cu`. Grids, blocks and argument
+//! kernels in `kernels/gb10/glm-5.3-flash/exl3/kda_fla.cu`. Grids, blocks and argument
 //! order mirror the byte-exact GPU tests in `tests/exl3_validation/kda_fla/`.
 
 use anyhow::{Result, ensure};

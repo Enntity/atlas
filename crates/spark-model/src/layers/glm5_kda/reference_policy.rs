@@ -3,7 +3,7 @@
 //! EXL3-only reference-policy KDA core (`ATLAS_KDA_FLA_REFERENCE=1`).
 //!
 //! Selects the byte-exact port of the pinned FLA/vLLM reference
-//! (`kernels/gb10/common/kda_fla.cu`, docs/design/exl3-kda-reference-core.md)
+//! (`kernels/gb10/glm-5.3-flash/exl3/kda_fla.cu`, docs/design/exl3-kda-reference-core.md)
 //! instead of Atlas's correctly rounded recurrence. Unset or `0` leaves every
 //! kernel handle and launch exactly as before. Setting it on an unsupported
 //! checkpoint or together with another prefill override is a startup error.

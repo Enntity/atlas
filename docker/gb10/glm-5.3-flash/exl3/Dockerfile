@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Atlas native EXL3 GLM-5.3-Flash validation image (glm-5.3-flash-exl3/exl3).
+# Atlas native EXL3 GLM-5.3-Flash validation image (glm-5.3-flash/exl3).
 #
 # Builds spark-server AND the exl3_moe_scratch_check example from one source
 # snapshot, packages the pinned coherent nvidia-cublas 13.1.1.3 classic+Lt pair
@@ -73,7 +73,7 @@ ENV CARGO_BUILD_JOBS=1
 ENV CMAKE_BUILD_PARALLEL_LEVEL=1
 ENV MAKEFLAGS=-j1
 ENV ATLAS_TARGET_HW=gb10
-ENV ATLAS_TARGET_MODEL=glm-5.3-flash-exl3
+ENV ATLAS_TARGET_MODEL=glm-5.3-flash
 ENV ATLAS_TARGET_QUANT=exl3
 WORKDIR /build
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -93,7 +93,7 @@ RUN taskset -c "${ATLAS_BUILD_CPU}" cargo build --locked --release -p spark-serv
     python3 /build/tools/build_manifest.py \
       --release-dir /build/target/release \
       --fingerprint-dir /build/fingerprint \
-      --target-key gb10/glm-5.3-flash-exl3/exl3 \
+      --target-key gb10/glm-5.3-flash/exl3 \
       --git-sha "${ATLAS_GIT_SHA}" \
       --source-snapshot-sha256 "${ATLAS_SOURCE_SHA256}" \
       --out /build/fingerprint/build-manifest.json && \
@@ -108,7 +108,7 @@ LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 LABEL org.opencontainers.image.revision="${ATLAS_GIT_SHA}"
 LABEL io.atlas.source.sha256="${ATLAS_SOURCE_SHA256}"
 LABEL io.atlas.rust.toolchain="${RUST_TOOLCHAIN}"
-LABEL io.atlas.validation.target="glm-5.3-flash-exl3/exl3"
+LABEL io.atlas.validation.target="glm-5.3-flash/exl3"
 LABEL io.atlas.blas.provider="nvidia-cublas 13.1.1.3"
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends --allow-change-held-packages \
@@ -122,7 +122,7 @@ COPY --from=builder /build/target/release/examples/exl3_moe_scratch_check /usr/l
 # ${LD_LIBRARY_PATH:+...} is Dockerfile-interpolated against the base image.
 COPY blas131/ /opt/atlas/cublas-13.1.1.3/
 ENV LD_LIBRARY_PATH=/opt/atlas/cublas-13.1.1.3${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
-COPY docker/gb10/glm-5.3-flash-exl3/exl3/cublas131.sha256 /usr/local/share/atlas/fingerprint/cublas131.sha256
+COPY docker/gb10/glm-5.3-flash/exl3/cublas131.sha256 /usr/local/share/atlas/fingerprint/cublas131.sha256
 RUN sha256sum -c /usr/local/share/atlas/fingerprint/cublas131.sha256
 # Fail the build unless the server's link-time libcublasLt and the classic
 # library's own Lt dependency resolve to the pinned directory. The classic

@@ -11,9 +11,9 @@ from build_manifest import (
     parse_target_closures,
 )
 
-TARGET_KEY = "gb10/glm-5.3-flash-exl3/exl3"
+TARGET_KEY = "gb10/glm-5.3-flash/exl3"
 CLOSURES = (
-    '{"gb10/glm-5.3-flash-exl3/exl3":{"hash":"h1","arch":"sm_121f",'
+    '{"gb10/glm-5.3-flash/exl3":{"hash":"h1","arch":"sm_121f",'
     '"compiler":"Build cuda_13.0.r13.0/compiler.36260728_0",'
     '"flags":["--fmad=false","-DTQ_PLUS_SIGNS"],"module_flags":{"exl3_mhc":["--fmad=true"]}}}'
 )
@@ -25,7 +25,7 @@ def make_tree(root, *, second_dir=False, spark_missing_ptx=False, example_partia
     release = root / "release"
     out = release / "build/atlas-kernels-abc/out"
     out.mkdir(parents=True)
-    (out / "target_ptx.rs").write_text('pub const M: &str = "glm-5.3-flash-exl3";')
+    (out / "target_ptx.rs").write_text('pub const M: &str = "glm-5.3-flash";')
     (out / "t0__exl3_mhc.ptx").write_bytes(PTX_MHC)
     (out / "t0__exl3_linear_mma.ptx").write_bytes(PTX_LIN)
     (out.parent / "output").write_text(

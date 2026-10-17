@@ -199,7 +199,7 @@ fn main() -> Result<()> {
     c.ep_rank = 0;
     c.ep_world_size = 1;
     c.expert_tp = false;
-    let target = atlas_kernels::ptx_for_exact_target("glm-5.3-flash-exl3", "exl3")
+    let target = atlas_kernels::ptx_for_exact_target("glm-5.3-flash", "exl3")
         .context("actual native EXL3 embedded target required")?;
     ensure!(
         !target.modules.is_empty() && atlas_kernels::TARGET_CLOSURES != "{}",

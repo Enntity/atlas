@@ -41,15 +41,23 @@ fn effective_module_flags_are_part_of_the_real_compile_dedup_key() {
 }
 
 #[test]
-fn actual_exl3_model_declares_only_its_mhc_override() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/gb10/glm-5.3-flash-exl3/MODEL.toml");
+fn actual_glm_exl3_quant_dir_declares_only_its_mhc_override() {
+    let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
+    let path = kernels.join("glm-5.3-flash/exl3/KERNEL.toml");
     let flags = module_flags::parse_module_compile_flags(&path, "nvidia");
     assert_eq!(flags, overrides());
     assert!(module_flags::parse_module_compile_flags(&path, "metal").is_empty());
-    let legacy = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/gb10/deepseek-v4-flash/nvfp4/KERNEL.toml");
-    assert!(module_flags::parse_module_compile_flags(&legacy, "nvidia").is_empty());
+    // exl3_mhc compiles only in the EXL3 overlay; an override in a shared
+    // layer would name a module the other targets lack and fail their build.
+    for shared in [
+        "common/KERNEL.toml",
+        "glm-5.3-flash/nvfp4/KERNEL.toml",
+        "glm-5.3-flash/MODEL.toml",
+        "deepseek-v4-flash/nvfp4/KERNEL.toml",
+    ] {
+        let flags = module_flags::parse_module_compile_flags(&kernels.join(shared), "nvidia");
+        assert!(flags.is_empty(), "{shared}: {flags:?}");
+    }
 }
 
 #[test]

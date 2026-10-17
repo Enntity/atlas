@@ -154,7 +154,7 @@ def main():
     for name, position, width in (('up_xh', 1, hidden), ('up_yh', 3, intermediate),
                                   ('down_xh', 2, intermediate), ('down_yh', 0, hidden)):
         arrays['reference_' + name] = layer._exl3_fused_temps[position][0, :rows, :width].index_select(0, input_to_sorted).float().cpu().numpy()
-    common = Path(__file__).resolve().parents[2] / 'kernels/gb10/common'
+    common = Path(__file__).resolve().parents[2] / 'kernels/gb10/glm-5.3-flash/exl3'
     diagnostic_source = r"""
 extern "C" __global__ void diagnostic_f16_input_hadamard(
     const __nv_bfloat16* x, const __half* suh, float* xh,

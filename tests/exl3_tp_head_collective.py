@@ -64,7 +64,7 @@ def main():
         torch.cuda.synchronize()
         logits = cp.from_dlpack(gathered.view(torch.float32))
         output = cp.full(rows * active_vocab + 4, -999, dtype=cp.float32)
-        root = Path(__file__).resolve().parents[1] / 'kernels/gb10/common'
+        root = Path(__file__).resolve().parents[1] / 'kernels/gb10/glm-5.3-flash/exl3'
         module = cp.RawModule(code=(root / 'exl3.cu').read_text(),
                               options=('--std=c++17', '-I' + str(root)))
         reorder = module.get_function('exl3_vocab_gather_reorder')

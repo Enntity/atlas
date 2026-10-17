@@ -60,7 +60,7 @@ def main():
     spec = importlib.util.spec_from_file_location('exl3_shared_reference', args.reference_plugin)
     reference = importlib.util.module_from_spec(spec); sys.modules[spec.name] = reference
     spec.loader.exec_module(reference)
-    common = Path(__file__).resolve().parents[2] / 'kernels/gb10/common'
+    common = Path(__file__).resolve().parents[2] / 'kernels/gb10/glm-5.3-flash/exl3'
     source = common / 'exl3_shared.cu'
     headers = sorted(common.glob('exl3*.cuh'))
     bindings = {str(p): digest(p) for p in [source, *headers, args.reference_plugin, Path(__file__)]}
