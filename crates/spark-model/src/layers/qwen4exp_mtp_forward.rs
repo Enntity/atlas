@@ -299,6 +299,21 @@ impl Qwen4ExpMtpHead {
         let hc = ctx.config.hc_mult.max(1);
         let eps = ctx.config.rms_norm_eps as f32;
         let w = self.module.pre_fc_norm_hidden.weight;
+        // `ATLAS_QWEN4EXP_MTP_FLAT_NORM`: one norm over each token's whole
+        // `[hc_mult * hidden]` row, as vLLM (`qwen4exp_mtp_norm.rs`).
+        if super::qwen4exp_mtp_norm::flat_norm() {
+            return ops::rms_norm_f32(
+                ctx.gpu,
+                self.rms_norm_f32_k,
+                streams,
+                w,
+                out,
+                (rows / hc) as u32,
+                (hc * h) as u32,
+                eps,
+                stream,
+            );
+        }
         if self.rms_norm_f32_grouped_k.0 != 0 {
             return ops::rms_norm_f32_grouped(
                 ctx.gpu,

@@ -181,6 +181,9 @@ pub mod qwen4exp_mtp_absorb;
 #[path = "qwen4exp_mtp_rows.rs"]
 mod qwen4exp_mtp_rows;
 
+#[path = "qwen4exp_mtp_norm.rs"]
+mod qwen4exp_mtp_norm;
+
 #[path = "qwen4exp_mtp_prompt.rs"]
 pub mod qwen4exp_mtp_prompt;
 
@@ -224,6 +227,9 @@ impl DraftProposer for Qwen4ExpMtpHead {
             // `body.decode` left holding the drafter's own residual — so
             // unlike the collapsed-hidden proposers there is nothing to thread
             // between iterations.
+            if i < 2 {
+                self.norm_diag(ctx, i, stream)?; // ATLAS_QWEN4EXP_MTP_NORM_DIAG
+            }
             let want_conf = i > 0 && self.conf_stop > 0.0;
             let (draft, conf) = self.forward_one(
                 current_token,
