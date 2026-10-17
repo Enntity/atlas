@@ -47,6 +47,8 @@ struct Recorder {
     /// once `script` (words it sends first, in order) runs out.
     peer_word: AtomicU32,
     script: Mutex<VecDeque<u32>>,
+    /// Words received as idle (unlatched) waits for rank 0.
+    idle_receives: AtomicU32,
 }
 
 struct Gpu {
@@ -285,6 +287,10 @@ impl spark_comm::CommBackend for Rank {
     fn barrier(&self) -> Result<()> {
         Ok(())
     }
+    fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
+        self.2.idle_receives.fetch_add(1, Ordering::Relaxed);
+        self.broadcast(ptr, 4, 0)
+    }
     fn send_to(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
         Ok(())
     }
@@ -451,6 +457,11 @@ impl Fixture {
         self.record.events.lock().clone()
     }
     /// The [`Order`] calls since the previous call.
+    /// Idle receives of rank 0's word so far (worker side).
+    #[allow(dead_code)]
+    pub fn idle_receives(&self) -> u32 {
+        self.record.idle_receives.load(Ordering::Relaxed)
+    }
     pub fn order(&self) -> Vec<Order> {
         std::mem::take(&mut *self.record.order.lock())
     }

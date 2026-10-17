@@ -45,7 +45,7 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use spark_runtime::prefix_cache::vision_key::vision_cache_key;
 
 use super::types::TransformerModel;
@@ -63,6 +63,24 @@ fn switch_on() -> bool {
 #[path = "vision_cache_items.rs"]
 mod items;
 pub(crate) use items::{cached_items, first_pad_positions, items_in_range, last_pad_positions};
+
+/// The encode of `items` (prompt-order indices into `counts`, each item's
+/// rows): its place in the prompt-order packed output of the items the cache
+/// did not cover wholly (the virtual row its first item starts at: every row
+/// before it, less the `skip_rows` of wholly cached leading items), and its
+/// row count. An empty selection keeps the previous window's base.
+pub(crate) fn encode_window(
+    counts: &[usize],
+    items: &[usize],
+    rows_base: usize,
+    skip_rows: usize,
+) -> (usize, usize) {
+    let a = items
+        .first()
+        .map_or(rows_base, |&first| counts[..first].iter().sum())
+        .saturating_sub(skip_rows);
+    (a, items.iter().map(|&i| counts[i]).sum())
+}
 
 impl TransformerModel {
     /// Whether vision prompts are keyed for the prefix cache (module docs).
@@ -309,30 +327,15 @@ impl TransformerModel {
             .vision_encoder
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("vision encode without an encoder"))?;
-        let grids = &seq.vision.grids;
-        // The encoded run's place in the prompt-order packed non-cached
-        // output: every item before the first encoded one contributes its
-        // rows (cached items' rows are skipped by the splice, not packed).
+        let counts: Vec<usize> = seq
+            .vision
+            .grids
+            .iter()
+            .map(|&(t, h, w)| t * h * w)
+            .collect();
         // Computed on BOTH ranks (the worker has no pixels but must slide
         // its window identically), so it cannot depend on the items alone.
-        let a: usize = items
-            .first()
-            .map_or(seq.vision.rows_base, |&first| {
-                (0..first)
-                    .map(|i| {
-                        let (t, h, w) = grids[i];
-                        t * h * w
-                    })
-                    .sum()
-            })
-            .saturating_sub(seq.vision.skip_rows);
-        let rows: usize = items
-            .iter()
-            .map(|&i| {
-                let (t, h, w) = grids[i];
-                t * h * w
-            })
-            .sum();
+        let (a, rows) = encode_window(&counts, items, seq.vision.rows_base, seq.vision.skip_rows);
         // Every rank derives `rows` from the same grids, so every rank fails
         // here alike, before the encode and any collective. The API admits
         // only requests whose every chunk fits (`vision_limits`).
@@ -361,7 +364,7 @@ impl TransformerModel {
         // the same point (`request_local`) instead of leaving the worker in a
         // collective the head never issues.
         if rows > 0 && self.multi_rank_protocol_active() {
-            let agreed = self.ep_min_u32(u32::from(encoded.is_ok()))?;
+            let agreed = self.ep_min_u32_head_late(u32::from(encoded.is_ok()))?;
             if agreed == 0 {
                 return Err(request_local(match encoded {
                     Err(e) => format!("vision encode failed: {e:#}"),
@@ -394,50 +397,8 @@ impl TransformerModel {
     }
 }
 
-impl TransformerModel {
-    /// The head's encode of `items` into `buf_out` row 0, checked against
-    /// the grids staged at admission (the key and the worker used those).
-    fn vision_encode_on_head(
-        &self,
-        seq: &SequenceState,
-        items: &[usize],
-        rows: usize,
-    ) -> Result<()> {
-        let ve = self
-            .vision_encoder
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vision encode without an encoder"))?;
-        let grids = &seq.vision.grids;
-        ensure!(
-            grids.len() == seq.vision.items.len(),
-            "vision items and grids disagree"
-        );
-        let refs: Vec<&VisionItem> = items.iter().map(|&i| &seq.vision.items[i]).collect();
-        let per_group = ve.forward_items(&refs, self.gpu.as_ref(), self.gpu.default_stream())?;
-        // The grids were derived before the encode (the key and the worker
-        // needed them); the encoder's own geometry must agree.
-        let mut group = 0usize;
-        for &i in items {
-            let item = &seq.vision.items[i];
-            let &(eh, ew, _) = per_group
-                .get(group)
-                .ok_or_else(|| anyhow::anyhow!("vision encoder returned {group} groups"))?;
-            ensure!(
-                (item.t_len(), eh, ew) == grids[i],
-                "deferred vision grid {:?} disagrees with the encoder's {:?}",
-                grids[i],
-                (item.t_len(), eh, ew)
-            );
-            group += item.t_len();
-        }
-        let encoded: usize = per_group.iter().map(|&(_, _, m)| m).sum();
-        ensure!(
-            encoded == rows,
-            "deferred vision encode produced {encoded} rows, the grids expect {rows}"
-        );
-        Ok(())
-    }
-}
+#[path = "vision_cache_head.rs"]
+mod head;
 
 #[cfg(test)]
 #[path = "vision_cache_stream_tests.rs"]

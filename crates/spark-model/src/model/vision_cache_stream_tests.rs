@@ -190,3 +190,71 @@ fn a_chunk_over_the_output_window_fails_alone_before_any_launch() {
         assert_eq!(f2.seq.vision.rows_encoded, 0);
     }
 }
+
+#[test]
+fn a_worker_waits_for_the_heads_encode_as_an_idle_receive() {
+    // The head encodes (about 20 s per 2048^2 image) while the worker, which
+    // holds no pixels, waits for the head's agreement word: a timed wait
+    // marked the communicator unhealthy past 30 s. The worker takes that
+    // word as an idle receive; the order of collectives is unchanged.
+    let (_, tokens) = staged();
+    let mut w = Fixture::new(2, 1, 1);
+    let tower = VisionEncoder::new_glm(
+        Some(test_tower::weights()),
+        &test_tower::config(),
+        w.model.gpu.as_ref(),
+    )
+    .unwrap();
+    w.model.vision_encoder = Some(tower);
+    w.seq.vision.grids = vec![(1, 8, 8)];
+    w.seq.vision.hashes = vec![1];
+    w.seq.vision.deferred = true;
+    w.seq.prefix_lookup_applied = true;
+    assert_eq!(w.idle_receives(), 0);
+    w.model
+        .vision_encode_chunk_items(&mut w.seq, &tokens, 0, tokens.len(), CALLER)
+        .unwrap();
+    assert_eq!(w.idle_receives(), 1, "the agreement's rank-0 word");
+    assert_eq!(w.seq.vision.rows_encoded, 64);
+}
+
+#[test]
+fn a_chunk_over_a_cached_head_splices_without_rows() {
+    // Issue 180 on a warm cache: item 0 (4 rows, pads 1..5) is cached whole
+    // and the prefix reaches 40, inside item 1 (64 rows, pads 6..70). The
+    // chunk [0, 40) computes nothing and the window is empty; it failed
+    // "vision pad overlay exceeds the resident window" on every rank.
+    let (mut f, _) = staged();
+    let tokens: Vec<u32> = [1]
+        .into_iter()
+        .chain(std::iter::repeat_n(PAD, 4))
+        .chain([2])
+        .chain(std::iter::repeat_n(PAD, 64))
+        .chain([3])
+        .collect();
+    f.seq.vision.grids = vec![(1, 2, 2), (1, 8, 8)];
+    f.seq.vision.computed_from = 40;
+    f.seq.vision.skip_rows = 4;
+    f.seq.vision.rows_encoded = 0;
+    f.seq.vision.rows_base = 0;
+    let hidden = f.model.buffers.hidden_states();
+    f.model
+        .splice_vision_rows(&f.seq, &tokens, 0, 40, hidden, CALLER)
+        .expect("a cached head needs no rows");
+    // The computed tail needs item 1's rows: refused without them, never
+    // left as raw token embeddings.
+    let err = f
+        .model
+        .splice_vision_rows(&f.seq, &tokens, 40, tokens.len() - 40, hidden, CALLER)
+        .unwrap_err();
+    assert!(crate::request_local::is_request_local(&err));
+    f.seq.vision.skip_rows = 0;
+    f.seq.vision.grids = vec![(1, 8, 8)];
+    let one: Vec<u32> = tokens[5..].to_vec();
+    assert!(
+        f.model
+            .splice_vision_rows(&f.seq, &one, 35, one.len() - 35, hidden, CALLER)
+            .is_err(),
+        "no skip, no rows: still refused"
+    );
+}

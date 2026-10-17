@@ -55,10 +55,14 @@ pub(crate) fn items_in_range(
         .iter()
         .zip(last_pad)
         .enumerate()
-        .filter(|&(_, (&first, &last))| {
-            let first = first.max(computed_from);
-            first < to && last >= from
-        })
+        // A placeholder in `[max(from, computed_from), to)`. Clamping only
+        // the first pad (`first.max(computed_from) < to && last >= from`)
+        // also selected an item the cache covers wholly but which ends inside
+        // the range: the window then started one item early while the splice
+        // skips that item's rows, and every later image read the previous
+        // image's rows (8 x 2048^2 on a warm cache: the sixth image answered
+        // as the fifth).
+        .filter(|&(_, (&first, &last))| first < to && last >= from.max(computed_from))
         .map(|(i, _)| i)
         .collect()
 }
