@@ -71,35 +71,44 @@ pub(super) fn concat_weights(
     if store.contains(&format!("{direct}.weight")) {
         return linear_ptr(store, gpu, direct);
     }
-    let mut loaded = Vec::with_capacity(parts.len());
-    let mut cols = None;
-    let mut rows = 0usize;
-    for part in parts {
-        let (ptr, [part_rows, part_cols]) = linear(store, gpu, part)?;
-        let expanded = ptr != store.get(&format!("{part}.weight"))?.ptr;
-        loaded.push((ptr, part_rows, expanded));
-        if let Some(expected) = cols {
-            ensure!(
-                part_cols == expected,
-                "GLM vision concatenated weights have inconsistent K"
-            );
-        } else {
-            cols = Some(part_cols);
+    // `(ptr, rows, expanded)`: an expanded part is a BF16 copy of an
+    // FP4-Local part, freed once copied, or on any error.
+    let mut loaded: Vec<(DevicePtr, usize, bool)> = Vec::with_capacity(parts.len());
+    let built = (|| -> Result<DevicePtr> {
+        let mut cols = None;
+        let mut rows = 0usize;
+        for part in parts {
+            let (ptr, [part_rows, part_cols]) = linear(store, gpu, part)?;
+            let expanded = ptr != store.get(&format!("{part}.weight"))?.ptr;
+            loaded.push((ptr, part_rows, expanded));
+            if let Some(expected) = cols {
+                ensure!(
+                    part_cols == expected,
+                    "GLM vision concatenated weights have inconsistent K"
+                );
+            } else {
+                cols = Some(part_cols);
+            }
+            rows += part_rows;
         }
-        rows += part_rows;
-    }
-    let cols = cols.context("empty GLM vision concatenation")?;
-    let dst = gpu.alloc(rows * cols * 2)?;
-    let mut row = 0usize;
-    for (ptr, part_rows, expanded) in loaded {
-        gpu.copy_d2d(ptr, dst.offset(row * cols * 2), part_rows * cols * 2)?;
+        let cols = cols.context("empty GLM vision concatenation")?;
+        let dst = gpu.alloc(rows * cols * 2)?;
+        let mut row = 0usize;
+        for &(ptr, part_rows, _) in &loaded {
+            if let Err(e) = gpu.copy_d2d(ptr, dst.offset(row * cols * 2), part_rows * cols * 2) {
+                gpu.free(dst)?;
+                return Err(e);
+            }
+            row += part_rows;
+        }
+        Ok(dst)
+    })();
+    for (ptr, _, expanded) in loaded {
         if expanded {
-            // A BF16 expansion of an FP4-Local part, dead once copied.
             gpu.free(ptr)?;
         }
-        row += part_rows;
     }
-    Ok(dst)
+    built
 }
 
 /// Every vision linear stem the loader may have expanded.
@@ -290,6 +299,38 @@ mod tests {
 
     /// BF16 as stored; MXFP8 and packed W4A16 NVFP4 expanded to BF16 with
     /// their logical `[rows, cols]`.
+    /// A concatenation whose later part fails frees the earlier parts'
+    /// expansions instead of leaking them; a good one frees them after the copy.
+    #[test]
+    fn concat_frees_part_expansions_on_success_and_on_failure() {
+        for (second, ok) in [("m2", true), ("bad", false)] {
+            let gpu = MockGpuBackend::new();
+            let mut map = HashMap::new();
+            for stem in ["m", "m2"] {
+                map.insert(
+                    format!("{stem}.weight"),
+                    tensor(&gpu, WeightDtype::FP8E4M3, vec![8, 64], 0),
+                );
+                map.insert(
+                    format!("{stem}.weight_scale"),
+                    tensor(&gpu, WeightDtype::UInt8, vec![8, 2], 127),
+                );
+            }
+            // K 32 against the first part's 64.
+            map.insert(
+                "bad.weight".to_string(),
+                tensor(&gpu, WeightDtype::BF16, vec![8, 32], 0),
+            );
+            let store = WeightStore::from_map(map);
+            let allocs = gpu.alloc_count();
+            let parts = ["m".to_string(), second.to_string()];
+            let fused = concat_weights(&store, &gpu, "absent", &parts);
+            assert_eq!(fused.is_ok(), ok, "{second}");
+            // Only the fused weight (on success) outlives the call.
+            assert_eq!(gpu.alloc_count(), allocs + usize::from(ok), "{second}");
+        }
+    }
+
     #[test]
     fn vit_linears_load_bf16_as_stored_and_expand_quantized_ones() {
         let gpu = MockGpuBackend::new();

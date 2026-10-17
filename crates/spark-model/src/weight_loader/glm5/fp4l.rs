@@ -35,6 +35,13 @@
 //! After a layer is built nothing reads its quantized sources again, so
 //! [`release_expanded`] frees them there, keeping resident memory at the
 //! derived copies alone.
+//!
+//! Teardown: the derived copies (the BF16 lm_head and ViT linears, like
+//! every NVFP4 / MXFP8 twin and BF16 TP shard the GLM loader makes) are
+//! loader allocations, not store tensors. `TransformerModel::release_pools`
+//! frees them in its final `sweep_unreleased`, after the store. They cannot
+//! join the store: loaders get `&WeightStore` (and `WeightStore::insert`
+//! needs `&mut`), and the store is shared by every loader of the build.
 
 use anyhow::{Context, Result, bail};
 use atlas_core::config::LayerType;
