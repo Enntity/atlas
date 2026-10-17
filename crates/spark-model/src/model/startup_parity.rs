@@ -198,6 +198,14 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_MLA_FUSE", || {
         Ok(ops::glm_mla_fuse_requested()? as u64)
     }),
+    // Which layer groups compute on the checkpoint's own formats; the shared
+    // expert's native TP split pairs halves across the ranks.
+    ("ATLAS_GLM_FP4L_NATIVE", || {
+        Ok(layers::glm_native::NativePolicy::from_env().bits())
+    }),
+    ("ATLAS_GLM_FP4L_FP8_PREFILL", || {
+        Ok(ops::Fp8bPrefill::from_env()? as u64)
+    }),
     ("ATLAS_GLM_MXFP8_TILED", || {
         Ok(ops::mxfp8_tiled_requested()? as u64)
     }),

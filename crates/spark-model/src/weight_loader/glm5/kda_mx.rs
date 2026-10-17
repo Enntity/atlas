@@ -44,13 +44,16 @@ pub(super) struct KdaMxPolicy {
 }
 
 impl KdaMxPolicy {
-    pub(super) const DECODE: &'static str = "ATLAS_GLM_FP4L_KDA_MXFP8_DECODE";
-    pub(super) const W8A8: &'static str = "ATLAS_GLM_FP4L_KDA_W8A8_PREFILL";
+    pub(super) const DECODE: &'static str = crate::layers::glm_native::NativePolicy::KDA_DECODE;
+    pub(super) const W8A8: &'static str = crate::layers::glm_native::NativePolicy::KDA_W8A8;
 
+    /// The two switches, each also on under `ATLAS_GLM_FP4L_NATIVE`
+    /// (`layers::glm_native`).
     pub(super) fn from_env() -> Self {
+        let native = crate::layers::glm_native::NativePolicy::from_env();
         Self {
-            decode: super::components::env_flag(Self::DECODE),
-            w8a8_prefill: super::components::env_flag(Self::W8A8),
+            decode: native.kda_decode,
+            w8a8_prefill: native.kda_w8a8,
         }
     }
 
