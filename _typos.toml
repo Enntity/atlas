@@ -165,6 +165,10 @@ aout = "aout"
 # `nothink` — the thinking-disabled workload/template variant
 # (`tools+nothink`). Not a typo of "nothing".
 nothink = "nothink"
+# `copys` — upstream test identifier `a_cut_keeps_a_copys_confidences_...`
+# (`spark-server/src/scheduler/copy_drafts_tests.rs`). Renaming upstream's
+# test is not this PR's business; allowlist the word instead.
+copys = "copys"
 
 [default.extend-identifiers]
 # `PNGs` — the plural of PNG, in the vision-fixture provisioning commentary.
