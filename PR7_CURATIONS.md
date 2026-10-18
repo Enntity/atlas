@@ -1,26 +1,20 @@
-# PR-7 commit curation — followup/pr7-curation @ 2e8b54db
+# PR-7 commit curation — followup/pr7-curation @ 2e8b54db + 4 groups
 Branch: followup/pr7-curation (worktree ../atlas-pr7); not pushed.
-Source: pr/glm53-exl3 @ 2e8b54db (rebased onto spark-shared a9464810, 33 topic
-squashes + fmt). Diff vs upstream base: ~70 commits, 714 files, +95,982.
+Source: pr/glm53-exl3 @ 2e8b54db (rebased onto spark-shared a9464810).
+Diff vs upstream base: ~70 commits, 714 files, +95,982.
 
-Exclude (already in docs/design/pr5-description-draft.md §Packaging):
-- Root working notes: todo.md, continue.md, decisions.md, assumptions.md,
-  q2-diagnostic.md, prefill-*.md, p13-*, CODE_REVIEW_*
-- docs/design/ + docs/plans/ validation records (45 files, ~55k lines with harness)
-- tests/exl3_validation/ (237 files, harness + receipts)
-- atlas-kv-cache-server / atlas-codecs crates (unrelated to GLM EXL3)
-- F4 config stub (not in PR tip; dev-only)
-- Kernel *_opt drafts already dropped by merge (6a5110c2)
+Exclude (docs/design/pr5-description-draft.md §Packaging; todo.md PR-7):
+- Root working notes (todo.md, continue.md, decisions.md, assumptions.md,
+  q2-diagnostic.md, prefill-*.md, p13-*, CODE_REVIEW_*)
+- docs/design/ + docs/plans/ validation records (45 files)
+- tests/exl3_validation/ harnesses (237 files)
+- atlas-kv-cache-server / atlas-codecs crates
+- F4 config stub (dev-only); *_opt kernel drafts (already dropped 6a5110c2)
 
-Reviewable groups (to be finalized into 4–6 commits before PR):
-1. Build / kernel target (glm-5.3-flash EXL3, MODEL.toml, symlink repair)
-2. Server / scheduler / wire (EP_CMD_REQUEST_ID 0xFFFF_FFF9, request-id,
-   stop strings/seed fixes, thinking-loop watchdog, grammar mask)
-3. Model / weight / MTP / sparse-decode admission (qwen3_attention EXL3
-   guards, glm_sparse_decode, prefill_stream, choose_seed)
-4. CI / license / format (SPDX, 500-line cap inherited red only, fmt clean)
-5. Evidence / benchmark harness — EXCLUDED from PR (held in branch,
-   merged separately if needed)
+Reviewable groups (this branch — 4 marker commits above a9464810):
+G1 build/kernel — EXL3 target, MODEL.toml, nvfp4 build, symlink repair
+G2 server/scheduler — EP=0xFFFF_FFF9 wire, request-id, stop/seed, grammar
+G3 model/wire — qwen3_attention EXL3 guards, glm_sparse_decode, MTP, prefill
+G4 CI/license — fmt clean, SPDX green, 500-line cap inherited; exclusions noted
 
-Accept: PR opens from this grouping once exclusions confirmed; no new
-code added to this branch — packaging only.
+Accept: open PR from this grouping; no new code — packaging only.
