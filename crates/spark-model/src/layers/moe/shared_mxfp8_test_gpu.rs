@@ -236,11 +236,11 @@ fn shared_mxfp8_matches_f64_and_is_row_invariant() -> Result<()> {
         let w = weights(layer, &mut rng)?;
         // The whole expert (TP1), then a TP2 rank's slices (`shared_mxfp8.rs`).
         let mut decoded = Vec::new();
+        let x = activations(&mut rng, T);
         for (rank, size) in [(0, 1), (0, 2), (1, 2)] {
             let dev = upload_weights(gpu, &w, (rank, size))?;
             let il = I / size;
             let mx = Mxfp8SharedExpert::from_raw(gpu, dev.raw, [H, I], (rank, size), Some(T))?;
-            let x = activations(&mut rng, T);
             let xd = upload(gpu, &bytes(&x))?;
             let (gu, act, out) = (
                 gpu.alloc(T * 2 * il * 2)?,
