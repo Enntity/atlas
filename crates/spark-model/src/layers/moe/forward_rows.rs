@@ -142,8 +142,8 @@ impl MoeLayer {
                 )?;
             }
         }
-        let shared = (shared_out, side.is_some());
-        let posted = self.forward_ep_reduce(output, shared, input, rows, hc_post, ctx, stream)?;
+        let posted =
+            self.forward_ep_reduce(output, shared_out, input, rows, hc_post, ctx, stream)?;
         Ok(Some((output, posted)))
     }
 
@@ -307,8 +307,13 @@ impl MoeLayer {
         }
 
         // Each row's blend, as `forward_row_local` runs it: under EP against a
-        // zeroed shared row (the EP reduce adds the shared expert once).
-        let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        // zeroed shared row (the EP reduce adds the shared expert once), but
+        // with an MXFP8 one's partial (joined first when it was forked).
+        let is_ep =
+            ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.mxfp8_shared_split();
+        if !unfused_here && self.mxfp8_shared_split() {
+            self.join_mxfp8_shared(ctx, stream)?;
+        }
         let zero_row = if is_ep {
             self.ep_blend_zero_row(ctx, stream)?
         } else {

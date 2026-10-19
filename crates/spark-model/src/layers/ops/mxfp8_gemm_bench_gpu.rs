@@ -82,6 +82,7 @@ fn mxfp8_gemm_bench_against_bf16_cublaslt() -> Result<()> {
             "tp2 gdn qkvz" | "tp2 gdn out" => (36.0, true),
             "tp2 qsa q" | "tp2 qsa o" => (12.0, true),
             "tp2 qsa k, v" => (24.0, false),
+            "tp2 shared gate, up" | "tp2 shared down" => (48.0, true),
             other => anyhow::bail!("no per-rank GEMM count for {other:?}"),
         };
         for (mi, &m) in MS.iter().enumerate() {

@@ -34,18 +34,20 @@
 //! and up to BF16, SiLU to BF16, the product to BF16 (`mx_swiglu`). The
 //! sigmoid `shared_expert_gate` stays the checkpoint's BF16 in the blend.
 //!
-//! Replicated on every EP rank, as the NVFP4 shared expert was: each rank
-//! computes all of it, and the EP reduce adds it once after the all-reduce.
+//! Under EP the intermediate is split over the ranks, as the reference's
+//! TP2 layout splits it (vLLM `Qwen2MoeMLP`: a column-parallel gate/up, a
+//! row-parallel down without its reduce, then `sigmoid(shared_expert_gate(x))
+//! * partial` added to the routed partial before the one all-reduce): rank
+//! `r` of `n` holds gate/up rows `[r * I/n, (r + 1) * I/n)` and the matching
+//! down columns, its partial joins the routed partial in the weighted-sum
+//! blend before the EP all-reduce (or reduce-scatter), and nothing is added
+//! after it. Each rank reads `1/n` of the weights. The gate scales the
+//! partials, which by linearity is the gate times their sum.
+//!
 //! There (TP=EP=2 decode, verify and batch), it runs on a side stream
-//! ([`SideLane`]) forked at the MoE's entry and joined after the all-reduce
-//! is issued: it reads only the MoE input, so it overlaps the router, the
-//! routed experts and the all-reduce's wait on the peer instead of adding
-//! its weight bytes to the step. The same kernels on the same operands:
-//! the bytes do not change. GB10, one EP2 rank's MoE layer (the TC v3 units,
-//! `scripts/dev/qwen4exp_moe_c8_bench.sh time tc3`, min of 7, us; NVFP4
-//! shared unit / MXFP8 in line / MXFP8 on the side lane): 1 row 77.0 / 89.4
-//! / 79.6, 4 rows 265.3 / 266.5 / 261.9, 16 rows 520.3 / 521.8 / 521.5, 32
-//! rows (C8, 70 unique experts) 852.4 / 856.7 / 845.1.
+//! ([`SideLane`]) forked at the MoE's entry and joined before the blend: it
+//! reads only the MoE input, so it overlaps the router and the routed
+//! experts. The same kernels on the same operands: the bytes do not change.
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
@@ -56,7 +58,7 @@ use super::*;
 use crate::layers::ops::{
     MX_QUANT_KERNEL, MXFP8_ACT_MODULE, MXFP8_BLOCK, MxAct, MxW8a8, qwen4exp_w8a8,
 };
-use crate::weight_map::{Mxfp8Weight, RawMxfp8, mxfp8_rows_twin, raw_mxfp8};
+use crate::weight_map::{Mxfp8Weight, RawMxfp8, mxfp8_cols_twin, mxfp8_rows_twin, raw_mxfp8};
 
 /// The kernel module of the shared expert's GEMV tiers and prefill SiLU.
 const MODULE: &str = "mxfp8_gemv";
@@ -118,6 +120,9 @@ pub(crate) struct Mxfp8SharedExpert {
     w8a8: Option<(MxW8a8, MxW8a8)>,
     /// Under EP (see the module docs).
     side: Option<SideLane>,
+    /// This rank holds a slice: its output is a partial, blended before the
+    /// EP reduce.
+    split: bool,
     k: Kernels,
     hidden: usize,
     inter: usize,
@@ -142,37 +147,42 @@ impl Mxfp8SharedExpert {
         };
         let parts = [raw("gate_proj")?, raw("up_proj")?, raw("down_proj")?];
         let w8a8 = qwen4exp_w8a8::enabled().then_some(config.max_batch_tokens);
-        let mut mx =
-            Self::from_raw(gpu, parts, [hidden, inter], w8a8).with_context(|| lp.to_string())?;
-        if config.ep_world_size > 1 {
-            mx.side = Some(SideLane::get(gpu, [hidden, inter])?);
+        let ranks = (config.ep_rank, config.ep_world_size.max(1));
+        let mut mx = Self::from_raw(gpu, parts, [hidden, inter], ranks, w8a8)
+            .with_context(|| lp.to_string())?;
+        if mx.split {
+            mx.side = Some(SideLane::get(gpu, [hidden, mx.inter])?);
         }
         Ok(mx)
     }
 
     /// [`Self::load`] from raw `[gate, up, down]` MXFP8 tensors of a
-    /// `[hidden, inter]` expert, with W8A8 operands tuned up to `w8a8` rows
-    /// when it is `Some`.
+    /// `[hidden, inter]` expert, rank `ranks.0` of `ranks.1`'s slice (module
+    /// docs), with W8A8 operands tuned up to `w8a8` rows when it is `Some`.
     pub(crate) fn from_raw(
         gpu: &dyn GpuBackend,
         [gate, up, down]: [RawMxfp8; 3],
-        [hidden, inter]: [usize; 2],
+        [hidden, full]: [usize; 2],
+        (rank, size): (usize, usize),
         w8a8: Option<usize>,
     ) -> Result<Self> {
+        let inter = full / size;
         ensure!(
-            [gate, up].iter().all(|w| (w.n, w.k) == (inter, hidden))
-                && (down.n, down.k) == (hidden, inter)
+            [gate, up].iter().all(|w| (w.n, w.k) == (full, hidden))
+                && (down.n, down.k) == (hidden, full)
+                && rank < size
+                && full == inter * size
                 && inter.is_multiple_of(MXFP8_BLOCK),
-            "MXFP8 shared expert gate {:?} / up {:?} / down {:?}, not [{inter}, {hidden}] / \
-             [{hidden}, {inter}]",
+            "MXFP8 shared expert gate {:?} / up {:?} / down {:?}, not [{full}, {hidden}] / \
+             [{hidden}, {full}] in {size} slices of whole 32-value blocks",
             (gate.n, gate.k),
             (up.n, up.k),
             (down.n, down.k),
         );
         let stream = gpu.default_stream();
         let (gate_up, ..) =
-            mxfp8_rows_twin(gpu, &[(gate, &[inter]), (up, &[inter])], 0, 1, stream)?;
-        let (down, ..) = mxfp8_rows_twin(gpu, &[(down, &[hidden])], 0, 1, stream)?;
+            mxfp8_rows_twin(gpu, &[(gate, &[full]), (up, &[full])], rank, size, stream)?;
+        let (down, ..) = mxfp8_cols_twin(gpu, down, rank, size, stream)?;
         let w8a8 = match w8a8 {
             Some(m_max) => Some((
                 MxW8a8::from_twin(gpu, &gate_up, [2 * inter, hidden], m_max, stream)?,
@@ -200,6 +210,7 @@ impl Mxfp8SharedExpert {
             down,
             w8a8,
             side: None,
+            split: size > 1,
             k,
             hidden,
             inter,
@@ -273,9 +284,9 @@ impl Mxfp8SharedExpert {
 impl MoeLayer {
     /// An EP decode / verify / batch step of `rows` rows: fork the MXFP8
     /// shared expert of `input` onto the side lane (module docs) and return
-    /// where its output lands, for [`Self::forward_ep_reduce`] to blend
-    /// after [`Self::join_mxfp8_shared`]. `None`: nothing forked, the step
-    /// runs it in line (`run_unfused_shared_expert`).
+    /// where its partial lands, for the blend to read after
+    /// [`Self::join_mxfp8_shared`]. `None`: nothing forked, the step runs it
+    /// in line (`run_unfused_shared_expert`).
     pub(super) fn fork_mxfp8_shared(
         &self,
         input: DevicePtr,
@@ -299,6 +310,12 @@ impl MoeLayer {
         mx.decode(gpu, input, rows, lane.act, lane.out, lane.stream)?;
         gpu.record_event(lane.join, lane.stream)?;
         Ok(Some(lane.out))
+    }
+
+    /// The layer's MXFP8 shared expert is this rank's slice (module docs):
+    /// its output joins the routed partial before the EP reduce.
+    pub(super) fn mxfp8_shared_split(&self) -> bool {
+        self.mxfp8_shared_expert.is_some_and(|mx| mx.split)
     }
 
     /// `stream` waits for the forked shared expert ([`Self::fork_mxfp8_shared`]).

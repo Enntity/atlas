@@ -43,8 +43,9 @@ const fn shape(label: &'static str, n: u32, k: u32, on: &'static [usize]) -> MxS
 
 /// The FP4-Local prefill projections `ATLAS_QWEN4EXP_PREFILL_W8A8` runs, at
 /// TP2 (a rank's cut) and TP1. K and V are separate GEMMs of one shape. The
-/// shared expert (gate and up stacked, then down) is whole on every rank.
-pub const MX_SWEEP: [MxSweepShape; 12] = [
+/// shared expert (gate and up stacked, then down) is a rank's slice of its
+/// intermediate at TP2 and whole at TP1.
+pub const MX_SWEEP: [MxSweepShape; 14] = [
     shape("tp2 gdn qkvz", 8192, 2560, SWEPT_2026_10_15),
     shape("tp2 gdn out", 2560, 3072, SWEPT_2026_10_15),
     shape("tp2 qsa q", 6144, 2560, SWEPT_2026_10_15),
@@ -58,8 +59,10 @@ pub const MX_SWEEP: [MxSweepShape; 12] = [
     // depend on the shape and the row count, not on the weights.
     shape("tp1 qsa k, v", 512, 2560, SWEPT_2026_10_15),
     shape("tp1 qsa o", 2560, 6144, NOT_SWEPT),
-    shape("shared gate, up", 1280, 2560, SWEPT_2026_10_19),
-    shape("shared down", 2560, 640, SWEPT_2026_10_19),
+    shape("tp2 shared gate, up", 640, 2560, NOT_SWEPT),
+    shape("tp2 shared down", 2560, 320, NOT_SWEPT),
+    shape("tp1 shared gate, up", 1280, 2560, SWEPT_2026_10_19),
+    shape("tp1 shared down", 2560, 640, SWEPT_2026_10_19),
 ];
 
 /// Whether the sweep passed for `n x k` on cuBLASLt `version`.
@@ -80,7 +83,14 @@ mod tests {
                 assert!(verified(v, n, k), "{v} {n}x{k}");
             }
             // Added to the sweep, not run yet.
-            for (n, k) in [(256, 2560), (16384, 2560), (2560, 6144), (12288, 2560)] {
+            for (n, k) in [
+                (256, 2560),
+                (16384, 2560),
+                (2560, 6144),
+                (12288, 2560),
+                (640, 2560),
+                (2560, 320),
+            ] {
                 assert!(!verified(v, n, k), "{v} {n}x{k}");
             }
             // The shared expert's: swept on 13.0.0 only.
@@ -88,7 +98,7 @@ mod tests {
                 assert_eq!(verified(v, n, k), v == 130000, "{v} {n}x{k}");
             }
             // Never swept (the indexer doesn't run W8A8).
-            for (n, k) in [(320, 2560), (640, 2560), (2560, 320), (384, 1536)] {
+            for (n, k) in [(320, 2560), (384, 1536)] {
                 assert!(!verified(v, n, k), "{v} {n}x{k}");
             }
         }
