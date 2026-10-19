@@ -85,6 +85,43 @@ pub fn mxfp8_quant_act(
         .launch(stream)
 }
 
+/// `mxfp8_quant_act` of `SiLU(gate) * up`: `gu` holds `m` BF16 rows
+/// `[gate | up]` (`2 * inter` wide, contiguous; a gate/up GEMM's output), and
+/// `q` / `sf` get the E4M3 `[m, inter]` and tiled scales of the activation
+/// rounded to BF16 as `mx_swiglu` rounds it -- the operand of the down
+/// projection. `kernel` is `mxfp8_swiglu_quant_act` (module `mxfp8_gemv`).
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_swiglu_quant_act(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    gu: DevicePtr,
+    q: DevicePtr,
+    sf: DevicePtr,
+    m: u32,
+    inter: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        m > 0 && inter > 0 && (inter as usize).is_multiple_of(MXFP8_BLOCK),
+        "mxfp8_swiglu_quant_act: m={m} inter={inter} (need inter % 32 == 0)"
+    );
+    let threads = u64::from(m) * u64::from(inter / 8);
+    ensure!(
+        threads <= u64::from(u32::MAX),
+        "mxfp8_swiglu_quant_act: {m} x {inter} is too large for one launch"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([div_ceil(threads as u32, 256), 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(gu)
+        .arg_ptr(q)
+        .arg_ptr(sf)
+        .arg_u32(m)
+        .arg_u32(inter)
+        .arg_u32(mx_lt_inner_pad(inter as usize) as u32)
+        .launch(stream)
+}
+
 /// Relayout row-major UE8M0 scales (`rows` rows of `k / 32`, row stride
 /// `src_ld` bytes: a TP rank's K slice is `src + k0 / 32` with the full
 /// width's stride) into the tiled layout at `dst`

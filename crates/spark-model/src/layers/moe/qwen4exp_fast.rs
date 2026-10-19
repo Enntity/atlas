@@ -141,6 +141,7 @@ impl MoeLayer {
             && self.correction_bias_dev.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
+            // Its multi-row GEMM is not the one-row GEMV; an MXFP8 one runs below.
             && !self.has_mixed_bf16_shared_expert()
             && self.router_logits_n as usize == ctx.config.num_experts)
         {
@@ -217,6 +218,20 @@ impl MoeLayer {
                 rows,
                 stream,
             )?;
+            // FP4-Local's MXFP8 shared expert (no shared tables above).
+            if self.has_unfused_shared_expert() {
+                self.run_unfused_shared_expert(
+                    input.offset(first * h * bf16),
+                    rows as u32,
+                    h as u32,
+                    ctx.config.shared_expert_intermediate_size as u32,
+                    shared_gate_scratch,
+                    shared_up_scratch,
+                    shared_out,
+                    ctx,
+                    stream,
+                )?;
+            }
             for t in 0..rows {
                 let row = first + t;
                 let output_t = ctx.buffers.moe_output().offset(row * h * bf16);

@@ -414,6 +414,9 @@ pub struct MoeLayer {
     // Checkpoint-native BF16 shared expert. Independent of routed-expert
     // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
     pub(super) bf16_shared_expert: Option<Bf16SharedExpert>,
+    // Checkpoint-native MXFP8 shared expert (FP4-Local), likewise outside the
+    // fused routed kernels: `shared_mxfp8.rs`.
+    pub(super) mxfp8_shared_expert: Option<Mxfp8SharedExpert>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     pub(super) fp8_shared_expert: Option<Fp8ExpertWeight>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>

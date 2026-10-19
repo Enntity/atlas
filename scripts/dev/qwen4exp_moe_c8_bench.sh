@@ -13,7 +13,7 @@ nvcc=${NVCC:-nvcc}
 flags=(--ptx -arch=sm_121f -O3 --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr --Werror all-warnings)
 pids=()
 "$nvcc" "${flags[@]}" kernels/gb10/common/moe_shared_expert_fused.cu -o "$out/moe_shared_expert_fused.ptx" & pids+=($!)
-for stem in qwen4exp_moe_rows qwen4exp_moe_c8 qwen4exp_moe_c8_tc qwen4exp_moe_c8_tc3 moe_prefill_q38; do
+for stem in qwen4exp_moe_rows qwen4exp_moe_c8 qwen4exp_moe_c8_tc qwen4exp_moe_c8_tc3 moe_prefill_q38 mxfp8_gemv; do
   [[ -f kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu ]] || continue
   "$nvcc" "${flags[@]}" "kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
 done

@@ -16,12 +16,17 @@
 //! for the non-native-FP8 path, matching qwen35. Its precision matters more
 //! than its size: at 512 experts the top-10 weights cluster tightly, and a
 //! 4-bit ULP wider than that spread cannot tell them apart.
+//!
+//! FP4-Local (`mxfp8_backbone`) ships the shared expert MXFP8: it loads as
+//! the checkpoint's own bytes (`layers::moe::Mxfp8SharedExpert`) and the
+//! NVFP4 shared expert the BF16 releases get is never built.
 
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
+use crate::layers::moe::Mxfp8SharedExpert;
 use crate::layers::{FfnComponent, MoeLayer};
 use crate::weight_map::{Nvfp4Variant, load_moe_qwen35, quantize_to_nvfp4};
 
@@ -31,6 +36,7 @@ pub(super) fn build_moe(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
+    mxfp8_backbone: bool,
 ) -> Result<FfnComponent> {
     let h = config.hidden_size;
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
@@ -48,6 +54,7 @@ pub(super) fn build_moe(
         quantize_k,
         stream,
         false,
+        !mxfp8_backbone,
     )
     .with_context(|| format!("qwen4_exp: MoE block at {lp}"))?;
 
@@ -61,6 +68,11 @@ pub(super) fn build_moe(
         stream,
     )?);
 
-    let moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    if mxfp8_backbone {
+        let shared = Mxfp8SharedExpert::load(store, lp, config, gpu)
+            .with_context(|| format!("qwen4_exp: MXFP8 shared expert at {lp}"))?;
+        moe.set_mxfp8_shared_expert(shared)?;
+    }
     Ok(FfnComponent::Moe(moe))
 }

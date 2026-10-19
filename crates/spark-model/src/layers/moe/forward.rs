@@ -730,8 +730,8 @@ impl MoeLayer {
             )?;
         }
 
-        if self.has_mixed_bf16_shared_expert() {
-            self.run_bf16_shared_expert(
+        if self.has_unfused_shared_expert() {
+            self.run_unfused_shared_expert(
                 input,
                 1,
                 h,

@@ -47,6 +47,19 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        // FP4-Local's MXFP8 shared expert has this one prefill arm.
+        if self.try_mxfp8_shared_prefill(
+            input,
+            n,
+            [shared_gate_out, shared_up_out, shared_down_out],
+            ctx,
+            aux,
+        )? {
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         // ATLAS_GLM_CANONICAL_VERIFY: the tensor-core tier of `n` rows for
         // every verify width (the family the 9..32-row branch below runs).
         let canonical = ctx.config.model_type == "glm5_next"
@@ -122,7 +135,7 @@ impl MoeLayer {
             }
             return Ok(());
         }
-        if self.run_bf16_shared_expert(
+        if self.run_unfused_shared_expert(
             input,
             n,
             h,

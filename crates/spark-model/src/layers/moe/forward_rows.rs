@@ -53,7 +53,8 @@ impl MoeLayer {
     /// Whether `forward_row_local` takes the originals-layout NVFP4 arm with
     /// the plain softmax router — the arm the row pair reproduces — with no
     /// hook (LoRA, pre-expert norm, router pre-norm, mixed BF16 shared
-    /// expert) in between.
+    /// expert, whose multi-row GEMM is not the one-row GEMV) in between. An
+    /// MXFP8 shared expert's hook is row-invariant, and the pair runs it.
     fn rows_pair_eligible(&self, rows: usize, ctx: &ForwardContext) -> bool {
         let top_k = ctx.config.num_experts_per_tok;
         self.qwen4exp_moe_rows.ready()
@@ -281,6 +282,22 @@ impl MoeLayer {
                 &shared.down_proj,
                 shared_out,
                 (h32, inter32, top_k32, rows32),
+                stream,
+            )?;
+        }
+        // FP4-Local's MXFP8 shared expert (`shared_mxfp8.rs`; the kernels
+        // above ran without one): every row in one row-invariant pass, as
+        // `forward_row_local` runs it for one.
+        if self.has_unfused_shared_expert() {
+            self.run_unfused_shared_expert(
+                input,
+                rows32,
+                h32,
+                ctx.config.shared_expert_intermediate_size as u32,
+                ctx.buffers.logits(),
+                ctx.buffers.ssm_qkvz(),
+                shared_out,
+                ctx,
                 stream,
             )?;
         }
