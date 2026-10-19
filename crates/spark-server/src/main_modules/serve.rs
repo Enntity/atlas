@@ -343,8 +343,8 @@ pub(super) fn build_auth_config(
 }
 
 /// Resolve the vision pixel budget: operator override, else the checkpoint's
-/// own `preprocessor_config.json`, else `None` (preprocessor falls back to
-/// its historical 1280px long-side clamp).
+/// own declared image bound (`processor_pixels`), else `None` (preprocessor
+/// falls back to its historical 1280px long-side clamp).
 ///
 /// The checkpoint half is the point. `preprocessor_config.json` was in the
 /// download plan but nothing ever parsed it, so a model declaring
@@ -354,7 +354,7 @@ pub(super) fn build_auth_config(
 /// checkpoint at the resolution it was built for.
 pub(super) fn resolve_vision_max_pixels(
     args: &cli::ServeArgs,
-    model_dir: &std::path::Path,
+    declared: Option<usize>,
 ) -> Result<Option<usize>> {
     if args.vision_max_pixels > 0 {
         return Ok(Some(args.vision_max_pixels));
@@ -370,76 +370,7 @@ pub(super) fn resolve_vision_max_pixels(
             }
         }
     }
-    Ok(read_preprocessor_max_pixels(model_dir))
-}
-
-/// Pull the IMAGE area bound out of the checkpoint's processor config, if it
-/// ships one. `None` on any absence or malformation — a model without the
-/// file, or with one we cannot read, must keep the historical behaviour
-/// rather than fail to serve.
-///
-/// TWO FILENAMES, because the ecosystem uses both and a checkpoint ships one
-/// or the other, never both. HF's `save_pretrained` writes
-/// `preprocessor_config.json` with the image fields at the top level
-/// (`Qwen/Qwen3.6-35B-A3B-FP8`), while a combined processor writes
-/// `processor_config.json` with each modality under its own key
-/// (`unsloth/Qwen3.6-27B-NVFP4` → `image_processor.size.longest_edge`).
-/// Reading only the first is why the unsloth checkpoints — the ones actually
-/// being served — still ran the 1280px fallback after the area bound was
-/// supposedly honoured: they declare 16777216 and nothing looked in the file
-/// that says so.
-///
-/// The nested form is also why this cannot be a search for the first
-/// `longest_edge` in the document. `processor_config.json` carries a SECOND,
-/// LARGER bound under `video_processor` (25165824 vs the image 16777216);
-/// picking that one would over-admit every still image by half again its
-/// permitted area. The image bound is addressed explicitly.
-///
-/// Two spellings are accepted within whichever object we land on. HF's
-/// Qwen2VL/Qwen3VL processors write `size = {longest_edge, shortest_edge}`,
-/// where — despite the names — both are pixel COUNTS, not edge lengths
-/// (16777216 = 4096², 65536 = 256²). Older/other processors write
-/// `max_pixels` directly.
-pub(super) fn read_preprocessor_max_pixels(model_dir: &std::path::Path) -> Option<usize> {
-    // Ordered by precedence. `preprocessor_config.json` is the dedicated
-    // image-processor file, so it wins if a checkpoint somehow ships both.
-    const SOURCES: [(&str, Option<&str>); 3] = [
-        ("preprocessor_config.json", None),
-        ("preprocessor_config.json", Some("image_processor")),
-        ("processor_config.json", Some("image_processor")),
-    ];
-    for (file, nest) in SOURCES {
-        let path = model_dir.join(file);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let scope = match nest {
-            Some(key) => match json.get(key) {
-                Some(v) => v,
-                None => continue,
-            },
-            None => &json,
-        };
-        let from_size = scope
-            .get("size")
-            .and_then(|s| s.get("longest_edge"))
-            .and_then(serde_json::Value::as_u64);
-        let direct = scope.get("max_pixels").and_then(serde_json::Value::as_u64);
-        let Some(px) = from_size.or(direct).filter(|&p| p > 0) else {
-            continue;
-        };
-        tracing::info!(
-            "Vision area bound {} px from {}{} (was: hard-coded 1280px long side)",
-            px,
-            path.display(),
-            nest.map(|k| format!(" [{k}]")).unwrap_or_default(),
-        );
-        return Some(px as usize);
-    }
-    None
+    Ok(declared)
 }
 
 /// QV1 (2026-05-26): canonicalize the model's declared quantization to

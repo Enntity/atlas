@@ -24,6 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+use super::processor_pixels::{Modality, read_declared_pixels};
 use super::serve::{
     Prepared, canonicalize_model_quant, describe_quant_source, parse_default_chat_template_kwargs,
     pick_quant_variant, quant_pair_compatible, resolve_vision_max_pixels,
@@ -162,9 +163,19 @@ pub(crate) fn load_model(
     // preprocessor and the GPU encoder came to hold two different ideas of the
     // maximum image — the preprocessor clamped to 1280px, the encoder
     // allocated for 6400 patches, and nothing connected them.
-    let vision_max_pixels = resolve_vision_max_pixels(&args, &model_dir)?;
+    let image = read_declared_pixels(&model_dir, Modality::Image);
+    let vision_max_pixels = resolve_vision_max_pixels(&args, image.map(|d| d.max_pixels))?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        // HF's Qwen processors resize within both bounds: a still below the
+        // min is scaled up, a clip is sized over its frames.
+        v.min_pixels = image.and_then(|d| d.min_pixels);
+        v.video_pixels = read_declared_pixels(&model_dir, Modality::Video).and_then(|d| {
+            Some(atlas_core::config::PixelBounds {
+                min_pixels: d.min_pixels?,
+                max_pixels: d.max_pixels,
+            })
+        });
     }
     match vision_max_pixels {
         Some(px) => tracing::info!(
@@ -176,7 +187,7 @@ pub(crate) fn load_model(
                 // Deliberately does not name a file: the bound comes from
                 // whichever of preprocessor_config.json /
                 // processor_config.json the checkpoint actually ships, and
-                // `read_preprocessor_max_pixels` logs the resolved path and
+                // `read_declared_pixels` logs the resolved path and
                 // key on its own line. Naming one here was wrong for every
                 // unsloth checkpoint, which ships only the other.
                 "checkpoint processor config / ATLAS_VISION_MAX_PIXELS"

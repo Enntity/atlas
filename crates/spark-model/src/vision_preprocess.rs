@@ -16,10 +16,7 @@ use glm_sizing::glm_pixel_budget;
 #[cfg(test)]
 use glm_sizing::{GLM_FALLBACK_MAX_PATCHES, glm_runtime_max_pixels};
 pub(crate) use glm_sizing::{derive_glm_max_patches, glm_resize_or_pad, glm_target_size};
-use qwen_sizing::qwen_fit;
-pub(crate) use qwen_sizing::target_size_for;
-#[cfg(test)]
-use qwen_sizing::target_size_with_max_pixels;
+pub(crate) use qwen_sizing::qwen_fit;
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
@@ -48,16 +45,9 @@ pub(crate) const GLM_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 /// dense screenshots — paid for that directly, and nothing logged it.
 const FALLBACK_MAX_DIM: u32 = 1280;
 
-/// Absolute long-side ceiling that applies even when a `max_pixels` bound is
-/// in force. `max_pixels` is an AREA, so on a pathological aspect ratio it
-/// alone permits an unbounded long side (a 1×N strip). This is the safety
-/// net [`FALLBACK_MAX_DIM`] was informally providing before it became a
-/// fallback; it is deliberately far above any sane vision input.
-const ABS_MAX_DIM: u32 = 4096;
-
 /// Decoder limit: reject a header declaring more than this on either side
-/// before a single pixel is allocated. Everything is resized down to at most
-/// [`ABS_MAX_DIM`] anyway, so this only has to be above any real camera
+/// before a single pixel is allocated. Everything is resized down to the
+/// encoder's capacity anyway, so this only has to be above any real camera
 /// image; 16384 is ~4× the long side of a 50 MP photo.
 const DECODE_MAX_SIDE: u32 = 16_384;
 
@@ -280,7 +270,7 @@ fn still_target(
             false,
         );
     }
-    let (th, tw) = qwen_fit(vcfg, orig_h, orig_w, max_pixels);
+    let (th, tw) = qwen_fit(vcfg, orig_h, orig_w, max_pixels, None)?;
     let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, vcfg.patch_size).0;
     let patches = (th as usize / vcfg.patch_size) * (tw as usize / vcfg.patch_size);
     ensure!(
