@@ -22,7 +22,13 @@
 //!   row-invariant, so an SP half equals that half of the whole chunk
 //!   (`ATLAS_QWEN4EXP_PREFILL_SP_SHARED`). Without
 //!   `ATLAS_QWEN4EXP_PREFILL_W8A8` (`=0`, or under `_PREFILL_BF16_PROJ`,
-//!   prefill at decode precision) it runs the decode tiers.
+//!   prefill at decode precision) it runs the decode tiers. W8A8, not the
+//!   reference's other mode (A16: BF16 activations on the exact BF16
+//!   dequant), because it is the faster one: GB10, per layer, 2048 / 8192 /
+//!   16384 rows 0.25 / 0.99 / 2.14 ms against 0.38 / 1.89 / 3.81 ms
+//!   (`shared_mxfp8_prefill_bench`), with no resident BF16 copy. Its output
+//!   is ~4.5e-2 (rel-L2) from A16's on layers 0, 3, 47; the NVFP4
+//!   requantization this replaced was ~14% (decode) and ~17% (prefill, q38).
 //!
 //! The SiLU * up rounds as vLLM's `silu_and_mul` on BF16 GEMM outputs: gate
 //! and up to BF16, SiLU to BF16, the product to BF16 (`mx_swiglu`). The

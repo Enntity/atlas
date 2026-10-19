@@ -458,3 +458,62 @@ fn shared_mxfp8_decode_bench() -> Result<()> {
     }
     Ok(())
 }
+
+/// Prefill, per layer and pass of `m` rows: the W8A8 arm against the
+/// reference's other mode, A16 (BF16 activations: cuBLASLt BF16 GEMMs on the
+/// exact BF16 dequant, which would cost a resident BF16 copy), event-free
+/// host timing of back-to-back passes.
+#[test]
+#[ignore = "needs a GB10 GPU and a qwen3.8-flash-next kernel build"]
+fn shared_mxfp8_prefill_bench() -> Result<()> {
+    use spark_runtime::cublaslt;
+    let gpu = backend()?;
+    let stream = gpu.default_stream();
+    let mut rng = Rng(0x9f11_5ea7);
+    let w = weights(0, &mut rng)?;
+    let dev = upload_weights(gpu, &w)?;
+    let m_max = 16384;
+    let mx = Mxfp8SharedExpert::from_raw(gpu, dev.raw, [H, I], Some(m_max))?;
+    let bf = |v: &[f64]| bytes(&v.iter().map(|&x| bf(x as f32)).collect::<Vec<_>>());
+    let (wg, wu, wd) = (
+        upload(gpu, &bf(&dev.host_w[0]))?,
+        upload(gpu, &bf(&dev.host_w[1]))?,
+        upload(gpu, &bf(&dev.host_w[2]))?,
+    );
+    let silu = gpu.kernel("moe_silu_mul", "moe_silu_mul")?;
+    let x = upload(gpu, &bytes(&activations(&mut rng, m_max)))?;
+    let (g, u, gu, out) = (
+        gpu.alloc(m_max * I * 2)?,
+        gpu.alloc(m_max * I * 2)?,
+        gpu.alloc(m_max * 2 * I * 2)?,
+        gpu.alloc(m_max * H * 2)?,
+    );
+    let mxs = MxAct {
+        q: gpu.alloc(m_max * H)?,
+        sf: gpu.alloc(mx_lt_scale_bytes(m_max, H))?,
+    };
+    let time = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+        f()?;
+        gpu.synchronize(stream)?;
+        let t = std::time::Instant::now();
+        for _ in 0..10 {
+            f()?;
+        }
+        gpu.synchronize(stream)?;
+        Ok(t.elapsed().as_secs_f64() * 1e2)
+    };
+    for m in [512, 2048, 8192, 16384] {
+        let w8 = time(&mut || mx.prefill(gpu, x, m, mxs, [g, gu], out, stream))?;
+        let (mm, n, k) = (m as u32, I as u32, H as u32);
+        let a16 = time(&mut || {
+            cublaslt::bf16_gemm_act_weight_t(x.0, wg.0, g.0, mm, n, k, stream)?;
+            cublaslt::bf16_gemm_act_weight_t(x.0, wu.0, u.0, mm, n, k, stream)?;
+            ops::silu_mul(gpu, silu, g, u, g, mm * n, stream)?;
+            cublaslt::bf16_gemm_act_weight_t(g.0, wd.0, out.0, mm, k, n, stream)
+        })?;
+        eprintln!(
+            "MXFP8 shared expert prefill, {m} rows: W8A8 {w8:.3} ms, A16 (BF16 GEMMs) {a16:.3} ms a layer"
+        );
+    }
+    Ok(())
+}

@@ -27,6 +27,8 @@ pub struct MxSweepShape {
 
 /// 13.0.0 (the runtime image's) and 13.1.1: the sweep of 2026-10-15.
 const SWEPT_2026_10_15: &[usize] = &[130000, 130101];
+/// 13.0.0 only: the sweep of 2026-10-19 (the shared expert's shapes).
+const SWEPT_2026_10_19: &[usize] = &[130000];
 /// Added after that sweep; not run yet. See the module docs to promote.
 const NOT_SWEPT: &[usize] = &[];
 
@@ -56,8 +58,8 @@ pub const MX_SWEEP: [MxSweepShape; 12] = [
     // depend on the shape and the row count, not on the weights.
     shape("tp1 qsa k, v", 512, 2560, SWEPT_2026_10_15),
     shape("tp1 qsa o", 2560, 6144, NOT_SWEPT),
-    shape("shared gate, up", 1280, 2560, NOT_SWEPT),
-    shape("shared down", 2560, 640, NOT_SWEPT),
+    shape("shared gate, up", 1280, 2560, SWEPT_2026_10_19),
+    shape("shared down", 2560, 640, SWEPT_2026_10_19),
 ];
 
 /// Whether the sweep passed for `n x k` on cuBLASLt `version`.
@@ -78,15 +80,12 @@ mod tests {
                 assert!(verified(v, n, k), "{v} {n}x{k}");
             }
             // Added to the sweep, not run yet.
-            for (n, k) in [
-                (256, 2560),
-                (16384, 2560),
-                (2560, 6144),
-                (12288, 2560),
-                (1280, 2560),
-                (2560, 640),
-            ] {
+            for (n, k) in [(256, 2560), (16384, 2560), (2560, 6144), (12288, 2560)] {
                 assert!(!verified(v, n, k), "{v} {n}x{k}");
+            }
+            // The shared expert's: swept on 13.0.0 only.
+            for (n, k) in [(1280, 2560), (2560, 640)] {
+                assert_eq!(verified(v, n, k), v == 130000, "{v} {n}x{k}");
             }
             // Never swept (the indexer doesn't run W8A8).
             for (n, k) in [(320, 2560), (640, 2560), (2560, 320), (384, 1536)] {
