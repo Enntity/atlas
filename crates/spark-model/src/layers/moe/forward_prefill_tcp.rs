@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ATLAS_QWEN4EXP_PREFILL_MOE_BF16=1` (with `ATLAS_QWEN4EXP_PREFILL_MOE=1`):
-//! the routed-MoE prefill on tensor cores with the TC decode numerics
-//! (`kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4exp_moe_tcp.cu`), in place of
-//! the q38 routed chain's three launches (`moe_q38_a_to_e4m3`,
-//! `moe_q38[w]_gate_up_silu`, `moe_q38[w]_down`): BF16 weights
+//! The routed-MoE prefill on tensor cores with the TC decode numerics
+//! (`kernels/gb10/qwen3.8-flash-next/nvfp4/qwen4exp_moe_tcp.cu`): W4A16, the
+//! q38 chain's arm under `ATLAS_QWEN4EXP_PREFILL_MOE_BF16=1` (with
+//! `ATLAS_QWEN4EXP_PREFILL_MOE=1`) and for a layer without input scales
+//! (`forward_prefill_w4a4`). BF16 weights
 //! `lut * dec(scale)` (exact) with scale2 in the epilogue, BF16 activations,
 //! SiLU * up rounded to BF16, and the TC decode kernels' per-output MMA
 //! schedule, so a row's routed-expert bytes from prefill are the ones
@@ -13,7 +13,7 @@
 //! `ATLAS_QWEN4EXP_MOE_NO_CLAMP` neither applies the routed SwiGLU clamp;
 //! without it both do.
 //!
-//! Same buffers and row order as the q38 chain (expert-sorted rows, the BF16
+//! Same buffers and row order as the W4A4 chain (expert-sorted rows, the BF16
 //! activation in `expert_gate_out`, the down rows in `expert_down_out`), so
 //! the router, the shared expert, the local unpermute and the SP pipes around
 //! it are unchanged (the shared expert keeps its own prefill path).
@@ -39,10 +39,9 @@ const TCP_DN_OUT: u32 = 64;
 
 impl MoeLayer {
     /// The q38 routed chain's work on the BF16 tensor-core kernels; `false`,
-    /// nothing launched, when the switch is off or the shape or kernels are
-    /// not this model's.
+    /// nothing launched, when the shape or kernels are not this model's.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_tcp_routed_prefill(
+    pub(super) fn tcp_routed_prefill(
         &self,
         expert_input: DevicePtr,
         expert_offsets: DevicePtr,
@@ -51,7 +50,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if !tcp_requested() || h != 2560 || inter != 640 {
+        if h != 2560 || inter != 640 {
             return Ok(false);
         }
         let gpu = ctx.gpu;

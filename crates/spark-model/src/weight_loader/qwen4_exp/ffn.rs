@@ -61,6 +61,8 @@ pub(super) fn build_moe(
         stream,
     )?);
 
-    let moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    let mut moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    // The routed prefill's W4A4 activation scales (`moe::w4a4_scales`).
+    moe.load_w4a4_scales(store, &format!("{lp}.mlp"), config, gpu)?;
     Ok(FfnComponent::Moe(moe))
 }
