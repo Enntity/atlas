@@ -78,6 +78,7 @@ fn resolve(
     if policy.disable_thinking {
         return (false, None);
     }
+    let ceiling = atlas_kernels::thinking_ceiling(policy.max_thinking_budget);
     let (et, tb) = match directive {
         // No client/server directive → MODEL.toml decides. `None` budget
         // defers to the per-model `max_thinking_budget` below rather than
@@ -90,13 +91,10 @@ fn resolve(
         // `--max-thinking-budget` govern what "medium" means. Resolved at
         // the wire edge it was a hardcoded absolute (medium = 256) that no
         // server knob could reach (#328 family).
+        // Without a server ceiling an effort level is the template's alone.
         ThinkingDirective::OnEffort(level) => (
             true,
-            Some(effort_budget(
-                level,
-                policy.max_thinking_budget,
-                policy.effort_capped_at_ceiling,
-            )),
+            ceiling.map(|e| effort_budget(level, e, policy.effort_capped_at_ceiling)),
         ),
     };
     // `thinking_in_tools=false` is the MODEL.toml DEFAULT for tool-
@@ -109,7 +107,11 @@ fn resolve(
         et
     };
     let budget = if et {
-        let b = tb.unwrap_or(policy.max_thinking_budget);
+        // No client budget and no server ceiling: thinking is unbounded
+        // (the reference engines' behaviour), so there is nothing to clamp.
+        let Some(b) = tb.or(ceiling) else {
+            return (et, None);
+        };
         if !policy.cap_at_max_tokens {
             // vLLM single-budget: `max_thinking_budget` (or an explicit
             // client budget) is the sole cap. Reasoning may use the full
@@ -389,6 +391,61 @@ mod tests {
         // Budgetless On → max_thinking_budget, not clamped to 0.9*max_tokens.
         let (_, tb) = resolve(ThinkingDirective::On { budget: None }, no_cap, 1000, false);
         assert_eq!(tb, Some(2048));
+    }
+
+    #[test]
+    fn no_server_ceiling_leaves_only_client_budgets() {
+        // `max_thinking_budget = 0`: no server budget. Effort is the
+        // template's alone, budgetless thinking is unbounded, and an explicit
+        // client budget still binds (and is still clamped when the model
+        // keeps the 90% cap).
+        use crate::ir::EffortLevel::*;
+        let none = Policy {
+            max_thinking_budget: 0,
+            cap_at_max_tokens: false,
+            ..policy()
+        };
+        for directive in [
+            ThinkingDirective::On { budget: None },
+            ThinkingDirective::OnEffort(Low),
+            ThinkingDirective::OnEffort(XHigh),
+        ] {
+            assert_eq!(resolve(directive, none, 4096, false), (true, None));
+        }
+        let model_default = Policy {
+            model_default: true,
+            ..none
+        };
+        assert_eq!(
+            resolve(ThinkingDirective::Unspecified, model_default, 4096, false),
+            (true, None)
+        );
+        assert_eq!(
+            resolve(
+                ThinkingDirective::On { budget: Some(64) },
+                none,
+                4096,
+                false
+            ),
+            (true, Some(64))
+        );
+        let capped = Policy {
+            cap_at_max_tokens: true,
+            ..none
+        };
+        assert_eq!(
+            resolve(ThinkingDirective::On { budget: None }, capped, 1000, false),
+            (true, None)
+        );
+        assert_eq!(
+            resolve(
+                ThinkingDirective::On { budget: Some(4096) },
+                capped,
+                1000,
+                false
+            ),
+            (true, Some(900))
+        );
     }
 
     #[test]
