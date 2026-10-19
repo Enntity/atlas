@@ -98,7 +98,12 @@ pub(super) fn plan_verify(
     };
     for &idx in verify_idxs {
         let a = &active[idx];
-        if a.grammar_state.is_none() && a.pending_drafts.len() >= min_drafts {
+        // Batched DFlash cannot report generated scores. Keep those requests
+        // on the single-sequence scored path; native MTP batches can score.
+        if a.grammar_state.is_none()
+            && a.pending_drafts.len() >= min_drafts
+            && (!dflash_verify_raw_argmax || a.top_logprobs.is_none())
+        {
             plan.batch.push(idx);
         } else {
             plan.serial.push(idx);

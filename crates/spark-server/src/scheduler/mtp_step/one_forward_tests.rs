@@ -43,6 +43,7 @@ struct Stub {
     /// window past 4 rows, as qwen4_exp's exact lane does (and say its rows
     /// are serial decode's, `batch_verify_bit_exact`).
     decode_rows: bool,
+    fail_logits: bool,
     seen: Mutex<Seen>,
 }
 
@@ -50,6 +51,7 @@ impl Stub {
     fn new(decode_rows: bool) -> Self {
         Self {
             decode_rows,
+            fail_logits: false,
             seen: Mutex::new(Seen::default()),
         }
     }
@@ -227,6 +229,9 @@ impl Model for Stub {
         Ok(SequenceState::host_only(0))
     }
     fn copy_logits_to_host(&self, _p: DevicePtr, _d: &mut [u8]) -> Result<()> {
+        if self.fail_logits {
+            bail!("injected score read failure");
+        }
         Ok(())
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
@@ -468,3 +473,6 @@ fn deep_members_verify_their_own_ceiling_within_the_row_budget() {
 
 #[path = "one_forward_tests/copy.rs"]
 mod copy;
+
+#[path = "one_forward_logprob_tests.rs"]
+mod logprob_tests;
