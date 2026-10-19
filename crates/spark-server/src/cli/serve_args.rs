@@ -459,7 +459,9 @@ pub struct ServeArgs {
     /// = 1/4x, 1/2x, 1x, 2x, 4x of this value). An explicit client token
     /// budget (`thinking.budget_tokens`, `thinking_token_budget`) still
     /// wins outright; the (max_tokens * 9 / 10) safety cap is enforced
-    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`.
+    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`. 0 = no
+    /// server budget: effort levels are the template's alone and reasoning
+    /// runs until the model closes it (or `max_tokens`).
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 
@@ -504,8 +506,9 @@ pub struct ServeArgs {
     /// or `enable_thinking` in the request body). A JSON object with
     /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32),
     /// `reasoning_effort` (none|minimal|low|medium|high|xhigh|max — the
-    /// served default effort tier when clients are silent; unset = the
-    /// neutral "medium"), `preserve_thinking` (bool). Unknown keys or an
+    /// served default effort tier when clients are silent; unset = MODEL.toml
+    /// `[behavior].default_reasoning_effort`, else the template's own
+    /// default), `preserve_thinking` (bool). Unknown keys or an
     /// unknown `reasoning_effort` value abort startup (fail-fast; they
     /// were silently ignored before 2026-08-15).
     ///

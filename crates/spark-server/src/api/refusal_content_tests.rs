@@ -12,8 +12,6 @@
 use crate::AppState;
 use crate::ir;
 use serde_json::json;
-use std::sync::Arc;
-use std::time::Duration;
 
 /// A tiny real word-level tokenizer. This suite never decodes logprobs, so
 /// its vocabulary only has to be valid for `ChatTokenizer::from_model_dir`.
@@ -31,76 +29,29 @@ fn tokenizer(dir: &std::path::Path) -> crate::tokenizer::ChatTokenizer {
     let mut inner = tokenizers::Tokenizer::new(model);
     inner.with_decoder(Some(tokenizers::decoders::fuse::Fuse::new()));
     inner.save(dir.join("tokenizer.json"), false).unwrap();
-    crate::tokenizer::ChatTokenizer::from_model_dir(dir, 0, true, "glm5_next", "", None, false)
-        .unwrap()
+    crate::tokenizer::ChatTokenizer::from_model_dir(
+        dir,
+        0,
+        true,
+        "glm5_next",
+        "",
+        None,
+        false,
+        false,
+    )
+    .unwrap()
 }
 
 /// A minimal `AppState` — only the fields `build_choice_message` and the
 /// OpenAI encoder actually read are set to non-default values; the rest are
-/// the same neutral defaults the production server builds for a text-only,
-/// tool-free GLM serve.
+/// the neutral defaults of `api::test_app_state`.
 fn state(dir: &std::path::Path) -> AppState {
-    let (request_tx, _rx) = tokio::sync::mpsc::channel(1);
-    AppState {
-        tokenizer: tokenizer(dir),
-        model_name: "refusal-fixture".into(),
-        adapter_name: None,
-        adapter_names: vec![],
-        active_adapter: Arc::default(),
-        max_seq_len: 4096,
-        request_tx,
-        rotation_tx: None,
-        vision_config: None,
-        vision_max_pixels: None,
-        vision_limits: None,
-        vision_budget: None,
-        remote_image_policy: Default::default(),
-        video_ffmpeg: Default::default(),
-        video_fps: 1.0,
-        default_temperature: 0.0,
-        default_top_k: 0,
-        default_top_p: 1.0,
-        default_top_n_sigma: 0.0,
-        default_min_p: 0.0,
-        tool_call_parser: None,
-        chat: Default::default(),
-        reasoning_parser: Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser()),
-        think_end_token_id: Some(2),
-        think_start_token_id: Some(3),
-        tool_max_tokens: 192,
-        sampling_presets: Default::default(),
-        tool_call_start_token_id: None,
-        glm_tool_boundary: None,
-        auto_compact_threshold: None,
-        request_timeout: 0,
-        effective_context: 0,
-        behavior: Default::default(),
-        disable_thinking: false,
-        default_thinking: Default::default(),
-        default_reasoning_effort: None,
-        response_store: crate::response_store::ResponseStore::with_config(
-            1,
-            Duration::from_secs(60),
-        ),
-        conversation_store: crate::conversation_store::ConversationStore::with_config(
-            1,
-            Duration::from_secs(60),
-        ),
-        rate_limiter: crate::rate_limiter::RateLimiter::with_config(
-            crate::rate_limiter::RateLimitConfig {
-                rpm: 0,
-                tpm: 0,
-                burst_rpm: 1,
-                burst_tpm: 1,
-            },
-        ),
-        dump_writer: None,
-        lora_stageable: Default::default(),
-        lora_peer_addr: None,
-        promotion: None,
-        promoted_slots: Arc::default(),
-        lora_disk_stageable: Default::default(),
-    }
+    let mut state = crate::api::test_app_state::app_state(tokenizer(dir));
+    state.model_name = "refusal-fixture".into();
+    state.reasoning_parser = Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser());
+    state.think_end_token_id = Some(2);
+    state.think_start_token_id = Some(3);
+    state
 }
 
 /// A response carrying `finish_reason` only — this suite never decodes

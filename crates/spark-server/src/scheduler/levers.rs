@@ -71,8 +71,6 @@ pub struct SchedLevers {
     // ── Watchdogs ──
     /// Disable every generation watchdog.
     pub disable_watchdogs: bool,
-    /// Suppress EOS while inside a thinking block.
-    pub eos_suppressed_by_thinking: bool,
     /// Forced-token fast path. Ships ON; `ATLAS_DISABLE_FORCED_TOKEN=1` opts out.
     pub forced_token_fastpath: bool,
 
@@ -184,7 +182,6 @@ impl SchedLevers {
             disable_watchdogs: crate::scheduler::helpers::parse_disable_watchdogs(
                 std::env::var("ATLAS_DISABLE_WATCHDOGS").ok().as_deref(),
             ),
-            eos_suppressed_by_thinking: opt_in("ATLAS_EOS_SUPPRESS_THINKING"),
             forced_token_fastpath: crate::scheduler::helpers::parse_forced_token_fastpath(
                 std::env::var("ATLAS_DISABLE_FORCED_TOKEN").ok().as_deref(),
             ),
@@ -228,7 +225,6 @@ impl SchedLevers {
             dflash_resume_guard: 0,
             shadow_topk: 0,
             disable_watchdogs: false,
-            eos_suppressed_by_thinking: false,
             forced_token_fastpath: true,
             decode_timing: false,
             mtp_timing: false,

@@ -103,6 +103,11 @@ pub fn prefill_request(
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
         req_enable_thinking && think_end_token.is_some(),
+        first_token_thinking::native_opener(
+            sched.limits.glm_tool_boundary,
+            req_tools_present,
+            tool_call_start_token,
+        ),
         &mut sink,
     )?;
 
@@ -510,7 +515,7 @@ pub fn prefill_request(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
-            Some(spontaneous_think_budget)
+            atlas_kernels::thinking_ceiling(spontaneous_think_budget)
         } else {
             req_thinking_budget
         },

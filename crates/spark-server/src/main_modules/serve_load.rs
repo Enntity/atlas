@@ -796,6 +796,7 @@ pub(crate) fn load_model(
         ptx_set.behavior.jinja_template,
         Some(std::path::Path::new(".")), // repo root for override templates
         args.disable_template_overrides,
+        ptx_set.behavior.verbatim_prompt,
     )?;
 
     // (AM1 attractor-mask registration removed 2026-06-03 — see
@@ -1267,12 +1268,7 @@ pub(crate) fn load_model(
         } else {
             Some(rotation_tx)
         },
-        chat: crate::api::chat::levers::ChatLevers::resolve(
-            ptx_set.behavior.tscg,
-            ptx_set.behavior.template_owns_tool_definitions,
-            ptx_set.behavior.disable_cwd_hint_injection,
-            ptx_set.behavior.enable_stream_loop_guards,
-        ),
+        chat: crate::api::chat::levers::ChatLevers::resolve(&ptx_set.behavior),
         vision_max_pixels,
         vision_limits: vision_config.as_ref().map(|_| {
             spark_model::vision_limits::VisionRowLimits::resolve(
@@ -1329,7 +1325,10 @@ pub(crate) fn load_model(
         },
         disable_thinking: args.disable_thinking,
         default_thinking: default_kwargs.thinking,
-        default_reasoning_effort: default_kwargs.reasoning_effort,
+        default_reasoning_effort: match default_kwargs.reasoning_effort {
+            Some(effort) => Some(effort),
+            None => super::serve::model_default_reasoning_effort(&ptx_set.behavior)?,
+        },
         response_store,
         rate_limiter,
         conversation_store,

@@ -98,3 +98,5 @@ pub use stubs::{
 
 #[cfg(test)]
 mod refusal_content_tests;
+#[cfg(test)]
+pub(crate) mod test_app_state;

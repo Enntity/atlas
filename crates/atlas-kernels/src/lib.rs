@@ -377,6 +377,43 @@ pub struct ModelBehavior {
     /// multi-turn prompt bytes and therefore prefix-cache hit rate.
     /// Per-request `chat_template_kwargs.preserve_thinking` still wins.
     pub preserve_thinking: Option<bool>,
+    /// The prompt is the checkpoint template's render of the client's
+    /// conversation and nothing else, as on the reference server (vLLM over
+    /// transformers): no parser tool prompt or tool_choice instruction, no
+    /// tool-result markers, hints or repeat notices, no injected or dropped
+    /// system text, and `tojson` spaced like Python's `json.dumps`. Default
+    /// `false`, the Atlas prompt aids every other target was tuned with.
+    pub verbatim_prompt: bool,
+    /// The `reasoning_effort` template kwarg a request gets when neither the
+    /// client nor `--default-chat-template-kwargs` names one (a wire
+    /// spelling, `none|minimal|low|medium|high|xhigh|max`). Empty (default) =
+    /// left undefined, so the template's own default applies, as on the
+    /// reference server.
+    pub default_reasoning_effort: &'static str,
+    /// An end token sampled inside `<think>` ends the turn, reasoning and
+    /// all, as on the reference engines. Default `false`: the token is
+    /// discarded and the model kept reasoning, or, under
+    /// `honor_eos_inside_thinking`, the block is closed and the answer
+    /// follows.
+    pub eos_ends_thinking: bool,
+    /// Atlas's `<tool_call>` steering on tool-armed requests: the opener's
+    /// +3 logit bias, its decay over repeated rounds, and the loop
+    /// detector's mask of it. Default `true`; `false` leaves the opener's
+    /// logit to the model, as on the reference engines.
+    pub tool_call_steering: bool,
+}
+
+/// The server's own thinking ceiling for a `max_thinking_budget` value
+/// (MODEL.toml `[behavior]` or `--max-thinking-budget`): 0 means none, so
+/// reasoning runs until the model closes it or the request's `max_tokens`,
+/// as on the reference engines, and only a client's explicit token budget
+/// bounds it.
+pub const fn thinking_ceiling(max_thinking_budget: u32) -> Option<u32> {
+    if max_thinking_budget == 0 {
+        None
+    } else {
+        Some(max_thinking_budget)
+    }
 }
 
 /// Phase-C: maximum number of watchdog-triggered rollbacks a single
@@ -440,6 +477,10 @@ impl Default for ModelBehavior {
             rom_head: "",
             tool_retry: true,
             preserve_thinking: None,
+            verbatim_prompt: false,
+            default_reasoning_effort: "",
+            eos_ends_thinking: false,
+            tool_call_steering: true,
         }
     }
 }
