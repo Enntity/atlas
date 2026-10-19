@@ -445,6 +445,7 @@ impl MoeLayer {
             bf16_up_weight_ptrs: None,
             bf16_down_weight_ptrs: None,
             bf16_shared_expert: None,
+            mxfp8_shared_expert: None,
             fp8_shared_expert: None,
             moe_down_t_k64_fp4: super::super::try_kernel(
                 gpu,

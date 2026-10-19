@@ -70,7 +70,7 @@ impl MoeLayer {
                 self.lora.is_none()
                     && self.bf16_gate_weight_ptrs.is_none()
                     && self.fp8_gate_weight_ptrs.is_none()
-                    && !self.has_mixed_bf16_shared_expert()
+                    && !self.has_unfused_shared_expert()
                     && matches!(
                         self.experts_scale_kind,
                         crate::weight_map::WeightQuantFormat::Nvfp4
@@ -127,9 +127,9 @@ impl MoeLayer {
         // cannot compute a BF16 shared expert alongside NVFP4 routed weights.
         // Under the transposed unified layout we still batch the routed half
         // through the _t kernels and run the shared expert as one batched BF16
-        // GEMM pass afterwards (`mixed_bf16_shared` below). Every other layout
+        // GEMM pass afterwards (`unfused_shared` below). Every other layout
         // falls back to the per-token loop.
-        let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
+        let unfused_shared = self.has_unfused_shared_expert();
         // Either fused layout serves the mixed config. The originals-layout
         // kernels are usable only since 37e818ad NULL-guarded their shared
         // expert (their `_t` siblings always had that guard); before it, this
@@ -141,7 +141,7 @@ impl MoeLayer {
             && self.moe_expert_gate_up_shared_batch2.0 != 0
             && self.moe_expert_silu_down_shared_batch2.0 != 0
             && !self.gate_ptrs.packed_ptrs.is_null();
-        if mixed_bf16_shared && !((mixed_t_ok || mixed_orig_ok) && !is_ep) {
+        if unfused_shared && !((mixed_t_ok || mixed_orig_ok) && !is_ep) {
             return self.forward_batched(input, 2, ctx, stream);
         }
 
@@ -326,7 +326,7 @@ impl MoeLayer {
                 h,
                 top_k,
                 is_ep,
-                mixed_bf16_shared,
+                unfused_shared,
                 include_shared,
                 ctx,
                 stream,
@@ -347,7 +347,7 @@ impl MoeLayer {
                 h,
                 top_k,
                 is_ep,
-                mixed_bf16_shared,
+                unfused_shared,
                 ctx,
                 stream,
             )?;

@@ -100,6 +100,18 @@ __device__ __forceinline__ void mx_load(
     }
 }
 
+// SiLU(gate) * up of two projection outputs (FP32 sums), rounded as vLLM's
+// `silu_and_mul` on the BF16 GEMM outputs rounds: gate and up to BF16, SiLU
+// in FP32 to BF16, the product to BF16. The `_swiglu` tiers' epilogue (the
+// qwen3.8-flash-next target's MXFP8 shared expert); prefill's twin of it
+// reads the same BF16 values, so both write the same bytes per element.
+__device__ __forceinline__ __nv_bfloat16 mx_swiglu(float gate, float up) {
+    const float g = __bfloat162float(__float2bfloat16(gate));
+    const float u = __bfloat162float(__float2bfloat16(up));
+    const float s = __bfloat162float(__float2bfloat16(g / (1.0f + expf(-g))));
+    return __float2bfloat16(s * u);
+}
+
 // BF16 2^(s-127) (E8M0 scale; 0 decodes to 0, as does the NaN code 255).
 __device__ __forceinline__ __nv_bfloat162 mx_scale(unsigned int s) {
     const unsigned short bits = (s == 0u || s == 255u) ? 0 : (unsigned short)(s << 7);
@@ -110,8 +122,12 @@ __device__ __forceinline__ __nv_bfloat162 mx_scale(unsigned int s) {
 // The body for weight-row tile `cta` (rows 16 * cta ..): the plain tiers'
 // CTA `blockIdx.x`, or a CTA of a launch that runs other work beside it
 // (glm_mla_fuse.cu). TILED reads W / S in the chunk-tiled layout of
-// `mxfp8_tile16` (same values into the same MMAs: bit-identical).
-template <int NT, bool TILED = false>
+// `mxfp8_tile16` (same values into the same MMAs: bit-identical). SWIGLU
+// reads W as [gate; up] ([2N, K], N outputs): the CTA's rows g and g + 8 are
+// gate row 8 * cta + g and up row N + 8 * cta + g, so each lane holds both
+// projections of its outputs, and C[m, n] = mx_swiglu(gate, up): 8 outputs a
+// CTA, every projection value the plain tiers' sum (row-invariant alike).
+template <int NT, bool TILED = false, bool SWIGLU = false>
 __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     const __nv_bfloat16* __restrict__ A,
     const unsigned char* __restrict__ W,
@@ -137,8 +153,9 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     const unsigned int warp = threadIdx.x / MX_WARP;
     const unsigned int lane = threadIdx.x % MX_WARP;
     const unsigned int g = lane >> 2, c = lane & 3u;
-    const unsigned int r0 = cta * 16u + g, r1 = r0 + 8u;
-    const bool v0 = r0 < N, v1 = r1 < N;
+    static_assert(!(TILED && SWIGLU), "the SWIGLU tiers read the row-major twin");
+    const unsigned int r0 = cta * (SWIGLU ? 8u : 16u) + g, r1 = r0 + (SWIGLU ? N : 8u);
+    const bool v0 = r0 < N, v1 = SWIGLU ? v0 : r1 < N;
     const unsigned long long blocks = K / MX_BLOCK;
     const unsigned int chunks = (K + 63u) / 64u;
     const unsigned char *w0p, *w1p, *s0p, *s1p;
@@ -222,14 +239,20 @@ __device__ __forceinline__ void mxfp8_gemv_tc_cta(
     if (warp != 0) return;
     #pragma unroll
     for (int i = 0; i < NT; i++) {
+        float v[4];
         #pragma unroll
         for (int q = 0; q < 4; q++) {
-            float v = 0.0f;
+            v[q] = 0.0f;
             #pragma unroll
-            for (int w = 0; w < MX_WARPS; w++) v += s_red[w][lane][i * 4 + q];
+            for (int w = 0; w < MX_WARPS; w++) v[q] += s_red[w][lane][i * 4 + q];
+        }
+        #pragma unroll
+        for (int q = 0; q < (SWIGLU ? 2 : 4); q++) {
             const unsigned int n = (q < 2) ? r0 : r1;
             const unsigned int m = 8u * i + 2u * c + (q & 1u);
-            if (n < N && m < M) C[(unsigned long long)m * out_stride + n] = __float2bfloat16(v);
+            if (n < N && m < M)
+                C[(unsigned long long)m * out_stride + n] =
+                    SWIGLU ? mx_swiglu(v[q], v[q + 2]) : __float2bfloat16(v[q]);
         }
     }
 }

@@ -150,10 +150,28 @@ impl MoeLayer {
         }
 
         let output = ctx.buffers.moe_output();
-        // The shared expert's down output, kept until the EP reduce adds it.
-        let shared_out = ctx.buffers.attn_output();
-        self.forward_row_local(input, output, shared_out, single_seq_decode, ctx, stream)?;
-        let posted = self.forward_ep_reduce(output, shared_out, input, 1, hc_post, ctx, stream)?;
+        // The shared expert's down output, kept until the EP reduce adds it
+        // (an MXFP8 one's on the side lane when it forked there).
+        let side = self.fork_mxfp8_shared(input, 1, ctx, stream)?;
+        let shared_out = side.unwrap_or(ctx.buffers.attn_output());
+        self.forward_row_local(
+            input,
+            output,
+            shared_out,
+            side.is_none(),
+            single_seq_decode,
+            ctx,
+            stream,
+        )?;
+        let posted = self.forward_ep_reduce(
+            output,
+            (shared_out, side.is_some()),
+            input,
+            1,
+            hc_post,
+            ctx,
+            stream,
+        )?;
 
         if tracing::enabled!(tracing::Level::DEBUG) && !ctx.graph_capture {
             ctx.gpu.synchronize(stream)?;
@@ -173,7 +191,8 @@ impl MoeLayer {
     }
 
     /// One row of [`Self::forward`] from routing through the weighted-sum
-    /// blend into `output`, the shared expert's down output into `shared_out`.
+    /// blend into `output`, the shared expert's down output into `shared_out`
+    /// (an unfused one's only with `unfused_here`: else it was forked).
     /// Under EP the blend leaves the shared expert out (the EP reduce adds it
     /// once, after the all-reduce): [`Self::forward_ep_reduce`] completes it.
     /// [`Self::forward_rows`] runs this per row with the reduce batched.
@@ -183,6 +202,7 @@ impl MoeLayer {
         input: DevicePtr,
         output: DevicePtr,
         shared_out: DevicePtr,
+        unfused_here: bool,
         single_seq_decode: bool,
         ctx: &ForwardContext,
         stream: u64,
@@ -730,8 +750,8 @@ impl MoeLayer {
             )?;
         }
 
-        if self.has_mixed_bf16_shared_expert() {
-            self.run_bf16_shared_expert(
+        if unfused_here && self.has_unfused_shared_expert() {
+            self.run_unfused_shared_expert(
                 input,
                 1,
                 h,
@@ -823,12 +843,14 @@ impl MoeLayer {
     /// fused with the layer's mHC post). Each element is the
     /// same commutative two-rank BF16 sum and the same per-row blend as `rows`
     /// single-row tails, so a batched reduce is bit-identical to per-row ones.
+    /// With `forked`, the shared expert ran on the side lane
+    /// ([`Self::fork_mxfp8_shared`]), joined once the all-reduce is issued.
     /// Returns whether the post ran. No-op without EP.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn forward_ep_reduce(
         &self,
         output: DevicePtr,
-        shared_out: DevicePtr,
+        (shared_out, forked): (DevicePtr, bool),
         input: DevicePtr,
         rows: usize,
         hc_post: Option<ops::qwen4exp_decode_fuse::MoeHcPost>,
@@ -847,6 +869,9 @@ impl MoeLayer {
                 comm.all_reduce(output.0, rows * h as usize * 2)?;
             } else {
                 comm.all_reduce_async(output.0, rows * h as usize * 2, stream)?;
+            }
+            if forked {
+                self.join_mxfp8_shared(ctx, stream)?;
             }
             // Now add shared expert contribution ONCE (after all-reduce).
             // Must apply the sigmoid gate: output += sigmoid(dot(input, gate_w)) * shared_out.

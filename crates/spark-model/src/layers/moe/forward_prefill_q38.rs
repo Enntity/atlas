@@ -126,7 +126,8 @@ impl MoeLayer {
     /// the halves computed apart equal the whole chunk byte for byte
     /// (`scripts/dev/qwen4exp_moe_prefill_bench.cu`: 16016 split at 8192,
     /// 12000 at 6144, 5000 at 2048; q38 and W2). GB10, 16000 rows: 3.2 ms a
-    /// layer -> about half on each rank.
+    /// layer -> about half on each rank. The MXFP8 shared expert splits too
+    /// (row-invariant at every row count: `shared_mxfp8.rs`).
     pub(super) fn q38_sp_rows(
         &self,
         sp: crate::layers::glm_sp::SpRows,
@@ -138,9 +139,10 @@ impl MoeLayer {
             |rows: usize| crate::layers::w4a16_gemv_tiers::tc_kernel(rows as u32).0 == 0;
         let split = sp.full_shared
             && sp_shared_requested()
-            && self.q38_shared_shape_serves(h, inter, ctx)
-            && tiers_skip(sp.rows)
-            && tiers_skip(sp.total());
+            && (self.mxfp8_shared_expert.is_some()
+                || (self.q38_shared_shape_serves(h, inter, ctx)
+                    && tiers_skip(sp.rows)
+                    && tiers_skip(sp.total())));
         crate::layers::glm_sp::SpRows {
             full_shared: sp.full_shared && !split,
             ..sp

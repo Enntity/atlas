@@ -72,6 +72,15 @@ fn cut(label: &str) -> Option<Cut> {
         "tp2 qsa k, v" => (&[("self_attn.k_proj", &[(0, 256)])], None, 3),
         "tp1 qsa k, v" => (&[("self_attn.k_proj", &[(0, 512)])], None, 3),
         "tp2 qsa o" | "tp1 qsa o" => (&[], Some(("self_attn.o_proj", 0)), 3),
+        "shared gate, up" => (
+            &[
+                ("mlp.shared_expert.gate_proj", &[(0, 640)]),
+                ("mlp.shared_expert.up_proj", &[(0, 640)]),
+            ],
+            None,
+            0,
+        ),
+        "shared down" => (&[], Some(("mlp.shared_expert.down_proj", 0)), 0),
         _ => return None,
     })
 }

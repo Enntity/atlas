@@ -20,9 +20,9 @@
 //!   twins, freeing it.
 //! * MXFP8 QSA indexer `index_qk_proj` and ViT attention: the exact BF16
 //!   dequant (`dense_auto`).
-//! * MXFP8 shared expert: its exact BF16 dequant, REQUANTIZED to NVFP4 by
-//!   the shared MoE loader, as the BF16 releases' shared expert is. Not
-//!   exact, and kept as policy: the fused MoE kernels read NVFP4.
+//! * MXFP8 shared expert: the checkpoint's bytes (`layers::moe::
+//!   Mxfp8SharedExpert`): decode twins, prefill W8A8 on them; the fused
+//!   routed-expert kernels run without a shared expert.
 //! * W4A16 NVFP4 ViT MLP and merger: expanded to BF16 (`vision_dense_auto`,
 //!   one rounding; see there).
 //! * NVFP4 MTP experts: loaded natively (`mtp.rs`).
@@ -187,8 +187,8 @@ impl Qwen4ExpFormat {
                 "FP8/NVFP4 release"
             },
             if self.mxfp8_backbone {
-                "MXFP8 (GDN/QSA decode twins, prefill W8A8 on them or on their exact BF16; \
-                 indexer and ViT attention exact BF16; shared expert BF16 requantized to NVFP4)"
+                "MXFP8 (GDN/QSA and shared-expert decode twins, prefill W8A8 on them or on \
+                 the GDN/QSA exact BF16; indexer and ViT attention exact BF16)"
             } else {
                 "BF16"
             },

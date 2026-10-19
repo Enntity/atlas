@@ -203,6 +203,8 @@ mod helpers_b;
 mod helpers_c;
 mod route_dump;
 mod shared_fp8_cache;
+mod shared_mxfp8;
+pub(crate) use shared_mxfp8::Mxfp8SharedExpert;
 mod shared_fp8_cache_load;
 mod shared_fp8_cache_output;
 #[cfg(test)]

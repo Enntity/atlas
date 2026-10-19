@@ -291,7 +291,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         for i in 0..config.num_hidden_layers {
             let lp = config.layer_prefix(i);
             let f0 = free_now(gpu);
-            let ffn = ffn::build_moe(store, &lp, config, gpu, variant)?;
+            let ffn = ffn::build_moe(store, &lp, config, gpu, variant, format.mxfp8_backbone)?;
             let f1 = free_now(gpu);
             moe_bytes += f0.saturating_sub(f1);
 
@@ -391,8 +391,8 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             // Every reader of this layer's MXFP8 bytes is done: the GDN and
             // QSA decode twins, the exact BF16 dequants (prefill, the QSA
             // indexer's `index_qk_proj` in `attach_qsa` above), and the
-            // shared expert, whose BF16 dequant `build_moe` requantized to
-            // NVFP4. This is the one place they are released.
+            // shared expert's twins (`build_moe`). This is the one place
+            // they are released.
             if format.mxfp8_backbone {
                 mxfp8_released += format::release_mxfp8_sources(
                     store,
@@ -412,9 +412,9 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             tracing::info!(
                 "qwen4_exp: MXFP8 backbone loaded: GDN/QSA decode reads {}, prefill as \
                  the ATLAS_QWEN4EXP_PREFILL_W8A8 line says; QSA indexer exact BF16; shared \
-                 expert BF16 dequant requantized to NVFP4 (the fused MoE kernels read \
-                 NVFP4; the BF16 releases' shared expert takes the same requantization). \
-                 Released {:.2} GB of MXFP8 source bytes",
+                 expert on the checkpoint's MXFP8 bytes (decode twins; prefill W8A8 on them, \
+                 or their decode tiers with ATLAS_QWEN4EXP_PREFILL_W8A8 off). Released \
+                 {:.2} GB of MXFP8 source bytes",
                 if gdn == GdnProjections::Mxfp8Decode {
                     "the checkpoint's MXFP8 bytes"
                 } else {

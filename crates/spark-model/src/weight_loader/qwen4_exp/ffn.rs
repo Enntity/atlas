@@ -19,12 +19,17 @@
 //! changes the top-10 expert set of most tokens. Decode and verify read it
 //! through `dense_gemv_bf16` and its row-identical batched tiers, prefill
 //! through the q38 tile GEMM (`try_q38_router`).
+//!
+//! FP4-Local (`mxfp8_backbone`) ships the shared expert MXFP8: it loads as
+//! the checkpoint's own bytes (`layers::moe::Mxfp8SharedExpert`) and the
+//! NVFP4 shared expert the BF16 releases get is never built.
 
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
+use crate::layers::moe::Mxfp8SharedExpert;
 use crate::layers::{FfnComponent, MoeLayer};
 use crate::weight_map::{Nvfp4Variant, load_moe_qwen35};
 
@@ -34,6 +39,7 @@ pub(super) fn build_moe(
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
+    mxfp8_backbone: bool,
 ) -> Result<FfnComponent> {
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
@@ -50,11 +56,17 @@ pub(super) fn build_moe(
         quantize_k,
         stream,
         false,
+        !mxfp8_backbone,
     )
     .with_context(|| format!("qwen4_exp: MoE block at {lp}"))?;
 
     let mut moe = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
     // The routed prefill's W4A4 activation scales (`moe::w4a4_scales`).
     moe.load_w4a4_scales(store, &format!("{lp}.mlp"), config, gpu)?;
+    if mxfp8_backbone {
+        let shared = Mxfp8SharedExpert::load(store, lp, config, gpu)
+            .with_context(|| format!("qwen4_exp: MXFP8 shared expert at {lp}"))?;
+        moe.set_mxfp8_shared_expert(shared)?;
+    }
     Ok(FfnComponent::Moe(moe))
 }

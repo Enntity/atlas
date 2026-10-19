@@ -11,8 +11,9 @@
 //! Which projections: the GDN qkvz (`in_proj_qkv` + `in_proj_z`) and
 //! `out_proj`, the QSA q/k/v/o. Not `in_proj_a`/`in_proj_b` (the fused BA +
 //! gates kernel reads BF16; 0.2% of the GDN FLOPs), not the indexer's
-//! `index_qk_proj` (its kernels read BF16; N = 320 a rank), not the shared
-//! expert (NVFP4 on the fused MoE prefill kernels, as on the BF16 releases).
+//! `index_qk_proj` (its kernels read BF16; N = 320 a rank). The shared
+//! expert's W8A8 operands are its own (`layers/moe/shared_mxfp8.rs`), built
+//! with its twins under the same switch.
 //!
 //! Speed: `spark_runtime::cublaslt::fp8_gemm_act_weight_t_mx` (its doc
 //! holds the measured numbers and their source).

@@ -59,7 +59,9 @@ impl Qwen4ExpMoeRows {
     }
 
     /// [`Self::units`] on v3: the plan into `ws`, then the fused launch
-    /// (BF16 activations in `act`).
+    /// (BF16 activations in `act`). Null shared weights (all three): no
+    /// shared unit, and `sh_down_out` is left as it is (v1/v2 write zeros
+    /// there), for a shared expert the units do not carry.
     pub(super) fn units_tc3(
         &self,
         gpu: &dyn GpuBackend,
@@ -70,10 +72,12 @@ impl Qwen4ExpMoeRows {
         (top_k, rows): (u32, u32),
         stream: u64,
     ) -> Result<()> {
-        // v3 always runs the shared unit (v1/v2 write zeros without one).
+        let shared = sh_gate.weight.0 != 0;
         anyhow::ensure!(
-            [sh_gate, sh_up, sh_down].iter().all(|w| w.weight.0 != 0),
-            "qwen4exp MoE TC v3: no shared expert"
+            [sh_gate, sh_up, sh_down]
+                .iter()
+                .all(|w| (w.weight.0 != 0) == shared),
+            "qwen4exp MoE TC v3: a partial shared expert"
         );
         KernelLaunch::new(gpu, self.units_plan)
             .grid([1, 1, 1])
@@ -83,6 +87,7 @@ impl Qwen4ExpMoeRows {
             .arg_ptr(ws)
             .arg_u32(top_k)
             .arg_u32(rows)
+            .arg_u32(shared as u32)
             .launch(stream)?;
         let mut l = KernelLaunch::new(gpu, self.units_fused)
             .grid([self.units_ctas, 1, 1])
