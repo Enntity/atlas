@@ -42,7 +42,7 @@
 //! down columns, its partial joins the routed partial in the weighted-sum
 //! blend before the EP all-reduce (or reduce-scatter), and nothing is added
 //! after it. Each rank reads `1/n` of the weights. The gate scales the
-//! partials, which by linearity is the gate times their sum.
+//!   partials, which by linearity is the gate times their sum.
 //!
 //! There (TP=EP=2 decode, verify and batch), it runs on a side stream
 //! ([`SideLane`]) forked at the MoE's entry and joined before the blend: it
