@@ -101,7 +101,7 @@ pub(in crate::scheduler) fn think_gate(a: &mut ActiveSeq, tok: u32, env: &Commit
         if !env.quiet {
             tracing::debug!(
                 fires = a.think_watchdog_fires,
-                budget = decayed.max(8),
+                budget = ?a.thinking_budget,
                 "spontaneous <think>: entering thinking mode"
             );
         }
