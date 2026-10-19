@@ -4,42 +4,36 @@
 
 struct Tables { u64 *gp, *gs, *upk, *us, *dp, *ds; float *g2, *u2, *d2; };
 
-// The used experts of a layer on the device: the served [N, K/2] layout and
-// the prefill [K/2, N] copy (byte transposes), as 512-entry tables.
+// The used experts of a layer on the device in the served [N, K/2] layout,
+// as 512-entry tables, plus the W4A4 alphas (weight_scale_2 / g) and g2.
 struct LayerDev {
-    Tables o, t;
+    Tables o;
+    float g1;
+    float *ga, *ua, *da, *a2g;
     std::vector<void*> bufs;
     static unsigned char* up(std::vector<void*>& b, const std::vector<unsigned char>& v) {
         unsigned char* p = dput(v); b.push_back(p); return p;
     }
-    static std::vector<unsigned char> tr(const std::vector<unsigned char>& v, unsigned rows, unsigned cols) {
-        std::vector<unsigned char> o(v.size());
-        for (unsigned r = 0; r < rows; r++)
-            for (unsigned c = 0; c < cols; c++) o[(size_t)c * rows + r] = v[(size_t)r * cols + c];
-        return o;
-    }
-    LayerDev(const std::map<unsigned, Expert>& ex) {
-        std::vector<u64> P[2][6];
-        std::vector<float> S[3];
-        for (auto& v : P) for (auto& w : v) w.assign(NE, 0);
+    LayerDev(const std::map<unsigned, Expert>& ex, float g1_) : g1(g1_) {
+        std::vector<u64> P[6];
+        std::vector<float> S[7];
+        for (auto& w : P) w.assign(NE, 0);
         for (auto& v : S) v.assign(NE, 0.f);
         for (auto& [e, x] : ex) {
             const HostProj* pr[3] = {&x.g, &x.u, &x.d};
             for (int j = 0; j < 3; j++) {
                 const HostProj& h = *pr[j];
-                P[0][2 * j][e] = (u64)up(bufs, h.p);
-                P[0][2 * j + 1][e] = (u64)up(bufs, h.s);
-                P[1][2 * j][e] = (u64)up(bufs, tr(h.p, h.n, h.k / 2));
-                P[1][2 * j + 1][e] = (u64)up(bufs, tr(h.s, h.n, h.k / 16));
+                P[2 * j][e] = (u64)up(bufs, h.p);
+                P[2 * j + 1][e] = (u64)up(bufs, h.s);
                 S[j][e] = h.s2;
             }
+            const float g2 = 1.0f / x.d.is;
+            S[3][e] = x.g.s2 / g1; S[4][e] = x.u.s2 / g1; S[5][e] = x.d.s2 / g2; S[6][e] = g2;
         }
-        Tables* T[2] = {&o, &t};
-        for (int l = 0; l < 2; l++) {
-            T[l]->gp = dput(P[l][0]); T[l]->gs = dput(P[l][1]); T[l]->upk = dput(P[l][2]);
-            T[l]->us = dput(P[l][3]); T[l]->dp = dput(P[l][4]); T[l]->ds = dput(P[l][5]);
-            T[l]->g2 = dput(S[0]); T[l]->u2 = dput(S[1]); T[l]->d2 = dput(S[2]);
-        }
+        o.gp = dput(P[0]); o.gs = dput(P[1]); o.upk = dput(P[2]);
+        o.us = dput(P[3]); o.dp = dput(P[4]); o.ds = dput(P[5]);
+        o.g2 = dput(S[0]); o.u2 = dput(S[1]); o.d2 = dput(S[2]);
+        ga = dput(S[3]); ua = dput(S[4]); da = dput(S[5]); a2g = dput(S[6]);
     }
     ~LayerDev() { for (void* p : bufs) cudaFree(p); }
 };
@@ -80,25 +74,26 @@ static std::vector<unsigned short> run_path(char which, const LayerDev& L, const
         auto v = dget(down, y.size() * 2);
         memcpy(y.data(), v.data(), v.size());
     } else {  // 'd': the prefill chain over all 512 experts, rows sorted by expert
-        const Tables& t = L.t;
         std::vector<std::pair<unsigned, unsigned>> srt;  // (expert, slot q)
         for (unsigned q = 0; q < S; q++) srt.push_back({r.ids[q], q});
         std::sort(srt.begin(), srt.end());
         std::vector<int> off(NE + 1, 0), tok;
         for (auto& p : srt) { off[p.first + 1]++; tok.push_back((int)(p.second / TOPK)); }
         for (unsigned e = 0; e < NE; e++) off[e + 1] += off[e];
-        void *doff = dput(off), *dtok = dput(tok), *a8 = dzero((size_t)R * H), *act8 = dzero((size_t)S * I);
-        unsigned n = R * H, ne = NE;
-        const char* M = "moe_prefill_q38";
-        launch(load(M, "moe_q38_a_to_e4m3"), dim3((n / 4 + 255) / 256), dim3(256), {&A, &a8, &n});
-        launch(load(M, "moe_q38w_gate_up_silu"), dim3(I / 64, 1, NE), dim3(256),
-               {&a8, (void*)&t.gp, (void*)&t.gs, (void*)&t.g2, (void*)&t.upk, (void*)&t.us, (void*)&t.u2, &act8,
-                &doff, &dtok, &ne, &n_i, &k_h});
-        launch(load(M, "moe_q38w_down"), dim3(H / 128, 1, NE), dim3(256),
-               {&act8, (void*)&t.dp, (void*)&t.ds, (void*)&t.d2, &down, &doff, &ne, &n_h, &k_i});
+        void *doff = dput(off), *dtok = dput(tok), *a4 = dzero((size_t)R * H / 2), *a4s = dzero((size_t)R * H / 16);
+        void *act4 = dzero((size_t)S * I / 2), *act4s = dzero((size_t)S * I / 16);
+        unsigned groups = R * H / 16, ne = NE;
+        float g1 = L.g1;
+        const char* M = "moe_prefill_w4a4";
+        launch(load(M, "moe_w4a4_quant_input"), dim3((groups + 255) / 256), dim3(256), {&A, &a4, &a4s, &g1, &groups});
+        launch(load(M, "moe_w4a4_gate_up_silu"), dim3(I / 64, 1, NE), dim3(256),
+               {&a4, &a4s, (void*)&o.gp, (void*)&o.gs, (void*)&L.ga, (void*)&o.upk, (void*)&o.us, (void*)&L.ua,
+                (void*)&L.a2g, &act4, &act4s, &doff, &dtok, &ne, &n_i, &k_h});
+        launch(load(M, "moe_w4a4_down"), dim3(H / 128, 1, NE), dim3(256),
+               {&act4, &act4s, (void*)&o.dp, (void*)&o.ds, (void*)&L.da, &down, &doff, &ne, &n_h, &k_i});
         auto v = dget(down, y.size() * 2);
         for (unsigned i = 0; i < S; i++) memcpy(&y[(size_t)srt[i].second * H], &v[(size_t)i * H * 2], H * 2);
-        for (void* p : {doff, dtok, a8, act8}) cudaFree(p);
+        for (void* p : {doff, dtok, a4, a4s, act4, act4s}) cudaFree(p);
     }
     for (void* p : {A, ids, order, ws, act, go, uo, down, shg, shu, shd}) cudaFree(p);
     return y;
@@ -246,7 +241,12 @@ int main(int argc, char** argv) {
             ex[e] = {load_proj(ck, base + std::to_string(e) + ".gate_proj", I, H),
                      load_proj(ck, base + std::to_string(e) + ".up_proj", I, H),
                      load_proj(ck, base + std::to_string(e) + ".down_proj", H, I)};
-        LayerDev dev(ex);
+        // The W4A4 input's global scale: 1 / max over all 512 experts.
+        float a1 = 0;
+        for (unsigned x = 0; x < NE; x++)
+            for (const char* p : {".gate_proj", ".up_proj"})
+                a1 = std::max(a1, scalar(ck, base + std::to_string(x) + p + ".input_scale"));
+        LayerDev dev(ex, 1.0f / a1);
         // [path][ref n/c][slot outputs | routed sums]; floor = BF16(ref).
         Err e[5][2][2];
         long bites = 0, rows = 0;
@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
         printf("  %-22s | vs float64, no clamp (model)  | vs float64, decode clamp      |\n", "");
         printf("  %-22s | expert out    | routed sum    | expert out    | routed sum    |\n", "path");
         printf("  %-22s | relL2   maxabs| relL2   maxabs| relL2   maxabs| relL2   maxabs|\n", "");
-        const char* names[4] = {"BF16 floor (ref->bf16)", "(b) decode rows (FP32)", "(c) TC (BF16 MMA)", "(d) prefill FP8 (q38)"};
+        const char* names[4] = {"BF16 floor (ref->bf16)", "(b) decode rows (FP32)", "(c) TC (BF16 MMA)", "(d) prefill W4A4"};
         for (int p = 0; p < 4; p++) {
             printf("  %-22s |", names[p]);
             e[p][0][0].print(); e[p][0][1].print(); e[p][1][0].print(); e[p][1][1].print();

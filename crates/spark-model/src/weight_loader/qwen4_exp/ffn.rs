@@ -53,6 +53,8 @@ pub(super) fn build_moe(
     )
     .with_context(|| format!("qwen4_exp: MoE block at {lp}"))?;
 
-    let moe = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+    let mut moe = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
+    // The routed prefill's W4A4 activation scales (`moe::w4a4_scales`).
+    moe.load_w4a4_scales(store, &format!("{lp}.mlp"), config, gpu)?;
     Ok(FfnComponent::Moe(moe))
 }

@@ -4,9 +4,11 @@
 // `moe_w4a16_fused_gate_up_t_k64` + `moe_silu_mul` and of
 // `moe_w4a16_grouped_gemm_ptrtable_t_k64` (moe_w4a16_grouped_gemm.cu, the
 // qwen3.6-35b-a3b file this target symlinks). Opt-in:
-// ATLAS_QWEN4EXP_PREFILL_MOE=1. The routed pair also reads the checkpoint's
-// N-major expert planes, byte-identically, without the K-major duplicate
-// (`moe_q38{,w}n_*`, ATLAS_QWEN4EXP_PREFILL_MOE_NODUP; NM in q38_tile).
+// ATLAS_QWEN4EXP_PREFILL_MOE=1 serves the shared expert (dense entries) and
+// the router weight from here. The routed entries are no longer dispatched --
+// the routed prefill is the reference's W4A4 (moe_prefill_w4a4.cu) -- and
+// stay as the dev benches' E4M3 baseline; they also read the checkpoint's
+// N-major expert planes, byte-identically (`moe_q38{,w}n_*`; NM in q38_tile).
 //
 // WHAT THE DEFAULT DOES. Per 64-row x 128-column tile and 64-wide K step, its
 // 128 threads (4 warps) stage A (BF16, gathered through sorted_token_ids) and

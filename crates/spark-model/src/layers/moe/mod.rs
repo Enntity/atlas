@@ -35,6 +35,19 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale2_vals: DevicePtr,
 }
 
+impl ExpertPtrTable {
+    /// This table's weights with other per-expert `scale2_vals` (owned by
+    /// the caller; the pointer arrays stay this table's).
+    pub(crate) fn with_scale2(&self, scale2_vals: DevicePtr) -> Self {
+        Self {
+            allocation: None,
+            packed_ptrs: self.packed_ptrs,
+            scale_ptrs: self.scale_ptrs,
+            scale2_vals,
+        }
+    }
+}
+
 /// Device-resident top-k routing results that can be sliced across fused
 /// small-M expert waves without recomputing the router projection.
 #[derive(Clone, Copy)]
@@ -167,8 +180,6 @@ mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_q38;
 pub(crate) use forward_prefill_q38::{q38_requested, sp_shared_requested, w2_requested};
-mod forward_prefill_q38_nodup;
-pub(crate) use forward_prefill_q38_nodup::{nodup_requested, skips_routed_transpose};
 mod forward_prefill_q38_rs;
 mod forward_prefill_route;
 pub(crate) mod forward_prefill_route_sp;
@@ -177,6 +188,10 @@ pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill
 mod forward_prefill_router;
 mod forward_prefill_tcp;
 pub(crate) use forward_prefill_tcp::tcp_requested;
+mod forward_prefill_w4a4;
+pub(crate) use forward_prefill_w4a4::skips_routed_transpose;
+mod w4a4_scales;
+pub(crate) use w4a4_scales::W4a4Scales;
 mod forward_rows;
 mod forward_token_major;
 mod gate_up_m16;

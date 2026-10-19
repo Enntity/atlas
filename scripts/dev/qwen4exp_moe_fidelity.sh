@@ -9,7 +9,7 @@ mkdir -p "$out"
 nvcc=${NVCC:-nvcc}
 flags=(--ptx -arch=sm_121f -O3 --fmad=false -DTQ_PLUS_SIGNS --expt-relaxed-constexpr --Werror all-warnings)
 pids=()
-for stem in qwen4exp_moe_rows qwen4exp_moe_c8_tc moe_prefill_q38; do
+for stem in qwen4exp_moe_rows qwen4exp_moe_c8_tc moe_prefill_w4a4; do
   "$nvcc" "${flags[@]}" "kernels/gb10/qwen3.8-flash-next/nvfp4/$stem.cu" -o "$out/$stem.ptx" & pids+=($!)
 done
 "$nvcc" -O3 -std=c++17 -arch=sm_121a -Xcompiler -fopenmp -Iscripts/dev scripts/dev/qwen4exp_moe_fidelity.cu \

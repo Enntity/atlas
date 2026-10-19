@@ -91,12 +91,12 @@ impl MoeLayer {
             } else {
                 16
             };
-        // ATLAS_QWEN4EXP_PREFILL_MOE_NODUP: the routed experts stay in their
-        // checkpoint layout (`forward_prefill_q38_nodup`); the shared expert
-        // below is still transposed.
+        // qwen4_exp's prefill MoE: the routed experts stay in their
+        // checkpoint layout (`forward_prefill_w4a4`); the shared expert below
+        // is still transposed.
         let routed = !super::skips_routed_transpose(config);
         if !routed {
-            self.check_q38_nodup_planes()?;
+            self.check_routed_planes()?;
         }
         for expert in self.weights.experts.iter().filter(|_| routed) {
             if expert.gate_proj.is_null() {

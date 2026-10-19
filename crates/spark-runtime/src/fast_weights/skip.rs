@@ -10,7 +10,9 @@
 //!      table). Model-declared, so it is checked FIRST and independently of
 //!      expert parallelism.
 //!   2. **EP sharding** — remote experts belong to another rank.
-//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in.
+//!   3. **`skip_activation_scales`** — W4A4 `*.input_scale`, opt-in: not
+//!      uploaded but DEFERRED, every expert's on every rank (the model loader
+//!      reads the scalars from disk).
 //!   4. **`skip_mtp`** — `mtp.*` for a loader that builds no MTP head, opt-in.
 //!
 //!   5. **`skip_layer_prefix`** — an unused appended predictor layer, opt-in.
@@ -28,7 +30,13 @@ impl FastSafetensorsLoader {
     /// Expert TP: a routed expert's packed weight or block scale, which the
     /// model loader slices straight from disk. The appended predictor layer
     /// keeps its own replication rules, and the scalars load as usual.
+    /// The activation scales under `skip_activation_scales` too: one 0-dim
+    /// F32 per projection, read on the host (`DeferredTensor`) by a model
+    /// loader that needs them, whichever rank owns the expert.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        if self.skip_activation_scales && name.ends_with(".input_scale") {
+            return true;
+        }
         self.expert_tp
             && !name.starts_with("mtp.")
             && (name.ends_with(".weight") || name.ends_with(".weight_scale"))
@@ -82,11 +90,13 @@ impl FastSafetensorsLoader {
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
+        // W4A4 activation scales: not uploaded -- 4-byte allocations are
+        // almost pure granule padding at expert scale, and the NVFP4 loader
+        // falls back to `DevicePtr::NULL` -- but deferred (`should_defer_tensor`)
+        // for every expert, remote ones included: qwen4_exp's W4A4 prefill
+        // quantizes a layer's input under the max over all of them.
         if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
+            return false;
         }
         if self.ep_world_size <= 1 {
             return false;
