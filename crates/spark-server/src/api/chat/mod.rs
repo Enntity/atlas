@@ -525,3 +525,7 @@ pub(crate) async fn chat_completions_inner(
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "reference_prompt_tests.rs"]
+mod reference_prompt_tests;
