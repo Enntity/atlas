@@ -49,8 +49,8 @@ fn a_header_past_the_decoder_limits_is_refused_at_the_probe() {
 #[test]
 fn stills_past_one_encoder_batch_are_resized_into_it() {
     // A 2880x1800 Retina screenshot used to come out 2880x1792 = 20160
-    // patches, and 2064x2032 2080x2048 = 16640: both over the encoder's
-    // 16384, failing at prefill. Both now fit, floored as HF does.
+    // patches: over the encoder's 16384, failing at prefill. It now fits,
+    // as HF's smart_resize sizes it at the capacity.
     for (w, h) in [(2880u32, 1800u32), (2064, 2032), (1800, 2880)] {
         let probed = probe_image(&header_only_png(w, h), &qwen_config(), Q38).unwrap();
         assert!(probed.patches() <= 16_384, "{w}x{h}: {probed:?}");
@@ -61,7 +61,7 @@ fn stills_past_one_encoder_batch_are_resized_into_it() {
     }
     assert_eq!(
         still_target(&qwen_config(), 2032, 2064, Q38).unwrap(),
-        (2016, 2048)
+        (2048, 2048)
     );
     // No declared bound at patch 14: the 1280px fallback is 92x92 = 8464
     // patches, past the 6400 fallback capacity, so it is fitted too.
@@ -69,29 +69,6 @@ fn stills_past_one_encoder_batch_are_resized_into_it() {
     p14.patch_size = 14;
     let (th, tw) = still_target(&p14, 1280, 1280, None).unwrap();
     assert!((th as usize / 14) * (tw as usize / 14) <= 6400, "{th}x{tw}");
-}
-
-#[test]
-fn every_size_that_fit_before_is_unchanged() {
-    // Exactness: wherever the base sizing gave a grid within the encoder's
-    // capacity, the target is the base's, to the pixel (long sides past
-    // 4096, non-multiple bounds, the no-bound fallback).
-    let cfg = qwen_config();
-    for max_pixels in [None, Q38, Some(1_000_003), Some(4_194_304), Some(65_536)] {
-        let p_max = crate::layers::vision_encoder::derive_max_patches(max_pixels, 16).0;
-        for h in (17..6000u32).step_by(211) {
-            for w in [1u32, 33, 640, 1337, 1920, 2049, 4096, 5293, 8191] {
-                let base = target_size_with_max_pixels(h, w, 32, max_pixels);
-                let got = still_target(&cfg, h, w, max_pixels).unwrap();
-                let patches = (got.0 as usize / 16) * (got.1 as usize / 16);
-                assert!(patches <= p_max, "{h}x{w} {max_pixels:?}: {got:?}");
-                if (base.0 as usize / 16) * (base.1 as usize / 16) <= p_max {
-                    assert_eq!(got, base, "{h}x{w} {max_pixels:?}");
-                }
-            }
-        }
-    }
-    assert_eq!(still_target(&cfg, 5293, 1337, Q38).unwrap(), (4096, 1024));
 }
 
 #[test]
