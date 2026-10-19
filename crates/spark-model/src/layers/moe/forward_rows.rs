@@ -124,9 +124,10 @@ impl MoeLayer {
             self.reject_decode_lora(ctx, "forward_rows")?;
         }
         let output = ctx.buffers.moe_output();
-        let shared_out = ctx.buffers.attn_output();
+        let side = self.fork_mxfp8_shared(input, rows, ctx, stream)?;
+        let shared_out = side.unwrap_or(ctx.buffers.attn_output());
         if self.rows_pair_eligible(rows, ctx) {
-            self.forward_rows_pair(input, rows, output, shared_out, ctx, stream)?;
+            self.forward_rows_pair(input, rows, output, shared_out, side.is_none(), ctx, stream)?;
         } else {
             for r in 0..rows {
                 let off = r * h * bf16;
@@ -134,26 +135,29 @@ impl MoeLayer {
                     input.offset(off),
                     output.offset(off),
                     shared_out.offset(off),
+                    side.is_none(),
                     single_seq_decode,
                     ctx,
                     stream,
                 )?;
             }
         }
-        let posted =
-            self.forward_ep_reduce(output, shared_out, input, rows, hc_post, ctx, stream)?;
+        let shared = (shared_out, side.is_some());
+        let posted = self.forward_ep_reduce(output, shared, input, rows, hc_post, ctx, stream)?;
         Ok(Some((output, posted)))
     }
 
     /// The row pair (module docs): `forward_row_local`'s originals arm for
     /// `rows` rows with the router, the experts and the shared expert read
     /// once. Same buffers as the single-row arm, `rows` deep.
+    #[allow(clippy::too_many_arguments)]
     fn forward_rows_pair(
         &self,
         input: DevicePtr,
         rows: usize,
         output: DevicePtr,
         shared_out: DevicePtr,
+        unfused_here: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -287,8 +291,8 @@ impl MoeLayer {
         }
         // FP4-Local's MXFP8 shared expert (`shared_mxfp8.rs`; the kernels
         // above ran without one): every row in one row-invariant pass, as
-        // `forward_row_local` runs it for one.
-        if self.has_unfused_shared_expert() {
+        // `forward_row_local` runs it for one (unless it was forked).
+        if unfused_here && self.has_unfused_shared_expert() {
             self.run_unfused_shared_expert(
                 input,
                 rows32,

@@ -30,6 +30,16 @@
 //!
 //! Replicated on every EP rank, as the NVFP4 shared expert was: each rank
 //! computes all of it, and the EP reduce adds it once after the all-reduce.
+//! There (TP=EP=2 decode, verify and batch), it runs on a side stream
+//! ([`SideLane`]) forked at the MoE's entry and joined after the all-reduce
+//! is issued: it reads only the MoE input, so it overlaps the router, the
+//! routed experts and the all-reduce's wait on the peer instead of adding
+//! its weight bytes to the step. The same kernels on the same operands:
+//! the bytes do not change. GB10, one EP2 rank's MoE layer (the TC v3 units,
+//! `scripts/dev/qwen4exp_moe_c8_bench.sh time tc3`, min of 7, us; NVFP4
+//! shared unit / MXFP8 in line / MXFP8 on the side lane): 1 row 77.0 / 89.4
+//! / 79.6, 4 rows 265.3 / 266.5 / 261.9, 16 rows 520.3 / 521.8 / 521.5, 32
+//! rows (C8, 70 unique experts) 852.4 / 856.7 / 845.1.
 
 use anyhow::{Context, Result, ensure};
 use atlas_core::config::ModelConfig;
@@ -56,6 +66,41 @@ struct Kernels {
     swiglu_quant: KernelHandle,
 }
 
+/// Rows the side lane's own buffers hold: any decode, verify or batch step
+/// (a wider one runs in line).
+const SIDE_ROWS: usize = 256;
+
+/// The EP decode's side stream for the shared expert, its fork / join
+/// events and its own SiLU * up and output rows (no buffer the routed path
+/// writes). One per process: the layers fork and join it in turn.
+#[derive(Debug, Clone, Copy)]
+struct SideLane {
+    stream: u64,
+    fork: u64,
+    join: u64,
+    act: DevicePtr,
+    out: DevicePtr,
+}
+
+impl SideLane {
+    fn get(gpu: &dyn GpuBackend, [hidden, inter]: [usize; 2]) -> Result<Self> {
+        static LANE: std::sync::Mutex<Option<SideLane>> = std::sync::Mutex::new(None);
+        let mut lane = LANE.lock().map_err(|_| anyhow::anyhow!("side lane lock"))?;
+        if let Some(l) = *lane {
+            return Ok(l);
+        }
+        let l = Self {
+            stream: gpu.create_stream()?,
+            fork: gpu.create_event()?,
+            join: gpu.create_event()?,
+            act: gpu.alloc(SIDE_ROWS * inter * 2)?,
+            out: gpu.alloc(SIDE_ROWS * hidden * 2)?,
+        };
+        *lane = Some(l);
+        Ok(l)
+    }
+}
+
 /// One layer's MXFP8 shared expert; see the module docs.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Mxfp8SharedExpert {
@@ -65,6 +110,8 @@ pub(crate) struct Mxfp8SharedExpert {
     down: Mxfp8Weight,
     /// The W8A8 prefill operands over the twins (gate/up, down).
     w8a8: Option<(MxW8a8, MxW8a8)>,
+    /// Under EP (see the module docs).
+    side: Option<SideLane>,
     k: Kernels,
     hidden: usize,
     inter: usize,
@@ -89,7 +136,12 @@ impl Mxfp8SharedExpert {
         };
         let parts = [raw("gate_proj")?, raw("up_proj")?, raw("down_proj")?];
         let w8a8 = qwen4exp_w8a8::enabled().then_some(config.max_batch_tokens);
-        Self::from_raw(gpu, parts, [hidden, inter], w8a8).with_context(|| lp.to_string())
+        let mut mx =
+            Self::from_raw(gpu, parts, [hidden, inter], w8a8).with_context(|| lp.to_string())?;
+        if config.ep_world_size > 1 {
+            mx.side = Some(SideLane::get(gpu, [hidden, inter])?);
+        }
+        Ok(mx)
     }
 
     /// [`Self::load`] from raw `[gate, up, down]` MXFP8 tensors of a
@@ -141,6 +193,7 @@ impl Mxfp8SharedExpert {
             gate_up,
             down,
             w8a8,
+            side: None,
             k,
             hidden,
             inter,
@@ -212,6 +265,45 @@ impl Mxfp8SharedExpert {
 }
 
 impl MoeLayer {
+    /// An EP decode / verify / batch step of `rows` rows: fork the MXFP8
+    /// shared expert of `input` onto the side lane (module docs) and return
+    /// where its output lands, for [`Self::forward_ep_reduce`] to blend
+    /// after [`Self::join_mxfp8_shared`]. `None`: nothing forked, the step
+    /// runs it in line (`run_unfused_shared_expert`).
+    pub(super) fn fork_mxfp8_shared(
+        &self,
+        input: DevicePtr,
+        rows: usize,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<Option<DevicePtr>> {
+        let Some((mx, lane)) = self
+            .mxfp8_shared_expert
+            .as_ref()
+            .and_then(|mx| mx.side.map(|l| (mx, l)))
+        else {
+            return Ok(None);
+        };
+        if ctx.comm.is_none() || ctx.config.ep_world_size < 2 || rows > SIDE_ROWS {
+            return Ok(None);
+        }
+        let gpu = ctx.gpu;
+        gpu.record_event(lane.fork, stream)?;
+        gpu.stream_wait_event(lane.stream, lane.fork)?;
+        mx.decode(gpu, input, rows, lane.act, lane.out, lane.stream)?;
+        gpu.record_event(lane.join, lane.stream)?;
+        Ok(Some(lane.out))
+    }
+
+    /// `stream` waits for the forked shared expert ([`Self::fork_mxfp8_shared`]).
+    pub(super) fn join_mxfp8_shared(&self, ctx: &ForwardContext, stream: u64) -> Result<()> {
+        let lane = self
+            .mxfp8_shared_expert
+            .and_then(|mx| mx.side)
+            .ok_or_else(|| anyhow::anyhow!("no MXFP8 shared expert side lane to join"))?;
+        ctx.gpu.stream_wait_event(stream, lane.join)
+    }
+
     /// Install this layer's MXFP8 shared expert. The NVFP4 shared expert
     /// must be absent (the loader skips it): every fused kernel then runs
     /// without one, and this is the only shared expert there is.
