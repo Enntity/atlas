@@ -248,5 +248,18 @@ fn no_request_form_gets_a_thinking_budget_or_a_tool_call_bias() {
         )
         .unwrap_or_else(|_| panic!("{}: sampling setup", case.name));
         assert!(sampling.logit_bias.is_empty(), "{}: logit bias", case.name);
+        // tools + response_format under tool_choice auto: a Qwen XML call or
+        // the bare JSON (the union grammar).
+        let union = matches!(
+            &sampling.grammar_spec,
+            Some(crate::api::inference_types::GrammarSpec::ToolCallOrJson { parser, .. })
+                if parser.name() == "qwen3_coder"
+        );
+        assert_eq!(
+            union,
+            case.name == "tools_and_response_format",
+            "{}",
+            case.name
+        );
     }
 }

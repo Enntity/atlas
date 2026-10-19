@@ -138,3 +138,30 @@ fn an_oversized_or_invalid_schema_is_an_error() {
         );
     }
 }
+
+/// Qwen's XML call (`qwen3_coder`, Qwen3.8-Flash-Next and the Qwen3.5/3.6
+/// family): the output opens with a `<tool_call>\n<function=...>` call or is
+/// the bare JSON. (After a first call the tool branch is auto mode: text
+/// between and after calls is free, as for every parser.)
+#[test]
+fn the_union_takes_qwen_xml_calls() {
+    use crate::tool_parser::Qwen3CoderParser;
+    let qwen = "<tool_call>\n<function=get_weather>\n<parameter=location>\nBoston\n\
+                </parameter>\n</function>\n</tool_call>";
+    for schema in [Some(SCHEMA), None] {
+        let g = union(&Qwen3CoderParser, schema);
+        assert!(accepts(&g, qwen), "{schema:?}");
+        assert!(accepts(&g, &format!("{qwen}\n{qwen}")), "parallel calls");
+        assert!(accepts(&g, ANSWER), "{schema:?}");
+        for bad in [
+            format!("```json\n{ANSWER}\n```"),
+            format!("I'll check.\n{qwen}"),
+            CALL.to_string(),
+            // An undeclared parameter or function is no call.
+            qwen.replace("location", "city"),
+            qwen.replace("get_weather", "get_time"),
+        ] {
+            assert!(!accepts(&g, &bad), "{schema:?}: {bad:?}");
+        }
+    }
+}
