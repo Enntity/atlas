@@ -1329,7 +1329,10 @@ pub(crate) fn load_model(
         },
         disable_thinking: args.disable_thinking,
         default_thinking: default_kwargs.thinking,
-        default_reasoning_effort: default_kwargs.reasoning_effort,
+        default_reasoning_effort: match default_kwargs.reasoning_effort {
+            Some(effort) => Some(effort),
+            None => super::serve::model_default_reasoning_effort(&ptx_set.behavior)?,
+        },
         response_store,
         rate_limiter,
         conversation_store,
