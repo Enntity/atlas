@@ -3,8 +3,8 @@
 //! `ATLAS_QWEN4EXP_PREFILL_MOE=1`: Qwen3.8-Flash-Next's MoE prefill GEMMs on
 //! `moe_prefill_q38.cu`, every output byte unchanged:
 //!
-//! * the router logits ([`MoeLayer::try_q38_router`]): BF16 weight + the
-//!   tile GEMM instead of `w4a16_gemm` (6.44 -> 0.82 ms a layer at 16K);
+//! * the router logits ([`MoeLayer::try_q38_router`]): the checkpoint's BF16
+//!   weight on the tile GEMM (0.82 ms a layer at 16K);
 //! * the shared expert ([`MoeLayer::try_q38_shared`]): 4.88 -> 3.41 ms;
 //! * the routed experts, below.
 //!
@@ -122,19 +122,16 @@ pub(super) fn finish_q38_check(ctx: &ForwardContext, rows: u32, h: u32, stream: 
 
 impl MoeLayer {
     /// The router logits of a prefill chunk, when the q38 arm serves them:
-    /// `moe_q38_router_dequant` writes the NVFP4 router weight as the BF16
-    /// `[N, K]` values `w4a16_gemm` forms in its loop, and
-    /// `dense_gemm_bf16_pipelined` runs the same in-order m16n8k16 chain over
-    /// them -- byte-identical logits, so identical routing. GB10, 16000
-    /// tokens x 512 experts: 6.44 -> 0.82 ms a layer (2.7x at 300 tokens).
-    /// The BF16 weight (2.6 MB) is staged in `expert_up_out`, which the
-    /// routed GEMMs only fill after the router has run. `Ok(false)` launched
-    /// nothing.
+    /// `dense_gemm_bf16_pipelined` (128-row tiles, one in-order m16n8k16
+    /// chain per output) over the checkpoint's BF16 router weight, so a row's
+    /// logits do not depend on the rows beside it. GB10, 16000 tokens x 512
+    /// experts: 0.82 ms a layer, against 6.44 for the scalar-order GEMM the
+    /// other models' BF16 routers take. Below 32 rows only under `_MOE_W2`,
+    /// as before. `Ok(false)` launched nothing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_q38_router(
         &self,
         router_in: DevicePtr,
-        w: &QuantizedWeight,
         logits: DevicePtr,
         n: u32,
         n_out: u32,
@@ -142,36 +139,20 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        let bytes = n_out as usize * h as usize * 2;
         if !q38_requested()
             || ctx.config.model_type != "qwen4_exp"
+            || self.gate_nvfp4.is_some()
+            || self.gate_fp8.is_some()
             || (n < 32 && !w2_requested())
             || !h.is_multiple_of(16)
-            || ctx.buffers.sizes().expert_up_out < bytes
         {
             return Ok(false);
         }
-        let gpu = ctx.gpu;
-        let k_dq = crate::layers::try_kernel(gpu, "moe_prefill_q38", "moe_q38_router_dequant");
-        if k_dq.0 == 0 {
-            return Ok(false);
-        }
-        let k_gemm = gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
-        let w_bf16 = ctx.buffers.expert_up_out();
-        KernelLaunch::new(gpu, k_dq)
-            .grid([(n_out * h / 2).div_ceil(256), 1, 1])
-            .block([256, 1, 1])
-            .arg_ptr(w.weight)
-            .arg_ptr(w.weight_scale)
-            .arg_f32(w.weight_scale_2)
-            .arg_ptr(w_bf16)
-            .arg_u32(n_out)
-            .arg_u32(h)
-            .launch(stream)?;
+        let k_gemm = ctx.gpu.kernel("gemm", "dense_gemm_bf16_pipelined")?;
         super::forward_prefill_route_sp::q38_router_gemm(
-            gpu,
+            ctx.gpu,
             k_gemm,
-            [router_in, w_bf16, logits],
+            [router_in, self.weights.gate.weight, logits],
             [n, n_out, h],
             stream,
         )?;

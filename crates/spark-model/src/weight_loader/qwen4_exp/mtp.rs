@@ -291,11 +291,9 @@ fn build_mtp_moe(
         correction_bias: None,
     };
 
-    // Router precision matters more than router size here: at 512 experts the
-    // top-10 weights cluster tightly. Same treatment as `ffn::build_moe`.
-    let gate_nvfp4 = super::helpers::mtp_router_nvfp4(|| q(&gate, n_experts, h))?;
-    let moe = MoeLayer::new(weights, n_experts, gate_nvfp4, gpu, config)
-        .context("qwen4_exp MTP: MoeLayer")?;
+    // The checkpoint's BF16 router, as `ffn::build_moe`'s.
+    let moe =
+        MoeLayer::new(weights, n_experts, None, gpu, config).context("qwen4_exp MTP: MoeLayer")?;
     Ok(FfnComponent::Moe(moe))
 }
 

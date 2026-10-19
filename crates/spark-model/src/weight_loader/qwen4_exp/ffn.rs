@@ -12,10 +12,13 @@
 //! against 256 x 512 there — but those come from `config`, not from the
 //! loader, so nothing needs re-deriving.
 //!
-//! The router (`mlp.gate`) is left BF16 and runtime-quantized to NVFP4 only
-//! for the non-native-FP8 path, matching qwen35. Its precision matters more
-//! than its size: at 512 experts the top-10 weights cluster tightly, and a
-//! 4-bit ULP wider than that spread cannot tell them apart.
+//! The router (`mlp.gate`) stays the checkpoint's BF16 (`gate_nvfp4: None`),
+//! as every release ships it and NVIDIA's reference engine runs it. Its
+//! precision matters more than its size: at 512 experts the top-10 weights
+//! cluster tightly, and an NVFP4 copy (8.5-9.3% weight error on FP4-Local)
+//! changes the top-10 expert set of most tokens. Decode and verify read it
+//! through `dense_gemv_bf16` and its row-identical batched tiers, prefill
+//! through the q38 tile GEMM (`try_q38_router`).
 
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
@@ -23,7 +26,7 @@ use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
 use crate::layers::{FfnComponent, MoeLayer};
-use crate::weight_map::{Nvfp4Variant, load_moe_qwen35, quantize_to_nvfp4};
+use crate::weight_map::{Nvfp4Variant, load_moe_qwen35};
 
 pub(super) fn build_moe(
     store: &WeightStore,
@@ -32,7 +35,6 @@ pub(super) fn build_moe(
     gpu: &dyn GpuBackend,
     variant: Nvfp4Variant,
 ) -> Result<FfnComponent> {
-    let h = config.hidden_size;
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
     let stream = gpu.default_stream();
@@ -51,16 +53,6 @@ pub(super) fn build_moe(
     )
     .with_context(|| format!("qwen4_exp: MoE block at {lp}"))?;
 
-    let gate_nvfp4 = Some(quantize_to_nvfp4(
-        &weights.gate,
-        config.num_experts,
-        h,
-        gpu,
-        absmax_k,
-        quantize_k,
-        stream,
-    )?);
-
-    let moe = MoeLayer::new(weights, config.num_experts, gate_nvfp4, gpu, config)?;
+    let moe = MoeLayer::new(weights, config.num_experts, None, gpu, config)?;
     Ok(FfnComponent::Moe(moe))
 }

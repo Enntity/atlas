@@ -59,19 +59,18 @@ impl MoeLayer {
             && ctx.config.ep_world_size > 1
             && sp.rows >= 32
             && sp.peer_rows >= 32
-            && self.gate_fp8.is_none()
             && self.tid2eid_dev.is_none()
             && self.correction_bias_dev.is_none()
             && self.weights.router_pre_norm.is_none()
             && self.lora.is_none();
-        let Some(router) = self.gate_nvfp4.as_ref().filter(|_| serves) else {
+        if !serves {
             return Ok(());
-        };
+        }
         let logits = ctx.buffers.gate_logits();
         let rows = sp.rows as u32;
         let local_in = sp.local(input, h);
         let n_out = self.router_logits_n;
-        if !self.try_q38_router(local_in, router, logits, rows, n_out, h as u32, ctx, stream)? {
+        if !self.try_q38_router(local_in, logits, rows, n_out, h as u32, ctx, stream)? {
             return Ok(());
         }
         let top_k = ctx.config.num_experts_per_tok;
@@ -125,7 +124,7 @@ impl MoeLayer {
 }
 
 /// The q38 router GEMM: `dense_gemm_bf16_pipelined` of `[n, h]` rows by the
-/// dequantised `[n_out, h]` weight. `ptrs` = [input, weight, logits].
+/// BF16 `[n_out, h]` router weight. `ptrs` = [input, weight, logits].
 pub(super) fn q38_router_gemm(
     gpu: &dyn GpuBackend,
     k_gemm: KernelHandle,
@@ -170,3 +169,7 @@ fn routes(gpu: &dyn GpuBackend, bytes: usize, stream: u64) -> Result<DevicePtr> 
 #[cfg(test)]
 #[path = "forward_prefill_route_sp_gpu_tests.rs"]
 mod gpu_tests;
+
+#[cfg(test)]
+#[path = "router_bf16_gpu_tests.rs"]
+mod router_bf16_gpu_tests;

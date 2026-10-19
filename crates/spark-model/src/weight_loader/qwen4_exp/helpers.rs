@@ -79,14 +79,3 @@ pub(super) fn mtp_drafter_config(config: &ModelConfig) -> ModelConfig {
     config.attn_proj_bf16 |= mtp_env_on("ATLAS_QWEN4EXP_MTP_BF16_ATTN");
     config
 }
-
-/// The drafter router's NVFP4 copy from `quantize`, or none with
-/// `ATLAS_QWEN4EXP_MTP_BF16_ROUTER=1` (BF16, as TensorFold's; the target's
-/// router is untouched). Drafts only, never output.
-pub(super) fn mtp_router_nvfp4<T>(quantize: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
-    if mtp_env_on("ATLAS_QWEN4EXP_MTP_BF16_ROUTER") {
-        Ok(None)
-    } else {
-        quantize().map(Some)
-    }
-}
