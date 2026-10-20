@@ -44,6 +44,9 @@ struct Stub {
     /// are serial decode's, `batch_verify_bit_exact`).
     decode_rows: bool,
     fail_logits: bool,
+    bootstrap_rows: Vec<Vec<f32>>,
+    fp32: bool,
+    fail_row: Option<usize>,
     seen: Mutex<Seen>,
 }
 
@@ -52,6 +55,9 @@ impl Stub {
         Self {
             decode_rows,
             fail_logits: false,
+            bootstrap_rows: Vec::new(),
+            fp32: false,
+            fail_row: None,
             seen: Mutex::new(Seen::default()),
         }
     }
@@ -220,7 +226,10 @@ impl Model for Stub {
         Ok(())
     }
     fn vocab_size(&self) -> usize {
-        0
+        self.bootstrap_rows.first().map_or(0, Vec::len)
+    }
+    fn decode_logits_fp32(&self) -> bool {
+        self.fp32
     }
     fn bind_gpu_to_thread(&self) -> Result<()> {
         Ok(())
@@ -228,11 +237,11 @@ impl Model for Stub {
     fn alloc_sequence(&self) -> Result<SequenceState> {
         Ok(SequenceState::host_only(0))
     }
-    fn copy_logits_to_host(&self, _p: DevicePtr, _d: &mut [u8]) -> Result<()> {
+    fn copy_logits_to_host(&self, p: DevicePtr, d: &mut [u8]) -> Result<()> {
         if self.fail_logits {
             bail!("injected score read failure");
         }
-        Ok(())
+        self.copy_bootstrap_logits(p, d)
     }
     fn logits_buffer_ptr(&self) -> DevicePtr {
         DevicePtr::NULL
@@ -476,3 +485,6 @@ mod copy;
 
 #[path = "one_forward_logprob_tests.rs"]
 mod logprob_tests;
+
+#[path = "bootstrap_score_tests.rs"]
+mod bootstrap_score_tests;
