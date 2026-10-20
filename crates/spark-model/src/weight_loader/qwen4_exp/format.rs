@@ -26,7 +26,7 @@
 //! * W4A16 NVFP4 ViT MLP and merger: expanded to BF16 (`vision_dense_auto`,
 //!   one rounding; see there).
 //! * NVFP4 MTP experts: loaded natively (`mtp.rs`).
-//! * F32 norms: rounded to BF16, RNE (`helpers::bf16_norm`).
+//! * F32 norms: kept F32 end to end (`helpers::f32_norm`).
 //!
 //! What lives here is the detection the loader branches on
 //! (`mxfp8_backbone`), one summary line, and the release of each MXFP8

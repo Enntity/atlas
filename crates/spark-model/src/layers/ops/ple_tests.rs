@@ -71,6 +71,14 @@ impl Fx {
     }
 }
 
+/// BF16 bytes widened exactly to F32 (`bits << 16`), as the loader's
+/// `f32_norm` does for a BF16 release: the norm kernels read F32.
+fn widen_bf16(b: &[u8]) -> Vec<u8> {
+    b.chunks_exact(2)
+        .flat_map(|c| ((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).to_le_bytes())
+        .collect()
+}
+
 fn upload(g: &dyn GpuBackend, b: &[u8]) -> DevicePtr {
     let p = g.alloc(b.len().max(256)).unwrap();
     g.copy_h2d_async(b, p, g.default_stream()).unwrap();
@@ -159,9 +167,9 @@ fn ple_kernels_match_reference() {
     let hidden = upload(g, &f.bytes("hidden"));
     let key = upload(g, &f.bytes("key_proj_out"));
     let value = upload(g, &f.bytes("value_proj_out"));
-    let nq = upload(g, &f.bytes("w_norm_query"));
-    let nk = upload(g, &f.bytes("w_norm_key"));
-    let nc = upload(g, &f.bytes("w_norm_conv"));
+    let nq = upload(g, &widen_bf16(&f.bytes("w_norm_query")));
+    let nk = upload(g, &widen_bf16(&f.bytes("w_norm_key")));
+    let nc = upload(g, &widen_bf16(&f.bytes("w_norm_conv")));
     let gated = g.alloc(t * c * 4).unwrap();
     // FP32: the conv reads this, and BF16 here costs the output 2.7%.
     let gated_normed = g.alloc(t * c * 4).unwrap();
