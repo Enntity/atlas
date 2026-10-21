@@ -23,7 +23,8 @@ impl TransformerModel {
             return Ok(());
         }
         let trace = std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1");
-        let result = self.dflash_capture_rows_inner(row0, rows, dst, dst_stride, stream);
+        let result =
+            self.dflash_capture_rows_inner(&self.buffers, row0, rows, dst, dst_stride, stream);
         if trace && result.is_ok() {
             // Debug only: synchronous readback of the first captured row.
             self.gpu.synchronize(stream)?;
@@ -40,8 +41,11 @@ impl TransformerModel {
         result
     }
 
-    fn dflash_capture_rows_inner(
+    /// [`Self::dflash_capture_rows`] from the rows of `arena` (the model's,
+    /// or a pipelined half-chunk's).
+    pub(in crate::model) fn dflash_capture_rows_inner(
         &self,
+        arena: &spark_runtime::buffers::BufferArena,
         row0: usize,
         rows: usize,
         dst: spark_runtime::gpu::DevicePtr,
@@ -50,6 +54,18 @@ impl TransformerModel {
     ) -> Result<()> {
         let h = self.config.hidden_size;
         let hc = self.config.hc_mult;
+        if let Some(src) = crate::layers::glm_sp::capture_source() {
+            // The chunk's rows, contracted and gathered already.
+            return self.gpu.copy_d2d_2d_async(
+                src.offset(row0 * h * 2),
+                h * 2,
+                dst,
+                dst_stride,
+                h * 2,
+                rows,
+                stream,
+            );
+        }
         if hc > 1 {
             static KERNEL: std::sync::OnceLock<spark_runtime::gpu::KernelHandle> =
                 std::sync::OnceLock::new();
@@ -75,7 +91,7 @@ impl TransformerModel {
             return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .grid([rows as u32, 1, 1])
                 .block([256, 1, 1])
-                .arg_ptr(self.buffers.hc_streams().offset(
+                .arg_ptr(arena.hc_streams().offset(
                     row0 * hc * h * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
                 ))
                 .arg_ptr(dst)
@@ -84,7 +100,7 @@ impl TransformerModel {
                 .arg_u32((dst_stride / 2) as u32)
                 .launch(stream);
         }
-        let src = self.buffers.hidden_states();
+        let src = arena.hidden_states();
         for t in 0..rows {
             self.gpu.copy_d2d_async(
                 src.offset((row0 + t) * h * 2),
@@ -168,7 +184,10 @@ impl TransformerModel {
         let own_row = dstate.own_row;
         // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
         // upper half, compacted at row 0) in the highway.
-        let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
+        // Gathered over a chain (`glm_sp::capture_source`), every row is here.
+        let sp_row0 = crate::layers::glm_sp::current()
+            .filter(|_| crate::layers::glm_sp::capture_source().is_none())
+            .map_or(0, |sp| sp.row0);
         // The accumulator holds the LAST `max_ctx_len` prompt positions (the
         // drafter's context window), not the first: slot 0 is position
         // `window_start`. Earlier rows of this chunk are dropped. Where the

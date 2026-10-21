@@ -58,11 +58,23 @@ The Python validation runtime digest was
 These are retained-environment identifiers, not published image availability
 or a complete reproducible upstream build recipe.
 
+## TP2/TP4 derivative
+
+The unified RC extends the retained wrapper to ABI2 with explicit local heads.
+TP2 keeps32-head geometry; TP4 uses16. `SOURCE_MAP.json` records the original
+import hashes, not the modified wrapper hashes. Kernel math in the pinned
+FlashInfer source is unchanged; the wrapper selects its existing16-head dispatch
+and sizes each query, output and LSE span accordingly.
+
 ## ABI, ownership and precision
 
-`atlas-glm-sparse-native.h` defines ABI1:112-byte arguments,8-byte alignment,
+`atlas-glm-sparse-native.h` defines ABI2:120-byte arguments,8-byte alignment,
 ten disjoint device spans, caller-owned device/context/stream and capacities.
-Call `atlas_glm_sparse_native_init()` on the serving context **before KV free
+The final scalars select16 heads forTP4 or32 forTP2 and reserve a zero field.
+ABI1 libraries are rejected at startup; rebuild the library with the engine.
+The pinned upstream dispatch uses SG16 forTP4 and MG32 forTP2. Each selected
+kernel is initialized before sizing; TP2 does not load an unused TP4 kernel.
+Call `atlas_glm_sparse_native_init(heads)` on the serving context **before KV free
 memory sizing**. It forces the selected kernel/module setup without attention
 execution or buffer allocation. The process retains the shared-library mapping.
 Run is asynchronous and allocates nothing; every span remains live through
@@ -70,7 +82,7 @@ stream completion. Any failure after submission aborts that forward pass; do
 not retry through a different attention implementation.
 
 This route accepts only ordinary continued GLM prefills with2048..4100rows,
-seq_start>=2048, end<=32768,32heads and BF16 physical16-token cache blocks.
+seq_start>=2048, end<=32768,16 or32 local heads and BF16 physical16-token cache blocks.
 Q is copied from512 to576 channels with zero RoPE padding. The KV pack uses
 E4M3 plus four FP32 scales and zero RoPE, so it changes attention operand
 precision relative to the original BF16 attention kernel. The reviewed prep

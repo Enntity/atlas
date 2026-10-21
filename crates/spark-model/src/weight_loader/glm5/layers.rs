@@ -17,12 +17,30 @@ use crate::weight_map::{
     quantize_to_nvfp4,
 };
 
+// Target weight conversion uses nearest-even; activation quantization keeps its own entry.
+pub(super) const WEIGHT_QUANTIZER: &str = "quantize_bf16_to_nvfp4_weight_rne";
+
 pub(super) fn load_all(
     store: &WeightStore,
     config: &ModelConfig,
     gpu: &dyn GpuBackend,
     layer_kv_dtypes: &[KvCacheDtype],
 ) -> Result<Vec<Box<dyn TransformerLayer>>> {
+    if let Some(mode) = crate::layers::glm_native::mode::selected()? {
+        anyhow::ensure!(
+            crate::layers::glm_native::topology::supported_parallelism(
+                config.ep_world_size,
+                config.tp_world_size,
+                config.ep_world_size,
+            ),
+            "GLM serving modes require matching TP2/EP2 or TP4/EP4"
+        );
+        mode.validate(
+            crate::layers::glm_native::NativePolicy::from_env(),
+            std::env::var("ATLAS_GLM_FP4L_INPUT_SCALES").as_deref() == Ok("1"),
+            std::env::var("ATLAS_GLM_FP4L_DECODE_A16").as_deref() == Ok("1"),
+        )?;
+    }
     anyhow::ensure!(
         config.max_position_embeddings >= 2048 && config.index_topk == 2048,
         "GLM-5 Atlas bring-up expects index_topk=2048"
@@ -30,74 +48,111 @@ pub(super) fn load_all(
     let variant = detect_nvfp4_variant(store, config);
     let qctx = QuantizeCtx {
         absmax_k: gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-        quantize_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+        quantize_k: gpu.kernel("quantize_nvfp4", WEIGHT_QUANTIZER)?,
         stream: gpu.default_stream(),
     };
     let mut layers: Vec<Box<dyn TransformerLayer>> = Vec::with_capacity(config.num_hidden_layers);
     let mut attn_idx = 0usize;
     let mut released = 0usize;
-    for layer_idx in 0..config.num_hidden_layers {
-        let lp = config.layer_prefix(layer_idx);
-        let input_norm = norm_bf16(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
-        let post_attn_norm =
-            norm_bf16(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
-        let ffn =
-            super::components::load_ffn(store, &lp, layer_idx, config, gpu, variant, qctx, true)?;
-        let hc = super::components::load_hc(store, &lp, layer_idx, config, gpu)?;
-        match config.layer_type(layer_idx) {
-            LayerType::LinearAttention => {
-                let weights =
-                    super::components::load_kda_weights(store, &lp, config, gpu, qctx, None)?;
-                layers.push(Box::new(Glm5KdaLayer::new(
-                    input_norm,
-                    post_attn_norm,
-                    weights,
-                    ffn,
-                    hc,
-                    layer_idx,
-                    config,
-                    gpu,
-                )?));
+    // Expert TP: the next MoE layer's expert slices are read from disk while
+    // this layer builds (`expert_tp::read_layer_experts`).
+    let tp_moe =
+        |layer_idx: usize| config.expert_tp && !config.mlp_only_layers.contains(&layer_idx);
+    let mlp = |layer_idx: usize| format!("{}.mlp", config.layer_prefix(layer_idx));
+    std::thread::scope(|scope| -> Result<()> {
+        let read_ahead = |from: usize| {
+            (from..config.num_hidden_layers)
+                .find(|&i| tp_moe(i))
+                .map(|next| {
+                    let next_mlp = mlp(next);
+                    let read = scope.spawn(move || {
+                        super::expert_tp::read_layer_experts(store, &next_mlp, config)
+                    });
+                    (next, read)
+                })
+        };
+        let mut ahead = read_ahead(0);
+        for layer_idx in 0..config.num_hidden_layers {
+            let lp = config.layer_prefix(layer_idx);
+            let host_experts = match ahead.take_if(|(next, _)| *next == layer_idx) {
+                Some((_, read)) => {
+                    let host = read.join().expect("expert read-ahead panicked")?;
+                    ahead = read_ahead(layer_idx + 1);
+                    Some(host)
+                }
+                None => None,
+            };
+            let input_norm = norm_bf16(store, &format!("{lp}.input_layernorm.weight"), gpu)?;
+            let post_attn_norm =
+                norm_bf16(store, &format!("{lp}.post_attention_layernorm.weight"), gpu)?;
+            let ffn = super::components::load_ffn(
+                store,
+                &lp,
+                layer_idx,
+                config,
+                gpu,
+                variant,
+                qctx,
+                true,
+                host_experts,
+            )?;
+            let hc = super::components::load_hc(store, &lp, layer_idx, config, gpu)?;
+            match config.layer_type(layer_idx) {
+                LayerType::LinearAttention => {
+                    let weights =
+                        super::components::load_kda_weights(store, &lp, config, gpu, qctx, None)?;
+                    layers.push(Box::new(Glm5KdaLayer::new(
+                        input_norm,
+                        post_attn_norm,
+                        weights,
+                        ffn,
+                        hc,
+                        layer_idx,
+                        config,
+                        gpu,
+                    )?));
+                }
+                LayerType::FullAttention => {
+                    let kv_dtype = layer_kv_dtypes
+                        .get(attn_idx)
+                        .copied()
+                        .unwrap_or(KvCacheDtype::Bf16);
+                    let layer = load_mla_layer(
+                        store,
+                        &lp,
+                        layer_idx,
+                        attn_idx,
+                        input_norm,
+                        post_attn_norm,
+                        ffn,
+                        Some(hc),
+                        config,
+                        gpu,
+                        kv_dtype,
+                        false,
+                        None,
+                    )?;
+                    layers.push(layer);
+                    attn_idx += 1;
+                }
+                other => anyhow::bail!("GLM-5 unsupported layer type {other:?}"),
             }
-            LayerType::FullAttention => {
-                let kv_dtype = layer_kv_dtypes
-                    .get(attn_idx)
-                    .copied()
-                    .unwrap_or(KvCacheDtype::Bf16);
-                let layer = load_mla_layer(
-                    store,
-                    &lp,
-                    layer_idx,
-                    attn_idx,
-                    input_norm,
-                    post_attn_norm,
-                    ffn,
-                    Some(hc),
-                    config,
-                    gpu,
-                    kv_dtype,
-                    false,
-                    None,
-                )?;
-                layers.push(layer);
-                attn_idx += 1;
+            // The layer holds its derived copies now; FP4-Local's FP8 sources
+            // are dead (no-op on the NVFP4 release, whose stems are BF16).
+            let dense_ffn = config.mlp_only_layers.contains(&layer_idx);
+            for stem in decoder_expanded_stems(&lp, config.layer_type(layer_idx), dense_ffn) {
+                released += release_expanded(store, gpu, &stem, false)?;
             }
-            other => anyhow::bail!("GLM-5 unsupported layer type {other:?}"),
+            if layer_idx < 5 || (layer_idx + 1).is_multiple_of(10) {
+                tracing::info!(
+                    "GLM-5 loaded layers 0..{} — {:.1} GiB free",
+                    layer_idx + 1,
+                    gpu.free_memory()? as f64 / 1_073_741_824.0,
+                );
+            }
         }
-        // The layer holds its derived copies now; FP4-Local's FP8 sources
-        // are dead (no-op on the NVFP4 release, whose stems are BF16).
-        let dense_ffn = config.mlp_only_layers.contains(&layer_idx);
-        for stem in decoder_expanded_stems(&lp, config.layer_type(layer_idx), dense_ffn) {
-            released += release_expanded(store, gpu, &stem, false)?;
-        }
-        if layer_idx < 5 || (layer_idx + 1).is_multiple_of(10) {
-            tracing::info!(
-                "GLM-5 loaded layers 0..{} — {:.1} GiB free",
-                layer_idx + 1,
-                gpu.free_memory()? as f64 / 1_073_741_824.0,
-            );
-        }
-    }
+        Ok(())
+    })?;
     if released > 0 {
         tracing::info!(
             "GLM-5 FP4-Local: released {:.2} GiB of MXFP8/FP8-block sources after expansion",
@@ -218,6 +273,18 @@ pub(super) fn load_mla_layer(
         force_dimension_overrides,
         gpu,
     )?;
+    let o_full = if native.is_some() {
+        super::mla_native::mla_o_full(
+            crate::layers::glm_native::NativePolicy::from_env(),
+            store,
+            &p,
+            &tp,
+            force_dimension_overrides,
+            gpu,
+        )?
+    } else {
+        None
+    };
     if let Some(twins) = native.as_mut() {
         super::mla_native::tile_large_twins(twins, native_prefill, gpu)?;
         // Pick each W8A8 prefill GEMM now (cuBLASLt block FP8, else the
@@ -352,7 +419,7 @@ pub(super) fn load_mla_layer(
             .zip(twins)
             .map(|(key, (twin, nk))| (key, nk, twin))
             .collect();
-        layer.install_mla_native(twins, native_prefill);
+        layer.install_mla_native(twins, native_prefill, o_full);
     }
     if !opt_in_twins.is_empty() {
         layer.install_mla_mxfp8(gpu, &opt_in_twins)?;

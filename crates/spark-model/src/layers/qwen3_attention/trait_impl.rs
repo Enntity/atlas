@@ -33,6 +33,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_glm_long_owners_mla(owners, cache, stage, ctx, stream)
     }
 
@@ -271,6 +273,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_inner(
             hidden,
             residual,
@@ -369,6 +373,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_multi_seq_inner(
             hidden,
             residual,
@@ -397,6 +403,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_multi_seq_inner(
             hidden,
             residual,

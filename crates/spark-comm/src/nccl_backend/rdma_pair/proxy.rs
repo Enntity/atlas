@@ -22,6 +22,51 @@ pub(super) fn chain_requested() -> bool {
     std::env::var("ATLAS_RDMA_PAIR_CHAIN").as_deref() == Ok("1")
 }
 
+/// Pin the calling proxy thread to the fastest core this process may run on
+/// (the highest `cpuinfo_max_freq`, the last such core), unless
+/// `ATLAS_RDMA_PROXY_PIN=0`. Unpinned, the scheduler moves the spinning
+/// proxy between GB10's big (3.9 GHz) and little (2.8 GHz) cores, and every
+/// hop of a decode all-reduce waits on it. Best effort: logs and runs on
+/// unpinned if the cores cannot be read or set.
+pub(super) fn pin_proxy() {
+    if std::env::var("ATLAS_RDMA_PROXY_PIN").as_deref() == Ok("0") {
+        return;
+    }
+    // SAFETY: a zeroed cpu_set_t is a valid empty set; the libc calls get
+    // its size and write or read only it.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    if unsafe { libc::sched_getaffinity(0, size, &mut set) } != 0 {
+        tracing::warn!("RDMA proxy: sched_getaffinity failed; not pinned");
+        return;
+    }
+    let max_freq = |cpu: usize| {
+        std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
+        ))
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let best = (0..libc::CPU_SETSIZE as usize)
+        .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &set) })
+        .filter_map(|cpu| max_freq(cpu).map(|f| (f, cpu)))
+        .max();
+    let Some((freq, cpu)) = best else {
+        tracing::warn!("RDMA proxy: no core frequencies readable; not pinned");
+        return;
+    };
+    // SAFETY: as above.
+    unsafe {
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+    }
+    if unsafe { libc::sched_setaffinity(0, size, &set) } == 0 {
+        tracing::info!("RDMA proxy pinned to cpu {cpu} ({} MHz)", freq / 1000);
+    } else {
+        tracing::warn!("RDMA proxy: sched_setaffinity({cpu}) failed; not pinned");
+    }
+}
+
 /// The command ring's proxy half with the addresses of this rank's command
 /// region and the peer's.
 pub(super) struct CmdLink {
@@ -249,7 +294,7 @@ fn send_segment(
 /// is 50,000 us and the naps stay the legacy ones: the head's next step
 /// words come a drafter pass (6-16 ms) after its last collective and must
 /// not meet a napping proxy, while a nap between requests costs nothing.
-struct Idle {
+pub(super) struct Idle {
     spin: Option<Duration>,
     nap: Duration,
     since: Option<Instant>,
@@ -257,7 +302,7 @@ struct Idle {
 }
 
 impl Idle {
-    fn from_env(oneshot: bool, cmd: bool) -> Self {
+    pub(super) fn from_env(oneshot: bool, cmd: bool) -> Self {
         let us = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok());
         let fine = us("ATLAS_RDMA_PAIR_SPIN_US").or(oneshot.then_some(10_000));
         let spin = fine.or(cmd.then_some(50_000)).map(Duration::from_micros);
@@ -275,12 +320,12 @@ impl Idle {
         }
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.since = None;
         self.spins = 0;
     }
 
-    fn wait(&mut self) {
+    pub(super) fn wait(&mut self) {
         let napping = match self.spin {
             None => {
                 self.spins = self.spins.saturating_add(1);

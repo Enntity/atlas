@@ -484,7 +484,7 @@ fn mxfp8_gemm_is_correct_and_every_in_order_kernel_gives_the_same_rows() -> Resu
 fn mxfp8_gemm_pinned_rows_match_alone_inside_a_pack() -> Result<()> {
     let gpu = backend()?;
     let stream = gpu.default_stream();
-    let mut rng = Rng(0x9ac_ed);
+    let mut rng = Rng(0x0009_aced);
     const PACK: [(usize, usize); 3] = [(0, 30), (30, 40), (70, 28)];
     const TOTAL: usize = 98;
     for s in shapes()?.iter().filter(|s| s.label.contains("glm")) {

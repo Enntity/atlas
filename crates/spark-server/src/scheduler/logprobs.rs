@@ -49,6 +49,17 @@ pub fn extract_verify_logprobs(
     {
         return Vec::new();
     }
+    extract_verify_logprobs_from_bf16(&buf, vocab, tokens, k_logprobs)
+}
+
+/// Whole-vocabulary rows already fetched by the caller (including a split
+/// head's collective gather). Shared with the ordinary dense-head path.
+pub(super) fn extract_verify_logprobs_from_bf16(
+    buf: &[u8],
+    vocab: usize,
+    tokens: &[u32],
+    k_logprobs: u8,
+) -> Vec<crate::api::TokenLogprobs> {
     tokens
         .iter()
         .enumerate()

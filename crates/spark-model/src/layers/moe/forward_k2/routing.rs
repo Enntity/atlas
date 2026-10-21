@@ -36,7 +36,7 @@ impl MoeLayer {
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm,
+                self.router_gemm,
                 router_in,
                 &self.weights.gate,
                 gate_logits,

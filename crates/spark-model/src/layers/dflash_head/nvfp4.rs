@@ -28,7 +28,10 @@ impl BlockDiffusionDraftHead {
                 return Ok(());
             }
         };
-        let quant = match gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4") {
+        let quant = match gpu.kernel(
+            "quantize_nvfp4",
+            crate::layers::glm_native::mode::weight_quantizer()?,
+        ) {
             Ok(k) => k,
             Err(e) => {
                 tracing::warn!("NVFP4 quant kernel missing: {e}");

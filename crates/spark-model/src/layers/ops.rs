@@ -35,6 +35,8 @@ mod mxfp8;
 mod mxfp8_act;
 #[path = "ops/mxfp8_w8a8.rs"]
 mod mxfp8_w8a8;
+#[path = "ops/rank_join.rs"]
+mod rank_join;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -354,6 +356,7 @@ pub use qsa_rows::*;
 pub use quant_dispatch::*;
 pub use qwen4exp_moe::*;
 pub use qwen4exp_moe_rows::*;
+pub use rank_join::{rank_join_bf16, rank_join_kernel};
 pub use sampling::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;

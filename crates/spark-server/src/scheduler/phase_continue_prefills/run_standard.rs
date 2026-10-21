@@ -88,10 +88,14 @@ pub(super) fn run_standard_chunk_loop(
     {
         chunk_len = tb - p.chunk_offset;
     }
-    let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
-    // Align intermediate chunks to GDN WY4 boundary (4 tokens).
-    if !is_last && chunk_len >= 4 {
-        chunk_len = (chunk_len / 4) * 4;
+    let mut is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
+    // Align intermediate chunks to GDN WY4 boundary (4 tokens), and to
+    // the sequence-parallel row multiple.
+    if !is_last {
+        chunk_len = super::super::chunk_align(chunk_len, model.prefill_row_multiple());
+    }
+    if is_last {
+        (chunk_len, is_last) = super::super::sp_final_cut(chunk_len, model.prefill_row_multiple());
     }
 
     // ── Mixed forward: fuse prefill chunk + decode in one pass ──

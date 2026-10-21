@@ -37,6 +37,27 @@ impl MoeLayer {
         stream: u64,
         defer_shared_hc: bool,
     ) -> Result<()> {
+        // ATLAS_GLM_FP4L_DECODE_A16: a prompt chunk with verify rows runs
+        // each half on its own lane; decode and verify rows take W4A16 (BF16
+        // activations), as the reference's non-prompt rows.
+        if self.forward_prefill_mixed(input, num_tokens, ctx, stream, defer_shared_hc)? {
+            return Ok(());
+        }
+        let _a16 = super::input_scales::A16Scope::enter(self.a16_stream_fits(
+            num_tokens as u32,
+            ctx.config.hidden_size as u32,
+            ctx.config.routed_inter_local() as u32,
+        ));
+        if super::input_scales::A16Scope::lane() == super::input_scales::Activations::A16Grouped
+            && ctx
+                .gpu
+                .op_cache()
+                .first_shape("moe:decode_a16_grouped", num_tokens as u32, 0, 0)
+        {
+            tracing::info!(
+                "ATLAS_GLM_FP4L_DECODE_A16: rows={num_tokens} on the grouped W4A16 path (the stream twins do not take them)"
+            );
+        }
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
             !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
@@ -250,7 +271,8 @@ impl MoeLayer {
         let split = native_split
             || (split_eligible && self.shared_native.is_none() && self.shared_split_ready(ctx, n));
         if native_split {
-            self.run_shared_native_split(input, n, h, shared_inter, ctx, stream)?;
+            let touch = self.router_touch(n, h, inter, ctx);
+            self.run_shared_native_split(input, n, h, shared_inter, touch, ctx, stream)?;
         } else if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
         } else if has_shared && !overlap_shared_reduce {
@@ -273,8 +295,15 @@ impl MoeLayer {
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let row = h as usize * 2;
         det.tap("moe_in", input, (0, num_tokens), row);
-        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs).
-        let routes = self.route_and_sort(input, [n, h, inter], det, ctx, stream)?;
+        // 1-3. Router GEMM, top-k, sort by expert (route_fuse.rs), or under
+        // ATLAS_GLM_SP_MOE_QUANT_GATHER this rank's rows routed and quantized,
+        // then gathered (sp_quant_gather.rs).
+        let quant_gather = crate::layers::glm_sp::current()
+            .filter(|&sp| num_tokens == sp.total() && self.sp_quant_gather(sp, ctx));
+        let routes = match quant_gather {
+            Some(sp) => self.route_sp_quantized(input, sp, ctx, stream)?,
+            None => self.route_and_sort(input, [n, h, inter], det, ctx, stream)?,
+        };
         let super::route_fuse::Routes {
             indices: indices_dev,
             weights: weights_dev,
@@ -313,7 +342,7 @@ impl MoeLayer {
         // 4-6. Routed grouped-GEMM phase (grid sizing → grouped gate+up
         // GEMM → SiLU → grouped down GEMM). Hoisted to forward_prefill_routed.rs
         // to keep this file under the 500 LoC cap; behavior identical.
-        self.run_routed_grouped_gemm(
+        let e4m3_scales = self.run_routed_grouped_gemm(
             expert_input,
             expert_offsets,
             sorted_token_ids,
@@ -325,6 +354,7 @@ impl MoeLayer {
             num_tokens,
             num_experts as usize,
             prerouted,
+            quant_gather.is_some(),
             &mut t0,
             ctx,
             stream,
@@ -351,6 +381,7 @@ impl MoeLayer {
             shared_in,
             shared_n,
             defer_shared_hc,
+            e4m3_scales,
             ctx,
             stream,
         )?;

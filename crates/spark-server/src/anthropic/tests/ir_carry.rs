@@ -248,7 +248,7 @@ fn rendered_prompt_json_matches_retired_json_hop_output() {
             ],
             "reasoning_content": "need the tool"
         },
-        {"role": "tool", "content": "[tool error]\nnetwork down"},
+        {"role": "tool", "content": "[tool error]\nnetwork down", "tool_call_id": "c1"},
         {"role": "user", "content": "try again"}
     ]);
     assert_eq!(serde_json::Value::Array(json), expected);

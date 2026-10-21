@@ -4,7 +4,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-// ABI1, sizeof112/alignment8. Caller owns CUDA device/context/stream and spans.
+// ABI2, sizeof120/alignment8. Caller owns CUDA device/context/stream and spans.
 // All ten device spans must be disjoint and survive stream completion. Rust
 // checks actual allocation capacities; C checks geometry, alignment and spans.
 typedef struct AtlasGlmSparseNativeArgs {
@@ -12,10 +12,11 @@ typedef struct AtlasGlmSparseNativeArgs {
     uint64_t main_out, tail_out, out;
     uint64_t metadata_bytes, stream;
     uint32_t rows, seq_start, physical_blocks, block_table_count;
+    uint32_t heads, reserved; // heads16(TP4) or32(TP2); reserved must be0.
 } AtlasGlmSparseNativeArgs;
 int atlas_glm_sparse_native_version(void);
 // Call on the serving CUDA context before KV free-memory sizing.
-int atlas_glm_sparse_native_init(void);
+int atlas_glm_sparse_native_init(uint32_t heads);
 // Asynchronous, no allocations/synchronization. Error after work submission is
 // fatal to this forward pass: caller must never retry with another implementation.
 // Selected IDs and block table are canonical, valid device data supplied by Atlas.
@@ -23,6 +24,6 @@ int atlas_glm_sparse_native_init(void);
 int atlas_glm_sparse_native_run(const AtlasGlmSparseNativeArgs* args);
 #ifdef __cplusplus
 }
-static_assert(sizeof(AtlasGlmSparseNativeArgs)==112);
+static_assert(sizeof(AtlasGlmSparseNativeArgs)==120);
 static_assert(alignof(AtlasGlmSparseNativeArgs)==8);
 #endif

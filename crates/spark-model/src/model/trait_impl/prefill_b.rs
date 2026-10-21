@@ -394,6 +394,7 @@ impl TransformerModel {
         // ── Phase 4: forward through all layers ──
         self.prefill_b_forward_layers(
             seq,
+            tokens,
             &mut kv_cache,
             chunk_start,
             chunk_len,
@@ -442,6 +443,16 @@ impl TransformerModel {
                 t_meta.saturating_sub(t_proc),
                 t_fwd.saturating_sub(t_meta),
                 t_fwd,
+            );
+        }
+        if spark_runtime::host_sync_trace::enabled() {
+            self.gpu.synchronize(stream)?;
+            tracing::info!(
+                "host waits in chunk {}..{} ({:.1} ms wall): {}",
+                chunk_start,
+                chunk_start + chunk_len,
+                tp.elapsed().as_secs_f64() * 1e3,
+                spark_runtime::host_sync_trace::take_report(15)
             );
         }
         if let Some(p) = passengers {

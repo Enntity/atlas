@@ -10,7 +10,7 @@ use super::plan::NativeArgs;
 pub(super) const FLAG: &str = "ATLAS_GLM_SPARSE_NATIVE";
 const LIBRARY: &str = "ATLAS_GLM_SPARSE_NATIVE_LIBRARY";
 pub(super) type Run = unsafe extern "C" fn(*const NativeArgs) -> i32;
-type Init = unsafe extern "C" fn() -> i32;
+type Init = unsafe extern "C" fn(u32) -> i32;
 
 struct Native {
     _library: Library,
@@ -58,8 +58,8 @@ fn load(path: &str) -> Result<Native> {
         library.get::<unsafe extern "C" fn() -> i32>(b"atlas_glm_sparse_native_version\0")?
     };
     ensure!(
-        unsafe { version() } == 1,
-        "native GLM sparse ABI mismatch (requires1)"
+        unsafe { version() } == 2,
+        "native GLM sparse ABI mismatch (requires2)"
     );
     let init = unsafe { *library.get::<Init>(b"atlas_glm_sparse_native_init\0")? };
     let run = unsafe { *library.get::<Run>(b"atlas_glm_sparse_native_run\0")? };
@@ -71,7 +71,7 @@ fn load(path: &str) -> Result<Native> {
     })
 }
 
-pub(super) fn initialize() -> Result<()> {
+pub(super) fn initialize(heads: u32) -> Result<()> {
     let path = env(LIBRARY)?;
     let path = validate_path(path.as_deref())?;
     let native = LOADED
@@ -84,15 +84,16 @@ pub(super) fn initialize() -> Result<()> {
     );
     // Cache only the mapping/symbols, never CUDA initialization success. Every
     // factory build initializes on its current serving context before KV sizing.
-    // ABI1 init loads/configures kernels without device buffers or attention.
-    let status = unsafe { (native.init)() };
+    // ABI2 init loads/configures kernels without device buffers or attention.
+    let status = unsafe { (native.init)(heads) };
     ensure!(
         status == 0,
         "native GLM sparse initialization failed ({status})"
     );
     tracing::info!(
         library = path,
-        abi = 1,
+        abi = 2,
+        heads,
         "GLM native sparse prefill initialized before KV sizing; rows2048..4100, continuation only"
     );
     Ok(())

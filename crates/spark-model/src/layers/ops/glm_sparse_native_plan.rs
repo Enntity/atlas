@@ -9,7 +9,7 @@ pub(crate) struct Span {
     pub bytes: usize,
 }
 
-/// ABI1: ten device addresses, metadata capacity, stream, then four u32 scalars.
+/// ABI2: ten device addresses, metadata capacity, stream, then six u32 scalars.
 /// Keep synchronized with the explicitly versioned atlas-glm-sparse-native.h.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +30,8 @@ pub(crate) struct NativeArgs {
     pub seq_start: u32,
     pub physical_blocks: u32,
     pub block_table_count: u32,
+    pub heads: u32,
+    pub reserved: u32,
 }
 
 pub(crate) fn admit(
@@ -62,10 +64,10 @@ pub(crate) struct Metadata {
 }
 
 impl Metadata {
-    pub fn new(rows: usize) -> Result<Self, &'static str> {
+    pub fn new(rows: usize, heads: usize) -> Result<Self, &'static str> {
         let ids = mul(rows, 2048 * 4)?;
         let counts = mul(rows, 4)?;
-        let lse = mul(rows, 32 * 4)?;
+        let lse = mul(rows, heads * 4)?;
         let sizes = [ids, ids, counts, counts, counts, lse, lse, lse];
         let mut offsets = [0; 8];
         let mut end = 0usize;
@@ -90,20 +92,24 @@ pub(crate) fn required_bytes(
     seq_end: usize,
     physical_blocks: usize,
     block_table_count: usize,
+    heads: usize,
 ) -> Result<([usize; 10], Metadata), &'static str> {
-    let output = mul(rows, 32 * 512 * 2)?;
+    if !matches!(heads, 16 | 32) {
+        return Err("native sparse requires 16 or 32 local heads");
+    }
+    let output = mul(rows, heads * 512 * 2)?;
     let packed_rows = seq_end
         .checked_add(63)
         .ok_or("native sparse history overflow")?
         & !63;
-    let metadata = Metadata::new(rows)?;
+    let metadata = Metadata::new(rows, heads)?;
     Ok((
         [
             output,
             mul(physical_blocks, 16 * 512 * 2)?,
             mul(rows, 2051 * 4)?,
             mul(block_table_count, 4)?,
-            mul(rows, 32 * 576 * 2)?,
+            mul(rows, heads * 576 * 2)?,
             mul(packed_rows, 656)?,
             metadata.bytes,
             output,
@@ -124,6 +130,7 @@ impl Plan {
         seq_start: usize,
         physical_blocks: usize,
         block_table_count: usize,
+        heads: usize,
         storage: [Span; 10],
         stream: u64,
     ) -> Result<Self, &'static str> {
@@ -134,7 +141,7 @@ impl Plan {
             return Err("native sparse missing physical cache or logical block table");
         }
         let (required, metadata) =
-            required_bytes(rows, seq_end, physical_blocks, block_table_count)?;
+            required_bytes(rows, seq_end, physical_blocks, block_table_count, heads)?;
         let alignment = [2u64, 2, 4, 4, 256, 256, 256, 256, 256, 256];
         let mut ends = [0u64; 10];
         for i in 0..10 {
@@ -183,6 +190,8 @@ impl Plan {
                     .map_err(|_| "native sparse block count overflow")?,
                 block_table_count: u32::try_from(block_table_count)
                     .map_err(|_| "native sparse table count overflow")?,
+                heads: heads as u32,
+                reserved: 0,
             },
         })
     }

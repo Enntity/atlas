@@ -80,7 +80,10 @@ const TIER_FAMILIES: [(&str, &str); 4] = [
 /// The single kernels [`native_kernels`] resolves: (module, function).
 const SINGLE_KERNELS: [(&str, &str); 5] = [
     (MX_GEMV_MODULE, "mxfp8_to_bf16"),
-    ("per_token_group_quant_fp8", "per_token_group_quant_fp8"),
+    (
+        "per_token_group_quant_fp8",
+        "per_token_group_quant_fp8_warp",
+    ),
     ("fp8_gemm_t_blockscaled", "fp8_gemm_t_blockscaled"),
     ("w8a16_gemm_pipelined", "w8a16_gemm_pipelined"),
     (super::MXFP8_ACT_MODULE, super::MX_QUANT_KERNEL),
@@ -619,25 +622,92 @@ fn fp8b_w8a8_lt(w: &Fp8BlockWeight, n: usize, k: usize) -> bool {
     })
 }
 
+/// `ATLAS_GLM_FP8B_CUTLASS` as set (read once): `1` runs the W8A8 block FP8
+/// prefill GEMM of a shape cuBLASLt refuses on CUTLASS's SM120 blockwise
+/// kernel (`spark_runtime::cutlass::fp8_blockwise_gemm_act_weight_t`, about
+/// 9x `fp8_gemm_t_blockscaled`), `0` (the default) on the in-tree kernel.
+/// Same W8A8 numerics and activation quantization; the group sums are added
+/// in another order, so the output bits differ from the in-tree kernel's.
+pub fn fp8b_cutlass_requested() -> Result<bool> {
+    static ON: std::sync::OnceLock<std::result::Result<bool, String>> = std::sync::OnceLock::new();
+    ON.get_or_init(
+        || match std::env::var("ATLAS_GLM_FP8B_CUTLASS").as_deref() {
+            Err(_) | Ok("0") => Ok(false),
+            Ok("1") => Ok(true),
+            Ok(v) => Err(format!("ATLAS_GLM_FP8B_CUTLASS must be 0 or 1, got {v:?}")),
+        },
+    )
+    .clone()
+    .map_err(anyhow::Error::msg)
+}
+
+/// The activation rows of a W8A8 block FP8 prefill: BF16 rows, cast pass by
+/// pass into the FP8 scratch (`per_token_group_quant_fp8`), or rows already
+/// cast to that kernel's bytes: E4M3 `act` (`[m, k]`) and f32 `scale`
+/// (`[m, k / 128]`), both row-major, so any row block casts on its own
+/// (`ATLAS_GLM_SP_MLA_QUANT_GATHER`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8bRows {
+    Bf16(DevicePtr),
+    Cast { act: DevicePtr, scale: DevicePtr },
+}
+
+impl Fp8bRows {
+    /// The E4M3 rows and scales of rows `[first, first + rows)` of a
+    /// `[_, k]` input: cast into `scratch` (from its row 0), or where the
+    /// cast rows already sit.
+    fn pass(
+        self,
+        gpu: &dyn GpuBackend,
+        kernels: &NativeKernels,
+        scratch: Fp8ActScratch,
+        (first, rows): (usize, usize),
+        k: usize,
+        stream: u64,
+    ) -> Result<(DevicePtr, DevicePtr)> {
+        match self {
+            Self::Bf16(input) => {
+                super::per_token_group_quant_fp8_warp(
+                    gpu,
+                    kernels.act_quant,
+                    input.offset(first * k * 2),
+                    scratch.act,
+                    scratch.scale,
+                    rows as u32,
+                    k as u32,
+                    stream,
+                )?;
+                Ok((scratch.act, scratch.scale))
+            }
+            Self::Cast { act, scale } => Ok((
+                act.offset(first * k),
+                scale.offset(first * (k / FP8_BLOCK) * 4),
+            )),
+        }
+    }
+}
+
 /// The in-tree W8A8 block FP8 prefill: per-token-group activation quant and
 /// `fp8_gemm_t_blockscaled` (one fixed kernel; each output word is one
 /// thread's in-order sum, so rows are chunk- and height-invariant), in row
-/// passes that fit the FP8 scratch.
+/// passes that fit the FP8 scratch; or, `cutlass`, CUTLASS's blockwise
+/// kernel on the same quantized operands (no split-K: rows are as
+/// invariant). Already cast `input` rows run the same passes on their own
+/// bytes.
 #[allow(clippy::too_many_arguments)]
-fn fp8b_w8a8_hand(
+pub(crate) fn fp8b_w8a8_hand(
     gpu: &dyn GpuBackend,
     kernels: &NativeKernels,
     scratch: Fp8ActScratch,
     w: &Fp8BlockWeight,
-    input: DevicePtr,
+    input: Fp8bRows,
     output: DevicePtr,
-    m: usize,
-    n: usize,
-    k: usize,
+    [m, n, k]: [usize; 3],
+    cutlass: bool,
     stream: u64,
 ) -> Result<()> {
     ensure!(
-        kernels.act_quant.0 != 0 && kernels.w8a8_gemm.0 != 0,
+        kernels.act_quant.0 != 0 && (cutlass || kernels.w8a8_gemm.0 != 0),
         "per_token_group_quant_fp8 / fp8_gemm_t_blockscaled are missing"
     );
     let chunk = (scratch.act_bytes / k).min(scratch.scale_bytes / (k / FP8_BLOCK * 4)) / 64 * 64;
@@ -646,22 +716,26 @@ fn fp8b_w8a8_hand(
         "FP8 W8A8 prefill: the FP8 scratch holds no 64-row [_, {k}] tile"
     );
     for first in (0..m).step_by(chunk) {
-        let rows = (m - first).min(chunk) as u32;
-        super::per_token_group_quant_fp8(
-            gpu,
-            kernels.act_quant,
-            input.offset(first * k * 2),
-            scratch.act,
-            scratch.scale,
-            rows,
-            k as u32,
-            stream,
-        )?;
+        let rows = (m - first).min(chunk);
+        let (act, scale) = input.pass(gpu, kernels, scratch, (first, rows), k, stream)?;
+        let rows = rows as u32;
+        if cutlass {
+            spark_runtime::cutlass::fp8_blockwise_gemm_act_weight_t(
+                act.0,
+                scale.0,
+                w.data.0,
+                w.scales.0,
+                output.offset(first * n * 2).0,
+                [rows, n as u32, k as u32],
+                stream,
+            )?;
+            continue;
+        }
         super::fp8_gemm_t_blockscaled(
             gpu,
             kernels.w8a8_gemm,
-            scratch.act,
-            scratch.scale,
+            act,
+            scale,
             w.data,
             w.scales,
             output.offset(first * n * 2),
@@ -711,71 +785,105 @@ pub fn fp8b_prefill_gemm(
                 stream,
             )
         }
-        Fp8bPrefill::W8a8 if !fp8b_w8a8_lt(w, n, k) => {
-            fp8b_w8a8_hand(gpu, kernels, scratch, w, input, output, m, n, k, stream)
-        }
-        Fp8bPrefill::W8a8 => {
-            ensure!(
-                kernels.act_quant.0 != 0,
-                "per_token_group_quant_fp8 is missing"
-            );
-            let plan = scratch.blk_plan(k, n)?;
-            let (act, act_scale, kg4) = (scratch.act, scratch.scale, k / FP8_BLOCK * 4);
-            let gemm = |a: DevicePtr, sf: DevicePtr, out: DevicePtr, rows: usize| {
-                spark_runtime::cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned(
-                    a.0,
-                    sf.0,
-                    w.data.0,
-                    w.scales.0,
-                    out.0,
-                    [rows as u32, n as u32, k as u32],
-                    stream,
-                )
-            };
-            for first in (0..m).step_by(plan.rows) {
-                let rows = (m - first).min(plan.rows);
-                super::per_token_group_quant_fp8(
-                    gpu,
-                    kernels.act_quant,
-                    input.offset(first * k * 2),
-                    act,
-                    act_scale,
-                    rows as u32,
-                    k as u32,
-                    stream,
-                )?;
-                let main = rows / 16 * 16;
-                if main > 0 {
-                    gemm(act, act_scale, output.offset(first * n * 2), main)?;
-                }
-                let tail = rows - main;
-                if tail > 0 {
-                    // The last < 16 rows as one 16-row pass of the same
-                    // kernel: zero rows (E4M3 0, scale 0) pad it, its output
-                    // lands in the scratch's tail slot and its real rows are
-                    // copied out. Same kernel, row-independent: the same bytes
-                    // as inside a taller pass.
-                    let pad = main + 16 - rows;
-                    gpu.memset_async(act.offset(rows * k), 0, pad * k, stream)?;
-                    gpu.memset_async(act_scale.offset(rows * kg4), 0, pad * kg4, stream)?;
-                    gemm(
-                        act.offset(main * k),
-                        act_scale.offset(main * kg4),
-                        plan.tail_out,
-                        16,
-                    )?;
-                    gpu.copy_d2d_async(
-                        plan.tail_out,
-                        output.offset((first + main) * n * 2),
-                        tail * n * 2,
-                        stream,
-                    )?;
-                }
-            }
-            Ok(())
-        }
+        Fp8bPrefill::W8a8 => fp8b_w8a8_gemm(
+            gpu,
+            kernels,
+            scratch,
+            w,
+            Fp8bRows::Bf16(input),
+            output,
+            [m, n, k],
+            stream,
+        ),
         Fp8bPrefill::Bf16 => anyhow::bail!("fp8b_prefill_gemm: BF16 prefill is the caller's"),
     }
+}
+
+/// The W8A8 arm of [`fp8b_prefill_gemm`] on `input` rows, BF16 or already
+/// cast: the same passes and kernels either way, so cast rows give the bytes
+/// their BF16 rows would.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8b_w8a8_gemm(
+    gpu: &dyn GpuBackend,
+    kernels: &NativeKernels,
+    scratch: Fp8ActScratch,
+    w: &Fp8BlockWeight,
+    input: Fp8bRows,
+    output: DevicePtr,
+    [m, n, k]: [usize; 3],
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        !w.tiled && n.is_multiple_of(FP8_BLOCK) && k.is_multiple_of(FP8_BLOCK),
+        "fp8b_w8a8_gemm: [{n}, {k}] (tiled={})",
+        w.tiled
+    );
+    if !fp8b_w8a8_lt(w, n, k) {
+        let cutlass = fp8b_cutlass_requested()?;
+        return fp8b_w8a8_hand(
+            gpu,
+            kernels,
+            scratch,
+            w,
+            input,
+            output,
+            [m, n, k],
+            cutlass,
+            stream,
+        );
+    }
+    ensure!(
+        kernels.act_quant.0 != 0,
+        "per_token_group_quant_fp8 is missing"
+    );
+    let plan = scratch.blk_plan(k, n)?;
+    let kg4 = k / FP8_BLOCK * 4;
+    let gemm = |a: DevicePtr, sf: DevicePtr, out: DevicePtr, rows: usize| {
+        spark_runtime::cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned(
+            a.0,
+            sf.0,
+            w.data.0,
+            w.scales.0,
+            out.0,
+            [rows as u32, n as u32, k as u32],
+            stream,
+        )
+    };
+    for first in (0..m).step_by(plan.rows) {
+        let rows = (m - first).min(plan.rows);
+        let (act, act_scale) = input.pass(gpu, kernels, scratch, (first, rows), k, stream)?;
+        let main = rows / 16 * 16;
+        if main > 0 {
+            gemm(act, act_scale, output.offset(first * n * 2), main)?;
+        }
+        let tail = rows - main;
+        if tail > 0 {
+            // The last < 16 rows as one 16-row pass of the same kernel from
+            // the scratch: zero rows (E4M3 0, scale 0) pad it, its output
+            // lands in the scratch's tail slot and its real rows are copied
+            // out. Same kernel, row-independent: the same bytes as inside a
+            // taller pass. Cast rows bring their tail into the scratch.
+            let (pad_act, pad_scale) = (
+                scratch.act.offset(main * k),
+                scratch.scale.offset(main * kg4),
+            );
+            if act != scratch.act {
+                gpu.copy_d2d_async(act.offset(main * k), pad_act, tail * k, stream)?;
+                gpu.copy_d2d_async(act_scale.offset(main * kg4), pad_scale, tail * kg4, stream)?;
+            }
+            let pad = 16 - tail;
+            gpu.memset_async(pad_act.offset(tail * k), 0, pad * k, stream)?;
+            gpu.memset_async(pad_scale.offset(tail * kg4), 0, pad * kg4, stream)?;
+            gemm(pad_act, pad_scale, plan.tail_out, 16)?;
+            gpu.copy_d2d_async(
+                plan.tail_out,
+                output.offset((first + main) * n * 2),
+                tail * n * 2,
+                stream,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite FP8 block twin `w` (`[n, k]`, `n % 16 == 0`, `k % 64 == 0`) in
@@ -803,3 +911,7 @@ pub fn fp8b_tile_if_requested(
 #[cfg(test)]
 #[path = "fp8b_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "fp8b_cutlass_test_gpu.rs"]
+mod cutlass_gpu_tests;

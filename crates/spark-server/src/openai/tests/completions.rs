@@ -57,6 +57,7 @@ fn completion_request_defaults_match_openai_spec() {
         "prompt": "hello",
     }))
     .expect("valid completion request");
+    assert!(!req.return_token_ids);
     assert!(!req.echo);
     assert_eq!(req.n, 1);
     assert!(req.logprobs.is_none());
@@ -114,4 +115,13 @@ fn completion_request_n_bounds_are_handler_enforced() {
     }))
     .expect("parse");
     assert_eq!(req.n, 4096);
+}
+
+#[test]
+fn completion_request_deserializes_token_id_opt_in() {
+    let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "m", "prompt": [1, 2], "return_token_ids": true
+    }))
+    .expect("request");
+    assert!(req.return_token_ids);
 }

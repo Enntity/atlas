@@ -139,8 +139,19 @@ pub fn start_chunked_prefill(
 
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let chunk_len = total.min(max_prefill_tokens);
-    let is_last = chunk_len >= total;
+    let mut chunk_len = total.min(max_prefill_tokens);
+    let mut is_last = chunk_len >= total;
+    if is_last {
+        (chunk_len, is_last) = super::sp_final_cut(chunk_len, model.prefill_row_multiple());
+    }
+    // A first chunk that is not the prompt's last lands on the GDN WY4
+    // boundary like every later one (`run_standard`): the idle budget is the
+    // arena, `max_prefill_tokens + max_batch_size`, and an odd one (TP4's
+    // one sequence: 8193) would keep sequence-parallel prefill, which splits
+    // the rows over every rank, off the chunk.
+    if !is_last {
+        chunk_len = super::chunk_align(chunk_len, model.prefill_row_multiple());
+    }
 
     tracing::info!(
         "Chunked prefill start: {} prompt tokens, chunk_size={}, max_tokens={max_tokens}",

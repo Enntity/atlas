@@ -79,7 +79,8 @@ pub(super) fn plan_verify(
     // DSpark is included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP
     // still uses !dflash via the model self-gate (`dflash_hidden_save`).
     let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
-    if spark_model::speculative::glm_repair_policy::enabled()
+    if model.native_mtp_enabled()
+        || spark_model::speculative::glm_repair_policy::enabled()
         || !spark_model::speculative::mtp_multi_seq_mode()
         || !dspark_batch_ok
         || batch_verify_disabled()
@@ -98,7 +99,12 @@ pub(super) fn plan_verify(
     };
     for &idx in verify_idxs {
         let a = &active[idx];
-        if a.grammar_state.is_none() && a.pending_drafts.len() >= min_drafts {
+        // Batched DFlash cannot report generated scores. Keep those requests
+        // on the single-sequence scored path; native MTP batches can score.
+        if a.grammar_state.is_none()
+            && a.pending_drafts.len() >= min_drafts
+            && (!dflash_verify_raw_argmax || a.top_logprobs.is_none())
+        {
             plan.batch.push(idx);
         } else {
             plan.serial.push(idx);

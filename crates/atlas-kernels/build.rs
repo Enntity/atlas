@@ -110,6 +110,7 @@ struct Target {
     behavior_default_num_drafts: u32,
     behavior_disable_tool_steering: bool,
     behavior_template_owns_tool_definitions: bool,
+    behavior_verbatim_reasoning_effort: bool,
     behavior_disable_cwd_hint_injection: bool,
     behavior_use_sampling_presets_for_core: bool,
     behavior_use_sampling_preset_penalties_for_core: bool,
@@ -1249,6 +1250,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_default_num_drafts: pb.default_num_drafts,
                 behavior_disable_tool_steering: pb.disable_tool_steering,
                 behavior_template_owns_tool_definitions: pb.template_owns_tool_definitions,
+                behavior_verbatim_reasoning_effort: pb.verbatim_reasoning_effort,
                 behavior_disable_cwd_hint_injection: pb.disable_cwd_hint_injection,
                 behavior_use_sampling_presets_for_core: pb.use_sampling_presets_for_core,
                 behavior_use_sampling_preset_penalties_for_core: pb

@@ -30,15 +30,15 @@ pub fn dflash_verify_uses_raw_argmax(
 
 /// Per-sequence refinement of the process-wide DFlash raw-argmax verify
 /// mode. The shortcut is only honest when this sequence's verify pick is
-/// provably the raw argmax — penalty-neutral, no grammar mask, no EOS
-/// suppression. Anything else (presence/frequency/repetition penalties,
-/// logit bias, LZ/DRY, grammar, tool-call EOS masking) takes the pipeline
-/// branch so the emitted stream follows the request's sampling parameters.
-/// Verify positions are greedy argmax by design (`PositionKind::Verify`),
-/// so a nonzero request temperature does not itself disqualify the raw
-/// path — only transforms that can move the argmax do. A model whose verify
-/// head writes only argmax ids (`verify_logits_argmax_only`) always takes
-/// the raw path: its logits buffer is partly stale.
+/// provably the raw argmax — greedy, penalty-neutral, no grammar mask, no EOS
+/// suppression. Anything else (a sampled request, presence/frequency/
+/// repetition penalties, logit bias, LZ/DRY, grammar, tool-call EOS masking)
+/// takes the pipeline branch, which samples a sampled request's rows from
+/// the processed distribution, so the emitted stream follows the request's
+/// sampling parameters. A model whose verify head writes only argmax ids
+/// (`verify_logits_argmax_only`) always takes the raw path here: its logits
+/// buffer is partly stale. The DFlash tail serves such a head's other
+/// sequences through its sampled-verify exchange ([`dflash_seq_uses_split_rows`]).
 pub fn dflash_seq_uses_raw_argmax(
     raw_requested: bool,
     masked_requested: bool,
@@ -52,6 +52,28 @@ pub fn dflash_seq_uses_raw_argmax(
         model.verify_logits_argmax_only(),
         a,
     )
+}
+
+/// Whether this sequence's DFlash verify picks come from the argmax-only
+/// split head's rows (`verify_pipeline_helper::split_rows`): the head can
+/// sample (`verify_split_sampling`) and the pick is not the raw argmax. A
+/// strict structured-output greedy pick is: the split head masks its rows.
+pub fn dflash_seq_uses_split_rows(
+    raw_requested: bool,
+    masked_requested: bool,
+    model: &dyn spark_model::traits::Model,
+    a: &crate::scheduler::types::ActiveSeq,
+) -> bool {
+    model.verify_logits_argmax_only()
+        && model.verify_split_sampling()
+        && !(a.strict_grammar() && a.temperature == 0.0)
+        && !dflash_seq_raw_argmax_policy(
+            raw_requested,
+            masked_requested,
+            model.is_lightning_dspark_product(),
+            false,
+            a,
+        )
 }
 
 #[cfg(test)]

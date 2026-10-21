@@ -172,6 +172,7 @@ pub(super) fn generate_target_ptx_rs(
              \x20               default_num_drafts: {},\n\
              \x20               disable_tool_steering: {},\n\
              \x20               template_owns_tool_definitions: {},\n\
+             \x20               verbatim_reasoning_effort: {},\n\
              \x20               disable_cwd_hint_injection: {},\n\
              \x20               use_sampling_presets_for_core: {},\n\
              \x20               use_sampling_preset_penalties_for_core: {},\n\
@@ -219,6 +220,7 @@ pub(super) fn generate_target_ptx_rs(
             target.behavior_default_num_drafts,
             target.behavior_disable_tool_steering,
             target.behavior_template_owns_tool_definitions,
+            target.behavior_verbatim_reasoning_effort,
             target.behavior_disable_cwd_hint_injection,
             target.behavior_use_sampling_presets_for_core,
             target.behavior_use_sampling_preset_penalties_for_core,

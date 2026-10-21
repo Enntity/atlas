@@ -10,7 +10,7 @@ fn max_tokens_defaults_to_512_and_stays_below_flash_kda() {
     assert_eq!(parse_max_tokens(Some("x")), 512);
     assert_eq!(parse_max_tokens(Some("0")), 2);
     assert_eq!(parse_max_tokens(Some("4096")), MAX_TOKENS_CAP);
-    assert!(MAX_TOKENS_CAP < 2048);
+    const { assert!(MAX_TOKENS_CAP < 2048) };
 }
 
 #[test]

@@ -91,6 +91,9 @@ const GLM: &str = "glm5_next";
 const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // A rank that would only warn beside one that fails.
     ("ATLAS_STARTUP_PARITY=warn", || Ok(warn_only() as u64)),
+    ("ATLAS_GLM_STRICT_NATIVE_MTP", || {
+        Ok(layers::glm_native::mode::strict_native_mtp() as u64)
+    }),
     // The head's command words.
     ("ATLAS_EP_PROTOCOL=v2", || {
         Ok(super::ep_protocol_v2_requested() as u64)
@@ -103,6 +106,9 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
         Ok(pc::tail_split_min_tokens() as u64)
     }),
     ("ATLAS_GLM_PREFILL_SP", || Ok(glm_sp::requested() as u64)),
+    ("ATLAS_GLM_PREFILL_PIPE2", || {
+        Ok(super::glm_prefill_pipe::requested() as u64)
+    }),
     // Sequence-parallel prefill needs the BF16 highway, which needs the
     // DFlash lane.
     ("ATLAS_GLM_HC_BF16", || Ok(ops::hc_bf16_for(GLM) as u64)),
@@ -206,6 +212,21 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_FP4L_FP8_PREFILL", || {
         Ok(ops::Fp8bPrefill::from_env()? as u64)
     }),
+    // The W8A8 block FP8 prefill GEMM: rounds its group sums differently
+    // from the in-tree kernel, so ranks that disagree serve a mix of both.
+    ("ATLAS_GLM_FP8B_CUTLASS", || {
+        Ok(ops::fp8b_cutlass_requested()? as u64)
+    }),
+    // The routed down rows' format (lossy E4M3 or BF16), so every rank's
+    // partial sums round alike.
+    ("ATLAS_GLM_MOE_DOWN_E4M3", || {
+        Ok(moe::down_e4m3_requested() as u64)
+    }),
+    // The 16-head sparse prefill's key-tile split, so every rank's heads sum
+    // in one order.
+    ("ATLAS_GLM_SPARSE_PIPE_WG2", || {
+        Ok(ops::glm_sparse_pipe_wg2_requested("glm5_next")? as u64)
+    }),
     ("ATLAS_GLM_MXFP8_TILED", || {
         Ok(ops::mxfp8_tiled_requested()? as u64)
     }),
@@ -308,6 +329,14 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     // canonical row-invariant kernels (`layers::canonical_verify`).
     ("ATLAS_GLM_CANONICAL_VERIFY", || {
         Ok(layers::canonical_verify::enabled() as u64)
+    }),
+    ("ATLAS_GLM_SERVING_MODE", || {
+        use layers::glm_native::mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
     }),
     // Whether a verify can roll back the PLE carry every rank replicates
     // (qwen4_exp): without its snapshots `commit_accepted_prefix` refuses a

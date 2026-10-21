@@ -33,9 +33,12 @@ use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
 use crate::vision_preprocess::{
-    MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
-    patch_coordinates, target_size_for,
+    decode_data_uri_bytes, normalize_channel, patch_coordinates, target_size_for,
 };
+
+mod gif;
+mod glm;
+use gif::{gif_frames, gif_timeline};
 
 /// Frames per second to sample at, when the caller has no better idea.
 /// Matches the `fps: 2` every Qwen3-VL `video_processor` block declares.
@@ -153,13 +156,6 @@ pub fn sample_indices(
     out
 }
 
-/// GLM's processor uses an `fps_interval` timestamp walk followed by a
-/// linspace repair when the greedy walk misses its requested frame count.
-///
-/// Kept for the grouping contract's arithmetic above; the decode path now
-/// samples through [`crate::video_sample`] and only rounds to groups here.
-fn _legacy_sampling_reference() {}
-
 /// The only re-sampling left after the decoder has done the coverage work:
 /// drop any trailing partial temporal group.
 ///
@@ -254,27 +250,7 @@ fn decode_gif(
     use image::AnimationDecoder;
     use image::codecs::gif::GifDecoder;
 
-    // Pass one: replay the decoder's frame ITERATOR without materialising the
-    // pixel buffers, to count frames and accumulate the declared duration. The
-    // decoder still decompresses each frame here, but the buffers are dropped
-    // as they arrive rather than collected, so peak memory is one frame.
-    let header =
-        GifDecoder::new(std::io::Cursor::new(bytes.to_vec())).context("not a decodable GIF")?;
-    let mut count = 0usize;
-    let mut total_ms = 0f64;
-    // The largest declared frame area seen, for the memory bound below.
-    let mut max_area = 0usize;
-    for frame in header.into_frames() {
-        let frame = frame.context("failed to decode animation frames")?;
-        let buf = frame.buffer();
-        max_area = max_area.max(buf.width() as usize * buf.height() as usize);
-        let (num, den) = frame.delay().numer_denom_ms();
-        if den != 0 {
-            total_ms += num as f64 / den as f64;
-        }
-        count += 1;
-    }
-    ensure!(count > 0, "the container decoded to zero frames");
+    let (count, total_ms, max_area) = gif_timeline(bytes)?;
 
     // The decoded-pixel budget, shared with the ffmpeg path's `scale` bound:
     // `max_frames` frames at `max_decoded_pixels` each. `no_truncate` classes
@@ -340,18 +316,15 @@ fn decode_gif(
     // Decode once, keeping only the frames the plan selected, in plan order.
     let wanted_indices: Vec<usize> = plan.times.iter().map(|&t| index_for(t)).collect();
     let keep: std::collections::BTreeSet<usize> = wanted_indices.iter().copied().collect();
+    let keep: Vec<usize> = keep.into_iter().collect();
     let mut chosen: Vec<Option<RgbImage>> = vec![None; count];
-    for (i, frame) in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
-        .context("not a decodable GIF")?
-        .into_frames()
-        .enumerate()
-    {
-        if !keep.contains(&i) {
-            continue;
+    let mut next = keep.iter();
+    gif_frames(bytes, &keep, &mut |frame| {
+        if let Some(&i) = next.next() {
+            chosen[i] = Some(frame);
         }
-        let frame = frame.context("failed to decode animation frames")?;
-        chosen[i] = Some(image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8());
-    }
+        Ok(())
+    })?;
 
     let mut frames = Vec::with_capacity(wanted_indices.len());
     let mut times = Vec::with_capacity(wanted_indices.len());
@@ -378,6 +351,9 @@ pub fn preprocess_video(
         vcfg.patch_size > 0 && vcfg.spatial_merge_size > 0 && vcfg.temporal_patch_size > 0,
         "vision_config geometry is invalid (patch/merge/temporal size is 0)"
     );
+    if vcfg.is_glm5_next {
+        return glm::preprocess_glm_video(data_uri, vcfg, max_pixels, target_fps, ffmpeg);
+    }
     let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
     let tp = vcfg.temporal_patch_size;
 
@@ -406,93 +382,68 @@ pub fn preprocess_video(
     // count assumes a single grid.
     let first = &frames[keep[0]];
     let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
-    let (th, tw) = if vcfg.is_glm5_next {
-        glm_target_size(
-            vcfg,
-            first.height(),
-            first.width(),
-            keep.len(),
-            max_pixels,
-            true,
-        )?
-    } else {
-        target_size_for(first.height(), first.width(), grid_unit, max_pixels)
-    };
-    let glm_min_pixels = 16usize
-        * tp
-        * (vcfg.patch_size * vcfg.spatial_merge_size)
-            .saturating_mul(vcfg.patch_size * vcfg.spatial_merge_size);
-    let glm_allow_upscale = vcfg.is_glm5_next
-        && keep.len() * first.height() as usize * (first.width() as usize) < glm_min_pixels;
-
+    let (th, tw) = target_size_for(first.height(), first.width(), grid_unit, max_pixels);
     let ps = vcfg.patch_size;
-    let grid_h = (th as usize) / ps;
-    let grid_w = (tw as usize) / ps;
+    let (grid_h, grid_w) = (th as usize / ps, tw as usize / ps);
     let grid_t = keep.len() / tp;
-    let patch_dim = 3 * tp * ps * ps;
-    let plane = grid_h * grid_w;
-
-    let mut groups = Vec::with_capacity(grid_t);
-    for g in 0..grid_t {
-        // Resize this group's `tp` frames once each, up front: the patch loop
-        // reads every pixel of every frame, so resizing inside it would redo
-        // the work `patch²` times.
-        let resized: Vec<RgbImage> = (0..tp)
-            .map(|k| {
-                let f = &frames[keep[g * tp + k]];
-                if vcfg.is_glm5_next {
-                    glm_resize_or_pad(f, th, tw, glm_allow_upscale)
-                } else {
+    let groups = (0..grid_t)
+        .map(|g| {
+            // Resize this group's `tp` frames once each, up front: the patch
+            // loop reads every pixel of every frame, so resizing inside it
+            // would redo the work `patch²` times.
+            let resized: Vec<RgbImage> = (0..tp)
+                .map(|k| {
+                    let f = &frames[keep[g * tp + k]];
                     image::imageops::resize(f, tw, th, image::imageops::FilterType::CatmullRom)
-                }
-            })
-            .collect();
-
-        let mut pixels = vec![0.0f32; plane * patch_dim];
-        for (patch_idx, (ph, pw)) in patch_coordinates(vcfg, grid_h, grid_w)
-            .into_iter()
-            .enumerate()
-        {
-            for c in 0..3usize {
-                for (t, frame) in resized.iter().enumerate() {
-                    for py in 0..ps {
-                        for px in 0..ps {
-                            let raw = frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                [c] as f32
-                                / 255.0;
-                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                            pixels[patch_idx * patch_dim + off] = if vcfg.is_glm5_next {
-                                normalize_channel(
-                                    vcfg,
-                                    c,
-                                    frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                        [c],
-                                )
-                            } else {
-                                (raw - MEAN[c]) / STD[c]
-                            };
-                        }
-                    }
-                }
-            }
-        }
-        groups.push(pixels);
-    }
+                })
+                .collect();
+            patchify_group(vcfg, &resized, grid_h, grid_w)
+        })
+        .collect();
 
     Ok(PreprocessedVideo {
         groups,
         grid_t,
         grid_h,
         grid_w,
-        // The pinned GLM processor's non-Glm4v path formats full-second
-        // timestamps (`"{:.1f} seconds"`) and takes one timestamp per
-        // temporal pair. The decoder's per-frame source times are the SSOT
-        // for where each group sits — an assumed constant rate would drift
-        // from the positions actually sampled.
+        // One timestamp per temporal group, from the decoder's per-frame
+        // source times — an assumed constant rate would drift from the
+        // positions actually sampled.
         timestamps: (0..grid_t)
             .map(|g| frame_times[keep[g * tp]].floor())
             .collect(),
     })
+}
+
+/// One temporal group's `tp` frames, already at the `grid × patch` canvas,
+/// as `[grid_h * grid_w, C * tp * patch * patch]` normalized patches in the
+/// tower's patch order.
+fn patchify_group(
+    vcfg: &VisionConfig,
+    frames: &[RgbImage],
+    grid_h: usize,
+    grid_w: usize,
+) -> Vec<f32> {
+    let (ps, tp) = (vcfg.patch_size, vcfg.temporal_patch_size);
+    let patch_dim = 3 * tp * ps * ps;
+    let mut pixels = vec![0.0f32; grid_h * grid_w * patch_dim];
+    for (patch_idx, (ph, pw)) in patch_coordinates(vcfg, grid_h, grid_w)
+        .into_iter()
+        .enumerate()
+    {
+        for c in 0..3usize {
+            for (t, frame) in frames.iter().enumerate() {
+                for py in 0..ps {
+                    for px in 0..ps {
+                        let raw = frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)[c];
+                        let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
+                        pixels[patch_idx * patch_dim + off] = normalize_channel(vcfg, c, raw);
+                    }
+                }
+            }
+        }
+    }
+    pixels
 }
 
 #[cfg(test)]

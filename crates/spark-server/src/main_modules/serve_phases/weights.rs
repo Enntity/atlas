@@ -106,9 +106,7 @@ pub(crate) fn load_weight_store(
         vec![".ple.ple_embedding.ngram_embedding.shard_".to_string()]
     }
 
-    let use_fast_load =
-        !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0");
-    let store = if use_fast_load {
+    let store = if use_fast_load(args) {
         #[cfg(unix)]
         {
             tracing::info!("Using fast weight loader (O_DIRECT + pipelined read/copy)");
@@ -194,6 +192,12 @@ pub(crate) fn load_weight_store(
     Ok(store)
 }
 
+/// The fast weight loader (O_DIRECT, pipelined) unless `--no-fast-load` or
+/// `ATLAS_FAST_LOAD=0`.
+fn use_fast_load(args: &cli::ServeArgs) -> bool {
+    !args.no_fast_load && std::env::var("ATLAS_FAST_LOAD").ok().as_deref() != Some("0")
+}
+
 pub(crate) fn load_dflash_drafter(
     args: &cli::ServeArgs,
     ptx_set: &atlas_kernels::TargetPtxSet,
@@ -245,11 +249,23 @@ pub(crate) fn load_dflash_drafter(
             drafter_config,
         )));
     }
-    let mut loader = spark_runtime::weights::SafetensorsLoader::new();
-    loader.peak_memory_multiplier = None;
-    let mut drafter_store = loader
-        .load(&drafter_dir, gpu, 0)
-        .context("Failed to load DFlash drafter weights")?;
+    // The fast loader stores the same tensors and bytes
+    // (`dflash_fast_load_check`: 0.6 s against 5.3 s for the 2.2 GB drafter).
+    let mut drafter_store = if use_fast_load(args) {
+        #[cfg(unix)]
+        {
+            spark_runtime::fast_weights::FastSafetensorsLoader::new().load(&drafter_dir, gpu, 0)
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("--fast-load requires a Unix host (needs O_DIRECT / posix_fadvise)");
+        }
+    } else {
+        let mut loader = spark_runtime::weights::SafetensorsLoader::new();
+        loader.peak_memory_multiplier = None;
+        loader.load(&drafter_dir, gpu, 0)
+    }
+    .context("Failed to load DFlash drafter weights")?;
     // Before the KV pool is sized, so the freed BF16 bytes become KV blocks.
     if spark_model::weight_loader::dflash_preshrink::requested() {
         spark_model::weight_loader::dflash_preshrink::preshrink(

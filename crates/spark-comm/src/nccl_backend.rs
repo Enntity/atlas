@@ -10,6 +10,9 @@
 //! - Pre-registers buffers with NCCL (`ncclCommRegister`) to cache IB memory registration
 //! - Uses paired `ncclSend`/`ncclRecv` + local BF16 add instead of `ncclAllReduce`
 //!
+//! With `ATLAS_RDMA_ALLREDUCE=1` two ranks take the direct RDMA pair, and
+//! three or four ranks wired in a line the RDMA chain (`rdma_pair::chain`).
+//!
 //! Health monitoring and recovery:
 //! - Checks `ncclCommGetAsyncError` after each collective
 //! - Flags timed broadcasts after a stream sync taking at least 30s; this is
@@ -125,6 +128,9 @@ pub struct NcclBackend {
     /// Direct RDMA 2-rank all-reduce (`ATLAS_RDMA_ALLREDUCE=1`).
     #[cfg(atlas_rdma_verbs)]
     rdma: Option<rdma_pair::RdmaPair>,
+    /// The same with three or four ranks in a line (`rdma_pair::chain`).
+    #[cfg(atlas_rdma_verbs)]
+    chain: Option<rdma_pair::chain::RdmaChain>,
 }
 
 // SAFETY: `NcclComm` is an opaque NCCL handle. NCCL guarantees the handle
@@ -216,6 +222,8 @@ impl NcclBackend {
             master_port,
             recv_capacity,
         )?;
+        #[cfg(atlas_rdma_verbs)]
+        let chain = Self::connect_chain(rank, world_size, &peers, master_port)?;
 
         Ok(Self {
             comm: Mutex::new(comm),
@@ -236,6 +244,8 @@ impl NcclBackend {
             peer_lifeline: PeerLifeline::new(peers),
             #[cfg(atlas_rdma_verbs)]
             rdma,
+            #[cfg(atlas_rdma_verbs)]
+            chain,
         })
     }
 

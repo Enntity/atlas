@@ -46,6 +46,7 @@ pub(super) fn mla_native_twins(
         return Ok(None);
     }
     if raw_fp8_block(store, &format!("{p}.q_a_proj"))?.is_none() {
+        crate::layers::glm_native::mode::require_format(false, &format!("{p} FP8 block weights"))?;
         static IGNORED: std::sync::Once = std::sync::Once::new();
         IGNORED.call_once(|| {
             tracing::warn!(
@@ -96,6 +97,44 @@ pub(super) fn mla_native_twins(
         return Err(e);
     }
     Ok(Some(twins))
+}
+
+/// `ATLAS_GLM_SP_MLA_OPROJ_A2A=1`: the MLA o_proj on this rank's rows over
+/// every head (`qwen3_attention::prefill::paged_glm_a2a`).
+pub(crate) fn mla_oproj_a2a_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_SP_MLA_OPROJ_A2A").as_deref() == Ok("1"))
+}
+
+/// The whole, unsharded o_proj of the MLA layer at `p` as an FP8 block twin
+/// (`[hidden, heads * v]`, the checkpoint's bytes every rank's slice is cut
+/// from), under `ATLAS_GLM_SP_MLA_OPROJ_A2A` on the four-rank chain with
+/// native twins: +1 B a parameter (~64 MiB a layer at GLM's shape).
+pub(super) fn mla_o_full(
+    policy: NativePolicy,
+    store: &WeightStore,
+    p: &str,
+    tp: &MlaTpPlan,
+    mtp_body: bool,
+    gpu: &dyn GpuBackend,
+) -> Result<Option<Fp8BlockWeight>> {
+    if !(policy.mla_fp8 && !mtp_body && tp.tp_size == 4 && mla_oproj_a2a_requested()) {
+        return Ok(None);
+    }
+    let stem = format!("{p}.o_proj");
+    let Some(raw) = raw_fp8_block(store, &stem)? else {
+        return Ok(None);
+    };
+    let (n, k, _) = tp.o();
+    ensure!(
+        [raw.n, raw.k] == [n, k],
+        "{stem}: checkpoint FP8 block [{}, {}] is not the config's [{n}, {k}]",
+        raw.n,
+        raw.k
+    );
+    let stream = gpu.default_stream();
+    let (twin, ..) = fp8_block_twin(gpu, raw, TpShardKind::Replicated, 0, 1, stream)?;
+    Ok(Some(twin))
 }
 
 /// Tile q_b's and o's twins (the large ones only `fp8b_gemv` reads) under

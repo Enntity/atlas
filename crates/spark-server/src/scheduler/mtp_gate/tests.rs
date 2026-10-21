@@ -602,3 +602,17 @@ fn widening_still_pulls_the_probe_forward() {
         "probe pulled forward"
     );
 }
+
+#[test]
+fn request_disable_mtp_overrides_all_spec_dispatch_modes() {
+    for thinking in [false, true] {
+        for raw_argmax in [false, true] {
+            assert!(!spec_dispatch_eligible(
+                thinking, 100, 100, false, true, true, 0, raw_argmax,
+            ));
+            assert!(spec_dispatch_eligible(
+                thinking, 100, 100, false, false, true, 0, raw_argmax,
+            ));
+        }
+    }
+}

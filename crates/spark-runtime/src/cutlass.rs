@@ -81,8 +81,8 @@ mod grouped;
 mod pack;
 
 pub use gemm::{
-    bf16_gemm_act_weight_t, bf16_gemm_tuned, bf16_grouped_gemm_act_weight_t,
-    nvfp4_gemm_bf16_act_weight_t,
+    bf16_gemm_act_weight_t, bf16_gemm_tuned, bf16_gemm_tuned_f32out,
+    bf16_grouped_gemm_act_weight_t, fp8_blockwise_gemm_act_weight_t, nvfp4_gemm_bf16_act_weight_t,
 };
 pub use grouped::{nvfp4_grouped_down, nvfp4_grouped_gate_up, nvfp4_grouped_gate_up_fused};
 pub use pack::{pack_bf16_weight_to_nvfp4_t, pack_weight_sfb, transpose_nvfp4_packed_kton};
@@ -115,6 +115,18 @@ unsafe extern "C" {
         config: i32,
         stream: *mut c_void,
     ) -> i32;
+    pub(crate) fn atlas_cutlass_bf16_gemm_tuned_f32out(
+        act: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        lda: i32,
+        ldc: i32,
+        config: i32,
+        stream: *mut c_void,
+    ) -> i32;
     pub(crate) fn atlas_cutlass_bf16_grouped_gemm_act_weight_t(
         act: *const c_void,
         weight: *const c_void,
@@ -132,6 +144,19 @@ unsafe extern "C" {
         weight_packed_t: *const c_void,
         weight_scale_t: *const c_void,
         weight_scale_2: f32,
+        out: *mut c_void,
+        m: i32,
+        n: i32,
+        k: i32,
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: *mut c_void,
+    ) -> i32;
+    pub(crate) fn atlas_cutlass_fp8_blockwise_gemm_act_weight_t(
+        act: *const c_void,
+        act_sf: *const c_void,
+        weight: *const c_void,
+        weight_sf: *const c_void,
         out: *mut c_void,
         m: i32,
         n: i32,
@@ -324,8 +349,26 @@ pub(crate) fn drained(wrapper: &str, status: i32) -> i32 {
 
 #[cfg(atlas_cutlass)]
 pub(crate) struct Ctx {
-    pub(crate) workspace: u64,
+    lanes: crate::lane::LaneWorkspace,
     pub(crate) ws_size: usize,
+}
+
+#[cfg(atlas_cutlass)]
+impl Ctx {
+    /// The calling thread's scratch lane's workspace (`crate::lane`).
+    pub(crate) fn workspace(&self) -> Result<u64> {
+        self.lanes.get()
+    }
+}
+
+#[cfg(atlas_cutlass)]
+fn alloc_workspace(bytes: usize) -> Result<u64> {
+    let mut workspace = 0u64;
+    let status = unsafe { cuMemAlloc_v2(&mut workspace, bytes) };
+    if status != 0 {
+        bail!("cuMemAlloc CUTLASS workspace failed: {status}");
+    }
+    Ok(workspace)
 }
 
 #[cfg(atlas_cutlass)]
@@ -367,8 +410,22 @@ pub(crate) fn ctx() -> Result<&'static Ctx> {
     if status != 0 {
         bail!("cuMemAlloc CUTLASS workspace failed: {status}");
     }
-    let _ = CTX.set(Ctx { workspace, ws_size });
+    let _ = CTX.set(Ctx {
+        lanes: crate::lane::LaneWorkspace::new(ws_size, workspace, alloc_workspace),
+        ws_size,
+    });
     Ok(CTX.get().unwrap())
+}
+
+/// Allocate the shared CUTLASS workspace now, so the first prefill does not
+/// pay its lazy cuMemAlloc (28 ms inside the first 32K TP-4 prefill's MLA
+/// FP8 GEMM, rank-0 nsys 2026-10-18). Failure is logged, never fatal: the
+/// first GEMM retries it.
+pub fn prewarm() {
+    #[cfg(atlas_cutlass)]
+    if let Err(e) = ctx() {
+        tracing::warn!("CUTLASS prewarm: {e:#}");
+    }
 }
 
 #[cfg(test)]

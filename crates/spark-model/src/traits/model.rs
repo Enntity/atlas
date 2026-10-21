@@ -145,6 +145,32 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Whether a sampled verify on that argmax-only head can still pick from
+    /// the target's distribution: [`Self::verify_split_candidates`] and
+    /// [`Self::verify_split_full_rows`] serve.
+    fn verify_split_sampling(&self) -> bool {
+        false
+    }
+
+    /// Head only, between a verify's forward and its verdict word: every
+    /// rank's best logits of verify rows `[0, rows)` at `temperature`, with
+    /// the logits of `specials` (the tokens the host pipeline may mask) and
+    /// what the rest of each row adds up to (`spark_model::model::SplitRow`).
+    fn verify_split_candidates(
+        &self,
+        _rows: usize,
+        _temperature: f32,
+        _specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        bail!("this model has no split verify head")
+    }
+
+    /// Head only, like [`Self::verify_split_candidates`]: verify rows
+    /// `[0, rows)` whole, `rows * vocab` BF16 logits into `out`.
+    fn verify_split_full_rows(&self, _rows: usize, _out: &mut [u8]) -> Result<()> {
+        bail!("this model has no split verify head")
+    }
+
     /// Run beam search to completion for each request, returning each one's
     /// winning hypothesis token ids (EOS-terminated). Called from the prefill
     /// path for `num_beams > 1` requests, bypassing the token-by-token decode
@@ -995,6 +1021,42 @@ pub trait Model: Send + Sync {
     /// overwrites shared buffers including `norm_output`.
     fn save_hidden_for_mtp(&self, token_idx: usize, stream: u64) -> Result<()>;
 
+    /// True when this model uses native GLM MTP bootstrap. Native GLM starts
+    /// from the first token already sampled by prefill, so it must not run the
+    /// ordinary standalone decode bootstrap. Existing proposer families keep
+    /// the default false behavior.
+    fn native_mtp_bootstrap_enabled(&self) -> bool {
+        false
+    }
+
+    /// True when this model admits the native GLM MTP verifier/proposer lane.
+    /// This is separate from the bootstrap hook so scheduler routing cannot
+    /// accidentally infer native target semantics from a generic bootstrap.
+    fn native_mtp_enabled(&self) -> bool {
+        false
+    }
+
+    /// Confirm one native follower can immediately acquire this live owner's
+    /// target/predictor prefix. Returns target blocks shared with the owner;
+    /// `private_blocks` includes every live continuation and the follower's
+    /// replay, writable tail and speculative reserve. No default credit.
+    fn native_prefix_admission_blocks(
+        &self,
+        _owner: &SequenceState,
+        _tokens: &[u32],
+        _session_hash: u64,
+        _private_blocks: usize,
+    ) -> Result<Option<usize>> {
+        Ok(None)
+    }
+
+    /// Stage the final prompt hidden for native GLM's first proposal. The
+    /// proposal writes the `(first_generated_token, prompt_hidden)` pair at
+    /// `seq.seq_len`; default models do not need this hook.
+    fn save_native_mtp_prompt_hidden(&self, _seq: &SequenceState) -> Result<()> {
+        bail!("native MTP bootstrap is unsupported by this model")
+    }
+
     /// Move verify row `row` of the mHC stream highway into row 0, so a
     /// drafter that consumes the PRE-mixer residual reads the accepted
     /// position rather than the first verify row.
@@ -1307,6 +1369,13 @@ pub trait Model: Send + Sync {
         0
     }
 
+    /// Rows a long final prefill chunk is cut to a multiple of so it runs
+    /// sequence-parallel (GLM-5 over the four-rank chain); the few rows past
+    /// the cut run as one more chunk. 1 when nothing asks.
+    fn prefill_row_multiple(&self) -> usize {
+        1
+    }
+
     /// Tokens per paged-KV block, or `None` when the model has no paged KV.
     /// The scheduler uses this to land a prefill chunk boundary exactly on the
     /// block boundary a warm turn will match at (see
@@ -1393,6 +1462,36 @@ pub trait Model: Send + Sync {
         num_accepted: usize,
         stream: u64,
     ) -> Result<()>;
+
+    /// Append the accepted draft pair needed by native MTP before the next
+    /// proposal. The default is deliberately empty for DFlash and all other
+    /// existing proposer families.
+    fn repair_mtp_after_verify(
+        &self,
+        _accepted_draft: u32,
+        _position: usize,
+        _seq: &mut SequenceState,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Native row-indexed repair variant. `target_row` names the row in the
+    /// just-completed canonical verify forward whose post-norm hidden belongs
+    /// to `accepted_draft`. Existing proposers only have row-zero repair.
+    fn repair_mtp_after_verify_row(
+        &self,
+        accepted_draft: u32,
+        position: usize,
+        target_row: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        if target_row != 0 {
+            bail!("row-indexed MTP repair is unsupported for target row {target_row}");
+        }
+        self.repair_mtp_after_verify(accepted_draft, position, seq, stream)
+    }
 
     /// Launch SSM state checkpoint D2D copies on a secondary CUDA stream.
     ///

@@ -164,6 +164,7 @@ mod receive_only_tests {
             video_start_token_id: 0,
             video_end_token_id: 0,
             max_pixels: None,
+            token_budgets: Default::default(),
         }
     }
 

@@ -15,6 +15,8 @@
 //! EC  (seq_id rows | ctx << 12)
 //!                    -> either, with the rows of its context appends
 //!                       (`ATLAS_GLM_DRAFT_TP_CTX`, v2 only; `announce_word`)
+//!     then ctx'      -> a batched propose of more than four sequences:
+//!                       the rest of its appends' rows (`announce_extra`)
 //! ```
 //!
 //! The command carries no payload: both ranks plan the swaps from the same
@@ -31,7 +33,9 @@ use spark_comm::CommBackend;
 
 use super::types::TransformerModel;
 use crate::layers::BlockDiffusionDraftHead;
-use crate::layers::dflash_head::rank_split::announce_word;
+use crate::layers::dflash_head::rank_split::{
+    announce_extra, announce_word, ctx_requested, extra_follows,
+};
 use crate::speculative::DraftProposer;
 
 pub(super) const EP_CMD_DRAFT_ASSIST: u32 = 0xFFFF_FFEC;
@@ -56,7 +60,7 @@ impl TransformerModel {
 
     /// Head: announce the split propose about to run, with its packed
     /// context rows (`DraftProposer::rank_split_ctx`; 0 without v2).
-    pub(super) fn announce_draft_split(&self, ctx: u32) -> Result<()> {
+    pub(super) fn announce_draft_split(&self, ctx: u64) -> Result<()> {
         let word = announce_word(0, ctx)?;
         self.ep_broadcast_seq_and_cmd(word, EP_CMD_DRAFT_ASSIST, self.ep_protocol_v2)
     }
@@ -75,10 +79,19 @@ impl TransformerModel {
         Some((comm, rows))
     }
 
-    /// Head: announce the batched split propose of `rows` rows about to run,
-    /// with its packed context rows.
-    pub(super) fn announce_draft_split_rows(&self, rows: usize, ctx: u32) -> Result<()> {
-        self.ep_broadcast_seq_and_cmd(announce_word(rows, ctx)?, EP_CMD_DRAFT_ASSIST, true)
+    /// Head: announce the batched split propose of `rows` rows over
+    /// `sequences` sequences about to run, with its packed context rows.
+    pub(super) fn announce_draft_split_rows(
+        &self,
+        rows: usize,
+        sequences: usize,
+        ctx: u64,
+    ) -> Result<()> {
+        self.ep_broadcast_seq_and_cmd(announce_word(rows, ctx)?, EP_CMD_DRAFT_ASSIST, true)?;
+        if extra_follows(sequences, ctx_requested()?) {
+            self.ep_broadcast_u32(announce_extra(ctx))?;
+        }
+        Ok(())
     }
 
     /// Worker side of EC: `seq_id` is the announce word (`announce_word`).
@@ -90,7 +103,17 @@ impl TransformerModel {
         let comm = self
             .comm_ref()
             .context("rank-split propose without a communicator")?;
-        head.rank_split_serve(self.gpu.as_ref(), comm, self.gpu.default_stream(), seq_id)?;
+        let extra = head
+            .rank_split_extra_follows(seq_id)
+            .then(|| self.ep_broadcast_u32(0))
+            .transpose()?;
+        head.rank_split_serve(
+            self.gpu.as_ref(),
+            comm,
+            self.gpu.default_stream(),
+            seq_id,
+            extra,
+        )?;
         Ok(true)
     }
 }

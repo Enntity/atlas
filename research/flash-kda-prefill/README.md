@@ -14,7 +14,7 @@ Enable explicitly with `ATLAS_KDA_FLASH_PREFILL=1` and an absolute
 `libatlas_glm53_flash_kda.so` must be alongside it; link the shim with `$ORIGIN`
 rpath. Disabled by default. Missing library/symbols or wrong ABI fail startup.
 
-Only ordinary H32/D128 prefill with 2048 through4100 rows and lower-bound−5 is
+Only ordinary H32 (TP2) or H16 (TP4) D128 prefill with 2048 through4100 rows and lower-bound−5 is
 eligible. Decode, graph capture, MTP intermediate snapshots and short tails retain
 the existing recurrence. FlashKDA already normalizes Q/K; the adapter copies raw
 BF16 operands. Canonical FP32 key-major state is transposed in and out on the

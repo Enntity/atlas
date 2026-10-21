@@ -312,6 +312,75 @@ pub fn glm_index_topk_expand(
         .launch(stream)
 }
 
+/// The index split's compact form of `glm_index_topk_expand` rows
+/// (`glm_index_sel_pack` / `glm_index_sel_unpack`): each selected pool's run
+/// of `pool` ids as its first id, then the causal tail slots, so
+/// `topk / pool + width - topk` words a row instead of `width`. Unpacking a
+/// packed row gives back its exact words.
+#[derive(Clone, Copy, Debug)]
+pub struct GlmSelCompact {
+    pub pack: KernelHandle,
+    pub unpack: KernelHandle,
+    pub topk: u32,
+    pub pool: u32,
+    pub width: u32,
+}
+
+impl GlmSelCompact {
+    /// Words of a compact row.
+    pub fn row_words(&self) -> usize {
+        (self.topk / self.pool + self.width - self.topk) as usize
+    }
+
+    /// Pack `rows` expanded rows at `selected` into `compact`.
+    pub fn pack(
+        &self,
+        gpu: &dyn GpuBackend,
+        selected: DevicePtr,
+        compact: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        self.launch(gpu, self.pack, selected, compact, rows, stream)
+    }
+
+    /// Expand `rows` compact rows at `compact` into `selected`.
+    pub fn unpack(
+        &self,
+        gpu: &dyn GpuBackend,
+        compact: DevicePtr,
+        selected: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        self.launch(gpu, self.unpack, compact, selected, rows, stream)
+    }
+
+    fn launch(
+        &self,
+        gpu: &dyn GpuBackend,
+        kernel: KernelHandle,
+        from: DevicePtr,
+        to: DevicePtr,
+        rows: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        KernelLaunch::new(gpu, kernel)
+            .grid([rows as u32, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(from)
+            .arg_ptr(to)
+            .arg_u32(rows as u32)
+            .arg_u32(self.topk)
+            .arg_u32(self.pool)
+            .arg_u32(self.width)
+            .launch(stream)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn glm_sparse_mla_prefill(
     gpu: &dyn GpuBackend,

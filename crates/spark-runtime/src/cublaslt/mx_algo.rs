@@ -223,7 +223,7 @@ pub(super) fn matmul(
             out as *mut c_void,
             p.ld,
             algo.as_ptr() as *const c_void,
-            ctx.workspace as *mut c_void,
+            ctx.workspace()? as *mut c_void,
             ctx.ws_size,
             stream as *mut c_void,
         )
@@ -366,7 +366,7 @@ fn pin(
 
 /// Pin the MXFP8 W8A8 kernel of `n x k` now (load time): the fastest
 /// in-order candidate that takes every pinned height, timed at `ref_m` rows
-/// on scratch operands, kept for the run ([`pinned`]). A no-op once pinned.
+/// on scratch operands, kept for the run (`pinned`). A no-op once pinned.
 /// Synchronizes `stream`.
 pub fn fp8_gemm_mx_pinned_prepare(n: u32, k: u32, ref_m: u32, stream: u64) -> Result<()> {
     let ctx = ctx()?;

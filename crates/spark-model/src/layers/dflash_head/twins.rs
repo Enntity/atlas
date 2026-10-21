@@ -216,7 +216,10 @@ impl BlockDiffusionDraftHead {
                 k,
                 gpu,
                 gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                gpu.kernel(
+                    "quantize_nvfp4",
+                    crate::layers::glm_native::mode::weight_quantizer()?,
+                )?,
                 gpu.default_stream(),
             )?),
             ConvTwinKind::Mxfp8 => {
@@ -261,7 +264,10 @@ impl BlockDiffusionDraftHead {
         let fc_in = self.target_layer_ids.len() * self.target_hidden_size;
         let fused_n = self.num_layers * 2 * self.num_kv_heads * self.head_dim;
         let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-        let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let quant = gpu.kernel(
+            "quantize_nvfp4",
+            crate::layers::glm_native::mode::weight_quantizer()?,
+        )?;
         let stream = gpu.default_stream();
         let q4 = |w: &DenseWeight, n, k| {
             crate::weight_map::quantize_to_nvfp4(w, n, k, gpu, absmax, quant, stream)
@@ -316,7 +322,10 @@ impl BlockDiffusionDraftHead {
                 h,
                 gpu,
                 gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                gpu.kernel(
+                    "quantize_nvfp4",
+                    crate::layers::glm_native::mode::weight_quantizer()?,
+                )?,
                 stream,
             )?);
             gpu.synchronize(stream)?;

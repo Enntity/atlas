@@ -173,10 +173,12 @@ pub(crate) fn prepare_chat_prompt(
             .min(gen_max as u32);
         thinking_budget = thinking_budget.map(|b| b.max(deeper));
     }
+    // A template that owns its effort vocabulary gets the client's effort
+    // whatever thinking resolved to, as vLLM passes it.
     let reasoning_effort = effective_reasoning_effort(
         req.reasoning_effort,
         state.default_reasoning_effort,
-        enable_thinking,
+        enable_thinking || state.behavior.verbatim_reasoning_effort,
     );
     let us_thinking = _t_phase.elapsed().as_micros() - us_msg_entry;
 
@@ -199,7 +201,6 @@ pub(crate) fn prepare_chat_prompt(
         // leaves the Jinja variable undefined (template default).
         req.preserve_thinking.or(state.behavior.preserve_thinking),
         tools_active,
-        req.response_format.is_some(),
     )?;
     if state.chat.phase_timing {
         let us_template = _t_phase.elapsed().as_micros() - us_msg_entry - us_thinking;
@@ -260,6 +261,10 @@ fn inject_tool_system_prompt(messages: &mut Vec<crate::ir::Message>, tool_prompt
         messages.insert(0, crate::ir::Message::synthetic_system(tool_prompt));
     }
 }
+
+#[cfg(test)]
+#[path = "glm_prompt_parity_tests.rs"]
+mod glm_prompt_parity_tests;
 
 #[cfg(test)]
 mod tests {

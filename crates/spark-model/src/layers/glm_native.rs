@@ -21,6 +21,9 @@
 //! else off, like the loader's other flags; a group's own switch, when set,
 //! overrides the umbrella either way.
 
+pub mod mode;
+pub mod topology;
+
 /// Which layer groups load their checkpoint format natively.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativePolicy {

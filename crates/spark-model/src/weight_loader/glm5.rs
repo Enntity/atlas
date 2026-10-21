@@ -12,6 +12,10 @@ mod kda_side_pack;
 mod layers;
 mod mla_native;
 mod mla_twins;
+mod mtp;
+pub(crate) use mtp::{
+    Glm5MtpModule, glm5_mtp_draft_config, glm5_mtp_marker_names, load_glm5_mtp_module,
+};
 pub(crate) mod retirement;
 mod shared_native;
 mod tp;

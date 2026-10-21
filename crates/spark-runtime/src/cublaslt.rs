@@ -172,8 +172,24 @@ unsafe extern "C" {
 
 struct Ctx {
     handle: cublasLtHandle_t,
-    workspace: u64,
+    lanes: crate::lane::LaneWorkspace,
     ws_size: usize,
+}
+
+impl Ctx {
+    /// The calling thread's scratch lane's workspace (`crate::lane`).
+    fn workspace(&self) -> Result<u64> {
+        self.lanes.get()
+    }
+}
+
+fn alloc_workspace(bytes: usize) -> Result<u64> {
+    let mut ws: u64 = 0;
+    let st = unsafe { cuMemAlloc_v2(&mut ws, bytes) };
+    if st != 0 {
+        bail!("cuMemAlloc cuBLASLt workspace failed: {st}");
+    }
+    Ok(ws)
 }
 // cuBLASLt handle + device workspace are process-global; matmul is invoked
 // serially from the single-threaded scheduler forward.
@@ -209,7 +225,7 @@ fn ctx() -> Result<&'static Ctx> {
     }
     let _ = CTX.set(Ctx {
         handle,
-        workspace: ws,
+        lanes: crate::lane::LaneWorkspace::new(ws_size, ws, alloc_workspace),
         ws_size,
     });
     Ok(CTX.get().unwrap())
@@ -344,6 +360,36 @@ pub fn bf16_gemm_act_weight_t(
             Err(e)
         }
     }
+}
+
+/// [`bf16_gemm_act_weight_t`] with an FP32 `out[M,N]`: the FP32 accumulator
+/// unrounded (GLM-5's `moe_router_dtype: float32` router logits, the
+/// reference's `torch.mm(x, w.T, out_dtype=float32)`). No BF16 fallback.
+pub fn bf16_gemm_act_weight_t_f32out(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    let pick = if kchain_pin::applies(m, n, true) {
+        kchain_pin::Pick::Pin
+    } else {
+        kchain_pin::Pick::First
+    };
+    gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        CUBLAS_OP_T,
+        pick,
+        CUDA_R_32F,
+        stream,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]

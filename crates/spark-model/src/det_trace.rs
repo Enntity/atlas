@@ -37,6 +37,16 @@
 //! (absorbed queries), `x_attn_lat` (attention output before W_uv/`o_proj`);
 //! MoE `x_gate` (router logits).
 //!
+//! `ATLAS_GLM_DET_DUMP=<dir>` also writes every traced tensor's bytes to
+//! `<dir>/r<rank>_q<request>_c<chunk start>_L<layer>_<stage>_r<first row>_n<rows>.bin`,
+//! so runs whose bytes cannot match (another TP size, say) compare by value
+//! (`scripts/dev/det_dump_compare.py`).
+//!
+//! A DFlash verify block is traced too, as the chunk at its first row's
+//! position: per layer its MLA prefill taps and `v_out` (the layer's output
+//! rows), then `v_final` (normed hidden) and, where the whole vocab head runs
+//! here, `v_logits`.
+//!
 //! Every tap synchronizes the stream and copies the tensor to the host, so
 //! a traced prefill is several times slower and its stream timing differs.
 //! Unset, the taps return on one cached flag and nothing else changes.
@@ -314,6 +324,36 @@ fn device_line(
     format_line(at, stage, rows, bytes, hash)
 }
 
+/// `ATLAS_GLM_DET_DUMP`: the directory traced tensors are written to.
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("ATLAS_GLM_DET_DUMP").map(Into::into))
+        .as_deref()
+}
+
+/// Write `bytes` at `ptr` (read after `stream`) as `stage` of `at`, rows from
+/// `row0`, into the dump directory. Best effort: a debugging aid.
+fn dump(
+    at: At,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    stage: &str,
+    ptr: DevicePtr,
+    rows: (usize, usize),
+    bytes: usize,
+) {
+    let Some(dir) = dump_dir() else { return };
+    let mut host = vec![0u8; bytes];
+    if gpu.synchronize(stream).is_err() || gpu.copy_d2h(ptr, &mut host).is_err() {
+        return;
+    }
+    let name = format!(
+        "r{}_q{}_c{}_L{}_{stage}_r{}_n{}.bin",
+        at.rank, at.request, at.chunk_start, at.layer, rows.0, rows.1
+    );
+    let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(name), host));
+}
+
 /// Taps reading after `stream` (see [`on_stream`]).
 #[derive(Clone, Copy)]
 pub struct Taps<'a> {
@@ -345,6 +385,15 @@ impl Taps<'_> {
                 rows,
                 row_bytes,
             ));
+            dump(
+                at,
+                self.gpu,
+                self.stream,
+                stage,
+                ptr,
+                rows,
+                rows.1 * row_bytes,
+            );
         }
     }
 }

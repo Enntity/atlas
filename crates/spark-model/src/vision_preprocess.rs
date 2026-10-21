@@ -11,10 +11,10 @@ use atlas_core::config::VisionConfig;
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
 
 mod glm_sizing;
-use glm_sizing::glm_pixel_budget;
-#[cfg(test)]
-use glm_sizing::{GLM_FALLBACK_MAX_PATCHES, glm_runtime_max_pixels};
-pub(crate) use glm_sizing::{derive_glm_max_patches, glm_resize_or_pad, glm_target_size};
+pub(crate) use glm_sizing::{
+    glm_max_item_tokens, glm_max_sequence_patches, glm_pixel_budget, glm_resize_or_pad,
+    glm_target_size,
+};
 
 /// SigLIP normalization — matches HF's Qwen2VLImageProcessor
 /// (`image_mean = image_std = (0.5, 0.5, 0.5)` → pixels mapped to [-1, 1]).
@@ -54,14 +54,14 @@ const ABS_MAX_DIM: u32 = 4096;
 /// before a single pixel is allocated. Everything is resized down to at most
 /// [`ABS_MAX_DIM`] anyway, so this only has to be above any real camera
 /// image; 16384 is ~4× the long side of a 50 MP photo.
-const DECODE_MAX_SIDE: u32 = 16_384;
+pub(crate) const DECODE_MAX_SIDE: u32 = 16_384;
 
 /// Decoder limit: bytes the decoder may hold at once for one image. The
 /// `image` crate's own default is 512 MiB, which on GB10's UNIFIED 121 GB
 /// CPU+GPU memory is a per-request budget competing directly with the KV
 /// cache — and the request body arrives over HTTP from an unauthenticated
 /// caller. 192 MiB still admits an 8000×8000 RGB image.
-const DECODE_MAX_ALLOC: u64 = 192 * 1024 * 1024;
+pub(crate) const DECODE_MAX_ALLOC: u64 = 192 * 1024 * 1024;
 
 /// Split a base64 `data:` URI (or a bare base64 string) into its declared
 /// MIME type and decoded bytes.

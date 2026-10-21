@@ -8,6 +8,7 @@ use atlas_core::config::ModelConfig;
 
 use crate::cli;
 
+mod glm_chain;
 mod gpu_init;
 mod independent;
 mod ssm_h_fp16;
@@ -22,10 +23,6 @@ pub(crate) struct ReservePreflight {
     pub(crate) ssm_prefill_chunk: usize,
     pub(crate) max_batch_tokens_pre: usize,
     pub(crate) resolved_prefill: Option<super::PrefillBudget>,
-}
-
-fn glm5_dual_spark_parallelism(world: usize, tp: usize, ep: usize) -> bool {
-    world == 2 && ep == 2 && matches!(tp, 1 | 2)
 }
 
 fn glm5_concurrency_supported(
@@ -77,8 +74,9 @@ pub(crate) fn preflight_reserve(
     let long_context = spark_model::speculative::glm_repair_policy::long_context_enabled();
     anyhow::ensure!(
         !long_context
-            || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled()),
-        "GLM long-context verification requires the GLM DFlash lane"
+            || (args.dflash && spark_model::speculative::glm_repair_policy::dflash_enabled())
+            || (args.speculative && spark_model::layers::glm_native::mode::strict_native_mtp()),
+        "GLM long-context verification requires the GLM DFlash lane or explicit strict native MTP"
     );
     // The long-context lane retains TP-local topology and the exact row budget.
     let bounded = long_context;
@@ -87,6 +85,15 @@ pub(crate) fn preflight_reserve(
         std::env::var("ATLAS_GLM_C4_SPARSE").ok().as_deref(),
     )?;
     if config.model_type == "glm5_next" {
+        // The parallelism and, beyond two ranks, the two-rank lanes first:
+        // later checks assume a supported topology.
+        glm_chain::parallelism_supported(
+            args.world_size,
+            args.tp_size,
+            args.ep_size,
+            spark_comm::rdma_requested(),
+        )?;
+        glm_chain::check(args.world_size, |name| std::env::var(name).ok())?;
         let sparse_decode =
             spark_model::layers::qwen3_attention::glm_multi_seq_sparse_enabled(&config.model_type);
         anyhow::ensure!(
@@ -158,13 +165,19 @@ pub(crate) fn preflight_reserve(
             config.index_topk,
         );
         anyhow::ensure!(
-            !(args.speculative || args.self_speculative || args.ngram_speculative),
-            "GLM-5 speculative decoding is served through --dflash; its native MTP layer \
-             and self/n-gram speculation are not supported"
-        );
-        anyhow::ensure!(
-            glm5_dual_spark_parallelism(args.world_size, args.tp_size, args.ep_size),
-            "GLM-5 dual-Spark support requires --world-size 2 --ep-size 2 and either --tp-size 1 (EP fallback) or --tp-size 2 (overlapping TP+EP)"
+            !(args.self_speculative || args.ngram_speculative)
+                && (!args.speculative
+                    || (spark_model::layers::glm_native::mode::strict_native_mtp()
+                        && !args.dflash
+                        && (1..=4).contains(&args.max_batch_size)
+                        && args.max_num_seqs == args.max_batch_size
+                        && (args.max_batch_size == 1 || ep_v2)
+                        && spark_model::layers::glm_native::topology::supported_parallelism(
+                            args.world_size,
+                            args.tp_size,
+                            args.ep_size,
+                        ))),
+            "GLM-5 native MTP requires explicit strict native MTP, TP2/EP2 or TP4/EP4, and C1..C4 with equal active/admitted limits"
         );
     }
     let h_state_bytes = config.ssm_h_state_bytes();
@@ -323,12 +336,40 @@ pub(crate) fn preflight_reserve(
             * config.num_ssm_layers()
             * (h_state_bytes + conv_state_bytes)
     };
-    let cuda_headroom: usize =
-        if args.speculative || args.self_speculative || args.ngram_speculative {
-            4 * 1024 * 1024 * 1024
-        } else {
-            512 * 1024 * 1024
-        };
+    // Native GLM allocates predictor weights/workspace before the free-memory
+    // snapshot and budgets its private KV jointly with target KV. Its eager
+    // owner staging is only tens of MiB; the generic 4 GiB speculation reserve
+    // charged that memory twice. GDN scratch and the KV growth floor remain.
+    // Earlier GLM admission checks constrain this exception to matching
+    // TP2/EP2 or TP4/EP4 C1..C4.
+    let native_preallocated = config.model_type == "glm5_next"
+        && args.speculative
+        && long_context
+        && spark_model::layers::glm_native::mode::strict_native_mtp()
+        && matches!(
+            spark_model::layers::glm_native::mode::selected()?,
+            Some(spark_model::layers::glm_native::mode::ServingMode::Strict)
+        );
+    if native_preallocated {
+        for flag in [
+            "ATLAS_GLM_MTP1_VERIFY_GRAPH",
+            "ATLAS_GLM_TP_VERIFY_GRAPH",
+            "ATLAS_GLM_MULTI_SEQ_SPARSE_GRAPHS",
+        ] {
+            anyhow::ensure!(
+                matches!(std::env::var(flag).ok().as_deref(), None | Some("0")),
+                "strict native GLM memory accounting requires eager verification: {flag} must be disabled"
+            );
+        }
+    }
+    let cuda_headroom: usize = if (args.speculative && !native_preallocated)
+        || args.self_speculative
+        || args.ngram_speculative
+    {
+        4 * 1024 * 1024 * 1024
+    } else {
+        512 * 1024 * 1024
+    };
     let gdn_two_phase_bytes: usize = {
         let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
         let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;

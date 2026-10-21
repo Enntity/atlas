@@ -223,6 +223,12 @@ pub struct ModelBehavior {
     /// Let the checkpoint chat template render tool definitions and examples;
     /// Atlas still renders API-level `tool_choice` policy instructions.
     pub template_owns_tool_definitions: bool,
+    /// Hand the client's `reasoning_effort` spelling to the chat template
+    /// verbatim (`minimal`, `max`, ...), as vLLM does, instead of Atlas's
+    /// cross-template tier (`minimal` -> `low`, `max` -> `xhigh`). For a
+    /// checkpoint template that owns its own effort vocabulary: GLM-5.3's
+    /// renders `low`/`high` as asked and everything else as `Max`.
+    pub verbatim_reasoning_effort: bool,
     /// Do not append Atlas's derived `<environment>working_directory` block to
     /// a client system prompt. Native agent clients may already provide the
     /// cwd; duplicating it can become a tool-selection attractor.
@@ -414,6 +420,7 @@ impl Default for ModelBehavior {
             default_num_drafts: 0,
             disable_tool_steering: false,
             template_owns_tool_definitions: false,
+            verbatim_reasoning_effort: false,
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             use_sampling_preset_penalties_for_core: true,

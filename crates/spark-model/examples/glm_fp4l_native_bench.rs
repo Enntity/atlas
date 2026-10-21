@@ -34,7 +34,11 @@
 //! Run (GB10, GLM kernel build):
 //!   ATLAS_TARGET_HW=gb10 ATLAS_TARGET_MODEL=glm-5.3-flash ATLAS_TARGET_QUANT=nvfp4 \
 //!     cargo run -p spark-model --release --features cuda,gpu-examples \
-//!     --example glm_fp4l_native_bench [reps=7]
+//!     --example glm_fp4l_native_bench [reps=7] [tp=2]
+//!
+//! `tp=4`: the MLA q_b / o at a TP4 rank's 16 heads ([4096 x 1536] /
+//! [4096 x 4096]); the q_b / o lines then add the FP8 block twin in the
+//! chunk-tiled layout (`ATLAS_GLM_MXFP8_TILED`).
 
 use anyhow::{Result, ensure};
 use spark_model::layers::ops::{self, MxPart, native_kernels};
@@ -245,6 +249,11 @@ fn main() -> Result<()> {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(7);
+    let tp: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    ensure!(matches!(tp, 2 | 4), "tp must be 2 or 4");
     let backend = AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())?;
     let g: &dyn GpuBackend = &backend;
     let missing = ops::missing_native_kernels(g);
@@ -272,8 +281,28 @@ fn main() -> Result<()> {
     let kda = Weight::new(g, &mut rng, 4096, 4096)?;
     let q_a = Weight::new(g, &mut rng, 1536, 4096)?;
     let kv_a = Weight::new(g, &mut rng, 512, 4096)?;
-    let q_b = Weight::new(g, &mut rng, 8192, 1536)?;
-    let mla_o = Weight::new(g, &mut rng, 4096, 8192)?;
+    let heads_dim = 16384 / tp;
+    let q_b = Weight::new(g, &mut rng, heads_dim, 1536)?;
+    let mla_o = Weight::new(g, &mut rng, 4096, heads_dim)?;
+    // The FP8 block twins of q_b / o again, value-tiled (TP4 only).
+    let tiled_fp8b = |w: &Weight| -> Result<Vec<Fp8BlockWeight>> {
+        if tp != 4 {
+            return Ok(Vec::new());
+        }
+        let mut set = Vec::new();
+        for t in &w.fp8b {
+            let data = g.alloc(w.n * w.k)?;
+            g.copy_d2d(t.data, data, w.n * w.k)?;
+            ops::mx_tile_values_in_place(g, data, w.n, w.k, 0)?;
+            set.push(Fp8BlockWeight {
+                data,
+                tiled: true,
+                ..*t
+            });
+        }
+        Ok(set)
+    };
+    let (q_b_tiled, mla_o_tiled) = (tiled_fp8b(&q_b)?, tiled_fp8b(&mla_o)?);
     let sh_gu = Weight::new(g, &mut rng, 2048, 4096)?;
     let sh_down = Weight::new(g, &mut rng, 4096, 2048)?;
     let dense_gu = Weight::new(g, &mut rng, 12288, 4096)?;
@@ -456,7 +485,7 @@ fn main() -> Result<()> {
             fb,
             q_a.fp8b_bytes() + kv_a.fp8b_bytes(),
         );
-        for (label, w) in [("q_b", &q_b), ("o", &mla_o)] {
+        for (label, w, tiled) in [("q_b", &q_b, &q_b_tiled), ("o", &mla_o, &mla_o_tiled)] {
             let copies = w.mx.len();
             let mx = time(g, reps, copies, &|c| {
                 ops::mxfp8_gemv_rows(
@@ -487,6 +516,18 @@ fn main() -> Result<()> {
                 fb,
                 w.fp8b_bytes(),
             );
+            if !tiled.is_empty() {
+                let ft = time(g, reps, tiled.len(), &|c| {
+                    ops::fp8b_gemv_rows(g, &nk.fp8b, &tiled[c], x, outs[0], m, w.n, w.k, w.n, 0)
+                })?;
+                line(&format!("{label} FP8 block tiled"), m, ft, w.fp8b_bytes());
+                line(
+                    &format!("{label} floor"),
+                    m,
+                    floor(w, w.fp8b_bytes())?,
+                    w.fp8b_bytes(),
+                );
+            }
         }
     }
 

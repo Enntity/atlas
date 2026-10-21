@@ -8,17 +8,23 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
+
+/// Reader threads per shard; how many tensors, and how many bytes past the
+/// next one the upload needs, they may hold ahead of it.
+const SHARD_READERS: usize = 8;
+const READ_AHEAD: usize = 16;
+const READ_AHEAD_BYTES: usize = 1 << 30;
 
 /// Load a single shard with O_DIRECT + pipelined read/copy.
 ///
 /// Pipeline:
-///   reader thread: pread tensor N into aligned buffer → sync_channel ──▶
-///   main thread:   recv → copy_h2d → store tensor
+///   reader threads: pread tensors into aligned buffers → sync_channel ──▶
+///   main thread:    recv, in tensor order → copy_h2d → store tensor
 ///
-/// The channel has capacity 1, so at any time the reader is ≤1 tensor
-/// ahead of the copier. Memory overhead per shard: 2 × max_tensor_bytes
-/// (rounded up to O_DIRECT alignment).
+/// The readers stay at most [`READ_AHEAD`] tensors, and past the next one
+/// [`READ_AHEAD_BYTES`], ahead of the copier.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn load_shard_fast(
     shard_path: &Path,
@@ -128,29 +134,94 @@ pub(super) fn load_shard_fast(
         advise_prefetch_shard(&buffered_file, shard_path, file_size);
     }
 
-    // Pipelined reader: sends (tensor_index, aligned_buffer, slice_start) to main.
+    // Pipelined readers: SHARD_READERS threads read tensors at most
+    // READ_AHEAD ahead of the copier and send (tensor_index, aligned_buffer,
+    // slice_start); the copier uploads them in tensor order. One reader
+    // waited on one read at a time (~0.7 GB/s over a GLM-5 TP4 rank's
+    // shards).
     type ReadMsg = (usize, direct_io::AlignedBuffer, usize);
-    let (tx, rx) = sync_channel::<Result<ReadMsg>>(1);
-    let tensors_for_reader: Vec<(u64, usize)> =
-        tensors.iter().map(|t| (t.abs_offset, t.len)).collect();
+    let (tx, rx) = sync_channel::<Result<ReadMsg>>(READ_AHEAD);
+    let tensors_for_reader: std::sync::Arc<Vec<(u64, usize)>> =
+        std::sync::Arc::new(tensors.iter().map(|t| (t.abs_offset, t.len)).collect());
     let raw_fd = {
         use std::os::unix::io::AsRawFd;
         data_fd.as_raw_fd()
     };
+    let next = std::sync::Arc::new(AtomicUsize::new(0));
+    let copied = std::sync::Arc::new(AtomicUsize::new(0));
+    let held = std::sync::Arc::new(AtomicUsize::new(0));
+    // Raised when the copier returns (an upload failed), so no reader waits
+    // for it forever.
+    struct Stop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let stop = Stop(std::sync::Arc::default());
 
     let _ = file_size; // retained for future use (tail-fragment buffered read)
-    let reader_handle = std::thread::spawn(move || {
-        for (idx, (abs_offset, len)) in tensors_for_reader.iter().enumerate() {
-            let msg = direct_io::read_tensor_aligned(raw_fd, *abs_offset, *len, using_direct)
-                .map(|(buf, slice_start)| (idx, buf, slice_start));
-            if tx.send(msg).is_err() {
-                break; // receiver dropped
+    let reader_handles: Vec<_> = (0..SHARD_READERS)
+        .map(|_| {
+            let (tx, list) = (tx.clone(), tensors_for_reader.clone());
+            let (next, copied, held) = (next.clone(), copied.clone(), held.clone());
+            let stop = stop.0.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(abs_offset, len)) = list.get(idx) else {
+                        break;
+                    };
+                    loop {
+                        let first = copied.load(Ordering::Acquire);
+                        if idx == first
+                            || (idx < first + READ_AHEAD
+                                && held.load(Ordering::Acquire) + len <= READ_AHEAD_BYTES)
+                        {
+                            break;
+                        }
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(50));
+                    }
+                    held.fetch_add(len, Ordering::AcqRel);
+                    let msg = direct_io::read_tensor_aligned(raw_fd, abs_offset, len, using_direct)
+                        .map(|(buf, slice_start)| (idx, buf, slice_start));
+                    if tx.send(msg).is_err() {
+                        break; // receiver dropped
+                    }
+                }
+            })
+        })
+        .collect();
+    drop(tx);
+    let mut early: std::collections::BTreeMap<usize, (direct_io::AlignedBuffer, usize)> =
+        std::collections::BTreeMap::new();
+    let mut want = 0usize;
+    // The reads in tensor order: each message, held until those before it
+    // have arrived.
+    let in_order = std::iter::from_fn(|| {
+        loop {
+            if let Some((buf, slice_start)) = early.remove(&want) {
+                held.fetch_sub(tensors_for_reader[want].1, Ordering::AcqRel);
+                want += 1;
+                copied.store(want, Ordering::Release);
+                return Some(Ok((want - 1, buf, slice_start)));
+            }
+            match rx.recv() {
+                Ok(Ok((idx, buf, slice_start))) => {
+                    early.insert(idx, (buf, slice_start));
+                }
+                Ok(Err(e)) => return Some(Err(e)),
+                Err(_) => return None,
             }
         }
     });
 
-    // Copier: drains the channel, does gpu alloc + copy_h2d, inserts into the map.
-    for result in rx {
+    // Copier: drains the reads in order, does gpu alloc + copy_h2d, inserts
+    // into the map.
+    for result in in_order {
         let (idx, buf, slice_start) = result?;
         let meta = &tensors[idx];
         let raw = &buf.as_slice()[slice_start..slice_start + meta.len];
@@ -193,9 +264,11 @@ pub(super) fn load_shard_fast(
         );
     }
 
-    reader_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    for reader in reader_handles {
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    }
 
     // Release file handles, then advise the kernel to drop any pages we did
     // end up caching on the buffered fallback path. O_DIRECT reads never hit

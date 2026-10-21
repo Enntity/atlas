@@ -204,7 +204,7 @@ pub(super) fn build_active_seq_from_prefill(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: p.enable_thinking,
         thinking_budget: if !immediate_finish && spontaneous_think {
-            Some(p.spontaneous_think_budget)
+            crate::ir::server_thinking_budget(p.spontaneous_think_budget)
         } else {
             p.thinking_budget
         },

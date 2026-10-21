@@ -45,7 +45,7 @@ extern "C" int atlas_sparse_merge(const void* main_out, const void* tail_out,
     void* output, float* output_lse, unsigned rows, unsigned heads, void* stream){
   if(!main_out || !tail_out || !main_lse || !tail_lse || !tail_counts ||
      !output || !output_lse) return (int)cudaErrorInvalidValue;
-  if(rows == 0 || heads != 32) return (int)cudaErrorInvalidValue;
+  if(rows == 0 || (heads != 16 && heads != 32)) return (int)cudaErrorInvalidValue;
   dim3 grid(rows, heads), block(256);
   atlas_sparse_merge_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(
       (const __nv_bfloat16*)main_out, (const __nv_bfloat16*)tail_out,

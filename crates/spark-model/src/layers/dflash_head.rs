@@ -715,6 +715,13 @@ pub struct BlockDiffusionDraftHead {
     /// One extra-lane stream may serve several seqs (n > lanes); the lane
     /// itself never moves for a seq.
     pub next_lane: std::sync::atomic::AtomicUsize,
+    /// Finished sequences' ctx accumulators, `(bytes, ptr)`, kept for the
+    /// next `alloc_state` (re-zeroed there) instead of freed: the
+    /// accumulator's cuMemAlloc was 3.2 ms of every request's TTFT on GB10
+    /// (rank-0 nsys 2026-10-18). At most `acc_pool_cap` (0: none, freed as
+    /// before).
+    pub acc_pool: Mutex<Vec<(usize, DevicePtr)>>,
+    pub acc_pool_cap: usize,
     /// Entry-ordering event: recorded on the default stream at the top of
     /// the multi-lane `propose_batch`; every extra lane waits on it so
     /// drafter-ctx precompute / `after_verify` writes enqueued on the
@@ -1149,7 +1156,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let max_ctx_len = self.ctx_window_len();
         let own = self.startup.diagnostics.first_append != FirstAppend::Legacy;
         let total = (max_ctx_len + own as usize) * ctx_slot_bytes;
-        let ctx_hidden_acc = gpu.alloc(total)?;
+        let pooled = {
+            let mut pool = self.acc_pool.lock();
+            pool.iter()
+                .position(|&(bytes, _)| bytes == total)
+                .map(|i| pool.swap_remove(i).1)
+        };
+        let ctx_hidden_acc = match pooled {
+            Some(ptr) => ptr,
+            None => gpu.alloc(total)?,
+        };
         // Initialize to zero so stale data doesn't leak between sequences.
         // Transactional: a failed memset frees the accumulator instead of
         // leaking it for the server's lifetime; a failed FREE during that
@@ -1264,7 +1280,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         &self,
         comm: &dyn spark_comm::CommBackend,
         seqs: &[rank_split::CtxSeq<'_>],
-    ) -> u32 {
+    ) -> u64 {
         self.split_ctx_rows(comm, seqs)
     }
 
@@ -1418,6 +1434,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // non-null pointer so a double free_state is a no-op. A failed free
         // is logged and the pointer RETAINED so a cleanup retry can release
         // it (a silently cleared pointer would leak unrecoverably).
+        if dstate.ctx_hidden_acc.0 != 0 {
+            let bytes = (dstate.max_ctx_len + usize::from(dstate.own_row.is_some()))
+                * dstate.ctx_slot_bytes;
+            let mut pool = self.acc_pool.lock();
+            if pool.len() < self.acc_pool_cap {
+                // Kept for the next sequence (`acc_pool`).
+                pool.push((bytes, dstate.ctx_hidden_acc));
+                dstate.ctx_hidden_acc = DevicePtr(0);
+                dstate.own_row = None;
+            }
+        }
         if dstate.ctx_hidden_acc.0 != 0 {
             if let Err(error) = gpu.free(dstate.ctx_hidden_acc) {
                 tracing::error!(

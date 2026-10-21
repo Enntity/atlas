@@ -301,7 +301,7 @@ fn chat_template_kwargs_reasoning_effort_channel() {
         req.client_thinking_directive(),
         ThinkingDirective::OnEffort(EffortLevel::XHigh)
     );
-    assert_eq!(req.client_reasoning_effort(), Some(ReasoningEffort::Max));
+    assert_eq!(req.client_reasoning_effort(), Some(ReasoningEffort::XHigh));
 }
 
 /// Trap C fix: a typo'd effort must FAIL, not silently resolve — on any
@@ -393,11 +393,28 @@ fn reasoning_effort_strings_render_template_safe() {
     // so Max MUST NOT surface as "max" (the template raises and the
     // request 400s). "medium" keeps its own level instead of demoting to
     // low (different Qwen3.8 instruction bytes).
-    use crate::ir::ReasoningEffort;
-    assert_eq!(ReasoningEffort::Max.as_str(), "xhigh");
-    assert_eq!(ReasoningEffort::Medium.as_str(), "medium");
-    assert_eq!(ReasoningEffort::High.as_str(), "high");
-    assert_eq!(ReasoningEffort::Low.as_str(), "low");
+    use crate::ir::ReasoningEffort::{self, *};
+    assert_eq!(Max.as_str(), "xhigh");
+    assert_eq!(XHigh.as_str(), "xhigh");
+    assert_eq!(Medium.as_str(), "medium");
+    assert_eq!(High.as_str(), "high");
+    assert_eq!(Low.as_str(), "low");
+    assert_eq!(Minimal.as_str(), "low");
+    // A template that owns its vocabulary (GLM-5.3) gets the wire spelling.
+    for (effort, wire) in [
+        (Minimal, "minimal"),
+        (Low, "low"),
+        (Medium, "medium"),
+        (High, "high"),
+        (XHigh, "xhigh"),
+        (Max, "max"),
+    ] {
+        assert_eq!(effort.wire_str(), wire);
+        assert_eq!(
+            crate::ir::parse_wire_effort(wire).and_then(|(e, _)| e),
+            Some(effort)
+        );
+    }
 
     let mut b = base_body();
     b["reasoning_effort"] = serde_json::json!("medium");

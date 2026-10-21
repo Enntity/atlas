@@ -34,7 +34,7 @@
 //! # EP
 //!
 //! One worker command, `0xFFFFFFE8`: preamble slot of the first prompt, then
-//! N, slots[N], lengths[N] and every prompt's tokens in one bulk broadcast.
+//! N, `slots[N]`, `lengths[N]` and every prompt's tokens in one bulk broadcast.
 //! The head decides the packing; the worker follows it.
 
 use anyhow::{Context, Result, ensure};

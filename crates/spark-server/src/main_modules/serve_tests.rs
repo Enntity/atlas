@@ -180,7 +180,7 @@ fn default_kwargs_reasoning_effort_sets_both_halves() {
     let kw = parse_default_chat_template_kwargs(r#"{"reasoning_effort":"xhigh"}"#).unwrap();
     // The template string AND the budget directive come from one parse,
     // so effort-silent requests get the same tier on both paths.
-    assert_eq!(kw.reasoning_effort, Some(ReasoningEffort::Max));
+    assert_eq!(kw.reasoning_effort, Some(ReasoningEffort::XHigh));
     assert_eq!(kw.thinking, ThinkingDirective::OnEffort(EffortLevel::XHigh));
     assert_eq!(kw.preserve_thinking, None);
 
@@ -234,4 +234,32 @@ fn default_kwargs_fail_fast_on_typos() {
     assert!(parse_default_chat_template_kwargs(r#"{"reasoning_efforts":"low"}"#).is_err());
     // Invalid JSON.
     assert!(parse_default_chat_template_kwargs("not json").is_err());
+}
+
+/// GLM-5.3 declares token budgets, not pixel areas: the nested image and
+/// video blocks of the shipped `processor_config.json` are read as given
+/// (the serving video cap is applied where the budget is used).
+#[test]
+fn reads_the_glm_token_budgets_per_modality() {
+    let d = dir_with(&[(
+        "processor_config.json",
+        r#"{
+            "image_processor": {"min_image_tokens": 16, "max_image_tokens": 8000},
+            "video_processor": {"min_image_tokens": 16, "max_image_tokens": 240000, "fps": 2}
+        }"#,
+    )]);
+    let budgets = read_glm_token_budgets(d.path());
+    assert_eq!(budgets.image, (16, 8000));
+    assert_eq!(budgets.video, (16, 240_000));
+    assert_eq!(read_preprocessor_max_pixels(d.path()), None);
+
+    let custom = dir_with(&[(
+        "processor_config.json",
+        r#"{"image_processor": {"max_image_tokens": 1024}}"#,
+    )]);
+    let budgets = read_glm_token_budgets(custom.path());
+    assert_eq!(budgets.image, (16, 1024), "a missing key keeps the default");
+    assert_eq!(budgets.video, (16, 240_000));
+    let empty = tempfile::tempdir().expect("tempdir");
+    assert_eq!(read_glm_token_budgets(empty.path()), Default::default());
 }

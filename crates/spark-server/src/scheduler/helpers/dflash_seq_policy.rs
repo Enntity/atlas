@@ -15,6 +15,7 @@ pub(super) fn dflash_seq_raw_argmax_policy(
         return true;
     }
     dflash_verify_uses_raw_argmax(raw_requested, masked_requested, lightning_product)
+        && a.temperature == 0.0
         && a.grammar_state.is_none()
         && !a.require_tool_call
         && crate::scheduler::fast_greedy::classify_penalties(
@@ -47,6 +48,9 @@ mod tests {
         // Process-wide flag still dominates: raw off stays off per-seq.
         a.require_tool_call = false;
         assert!(!gate(false, false, false, false, &a));
+        // A sampled request samples its verify rows (the pipeline's sampler).
+        a.temperature = 0.7;
+        assert!(!gate(true, false, false, false, &a));
     }
 
     #[test]

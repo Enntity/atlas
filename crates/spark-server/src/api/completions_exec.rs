@@ -110,7 +110,7 @@ pub(super) async fn run_blocking(
                 require_tool_call: false,
                 tools_present: false,
                 suppress_tool_call: false,
-                disable_mtp: false,
+                disable_mtp: req.disable_mtp,
                 grammar_spec: None,
                 // Distinct choices need distinct sampling streams; same
                 // offset scheme as chat_blocking's n>1 loop.
@@ -191,12 +191,13 @@ pub(super) async fn run_blocking(
                 0.0
             };
 
-            choices.push(CompletionChoice {
-                index: prompt_i * n + n_i,
+            choices.push(assemble_choice(
+                req,
+                prompt_i * n + n_i,
                 text,
-                finish_reason: response.finish_reason,
                 logprobs,
-            });
+                response,
+            ));
         }
     }
 
@@ -225,3 +226,82 @@ pub(super) async fn run_blocking(
     ))
     .into_response()
 }
+
+/// Assemble after text processing, retaining the scheduler's exact IDs when
+/// requested. Generated IDs never include an echoed prompt or reconstructed
+/// text, which can omit special tokens or merge byte pieces.
+fn assemble_choice(
+    req: &CompletionRequest,
+    index: usize,
+    text: String,
+    logprobs: Option<crate::openai::CompletionLogprobs>,
+    response: super::inference_types::InferenceResponse,
+) -> CompletionChoice {
+    CompletionChoice {
+        index,
+        text,
+        finish_reason: response.finish_reason,
+        token_ids: req.return_token_ids.then_some(response.output_tokens),
+        logprobs,
+    }
+}
+
+#[cfg(test)]
+mod token_ids_tests {
+    use super::*;
+
+    fn response(tokens: Vec<u32>) -> super::super::inference_types::InferenceResponse {
+        super::super::inference_types::InferenceResponse {
+            output_tokens: tokens,
+            finish_reason: "length".into(),
+            time_to_first_token_ms: 0.0,
+            decode_time_ms: 0.0,
+            logprobs: Vec::new(),
+            reasoning_tokens: 0,
+            cached_prompt_tokens: 0,
+            accepted_prediction_tokens: 0,
+            prompt_logprobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completion_token_ids_preserve_generated_ids_before_text_stripping() {
+        let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "prompt": [41, 42], "echo": true, "return_token_ids": true
+        }))
+        .expect("request");
+        // Text may be echoed and strip a special token; IDs are precisely the
+        // generated sequence, including special and byte-piece token IDs.
+        let choice = assemble_choice(
+            &req,
+            3,
+            "echoed promptanswer".into(),
+            None,
+            response(vec![154842, 281, 512]),
+        );
+        let wire = serde_json::to_value(choice).expect("serialize");
+        assert_eq!(wire["token_ids"], serde_json::json!([154842, 281, 512]));
+        assert_eq!(wire["index"], 3);
+        assert_eq!(wire["text"], "echoed promptanswer");
+    }
+
+    #[test]
+    fn completion_token_ids_opt_in_preserves_empty_and_omits_default() {
+        for requested in [false, true] {
+            let req: CompletionRequest = serde_json::from_value(serde_json::json!({
+                "model": "m", "prompt": "hello", "return_token_ids": requested
+            }))
+            .expect("request");
+            let choice = assemble_choice(&req, 0, String::new(), None, response(Vec::new()));
+            let wire = serde_json::to_value(choice).expect("serialize");
+            assert_eq!(wire.get("token_ids").is_some(), requested);
+            if requested {
+                assert_eq!(wire["token_ids"], serde_json::json!([]));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "completions_spec_policy_tests.rs"]
+mod spec_policy_tests;

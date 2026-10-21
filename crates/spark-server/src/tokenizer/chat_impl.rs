@@ -53,6 +53,31 @@ impl ChatTokenizer {
         repo_root: Option<&Path>,
         disable_template_overrides: bool,
     ) -> Result<Self> {
+        Self::from_model_dir_with(
+            model_dir,
+            eos_token_id,
+            supports_thinking,
+            model_type,
+            template_override,
+            repo_root,
+            disable_template_overrides,
+            super::jinja_helpers::ToolJsonStyle::from_env(),
+        )
+    }
+
+    /// [`from_model_dir`](Self::from_model_dir) with an explicit tool-JSON
+    /// style instead of the process environment's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_model_dir_with(
+        model_dir: &Path,
+        eos_token_id: u32,
+        supports_thinking: bool,
+        model_type: &str,
+        template_override: &str,
+        repo_root: Option<&Path>,
+        disable_template_overrides: bool,
+        tool_json_style: super::jinja_helpers::ToolJsonStyle,
+    ) -> Result<Self> {
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
@@ -107,7 +132,8 @@ impl ChatTokenizer {
             super::jinja_helpers::default_chatml_template(supports_thinking)
         };
 
-        let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
+        let jinja_env =
+            super::jinja_helpers::build_jinja_env_with(&chat_template, tool_json_style)?;
 
         // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
         // This variant gates historical <think> wrappers on enable_thinking, preventing
@@ -115,7 +141,7 @@ impl ChatTokenizer {
         let openai_jinja_env = super::jinja_helpers::load_openai_template(model_type, repo_root)
             .and_then(|tmpl| {
                 tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
-                super::jinja_helpers::build_jinja_env(&tmpl).ok()
+                super::jinja_helpers::build_jinja_env_with(&tmpl, tool_json_style).ok()
             });
         let chat_encoding = if model_type == "deepseek_v4" {
             tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
@@ -127,6 +153,16 @@ impl ChatTokenizer {
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(Self {
             tokenizer,
+            large_encode_gate: super::large_encode::configured(
+                std::env::var("ATLAS_LARGE_ENCODE_CONCURRENCY")
+                    .ok()
+                    .as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
+            ids_only: super::ids_only::configured(
+                std::env::var("ATLAS_TOKENIZER_IDS_ONLY").ok().as_deref(),
+            )
+            .map_err(anyhow::Error::msg)?,
             eos_token_id,
             supports_thinking,
             chat_encoding,
@@ -143,9 +179,14 @@ impl ChatTokenizer {
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
+        // HF's normalized splits/offsets can consume hundreds of MiB for a
+        // long prompt. Acquire before touching the tokenizer and retain the
+        // permit until the Encoding is dropped, including on error/unwind.
+        let _permit = self
+            .large_encode_gate
+            .as_ref()
+            .and_then(|gate| gate.acquire(text.len()));
+        let encoding = super::ids_only::encode(&self.tokenizer, text, self.ids_only)
             .map_err(|e| anyhow::anyhow!("Tokenizer encode error: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -270,7 +311,6 @@ impl ChatTokenizer {
                 reasoning_effort,
                 preserve_thinking,
                 allow_continue_final: true,
-                empty_think_off: false,
             },
         )?;
 
@@ -305,12 +345,9 @@ impl ChatTokenizer {
             disable_tool_steering,
             None,
             None,
-            false,
         )
     }
 
-    /// `empty_think_off`: see `chat_render::RenderFlags::empty_think_off`
-    /// (OpenAI-variant templates only).
     pub fn apply_chat_template_openai_with_effort(
         &self,
         messages: &[serde_json::Value],
@@ -319,7 +356,6 @@ impl ChatTokenizer {
         disable_tool_steering: bool,
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
-        empty_think_off: bool,
     ) -> Result<Vec<u32>> {
         if self.chat_encoding == ChatEncoding::DeepseekV4 {
             return self.apply_chat_template_jinja_with_effort(
@@ -345,7 +381,6 @@ impl ChatTokenizer {
                     reasoning_effort,
                     preserve_thinking,
                     allow_continue_final: false,
-                    empty_think_off,
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;

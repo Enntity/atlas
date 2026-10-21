@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod validation;
+
 impl MoeLayer {
     pub fn new(
         weights: MoeWeights,
@@ -27,32 +29,7 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Self> {
-        // Sanity-check the routing config: top-k that exceeds the
-        // expert count would index OOB in the topk kernel and produce
-        // silent NaN routing. Catch the misconfiguration at load time.
-        let c2_compact_moe = super::forward_c2::c2_compact_requested()?;
-        anyhow::ensure!(
-            config.num_experts_per_tok <= num_experts && num_experts > 0,
-            "MoE config invalid: num_experts_per_tok={} must be in 1..={}",
-            config.num_experts_per_tok,
-            num_experts,
-        );
-        // The check above bounds top-k by the expert count, which is the OOB
-        // the topk kernel can READ. It says nothing about the OOB the kernel
-        // can WRITE: the sigmoid routing kernels stage their top-K in a
-        // fixed-size shared array, and `top_k` was passed to them unbounded.
-        anyhow::ensure!(
-            config.num_experts_per_tok <= crate::layers::ops::MOE_TOPK_SIGMOID_MAX_TOP_K
-                && num_experts <= crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
-            "MoE config exceeds the routing kernels' fixed shared-memory bounds: \
-             num_experts_per_tok={} (max {}), num_experts={} (max {}). Raise \
-             MAX_TOP_K / MAX_EXPERTS in kernels/gb10/common/moe_topk_sigmoid.cu \
-             and their mirrors in layers::ops together.",
-            config.num_experts_per_tok,
-            crate::layers::ops::MOE_TOPK_SIGMOID_MAX_TOP_K,
-            num_experts,
-            crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
-        );
+        let c2_compact_moe = validation::routing(config, num_experts)?;
         let m16_gate_up = super::gate_up_m16::M16GateUp::new(gpu, config)?;
         let m5_projections = super::m5_projections::M5Projections::new(gpu, config)?;
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
@@ -66,7 +43,22 @@ impl MoeLayer {
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
-        let _ = num_experts;
+        // FP32 router logits (GLM-5): the router GEMMs below have FP32-output
+        // twins for a BF16 router weight only.
+        let router_f32 = config.router_logits_f32;
+        anyhow::ensure!(
+            !router_f32 || gate_nvfp4.is_none(),
+            "FP32 MoE router logits need a BF16 router weight (the NVFP4 router GEMVs store BF16)"
+        );
+        let logit = |name: &str| {
+            if router_f32 {
+                format!("{name}_f32")
+            } else {
+                name.to_string()
+            }
+        };
+        let dense_gemv = gpu.kernel("gemv", "dense_gemv_bf16")?;
+        let dense_gemm = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let optional = super::init_optional::OptionalKernels::resolve(gpu, config);
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         let mut layer = Self {
@@ -80,20 +72,41 @@ impl MoeLayer {
             gate_nvfp4,
             pre_expert_norm: None,
             pre_expert_norm_k: rms_norm_k,
-            dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv,
             dense_gemv_batchm: super::init_optional::router_gemv_batchm(gpu, config),
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
-            dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
-            dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
+            dense_gemm,
+            router_f32,
+            router_gemv: if router_f32 {
+                gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?
+            } else {
+                dense_gemv
+            },
+            router_gemm: if router_f32 {
+                gpu.kernel("gemm", "dense_gemm_bf16_f32out")?
+            } else {
+                dense_gemm
+            },
+            dense_gemm_router: super::super::try_kernel(
+                gpu,
+                "gemm",
+                if router_f32 {
+                    "dense_gemm_bf16_router_f32out"
+                } else {
+                    "dense_gemm_bf16_router"
+                },
+            ),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
-            dense_gemm_router_m5: super::super::try_kernel(
+            dense_gemm_router_m5: super::super::try_kernel_gated(
+                router_f32,
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_m5",
             ),
-            dense_gemm_router_rows: super::super::try_kernel(
+            dense_gemm_router_rows: super::super::try_kernel_gated(
+                router_f32,
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_rows",
@@ -171,6 +184,7 @@ impl MoeLayer {
             moe_w4a4_prequant_t_k128w: optional.moe_w4a4_prequant_t_k128w,
             moe_w4a4_prequant_gate_up_silu: optional.moe_w4a4_prequant_gate_up_silu,
             k128w_persist_ctas: optional.k128w_persist_ctas,
+            down_e4m3: optional.down_e4m3,
             moe_mtile_prefix_k: optional.moe_mtile_prefix_k,
             moe_w4a4_prequant_t_k64_compact: optional.moe_w4a4_prequant_t_k64_compact,
             moe_w4a4_prequant_t_k64_vecscale_compact: optional
@@ -240,6 +254,7 @@ impl MoeLayer {
             gate_ptrs_t: None,
             up_ptrs_t: None,
             down_ptrs_t: None,
+            input_scales: None,
             cutlass_grouped_host: None,
             _cutlass_sfb_owned: Vec::new(),
             routed_scales_released: false,
@@ -464,11 +479,15 @@ impl MoeLayer {
             // softmax-MoE model startup (observed on Qwen3.5-35B-A3B-FP8 in
             // alpha-2.43: "Module 'moe_topk_sig' not loaded" during model
             // build).
-            moe_topk_sigmoid_k: super::super::try_kernel(gpu, "moe_topk_sig", "moe_topk_sigmoid"),
+            moe_topk_sigmoid_k: super::super::try_kernel(
+                gpu,
+                "moe_topk_sig",
+                &logit("moe_topk_sigmoid"),
+            ),
             moe_topk_sigmoid_batched_k: super::super::try_kernel(
                 gpu,
                 "moe_topk_sig",
-                "moe_topk_sigmoid_batched",
+                &logit("moe_topk_sigmoid_batched"),
             ),
         };
         if crate::model::glm_independent::enabled(&config.model_type)? {

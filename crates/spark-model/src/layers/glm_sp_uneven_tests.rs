@@ -108,6 +108,15 @@ pub(crate) fn with_ctx<R>(
     comm: &LoopPair,
     f: impl FnOnce(&ForwardContext) -> R,
 ) -> R {
+    with_comm_ctx(gpu, comm, f)
+}
+
+/// [`with_ctx`] over any communicator.
+pub(crate) fn with_comm_ctx<R>(
+    gpu: &MockGpuBackend,
+    comm: &dyn CommBackend,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.tp_world_size = 2;
     let buffers = BufferArena::new(&config, 1, 256, 16, 1, gpu).unwrap();
@@ -126,7 +135,7 @@ pub(crate) fn with_ctx<R>(
         config: &config,
         attn_metadata: None,
         profile: false,
-        comm: Some(comm as &dyn spark_comm::CommBackend),
+        comm: Some(comm),
         graph_capture: false,
         gdn_exact_replay: false,
         token_ids: None,

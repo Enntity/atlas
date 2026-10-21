@@ -898,8 +898,9 @@ pub struct ServeArgs {
     /// Vision input pixel budget, applied before patching. Overrides the
     /// checkpoint in BOTH directions — it may raise the bound as well as lower
     /// it. Qwen paths interpret this as spatial H×W; GLM-5.3 interprets it as
-    /// the processor's temporal volume T×H×W and still applies its bounded
-    /// native encoder capacity.
+    /// the processor's temporal volume T×H×W, replacing the token budgets of
+    /// its `processor_config.json` for stills and videos alike (the native
+    /// encoder is sized from the result).
     ///
     /// 0 (the default) means "use the checkpoint's own bound", read from
     /// `preprocessor_config.json` (`size.longest_edge`, or `max_pixels`;
@@ -998,10 +999,11 @@ pub struct ServeArgs {
     pub video_fps: f32,
 
     /// Hard cap on frames taken from one video, before temporal grouping.
-    /// Matches the checkpoints' `max_frames`. At the default 2 fps this is
-    /// just over six minutes of clip.
-    #[arg(long, default_value_t = 768)]
-    pub video_max_frames: usize,
+    /// Defaults to the checkpoint processor's own cap: 2048 for GLM-5.3
+    /// (`max_frame_count_dynamic`, about 17 minutes at its 2 fps), 768 for
+    /// the Qwen-VL families (`max_frames`, just over six minutes).
+    #[arg(long)]
+    pub video_max_frames: Option<usize>,
 
     /// Wall-clock budget for decoding one video. Bounds a decoder that hangs
     /// on a malformed container; the child is killed when it expires.

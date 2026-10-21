@@ -268,3 +268,59 @@ fn a_stream_of_two_pngs_splits_into_two_frames() {
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[0].dimensions(), (4, 3));
 }
+
+// ── frames by index (GLM-5.3's sampler) ──────────────────────────────────
+
+fn ppm(width: u32, height: u32, value: u8) -> Vec<u8> {
+    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
+    out.extend(std::iter::repeat_n(value, (width * height * 3) as usize));
+    out
+}
+
+#[test]
+fn a_ppm_stream_splits_by_its_headers_and_is_bounded() {
+    let mut stream = ppm(4, 3, 7);
+    stream.extend(ppm(2, 2, 9));
+    let mut frames = Vec::new();
+    let n = frames::read_ppm_frames(&mut stream.as_slice(), 2, &mut |f| {
+        frames.push(f);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(n, 2);
+    assert_eq!(frames[0].dimensions(), (4, 3));
+    assert_eq!(frames[1].get_pixel(1, 1).0, [9, 9, 9]);
+    let err = frames::read_ppm_frames(&mut stream.as_slice(), 1, &mut |_| Ok(())).unwrap_err();
+    assert!(err.to_string().contains("more than 1"), "{err:#}");
+    let truncated = &stream[..stream.len() - 1];
+    assert!(frames::read_ppm_frames(&mut &truncated[..], 2, &mut |_| Ok(())).is_err());
+}
+
+/// The index decode returns exactly the source frames it names, at their
+/// native size: the same pixels as those positions of a decode of every frame.
+#[test]
+fn named_frames_decode_to_those_source_frames() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    let mp4 = make_mp4(3, 10, "320x240", "libx264").expect("encode");
+    assert_eq!(probe_frames(&mp4, &enabled()).unwrap(), (30, 10.0));
+    let decode = |indices: &[usize]| {
+        let mut frames = Vec::new();
+        let n = decode_frame_indices(&mp4, indices, &enabled(), &mut |f| {
+            frames.push(f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(n, indices.len());
+        frames
+    };
+    let all = decode(&(0..30).collect::<Vec<_>>());
+    let picked = decode(&[0, 5, 11, 29]);
+    assert_eq!(picked[0].dimensions(), (320, 240));
+    for (frame, index) in picked.iter().zip([0, 5, 11, 29]) {
+        assert_eq!(frame.as_raw(), all[index].as_raw(), "frame {index}");
+    }
+    assert_ne!(picked[0].as_raw(), picked[3].as_raw());
+}

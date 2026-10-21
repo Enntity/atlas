@@ -4,7 +4,7 @@
 #include "native-prep.cu"
 #include "split-ds.cuh"
 #include "merge-ds.cu"
-extern "C" int atlas_sparse_native_init_selected(void);
+extern "C" int atlas_sparse_native_init_selected(uint32_t heads);
 namespace {
 uint64_t align256(uint64_t n) { return (n+255)&~uint64_t(255); }
 void* ptr(uint64_t n) { return reinterpret_cast<void*>(n); }
@@ -12,7 +12,7 @@ struct Metadata {
     int32_t *main_ids, *tail_ids, *main_lengths, *tail_lengths, *tail_counts;
     float *main_lse, *tail_lse, *final_lse;
     uint64_t bytes;
-    Metadata(uint64_t base, uint32_t rows) {
+    Metadata(uint64_t base, uint32_t rows, uint32_t heads) {
         uint64_t offset=0;
         auto region=[&](uint64_t bytes) {
             offset=align256(offset); uint64_t address=base+offset;
@@ -23,16 +23,16 @@ struct Metadata {
         main_lengths=reinterpret_cast<int32_t*>(region(uint64_t(rows)*4));
         tail_lengths=reinterpret_cast<int32_t*>(region(uint64_t(rows)*4));
         tail_counts=reinterpret_cast<int32_t*>(region(uint64_t(rows)*4));
-        main_lse=reinterpret_cast<float*>(region(uint64_t(rows)*32*4));
-        tail_lse=reinterpret_cast<float*>(region(uint64_t(rows)*32*4));
-        final_lse=reinterpret_cast<float*>(region(uint64_t(rows)*32*4));
+        main_lse=reinterpret_cast<float*>(region(uint64_t(rows)*heads*4));
+        tail_lse=reinterpret_cast<float*>(region(uint64_t(rows)*heads*4));
+        final_lse=reinterpret_cast<float*>(region(uint64_t(rows)*heads*4));
         bytes=offset;
     }
 };
 }
-extern "C" int atlas_glm_sparse_native_version(void) { return 1; }
-extern "C" int atlas_glm_sparse_native_init(void) {
-    int status=atlas_sparse_native_init_selected();
+extern "C" int atlas_glm_sparse_native_version(void) { return 2; }
+extern "C" int atlas_glm_sparse_native_init(uint32_t heads) {
+    int status=atlas_sparse_native_init_selected(heads);
     if(status) return status;
     cudaFuncAttributes attr{};
     const void* functions[]={reinterpret_cast<const void*>(prep_q),
@@ -46,17 +46,17 @@ extern "C" int atlas_glm_sparse_native_init(void) {
 }
 extern "C" int atlas_glm_sparse_native_run(const AtlasGlmSparseNativeArgs* a) {
     if(!a) return -1;
-    if(a->rows<2048 || a->rows>4100 || a->seq_start<2048 ||
+    if((a->heads!=16 && a->heads!=32) || a->reserved!=0 || a->rows<2048 || a->rows>4100 || a->seq_start<2048 ||
        a->seq_start>32768-a->rows || !a->physical_blocks || a->physical_blocks>32768)
         return -2;
     uint32_t end=a->seq_start+a->rows;
     if(a->block_table_count<(end+15)/16) return -2;
     // Geometry is bounded before arithmetic. Check every live input/output span
     // before any CUDA call; each metadata offset below is relative to one owner.
-    Metadata layout(0,a->rows);
+    Metadata layout(0,a->rows,a->heads);
     if(a->metadata_bytes<layout.bytes) return -3;
-    uint64_t qbytes=uint64_t(a->rows)*32*512*2;
-    uint64_t qpadbytes=uint64_t(a->rows)*32*576*2;
+    uint64_t qbytes=uint64_t(a->rows)*a->heads*512*2;
+    uint64_t qpadbytes=uint64_t(a->rows)*a->heads*576*2;
     uint64_t kvbytes=uint64_t((end+63)/64)*64*656;
     const uint64_t addresses[]={a->q,a->kv,a->selected,a->table,a->qpad,
         a->packed_kv,a->metadata,a->main_out,a->tail_out,a->out};
@@ -70,9 +70,9 @@ extern "C" int atlas_glm_sparse_native_run(const AtlasGlmSparseNativeArgs* a) {
         for(unsigned j=0;j<i;++j)
             if(addresses[i]<addresses[j]+sizes[j] && addresses[j]<addresses[i]+sizes[i]) return -4;
     }
-    Metadata m(a->metadata,a->rows);
+    Metadata m(a->metadata,a->rows,a->heads);
     auto stream=reinterpret_cast<cudaStream_t>(a->stream);
-    int result=atlas_native_prep_q(ptr(a->q),ptr(a->qpad),a->rows,qbytes,qpadbytes,stream);
+    int result=atlas_native_prep_q(ptr(a->q),ptr(a->qpad),a->rows,a->heads,qbytes,qpadbytes,stream);
     if(result) return result;
     result=atlas_native_prep_kv(ptr(a->kv),a->physical_blocks,
         reinterpret_cast<const int32_t*>(a->table),a->block_table_count,
@@ -82,11 +82,11 @@ extern "C" int atlas_glm_sparse_native_run(const AtlasGlmSparseNativeArgs* a) {
         m.main_ids,m.tail_ids,m.main_lengths,m.tail_lengths,m.tail_counts,a->rows,a->seq_start);
     result=int(cudaGetLastError()); if(result) return result;
     result=atlas_sparse_native_launch_glm(ptr(a->qpad),ptr(a->packed_kv),m.main_ids,
-        ptr(a->main_out),m.main_lse,a->rows,32,0.0625f,m.main_lengths,stream);
+        ptr(a->main_out),m.main_lse,a->rows,a->heads,0.0625f,m.main_lengths,stream);
     if(result) return result;
     result=atlas_sparse_native_launch_glm(ptr(a->qpad),ptr(a->packed_kv),m.tail_ids,
-        ptr(a->tail_out),m.tail_lse,a->rows,32,0.0625f,m.tail_lengths,stream);
+        ptr(a->tail_out),m.tail_lse,a->rows,a->heads,0.0625f,m.tail_lengths,stream);
     if(result) return result;
     return atlas_sparse_merge(ptr(a->main_out),ptr(a->tail_out),m.main_lse,m.tail_lse,
-        m.tail_counts,ptr(a->out),m.final_lse,a->rows,32,stream);
+        m.tail_counts,ptr(a->out),m.final_lse,a->rows,a->heads,stream);
 }

@@ -6,6 +6,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+mod python_json;
+use python_json::python_tojson;
+
 pub(super) const TEMPLATE_OVERRIDE_DIR: &str = "jinja-templates";
 
 /// Build a precompiled minijinja Environment from the chat template.
@@ -25,15 +28,22 @@ pub(crate) enum ToolJsonStyle {
     HfSpaced,
 }
 
+impl ToolJsonStyle {
+    /// The production style: `ATLAS_USE_HF_REF_JSON_DUMPS=1` selects
+    /// [`HfSpaced`](Self::HfSpaced).
+    pub(crate) fn from_env() -> Self {
+        if std::env::var("ATLAS_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
+            Self::HfSpaced
+        } else {
+            Self::Compact
+        }
+    }
+}
+
 /// Production entry point: resolves the serialization style from the
 /// environment, then defers to [`build_jinja_env_with`].
 pub(super) fn build_jinja_env(chat_template: &str) -> Result<minijinja::Environment<'static>> {
-    let style = if std::env::var("ATLAS_USE_HF_REF_JSON_DUMPS").as_deref() == Ok("1") {
-        ToolJsonStyle::HfSpaced
-    } else {
-        ToolJsonStyle::Compact
-    };
-    build_jinja_env_with(chat_template, style)
+    build_jinja_env_with(chat_template, ToolJsonStyle::from_env())
 }
 
 /// Build a chat-template environment with an EXPLICIT tool-JSON style.
@@ -229,67 +239,6 @@ pub(crate) fn build_jinja_env_with(
     env.add_template("chat", template_static)
         .context("Failed to compile Jinja chat template")?;
     Ok(env)
-}
-
-/// A `serde_json` formatter that matches Python `json.dumps` default
-/// separators: `", "` between array/object items and `": "` between an
-/// object key and its value. serde_json's `CompactFormatter` (the
-/// default) emits no spaces, while jinja2's `tojson` uses `json.dumps`
-/// defaults. This bridges the two so Atlas's `<tools>` prompt block is
-/// byte-identical to transformers/vLLM.
-#[derive(Clone, Debug)]
-struct PythonJsonFormatter;
-
-fn python_tojson(value: minijinja::Value) -> Result<minijinja::Value, minijinja::Error> {
-    let mut buf = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut buf, PythonJsonFormatter);
-    serde::Serialize::serialize(&value, &mut serializer).map_err(|error| {
-        minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
-            format!("tojson serialization failed: {error}"),
-        )
-    })?;
-    let json = String::from_utf8(buf).map_err(|error| {
-        minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
-            format!("tojson produced invalid UTF-8: {error}"),
-        )
-    })?;
-    Ok(minijinja::Value::from_safe_string(json))
-}
-
-impl serde_json::ser::Formatter for PythonJsonFormatter {
-    #[inline]
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    #[inline]
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    #[inline]
-    fn begin_object_value<W>(&mut self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        writer.write_all(b": ")
-    }
 }
 
 /// Try loading an override template from `jinja-templates/`.

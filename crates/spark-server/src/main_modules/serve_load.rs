@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use super::serve::{
     Prepared, canonicalize_model_quant, describe_quant_source, parse_default_chat_template_kwargs,
-    pick_quant_variant, quant_pair_compatible, resolve_vision_max_pixels,
+    pick_quant_variant, quant_pair_compatible, read_glm_token_budgets, resolve_vision_max_pixels,
 };
 use crate::api::InferenceRequest;
 use crate::main_modules::AppState;
@@ -168,6 +168,9 @@ pub(crate) fn load_model(
     let vision_max_pixels = resolve_vision_max_pixels(&args, &model_dir)?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        if v.is_glm5_next {
+            v.token_budgets = read_glm_token_budgets(&model_dir);
+        }
     }
     match vision_max_pixels {
         Some(px) => tracing::info!(
@@ -225,10 +228,16 @@ pub(crate) fn load_model(
     // that enabled video and has no ffmpeg is misconfigured, and the operator
     // should learn that from the startup log rather than from a user's failed
     // request an hour later.
+    let glm_vision = config.vision.as_ref().is_some_and(|v| v.is_glm5_next);
+    let video_max_frames = args.video_max_frames.unwrap_or(if glm_vision {
+        spark_model::video_sample::GLM_DEFAULT_MAX_FRAMES
+    } else {
+        spark_model::video_preprocess::DEFAULT_MAX_FRAMES
+    });
     let video_ffmpeg = spark_model::video_decode_ffmpeg::FfmpegPolicy {
         enabled: args.video_allow_ffmpeg,
         binary: args.video_ffmpeg_path.clone(),
-        max_frames: args.video_max_frames,
+        max_frames: video_max_frames,
         timeout_secs: args.video_decode_timeout_s,
         ..Default::default()
     };
@@ -238,7 +247,7 @@ pub(crate) fn load_model(
             args.video_ffmpeg_path,
             v,
             args.video_fps,
-            args.video_max_frames,
+            video_max_frames,
         ),
         // WARN, not a hard failure: the server still serves text and images
         // perfectly well, and refusing to boot would turn a video
@@ -534,6 +543,9 @@ pub(crate) fn load_model(
     // Failure is logged inside and never fails the serve.
     #[cfg(feature = "cuda")]
     spark_runtime::cublaslt::prewarm(0);
+    // Likewise the CUTLASS workspace (512 MB, 28 ms of the first prefill).
+    #[cfg(feature = "cuda")]
+    spark_runtime::cutlass::prewarm();
 
     // 4. Post-load OOM check + audit log.
     serve_phases::post_load_memory_audit(

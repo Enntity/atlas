@@ -31,7 +31,7 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM long owner batch MLA cannot be the first or last layer"
         );
-        if crate::speculative::glm_repair_policy::dflash_enabled() {
+        if crate::speculative::glm_repair_policy::canonical_target_enabled() {
             return self.glm_long_owners_mla_chunk(owners, kv_cache, stage, ctx, stream);
         }
         let rows = long_owner::owner_rows(owners)?;
@@ -164,6 +164,9 @@ impl Qwen3AttentionLayer {
             self.block_idx != 0 && self.block_idx + 1 != ctx.config.num_hidden_layers,
             "GLM fused prefill + verify MLA cannot be the first or last layer"
         );
+        // The chunk's prompt rows, then the passengers' verify rows: the
+        // routed FFN runs each on its reference lane (ATLAS_GLM_FP4L_DECODE_A16).
+        let _prompt = crate::layers::moe::PromptRows::enter(num_tokens);
         let rows = long_owner::owner_rows(passengers)?;
         let meta = ctx
             .attn_metadata

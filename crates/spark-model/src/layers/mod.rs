@@ -7,10 +7,13 @@ pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
+pub mod glm5_mtp;
+pub(crate) mod glm5_mtp_cursor;
 pub mod glm_kv_shard;
 pub mod glm_native;
 pub mod glm_packed_scope;
 pub mod glm_sp;
+pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod moe;
@@ -79,6 +82,7 @@ pub(crate) use glm5_kda::{
     kda_batched_ffn_enabled, kda_multi_seq_enabled, kda_side_proj_lt_enabled,
     verify_fused_tp_hc_enabled,
 };
+pub use glm5_mtp::{Glm5MtpHead, Glm5MtpProposerState};
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{
     moe_grouped_decode_decide, moe_grouped_decode_enabled, moe_grouped_decode_for,
@@ -294,6 +298,7 @@ pub enum FfnComponent {
 
 mod ffn_c4;
 mod ffn_glm;
+pub(crate) use ffn_glm::ffn_glm_gather_group;
 
 impl FfnComponent {
     pub fn is_none(&self) -> bool {

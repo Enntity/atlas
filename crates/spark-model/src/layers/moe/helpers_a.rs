@@ -123,6 +123,7 @@ impl MoeLayer {
         self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
         if include_down {
             self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
+            self.build_input_scales(gpu)?;
         }
 
         // Transpose shared expert weights (tiny: ~5 MB per layer).
@@ -337,6 +338,7 @@ impl MoeLayer {
             &mut freed,
         )?;
         scratch.release(gpu)?;
+        self.build_input_scales(gpu)?;
 
         Ok(freed)
     }

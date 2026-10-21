@@ -512,7 +512,7 @@ pub fn prefill_request(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
-            Some(spontaneous_think_budget)
+            crate::ir::server_thinking_budget(spontaneous_think_budget)
         } else {
             req_thinking_budget
         },

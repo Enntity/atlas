@@ -19,9 +19,9 @@ def main():
     dev='cuda:0'; stream=torch.cuda.current_stream().cuda_stream
     lib=C.CDLL(str(path)); lib.atlas_native_prep_version.restype=C.c_int
     lib.atlas_native_prep_version.argtypes=[]
-    need(lib.atlas_native_prep_version()==1,'ABI mismatch')
+    need(lib.atlas_native_prep_version()==2,'ABI mismatch')
     qop=lib.atlas_native_prep_q; qop.restype=C.c_int
-    qop.argtypes=[C.c_void_p,C.c_void_p,C.c_uint32,C.c_uint64,C.c_uint64,C.c_void_p]
+    qop.argtypes=[C.c_void_p,C.c_void_p,C.c_uint32,C.c_uint32,C.c_uint64,C.c_uint64,C.c_void_p]
     kop=lib.atlas_native_prep_kv; kop.restype=C.c_int
     kop.argtypes=[C.c_void_p,C.c_uint32,C.c_void_p,C.c_uint32,C.c_void_p,C.c_uint64,C.c_uint32,C.c_void_p]
     def equal(a,b,label):
@@ -35,21 +35,22 @@ def main():
         return raw,raw[256:-256]
     def intact(raw):
         need(bool((raw[:256]==0xa5).all()) and bool((raw[-256:]==0xa5).all()),'redzone modified')
-    for rows in [1,3,65,128]:
-        q=torch.randn((rows,32,512),device=dev).bfloat16()
-        bits=q.view(torch.int16).flatten()
-        bits[:6]=torch.tensor([0,-32768,32705,-63,1,-32767],dtype=torch.int16,device=dev)
-        saved=q.clone(); raw,body=guard(rows*32*576*2)
-        out=body.view(torch.bfloat16).reshape(rows,32,576)
-        args=[q.data_ptr(),out.data_ptr(),rows,q.numel()*2,body.numel(),stream]
-        if rows==1:
-            for i,v,code in [(0,None,-1),(2,0,-2),(3,q.numel()*2-1,-3),(4,body.numel()-1,-3),(1,q.data_ptr(),-4)]:
-                bad=args.copy();bad[i]=v;need(qop(*bad)==code,'Q rejection failed')
-            need(bool((raw==0xa5).all()),'Q rejection wrote output')
-        need(qop(*args)==0,'Q launch failed');torch.cuda.synchronize()
-        expected=torch.zeros_like(out);expected[...,:512]=saved
-        equal(out,expected,'Q copy/zero');equal(q,saved,'Q input');intact(raw)
-        report(stage='q',rows=rows,passed=True)
+    for heads in [16,32]:
+        for rows in [1,3,65,128]:
+            q=torch.randn((rows,heads,512),device=dev).bfloat16()
+            bits=q.view(torch.int16).flatten()
+            bits[:6]=torch.tensor([0,-32768,32705,-63,1,-32767],dtype=torch.int16,device=dev)
+            saved=q.clone(); raw,body=guard(rows*heads*576*2)
+            out=body.view(torch.bfloat16).reshape(rows,heads,576)
+            args=[q.data_ptr(),out.data_ptr(),rows,heads,q.numel()*2,body.numel(),stream]
+            if rows==1:
+                for i,v,code in [(0,None,-1),(2,0,-2),(3,8,-2),(4,q.numel()*2-1,-3),(5,body.numel()-1,-3),(1,q.data_ptr(),-4)]:
+                    bad=args.copy();bad[i]=v;need(qop(*bad)==code,'Q rejection failed')
+                need(bool((raw==0xa5).all()),'Q rejection wrote output')
+            need(qop(*args)==0,'Q launch failed');torch.cuda.synchronize()
+            expected=torch.zeros_like(out);expected[...,:512]=saved
+            equal(out,expected,'Q copy/zero');equal(q,saved,'Q input');intact(raw)
+            report(stage='q',heads=heads,rows=rows,passed=True)
     for seq in [1,63,64,65,4096,32768]:
       for mode in ['zeros','tiny','random','extreme']:
         nb=(seq+15)//16; pb=nb+3; padded=(seq+63)//64*64
@@ -79,7 +80,7 @@ def main():
         need(torch.cuda.max_memory_reserved()<=limit,'memory cap exceeded')
         report(stage='kv',seqend=seq,mode=mode,passed=True)
         del src,saved,logical,quant,expected,raw,body,scales
-    report(stage='complete',passed=True,q_cases=4,kv_cases=24,peak_reserved_bytes=torch.cuda.max_memory_reserved(),scope='preparation byte oracle only; no attention or model correctness claim')
+    report(stage='complete',passed=True,q_cases=8,kv_cases=24,peak_reserved_bytes=torch.cuda.max_memory_reserved(),scope='preparation byte oracle only; no attention or model correctness claim')
 
 if __name__=='__main__':
     try: main()
