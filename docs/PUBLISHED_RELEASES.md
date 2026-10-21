@@ -39,13 +39,13 @@ commits.
 
 | | SparkGLM | SparkQwen |
 |---|---|---|
-| Product `main` pin | `sparkglm/atlas-20261017-fp4local` @ `b3b016ab`, 2026-10-17 ([sparkglm#53](https://github.com/Enntity/sparkglm/pull/53)) | `sparkqwen/atlas-20261017-vision` @ `92dd5435`, 2026-10-17 ([sparkqwen#12](https://github.com/Enntity/sparkqwen/pull/12)) |
+| Product `main` pin | `sparkglm/atlas-20261021-unified` @ `f4d95a10`, 2026-10-21 ([release](https://github.com/Enntity/sparkglm/releases/tag/unified-20261021)) | `sparkqwen/atlas-20261017-vision` @ `92dd5435`, 2026-10-17 ([sparkqwen#12](https://github.com/Enntity/sparkqwen/pull/12)) |
 | Shared layer | `upstream/atlas-shared-20261015-vision` @ `a9464810` | same |
 | Atlas-Inf base | `7ffd183f` | same |
-| Previous pin | `sparkglm/atlas-20261015-vision` @ `16315004` | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f` |
+| Previous pin | `sparkglm/atlas-20261017-fp4local` @ `b3b016ab` | `sparkqwen/atlas-20261016-drafter` @ `1aa8d99f` |
 
-The pinned engines are the current `sparkglm`, `sparkqwen` and
-`spark-shared` branch heads. Their measurements (text output, vision, fill, RigMark and a
+Release tags preserve their exact snapshots as product branches advance. The
+shared layer remains `a9464810`. Historical measurements (text output, vision, fill, RigMark and a
 same-prompt speed comparison against production) are in each product's
 `results/2026-10-15-shared-engine/`. SparkQwen's FP4-Local release adds the
 FP4-Local series on the `sparkqwen` layer: NVIDIA's
@@ -69,7 +69,7 @@ Its commits are mostly `shared:` and keep GLM's admitted sizes; they sit in
 the `sparkqwen` layer too. Measurements in SparkQwen's `results/2026-10-17-vision/`.
 
 SparkGLM's FP4-Local release (`sparkglm/atlas-20261017-fp4local` @ `b3b016ab`,
-the `sparkglm` branch head and SparkGLM's product pin since
+the previous SparkGLM product pin introduced by
 [sparkglm#53](https://github.com/Enntity/sparkglm/pull/53); image `ghcr.io/enntity/atlas-sparkglm:c8ced64316bf`) adds the
 FP4-Local series on the `sparkglm` layer: NVIDIA's
 `nvidia/GLM-5.3-Flash-FP4-Local` checkpoint (QAD; NVFP4 experts with
@@ -93,3 +93,21 @@ tail-split minimum and a MoE prefill row bound. The old
 prompt-logprob hash (`246cd1331b41`). Its `shared:` commits sit in the
 `sparkglm` layer until the shared layer moves. Measurements in SparkGLM's
 `results/2026-10-17-fp4local/`.
+
+## SparkGLM unified release, 2026-10-21
+
+`sparkglm/atlas-20261021-unified` at `f4d95a100516338c938a4524e23a65a2c4c3206e`
+extends the published FP4-Local foundation with Strict and Spark precision
+policies, corrected FP4 weight rounding, native MTP with prefix caching and
+C4 admission, and TP4 chain/ring transport. The product uses image
+`ghcr.io/enntity/atlas-sparkglm:e3792e6e8c51`. The shared and Qwen branches
+are unchanged; model-independent additions remain in the GLM product layer
+until the next shared refresh.
+
+The accepted export retains the qualified runtime source, with one
+documentation-only address substitution. Release packaging preserves the
+tested executable, native libraries, launcher and profile bytes. The product
+records the source mapping and image hashes, focused checks, earlier TP2
+validation and its surgical fixes, and every quick chain/ring repetition.
+This is scoped qualification, not a complete upstream CI or independent cold
+build claim. See [release evidence](https://github.com/Enntity/sparkglm/blob/main/results/2026-10-21-unified-release/RESULT.md).
