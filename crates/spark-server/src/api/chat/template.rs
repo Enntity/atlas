@@ -68,6 +68,17 @@ pub(super) fn render_template(
         None
     };
 
+    // GLM-5 registers its tool-envelope XML as added tokens. Escape matching
+    // markup in incoming message prose before rendering so it remains text;
+    // structured `tool_calls` are left untouched for the template to emit as
+    // real native calls.
+    let escaped_tool_markup = state
+        .tokenizer
+        .escape_glm_tool_markup(json_messages.iter_mut());
+    if escaped_tool_markup > 0 {
+        tracing::info!("{escaped_tool_markup} GLM tool markers in message text encoded as text");
+    }
+
     // In a request with media only the template's own vision markers may
     // become placeholders: markers written in message text encode as text
     // (`tokenizer::vision_markup`).

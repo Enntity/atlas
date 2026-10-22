@@ -58,17 +58,7 @@ fn markup_as_text() -> bool {
 /// Returns how many it replaced.
 fn escape_in_value(value: &mut serde_json::Value, markup: &[String]) -> usize {
     match value {
-        serde_json::Value::String(s) => {
-            let mut n = 0;
-            for (i, m) in markup.iter().enumerate() {
-                let hits = s.matches(m.as_str()).count();
-                if hits > 0 {
-                    *s = s.replace(m.as_str(), &format!("{OPEN}{i}{CLOSE}"));
-                    n += hits;
-                }
-            }
-            n
-        }
+        serde_json::Value::String(s) => replace_markers(s, markup, OPEN, CLOSE),
         serde_json::Value::Array(items) => {
             items.iter_mut().map(|v| escape_in_value(v, markup)).sum()
         }
@@ -79,25 +69,79 @@ fn escape_in_value(value: &mut serde_json::Value, markup: &[String]) -> usize {
     }
 }
 
+fn replace_markers(s: &mut String, markup: &[String], open: char, close: char) -> usize {
+    let mut n = 0;
+    for (i, m) in markup.iter().enumerate() {
+        let hits = s.matches(m.as_str()).count();
+        if hits > 0 {
+            *s = s.replace(m.as_str(), &format!("{open}{i}{close}"));
+            n += hits;
+        }
+    }
+    n
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct SentinelFamily<'a> {
+    pub(super) open: char,
+    pub(super) tag: Option<char>,
+    pub(super) close: char,
+    pub(super) markup: &'a [String],
+}
+
 /// Encode `rendered`, spelling each sentinel's marker as text. Without a
 /// sentinel this is `encode(rendered)`. A malformed sentinel stays text.
 fn encode_with_sentinels(
     rendered: &str,
     markup: &[String],
+    encode: impl FnMut(&str) -> Result<Vec<u32>>,
+) -> Result<Vec<u32>> {
+    encode_with_sentinel_families(
+        rendered,
+        &[SentinelFamily {
+            open: OPEN,
+            tag: None,
+            close: CLOSE,
+            markup,
+        }],
+        encode,
+    )
+}
+
+pub(super) fn encode_with_sentinel_families(
+    rendered: &str,
+    families: &[SentinelFamily<'_>],
     mut encode: impl FnMut(&str) -> Result<Vec<u32>>,
 ) -> Result<Vec<u32>> {
-    if !rendered.contains(OPEN) {
+    if !families.iter().any(|family| rendered.contains(family.open)) {
         return encode(rendered);
     }
     let mut out = Vec::new();
     let mut text_from = 0usize;
     let mut search_from = 0usize;
-    while let Some(off) = rendered[search_from..].find(OPEN) {
-        let open = search_from + off;
-        let body = open + OPEN.len_utf8();
-        let marker = rendered[body..].find(CLOSE).and_then(|len| {
+    while let Some((open, family_index)) = families
+        .iter()
+        .enumerate()
+        .filter_map(|(index, family)| {
+            rendered[search_from..]
+                .find(family.open)
+                .map(|offset| (search_from + offset, index))
+        })
+        .min_by_key(|(open, _)| *open)
+    {
+        let family = families[family_index];
+        let body_start = open + family.open.len_utf8();
+        let tag_len = family.tag.map_or(0, char::len_utf8);
+        if let Some(tag) = family.tag
+            && rendered[body_start..].chars().next() != Some(tag)
+        {
+            search_from = body_start;
+            continue;
+        }
+        let body = body_start + tag_len;
+        let marker = rendered[body..].find(family.close).and_then(|len| {
             let i: usize = rendered[body..body + len].parse().ok()?;
-            Some((markup.get(i)?, body + len + CLOSE.len_utf8()))
+            Some((family.markup.get(i)?, body + len + family.close.len_utf8()))
         });
         let Some((marker, next)) = marker else {
             search_from = body;
@@ -151,10 +195,27 @@ impl ChatTokenizer {
     /// Encode a rendered prompt whose message text may carry escaped vision
     /// markup ([`Self::escape_vision_markup`]).
     pub(super) fn encode_rendered(&self, rendered: &str) -> Result<Vec<u32>> {
-        if !rendered.contains(OPEN) {
+        let has_glm_tool_sentinel = super::glm_tool_markup::contains_sentinel(self, rendered);
+        if !rendered.contains(OPEN) && !has_glm_tool_sentinel {
             return self.encode(rendered);
         }
-        encode_with_sentinels(rendered, &self.vision_markup(), |s| self.encode(s))
+        let vision_markup = self.vision_markup();
+        let glm_tool_markup = super::glm_tool_markup::markers(self);
+        let mut families = vec![SentinelFamily {
+            open: OPEN,
+            tag: None,
+            close: CLOSE,
+            markup: &vision_markup,
+        }];
+        if has_glm_tool_sentinel {
+            families.push(SentinelFamily {
+                open: super::glm_tool_markup::OPEN,
+                tag: Some(super::glm_tool_markup::TAG),
+                close: super::glm_tool_markup::CLOSE,
+                markup: &glm_tool_markup,
+            });
+        }
+        encode_with_sentinel_families(rendered, &families, |s| self.encode(s))
     }
 }
 
