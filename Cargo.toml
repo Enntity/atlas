@@ -83,10 +83,10 @@ parking_lot = "0.12"
 # atlas-core: `default-features = false` so each consumer crate forwards the
 # right backend feature explicitly (cuda or metal). Without this, every
 # member would silently pull in cudarc via atlas-core's `cuda` default.
-atlas-core = { path = "crates/atlas-core", default-features = false }
-atlas-kernels = { path = "crates/atlas-kernels" }
-atlas-tier = { path = "crates/atlas-tier" }
-atlas-rdma = { path = "crates/atlas-rdma" }
+atlas-core = { version = "1.0.0-beta-preview", path = "crates/atlas-core", default-features = false }
+atlas-kernels = { version = "1.0.0-beta-preview", path = "crates/atlas-kernels" }
+atlas-tier = { version = "1.0.0-beta-preview", path = "crates/atlas-tier" }
+atlas-rdma = { version = "1.0.0-beta-preview", path = "crates/atlas-rdma" }
 
 # W7: the `[patch.crates-io] xgrammar-rs` entry was removed — Atlas now
 # depends on the pure-Rust `crates/xgrammar` crate directly (no FFI,
