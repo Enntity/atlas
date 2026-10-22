@@ -42,7 +42,7 @@ extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS", "--expt-relaxed-constexpr
 #       ~bandwidth floor). Resolved via soft probe
 #       (`gpu.kernel(...).unwrap_or(KernelHandle(0))` in qwen3_attention/
 #       init.rs), so a shadow without it silently keeps the block-per-row
-#       kernel — functionally identical, just slower. The nine gb10
+#       kernel — functionally identical, just slower. The eleven gb10
 #       rms_norm.cu shadows predate the kernel and carry no caller that
 #       requires it.
 #

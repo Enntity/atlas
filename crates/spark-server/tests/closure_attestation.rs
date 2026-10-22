@@ -59,7 +59,12 @@ fn the_baked_attestation_reproduces_from_the_tree() {
     let hardware: toml::Value =
         toml::from_str(&std::fs::read_to_string(root.join("kernels/gb10/HARDWARE.toml")).unwrap())
             .unwrap();
-    let arch = hardware["hardware"]["arch"].as_str().unwrap();
+    // Match build_codegen: hardware family-specific `sm_121f` is exposed
+    // by the compiled registry as the base architecture `sm_121`.
+    let arch = hardware["hardware"]["arch"]
+        .as_str()
+        .unwrap()
+        .trim_end_matches('f');
     let compiled = atlas_kernels::available_targets();
     let gb10: Vec<_> = compiled
         .iter()
