@@ -191,6 +191,7 @@ int cublasLtCreate(void){return 1;}
 int cublasLtDestroy(void){return 1;}
 int cublasLtMatmul(void){return 1;}
 int cublasLtMatmulAlgoGetHeuristic(void){return 1;}
+int cublasLtMatmulAlgoCheck(void){return 1;}
 int cublasLtMatmulAlgoConfigGetAttribute(void){return 1;}
 int cublasLtMatmulDescCreate(void){return 1;}
 int cublasLtMatmulDescDestroy(void){return 1;}
@@ -199,6 +200,7 @@ int cublasLtMatmulPreferenceCreate(void){return 1;}
 int cublasLtMatmulPreferenceDestroy(void){return 1;}
 int cublasLtMatmulPreferenceSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutCreate(void){return 1;}
+int cublasLtMatrixLayoutSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutDestroy(void){return 1;}
 EOF
 cc -shared -fPIC -nostdlib -o /tmp/libcublasLt.so /tmp/libcublaslt_stub.c
