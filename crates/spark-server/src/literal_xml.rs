@@ -23,6 +23,10 @@ impl LiteralXmlState {
         self.code_fence
             || self.inline_ticks != 0
             || self.quote.is_some()
+            // Models often nest unescaped quotation marks while quoting a
+            // sentence. A marker immediately touching either quote boundary
+            // is still a literal mention, even if that quote closed a span.
+            || matches!(self.previous, Some(b'"' | b'\''))
             // A delimiter run at the end of a chunk is conservatively
             // literal until the next non-backtick byte identifies its size.
             || self.pending_backticks != 0
@@ -246,6 +250,12 @@ mod tests {
         LiteralXmlState, marker_is_literal, mask_literal_markers, state_after,
         unmask_literal_markers,
     };
+
+    #[test]
+    fn marker_touching_nested_quote_boundary_is_literal() {
+        assert!(marker_is_literal("\"The opening tag is \""));
+        assert!(!marker_is_literal("\"finished quote\" "));
+    }
 
     #[test]
     fn tracks_inline_backticks() {
