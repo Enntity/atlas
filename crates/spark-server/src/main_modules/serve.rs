@@ -376,7 +376,7 @@ pub(super) fn resolve_vision_max_pixels(
 /// GLM-5.3's token budgets from its nested `processor_config.json`:
 /// `min_image_tokens` / `max_image_tokens` under `image_processor` and
 /// `video_processor`. GLM declares no pixel area (`size` / `max_pixels`), so
-/// [`read_preprocessor_max_pixels`] finds nothing and these are the bound.
+/// `read_preprocessor_max_pixels` finds nothing and these are the bound.
 /// A missing file or key keeps the processor classes' defaults, which the
 /// shipped checkpoint repeats.
 pub(super) fn read_glm_token_budgets(

@@ -4,6 +4,8 @@
 
 use super::*;
 
+#[path = "init_router.rs"]
+mod init_router;
 mod validation;
 
 impl MoeLayer {
@@ -35,28 +37,13 @@ impl MoeLayer {
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
-
-        // Extract the optional correction-bias device pointer before the
-        // struct literal below moves `weights`. `.map(|dw| dw.weight)` turns
-        // an `Option<DenseWeight>` into an `Option<DevicePtr>` for the
+        // Extract the optional correction-bias device pointer before weights moves
+        // into the struct literal. This maps DenseWeight to DevicePtr for the
         // `moe_topk_sigmoid` kernel's bias arg.
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
-        // FP32 router logits (GLM-5): the router GEMMs below have FP32-output
-        // twins for a BF16 router weight only.
-        let router_f32 = config.router_logits_f32;
-        anyhow::ensure!(
-            !router_f32 || gate_nvfp4.is_none(),
-            "FP32 MoE router logits need a BF16 router weight (the NVFP4 router GEMVs store BF16)"
-        );
-        let logit = |name: &str| {
-            if router_f32 {
-                format!("{name}_f32")
-            } else {
-                name.to_string()
-            }
-        };
+        let router_f32 = init_router::resolve(config.router_logits_f32, gate_nvfp4.is_none())?;
         let dense_gemv = gpu.kernel("gemv", "dense_gemv_bf16")?;
         let dense_gemm = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let optional = super::init_optional::OptionalKernels::resolve(gpu, config);
@@ -495,12 +482,12 @@ impl MoeLayer {
             moe_topk_sigmoid_k: super::super::try_kernel(
                 gpu,
                 "moe_topk_sig",
-                &logit("moe_topk_sigmoid"),
+                &init_router::kernel_name(router_f32, "moe_topk_sigmoid"),
             ),
             moe_topk_sigmoid_batched_k: super::super::try_kernel(
                 gpu,
                 "moe_topk_sig",
-                &logit("moe_topk_sigmoid_batched"),
+                &init_router::kernel_name(router_f32, "moe_topk_sigmoid_batched"),
             ),
         };
         if crate::model::glm_independent::enabled(&config.model_type)? {
