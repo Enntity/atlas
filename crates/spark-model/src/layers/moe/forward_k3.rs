@@ -45,7 +45,7 @@ impl MoeLayer {
                 self.lora.is_none()
                     && self.bf16_gate_weight_ptrs.is_none()
                     && self.fp8_gate_weight_ptrs.is_none()
-                    && !self.has_mixed_bf16_shared_expert()
+                    && !self.has_unfused_shared_expert()
                     && matches!(
                         self.experts_scale_kind,
                         crate::weight_map::WeightQuantFormat::Nvfp4
@@ -73,8 +73,8 @@ impl MoeLayer {
         // Mixed NVFP4-routed / BF16-shared (Laguna): batch the routed half
         // through the _t kernels and run the shared expert as one batched BF16
         // pass afterwards. See forward_k2 for the rationale.
-        let mixed_bf16_shared = self.has_mixed_bf16_shared_expert();
-        if mixed_bf16_shared
+        let unfused_shared = self.has_unfused_shared_expert();
+        if unfused_shared
             && !(self.use_btile_or_t_decode()
                 && self.moe_expert_gate_up_shared_batch3_t_k.0 != 0
                 && self.moe_expert_silu_down_shared_batch3_t_k.0 != 0
@@ -198,7 +198,7 @@ impl MoeLayer {
             // Mixed config: in-kernel shared expert off (NULL), computed in
             // BF16 below instead — the NVFP4 shared_*_t tables are load-time
             // placeholders and numerically wrong for this checkpoint.
-            let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared || !include_shared {
+            let (sh_gate_t, sh_up_t, sh_down_t) = if unfused_shared || !include_shared {
                 (&null_qw, &null_qw, &null_qw)
             } else {
                 (
@@ -304,9 +304,9 @@ impl MoeLayer {
                     stream,
                 )?;
             }
-            if mixed_bf16_shared {
+            if unfused_shared {
                 let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-                self.run_bf16_shared_expert(
+                self.run_unfused_shared_expert(
                     input,
                     3,
                     h,

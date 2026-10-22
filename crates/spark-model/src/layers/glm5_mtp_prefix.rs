@@ -4,7 +4,7 @@
 use super::*;
 
 fn prefix_blocks(rows: usize, block_size: usize) -> (usize, bool) {
-    (rows / block_size, rows % block_size != 0)
+    (rows / block_size, !rows.is_multiple_of(block_size))
 }
 
 fn copy_prefix_blocks(

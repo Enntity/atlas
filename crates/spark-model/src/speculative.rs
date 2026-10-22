@@ -322,6 +322,23 @@ pub trait DraftProposer: Send + Sync {
         None
     }
 
+    /// `ATLAS_QWEN4EXP_MTP_DRAFT_TP`: the announce word of a
+    /// [`Self::propose_batch`] of `n` sequences and `num_drafts` positions
+    /// handed `comm` (with a grammar mask or not), if the worker serves part
+    /// of it. The model announces such a propose with this word before it
+    /// calls it, and hands it `comm` then and only then. `ctx` is the
+    /// propose's: no announce for a propose that will not run batched.
+    fn draft_tp_word(
+        &self,
+        _comm: &dyn spark_comm::CommBackend,
+        _n: usize,
+        _num_drafts: usize,
+        _grammar: bool,
+        _ctx: &crate::layer::ForwardContext<'_>,
+    ) -> Option<u32> {
+        None
+    }
+
     /// `ATLAS_GLM_DRAFT_TP_CTX`: the context rows the split propose about to
     /// be announced over `comm` appends split, packed for the announce
     /// (`rank_split::announce_word`; 0 = none). `seqs` holds each sequence's
@@ -658,6 +675,53 @@ pub trait DraftProposer: Send + Sync {
         state: &mut dyn ProposerState,
         stream: u64,
     ) -> Result<()>;
+
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: the verify settling this state's drafts
+    /// accepted `tokens` (its first `tokens.len()` drafts), and `streams`
+    /// holds that verify's first `tokens.len()` rows of the target's final
+    /// stream highway (`[rows, hc, hidden]` FP32, the live forward's). A
+    /// proposer that rebuilds its context from the target copies them now —
+    /// the next forward reuses the buffer. Default: no-op.
+    fn stage_absorb(
+        &self,
+        _state: &mut dyn ProposerState,
+        _streams: DevicePtr,
+        _tokens: &[u32],
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL`: highway rows `hc_row ..` hold the final
+    /// streams of prompt positions `first_pos ..` (`rows` of them), noted at
+    /// a prefill chunk's capture point for [`Self::absorb_prompt`]. Default:
+    /// no-op.
+    fn note_prompt_rows(
+        &self,
+        _state: &mut dyn ProposerState,
+        _first_pos: usize,
+        _rows: usize,
+        _hc_row: usize,
+    ) {
+    }
+
+    /// After a prefill chunk returns (its logits computed, its highway rows
+    /// still live): build the drafter's context over the noted rows of
+    /// `prompt` (the whole prompt's tokens). Default: no-op.
+    fn absorb_prompt(
+        &self,
+        _state: &mut dyn ProposerState,
+        _prompt: &[u32],
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// At a propose, `tokens` the sequence's: hands over the token of a
+    /// prompt row [`Self::absorb_prompt`] left waiting. Default: no-op.
+    fn prompt_tail_token(&self, _state: &mut dyn ProposerState, _tokens: &[u32]) {}
 
     /// Free per-sequence proposer state (KV cache blocks, device buffers, etc.).
     ///

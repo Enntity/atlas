@@ -420,10 +420,7 @@ async fn post_json(target: &TargetEndpoint, path: &str, body: &Value) -> Result<
 /// extensions.
 fn dechunk(mut b: &[u8]) -> String {
     let mut out = Vec::new();
-    loop {
-        let Some(nl) = b.windows(2).position(|w| w == b"\r\n") else {
-            break;
-        };
+    while let Some(nl) = b.windows(2).position(|w| w == b"\r\n") {
         let len = usize::from_str_radix(String::from_utf8_lossy(&b[..nl]).trim(), 16).unwrap_or(0);
         if len == 0 {
             break;

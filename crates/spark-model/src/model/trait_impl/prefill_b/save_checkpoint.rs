@@ -148,11 +148,44 @@ impl TransformerModel {
         // warm multi-turn matches land on, so an aux-carrying model would
         // recompute every warm prefill from zero.
         let mut aux = self.ssm_snapshots.take_aux(snap_id);
-        self.collect_aux_states_into(seq, stream, &mut aux)?;
+        // ATLAS_QWEN4EXP_CKPT_AUX_SHARE: the mid-chunk finalize read these.
+        if !super::qwen4exp_ckpt::take_pass_aux(seq.slot_idx, seq.seq_len, &mut aux) {
+            self.collect_aux_states_into(seq, stream, &mut aux)?;
+        }
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
 
+        if !self
+            .register_intermediate_checkpoint(tokens, seq, kv_cache, end_token, snap_id, is_branch)
+        {
+            return Ok(());
+        }
+        tracing::info!(
+            "Intermediate SSM checkpoint saved at token {} (snapshot_id {}, block {})",
+            end_token,
+            snap_id,
+            end_block,
+        );
+        Ok(())
+    }
+
+    /// Index `snap_id` (SSM state + aux at `end_token`) as the intermediate
+    /// checkpoint of `tokens[..end_token]`, with the prefix-cache blocks
+    /// under it. `false` (snapshot freed): the boundary cannot be cached
+    /// (the KV is not valid that far, the sliding window has begun, or the
+    /// prefix holds a vision placeholder its content key does not cover).
+    pub(in crate::model) fn register_intermediate_checkpoint(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        kv_cache: &mut PagedKvCache,
+        end_token: usize,
+        snap_id: usize,
+        is_branch: bool,
+    ) -> bool {
+        let bs = kv_cache.block_size();
+        let end_block = end_token / bs;
         let boundary_tokens = &tokens[..end_token];
         // Phase 6.3 sliding-window: when HSS is engaged AND sliding has begun
         // (hss_window_start > 0), the front of the prefix is no longer
@@ -162,7 +195,7 @@ impl TransformerModel {
         let skip_boundary_insert = seq.hss_window_start() > 0 || end_block > seq.block_table.len();
         if skip_boundary_insert {
             self.ssm_snapshots.free(snap_id);
-            return Ok(());
+            return false;
         }
         let boundary_blocks = &seq.block_table[..end_block];
         // Vision chunks insert under their content key (`vision_cache`). A
@@ -172,7 +205,7 @@ impl TransformerModel {
         // state.
         let Some(boundary_key) = self.pc_key(seq, boundary_tokens) else {
             self.ssm_snapshots.free(snap_id);
-            return Ok(());
+            return false;
         };
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
@@ -211,15 +244,6 @@ impl TransformerModel {
             self.prefix_cache
                 .mark_branch_snapshot(&boundary_key, seq.adapter_id);
         }
-        // ATLAS_DFLASH_WARM_CTX=restore: the drafter rows up to this
-        // checkpoint, for the prefill that restores it.
-        self.dflash_warm_save(seq, &boundary_key, stream)?;
-        tracing::info!(
-            "Intermediate SSM checkpoint saved at token {} (snapshot_id {}, block {})",
-            end_token,
-            snap_id,
-            end_block,
-        );
-        Ok(())
+        true
     }
 }

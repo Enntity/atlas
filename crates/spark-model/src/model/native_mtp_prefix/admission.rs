@@ -226,10 +226,7 @@ mod tests {
 
     #[test]
     fn a_missing_worker_snapshot_or_owner_vetoes_the_credit() {
-        assert_eq!(
-            agreed_credit(Some(65_436), |local| Ok(local.min(0))).unwrap(),
-            None
-        );
+        assert_eq!(agreed_credit(Some(65_436), |_| Ok(0)).unwrap(), None);
         let mut voted = false;
         assert_eq!(
             agreed_credit(None, |local| {

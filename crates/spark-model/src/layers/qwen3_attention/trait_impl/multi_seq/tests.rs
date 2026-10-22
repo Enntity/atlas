@@ -192,3 +192,6 @@ fn fused_qkv_twin_never_reaches_the_base_weight_gemv() {
         );
     }
 }
+
+#[path = "dense_mx_tests.rs"]
+mod dense_mx;

@@ -131,6 +131,53 @@ pub fn mxfp8_gemv_rows(
     Ok(())
 }
 
+/// Outputs a `mxfp8_gemv_tc{8,16,32}_swiglu` CTA writes.
+const SWIGLU_CTA_COLS: u32 = 8;
+
+/// [`mxfp8_gemv_rows`]'s SwiGLU twin: `w` is `[gate; up]` (`[2 * inter, k]`,
+/// untiled) and row `r` of `output` (`[rows, inter]`, contiguous) is
+/// `SiLU(gate) * up` of row `r` of `input` (`[rows, k]`), each projection
+/// value the plain tiers' sum rounded to BF16 and the activation rounded as
+/// vLLM's `silu_and_mul` rounds it (`mx_swiglu` in `mxfp8_gemv.cu`).
+/// `swiglu` holds `mxfp8_gemv_tc{8,16,32}_swiglu`. Row-invariant like the
+/// plain tiers.
+#[allow(clippy::too_many_arguments)]
+pub fn mxfp8_swiglu_rows(
+    gpu: &dyn GpuBackend,
+    swiglu: &[KernelHandle; 3],
+    w: &Mxfp8Weight,
+    input: DevicePtr,
+    output: DevicePtr,
+    rows: usize,
+    inter: usize,
+    k: usize,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        !w.tiled && k.is_multiple_of(MXFP8_BLOCK),
+        "mxfp8_swiglu_rows: k={k} tiled={}",
+        w.tiled
+    );
+    for first in (0..rows).step_by(MXFP8_MAX_ROWS) {
+        let m = (rows - first).min(MXFP8_MAX_ROWS) as u32;
+        let kernel = swiglu[mxfp8_tier(m)];
+        ensure!(kernel.0 != 0, "mxfp8_swiglu_rows: no kernel for {m} rows");
+        KernelLaunch::new(gpu, kernel)
+            .grid([div_ceil(inter as u32, SWIGLU_CTA_COLS), 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(input.offset(first * k * 2))
+            .arg_ptr(w.data)
+            .arg_ptr(w.scales)
+            .arg_ptr(output.offset(first * inter * 2))
+            .arg_u32(m)
+            .arg_u32(inter as u32)
+            .arg_u32(k as u32)
+            .arg_u32(inter as u32)
+            .launch(stream)?;
+    }
+    Ok(())
+}
+
 /// The plain tier for `m` rows: 0 (`tc8`, up to 8), 1 (`tc16`) or 2 (`tc32`).
 pub fn mxfp8_tier(m: u32) -> usize {
     match m {

@@ -133,6 +133,8 @@ impl TransformerModel {
         let Some(prop_state) = proposer_state.as_mut() else {
             return Ok(());
         };
+        // ATLAS_QWEN4EXP_MTP_PREFILL: the sampled token of the prompt's last row.
+        proposer.prompt_tail_token(prop_state.as_mut(), seq_tokens);
         let prompt_len = *prompt_len;
         // ATLAS_MTP_DRAFTER_PREFILL: on the FIRST propose of a sequence,
         // batch-prefill the drafter's KV over the prompt (fresh-state check
@@ -670,8 +672,14 @@ impl TransformerModel {
             let ctx_rows = proposer.rank_split_ctx(comm, &seqs);
             self.announce_draft_split_rows(rows, tokens.len(), ctx_rows)?;
         }
+        // ATLAS_QWEN4EXP_MTP_DRAFT_TP: a qwen4_exp batched propose whose draft
+        // head the worker shares, announced with its plan.
+        let tp = match split {
+            Some(_) => None,
+            None => self.announce_draft_tp(proposer, tokens.len(), num_drafts, grammar, &ctx)?,
+        };
         let ctx = ForwardContext {
-            comm: split.map(|(comm, _)| comm),
+            comm: split.map(|(comm, _)| comm).or(tp),
             ..ctx
         };
         proposer.propose_batch(

@@ -35,14 +35,28 @@ pub(super) fn attach_qsa(
         // Already device-resident in the store; the indexer holds the
         // pointers (the store keeps the weights alive for the model's
         // lifetime, same as every other layer weight).
+        // The indexer kernels read these norms as BF16: refuse any other
+        // dtype rather than score keys with bytes of the wrong format.
         let up = |name: &str| -> Result<spark_runtime::gpu::DevicePtr> {
-            Ok(store
+            let t = store
                 .get(&format!("{lp}.self_attn.indexer.{name}"))
-                .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?
-                .ptr)
+                .with_context(|| format!("qwen4_exp layer {i}: indexer {name}"))?;
+            anyhow::ensure!(
+                t.dtype == spark_runtime::weights::WeightDtype::BF16,
+                "qwen4_exp layer {i}: indexer {name} is {:?}; the QSA indexer reads BF16",
+                t.dtype
+            );
+            Ok(t.ptr)
         };
+        // The projection through `dense_auto`, not the raw store pointer:
+        // FP4-Local ships it MXFP8, and the indexer kernels read BF16. On the
+        // BF16 releases `dense_auto` returns the store's own buffer, as before.
+        let qk_name = format!("{lp}.self_attn.indexer.index_qk_proj.weight");
+        let index_qk = crate::weight_map::dense_auto(store, &qk_name, gpu)
+            .with_context(|| format!("qwen4_exp layer {i}: indexer {qk_name}"))?
+            .weight;
         let qsa = crate::layers::qsa::QsaIndexer::new(
-            up("index_qk_proj.weight")?,
+            index_qk,
             up("q_layernorm.weight")?,
             up("k_layernorm.weight")?,
             config.index_n_heads,

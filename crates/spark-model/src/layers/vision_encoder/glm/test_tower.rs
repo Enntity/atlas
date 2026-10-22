@@ -39,6 +39,8 @@ pub(crate) fn config() -> VisionConfig {
         video_end_token_id: 0,
         max_pixels: Some(256 * TEMPORAL * PATCH * PATCH),
         token_budgets: Default::default(),
+        min_pixels: None,
+        video_pixels: None,
     }
 }
 

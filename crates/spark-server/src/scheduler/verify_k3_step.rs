@@ -104,6 +104,39 @@ fn k3_record_outcome(
     }
 }
 
+/// A K=3 verdict's re-propose from `token`: a copy in place of the head
+/// (`ATLAS_QWEN_COPY_DRAFTS`, `copy_drafts::mtp`), else the head at the
+/// request's own depth.
+fn k3_propose(
+    model: &dyn Model,
+    a: &mut ActiveSeq,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+    token: u32,
+    num_drafts: usize,
+) {
+    if crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+        return;
+    }
+    let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+    match model.run_mtp_propose_multi(
+        token,
+        a.seq.seq_len,
+        crate::scheduler::spec_step::effective_drafts_under_grammar(
+            a,
+            a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
+        ),
+        &mut a.seq,
+        0,
+        _mtp_grammar_mask.as_deref(),
+    ) {
+        Ok(d) if !d.is_empty() => a.pending_drafts = d,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("run_mtp_propose_multi: {e:#}");
+        }
+    }
+}
+
 /// K=3 verify: [last_token, draft1, draft2] → [v0, v1, v2]. Three outcomes.
 ///
 /// `verify_ctx` carries the tokenizer special-token IDs the
@@ -226,7 +259,9 @@ pub fn step_verify_k3(
     } else {
         2
     };
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 2, num_accepted);
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(2, num_accepted, num_drafts, sched.levers.depth());
     }
@@ -342,6 +377,7 @@ pub fn step_verify_k3(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 2 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..2]);
         if let Err(e) = model.select_mtp_stream_row(2) {
             tracing::error!("select_mtp_stream_row(2): {e:#}");
         }
@@ -349,28 +385,11 @@ pub fn step_verify_k3(
             tracing::error!("save_hidden_for_mtp(2): {e:#}");
             return;
         }
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 2, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 2) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            v2,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(
-                a,
-                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
-            ),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
-        }
+        k3_propose(model, a, sched, v2, num_drafts);
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
@@ -383,7 +402,7 @@ pub fn step_verify_k3(
     } else if num_accepted == 1 {
         a.seq.seq_len -= 1;
         a.seq.tokens.pop();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2 (STree-style in-place K=3 verify commit). Partial accept
@@ -404,6 +423,7 @@ pub fn step_verify_k3(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 1 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..1]);
         if let Err(e) = model.select_mtp_stream_row(1) {
             tracing::error!("select_mtp_stream_row(1): {e:#}");
         }
@@ -412,24 +432,7 @@ pub fn step_verify_k3(
             return;
         }
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            v1,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(
-                a,
-                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
-            ),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
-        }
+        k3_propose(model, a, sched, v1, num_drafts);
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);
@@ -443,7 +446,7 @@ pub fn step_verify_k3(
         a.seq.seq_len -= 2;
         a.seq.tokens.pop();
         a.seq.tokens.pop();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
         }
         // Item #2 (STree-style in-place K=3 verify commit). Partial accept
@@ -469,24 +472,7 @@ pub fn step_verify_k3(
             return;
         }
         let t_propose = Instant::now();
-        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
-        match model.run_mtp_propose_multi(
-            v0,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(
-                a,
-                a.mtp_acct.depth_drafts(num_drafts, sched.levers.depth()),
-            ),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::error!("run_mtp_propose_multi: {e:#}");
-            }
-        }
+        k3_propose(model, a, sched, v0, num_drafts);
         sched
             .timing
             .record(crate::scheduler::mtp_timing::Phase::Propose, t_propose);

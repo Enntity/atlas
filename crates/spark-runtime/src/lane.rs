@@ -7,8 +7,10 @@
 //! stream needs only lane 0, as before. A lane's copy is allocated on its
 //! first use.
 
+#[cfg(any(feature = "cuda", test))]
 use anyhow::{Result, bail};
 use std::cell::Cell;
+#[cfg(any(feature = "cuda", test))]
 use std::sync::OnceLock;
 
 /// Lanes there are.
@@ -41,12 +43,14 @@ pub fn enter(lane: usize) -> Scope {
 
 /// A device workspace of `size` bytes per lane, each allocated by `alloc`
 /// on its lane's first use.
+#[cfg(any(feature = "cuda", test))]
 pub(crate) struct LaneWorkspace {
     pub(crate) size: usize,
     ptrs: [OnceLock<u64>; LANES],
     alloc: fn(usize) -> Result<u64>,
 }
 
+#[cfg(any(feature = "cuda", test))]
 impl LaneWorkspace {
     /// `first` is lane 0's, allocated already.
     pub(crate) fn new(size: usize, first: u64, alloc: fn(usize) -> Result<u64>) -> Self {

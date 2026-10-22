@@ -35,6 +35,7 @@ fn tokenizer() -> crate::tokenizer::ChatTokenizer {
         "",
         None,
         false,
+        false,
     )
     .unwrap()
 }

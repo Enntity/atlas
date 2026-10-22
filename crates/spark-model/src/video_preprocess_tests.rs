@@ -39,6 +39,8 @@ fn cfg() -> VisionConfig {
         video_end_token_id: 0,
         max_pixels: None,
         token_budgets: Default::default(),
+        min_pixels: None,
+        video_pixels: None,
     }
 }
 
@@ -143,6 +145,33 @@ fn one_frame_cannot_make_a_group_at_tp2() {
     let got = sample_indices(1, 30.0, 2.0, 4, 768, 2);
     assert_eq!(got.len(), 1, "sampling reports the single frame it has");
     assert!(got.len() < 2, "and it is short of one tp=2 group");
+}
+
+#[test]
+fn glm5_sampling_plans_whole_temporal_groups() {
+    // The old sampler asked ffmpeg for an odd count and then duplicated the
+    // last frame so `group_indices` had a full pair. Duplicating charged the
+    // model for a frame it could not learn from. The split now is: the planner
+    // chooses how many frames to take, and the group step keeps whole pairs of
+    // them. So the contract to hold is that grouping never drops a frame the
+    // planner asked the decoder for, and that a short clip still yields at
+    // least one group.
+    for (duration, native, target) in [(2.5, 10.0, 2.0), (1.0, 8.0, 2.0), (300.0, 8.0, 2.0)] {
+        let want = crate::video_sample::wanted_frames(duration, native, target, 2_048, DEFAULT_FPS);
+        assert!(want >= 1, "planner returned no frames for {duration}s");
+        let plan = crate::video_sample::sample_plan(want, duration).expect("plan");
+        assert_eq!(plan.times.len(), want);
+        let grouped = group_indices(plan.times.len(), 2);
+        assert!(!grouped.is_empty(), "one group at tp=2 needs two frames");
+        // At most the odd trailing frame is dropped, and the planner's count
+        // was available to the caller to round before it got here.
+        assert!(
+            plan.times.len() - grouped.len() <= 1,
+            "grouping dropped {} of {} planned frames",
+            plan.times.len() - grouped.len(),
+            plan.times.len()
+        );
+    }
 }
 
 // ── decode + grouping, against a real generated GIF ──────────────────────
@@ -313,44 +342,4 @@ fn invalid_geometry_is_refused_before_dividing_by_it() {
     let mut c = cfg();
     c.patch_size = 0;
     assert!(preprocess_video(&uri, &c, None, 10.0, &no_ffmpeg()).is_err());
-}
-
-// ── GLM-5.3: the reference sampler and processor ─────────────────────────
-
-fn glm_cfg() -> VisionConfig {
-    VisionConfig {
-        is_glm5_next: true,
-        patch_size: 14,
-        ..cfg()
-    }
-}
-
-/// A 2.5 s GIF at 10 fps samples frames [0, 6, 12, 18, 24] (the reference
-/// returns them with the last repeated to fill the third pair), resized as one
-/// five-frame volume: 64x64 is under the 16-token minimum, so it is upscaled
-/// onto an 84x84 canvas. Each group is stamped with its first frame's whole
-/// second.
-#[test]
-fn a_glm_clip_takes_the_reference_frames_canvas_and_timestamps() {
-    let v = preprocess_video(&make_gif(25, 64), &glm_cfg(), None, 2.0, &no_ffmpeg()).unwrap();
-    assert_eq!((v.grid_t, v.grid_h, v.grid_w), (3, 6, 6));
-    assert_eq!(v.timestamps, vec![0.0, 1.0, 2.0]);
-    let last = &v.groups[2];
-    // Frame 24 twice: each patch's two temporal slices are equal.
-    let patch_dim = 3 * 2 * 14 * 14;
-    for patch in last.chunks(patch_dim) {
-        for c in 0..3 {
-            let slice = |t: usize| &patch[c * 392 + t * 196..c * 392 + (t + 1) * 196];
-            assert_eq!(slice(0), slice(1));
-        }
-    }
-    // Under one second still samples (one frame, padded to a pair); under
-    // half a second samples nothing, as in the reference.
-    let short = preprocess_video(&make_gif(9, 64), &glm_cfg(), None, 2.0, &no_ffmpeg()).unwrap();
-    assert_eq!(
-        (short.grid_t, short.grid_h, short.timestamps.len()),
-        (1, 12, 1)
-    );
-    let err = preprocess_video(&make_gif(3, 64), &glm_cfg(), None, 2.0, &no_ffmpeg()).unwrap_err();
-    assert!(format!("{err:#}").contains("too short"), "{err:#}");
 }

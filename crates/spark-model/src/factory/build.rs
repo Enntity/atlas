@@ -72,6 +72,11 @@ pub fn build_model(
     // encoder-decoder checkpoint). `None` = base model.
     nllb_lora_dir: Option<std::path::PathBuf>,
 ) -> Result<Box<dyn Model>> {
+    crate::weight_loader::qwen4_exp::mode::validate(
+        &config,
+        use_speculative,
+        self_speculative || dflash_args.is_some(),
+    )?;
     super::glm_sparse_decode::initialize(
         gpu.as_ref(),
         super::glm_sparse_decode::BuildPolicy {
@@ -371,6 +376,9 @@ pub fn build_model(
             ) {
                 Ok(m) => m,
                 Err(e) => {
+                    if crate::weight_loader::qwen4_exp::mode::selected()?.is_some() {
+                        return Err(e.context("Qwen serving mode requires a working MTP module"));
+                    }
                     tracing::error!("qwen4_exp MTP module load FAILED: {e:#}");
                     None
                 }
@@ -379,6 +387,12 @@ pub fn build_model(
             None
         };
     let q4e_mtp_loaded = q4e_mtp_module.is_some();
+    anyhow::ensure!(
+        crate::weight_loader::qwen4_exp::mode::selected()?.is_none()
+            || config.ep_rank != 0
+            || q4e_mtp_loaded,
+        "Qwen serving mode requires checkpoint MTP weights on rank 0"
+    );
     let q4e_mtp_embed = embed;
     let q4e_mtp_lm_head = lm_head;
 
@@ -724,8 +738,15 @@ pub fn build_model(
         sparse_index,
         glm_cache_plan.and_then(|p| p.shard()).map(|s| s.world),
     );
-    let reserve_net =
-        reserve_net + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
+    // ATLAS_QWEN4EXP_SNAPSHOT_SLOTS / _AUX_MB: the snapshots' host aux
+    // (`ssm_snapshot_budget`), 0 by default.
+    let snapshot_aux = crate::model::ssm_snapshot_budget::install(
+        &ssm_pools.snapshots,
+        layers.iter().map(|l| l.aux_bytes_per_token()).sum(),
+    );
+    let reserve_net = reserve_net
+        + snapshot_aux
+        + kv_nvme::host_reserve_bytes(nvme_geometry, ssm_pools.tier_lazy_host_bytes());
     let budget = kv_budget::measure(
         gpu.as_ref(),
         total_mem,
@@ -1069,7 +1090,36 @@ pub fn build_model(
     // Same shape as 6b: the module holds a reused trunk layer, and the
     // proposer supplies the MTP-specific ends (the per-stream combiner in
     // front, the head mixer behind).
+    //
+    // ATLAS_QWEN4EXP_MTP_DRAFT_TP: on the TP2 pair the worker builds the same
+    // draft head and projects half of each batched propose's
+    // (`layers::qwen4exp_mtp::draft_tp`); it proposes nothing.
+    let (q4e_draft_tp, rank) = {
+        let c = model.config_ref();
+        let pair = c.tp_world_size == 2 && c.ep_world_size == 2;
+        let on = c.model_type == "qwen4_exp" && use_speculative && pair;
+        (
+            on && crate::layers::qwen4exp_mtp::draft_tp::requested()?,
+            c.ep_rank,
+        )
+    };
+    if q4e_draft_tp && rank != 0 {
+        let (vocab, hidden) = {
+            let c = model.config_ref();
+            (c.vocab_size, c.hidden_size)
+        };
+        let assist = crate::layers::qwen4exp_mtp::draft_tp::Qwen4ExpDraftAssist::new(
+            &q4e_mtp_lm_head,
+            vocab,
+            hidden,
+            mtp_vocab_size,
+            model.gpu_backend(),
+        )?;
+        model.set_draft_assist(std::sync::Arc::new(assist));
+        tracing::info!("qwen4_exp MTP draft head installed on rank {rank} to serve draft TP");
+    }
     if let Some(q4e_module) = q4e_mtp_module {
+        crate::layers::qwen4exp_mtp::qwen4exp_mtp_prompt::check_exclusive()?;
         match crate::layers::Qwen4ExpMtpHead::new(
             q4e_module,
             q4e_mtp_embed,
@@ -1078,16 +1128,24 @@ pub fn build_model(
             mtp_vocab_size,
             max_seq_len,
         ) {
-            Ok(head) => {
+            Ok(mut head) => {
+                if q4e_draft_tp {
+                    head.enable_draft_tp(model.gpu_backend())?;
+                }
                 model.set_dflash_proposer(std::sync::Arc::new(head));
                 tracing::info!(
                     "qwen4_exp MTP speculative decoding: ENABLED (single module, \
                      reused full-attention body)"
                 );
             }
-            Err(e) => tracing::warn!(
-                "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
-            ),
+            Err(e) => {
+                if crate::weight_loader::qwen4_exp::mode::selected()?.is_some() {
+                    return Err(e.context("Qwen serving mode requires a working MTP proposer"));
+                }
+                tracing::warn!(
+                    "Failed to build qwen4_exp MTP proposer: {e:#}. Speculative decoding disabled."
+                );
+            }
         }
     }
 

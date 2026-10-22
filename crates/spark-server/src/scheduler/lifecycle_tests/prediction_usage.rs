@@ -120,3 +120,5 @@ async fn prediction_usage_stream_done_uses_returned_draft_count() {
         _ => panic!("expected Done"),
     }
 }
+
+mod k4;

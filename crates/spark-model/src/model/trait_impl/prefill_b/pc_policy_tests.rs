@@ -4,8 +4,8 @@
 //! two-rank restore-depth agreement.
 
 use super::{
-    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor,
-    parse_tail_split_min_tokens, tail_cut, tail_split_at,
+    Agreed, agree_restore, branch_checkpoint_at, branch_split_at, layer_write_floor, replay_floor,
+    tail_cut,
 };
 
 const BS: usize = 16;
@@ -28,42 +28,6 @@ fn tail_cut_is_one_block_below_the_last_boundary() {
         assert_eq!(tail_cut(n, BS), floor - BS, "n={n}");
         assert!(n - tail_cut(n, BS) > BS && n - tail_cut(n, BS) <= 2 * BS);
     }
-}
-
-/// `ATLAS_TAIL_SPLIT_MIN_TOKENS`: unset or 0 splits exactly as before; a
-/// prompt under the minimum runs one pass; at or above it, and on a warm or
-/// multi-chunk last chunk of such a prompt, the split is unchanged.
-#[test]
-fn tail_split_min_tokens_keeps_short_prompts_to_one_pass() {
-    assert_eq!(parse_tail_split_min_tokens(None), 0);
-    assert_eq!(parse_tail_split_min_tokens(Some("512")), 512);
-    assert_eq!(parse_tail_split_min_tokens(Some(" 256 ")), 256);
-    assert_eq!(parse_tail_split_min_tokens(Some("x")), 0);
-    let split = |total: usize, start: usize, disabled, min| {
-        tail_split_at(total, start, tail_cut(total, BS), disabled, min)
-    };
-    // Default: every prompt past 32 tokens splits (cold, start 0).
-    for n in [27, 32, 33, 80, 150, 511, 512, 40_000] {
-        assert_eq!(split(n, 0, false, 0), n > 32, "n={n}");
-    }
-    // With a 512-token minimum the mixed8 prompts run one pass ...
-    for n in [60, 80, 150, 511] {
-        assert!(!split(n, 0, false, 512), "n={n}");
-    }
-    // ... and longer ones split exactly as before, cold or warm.
-    for (n, start) in [(512, 0), (2_000, 0), (40_000, 32_768), (40_000, 39_952)] {
-        assert_eq!(
-            split(n, start, false, 512),
-            split(n, start, false, 0),
-            "n={n}"
-        );
-        assert!(split(n, start, false, 512), "n={n} start={start}");
-    }
-    // ATLAS_NO_TAIL_SPLIT still wins.
-    assert!(!split(40_000, 0, true, 0));
-    assert!(!split(40_000, 0, true, 512));
-    // Restored at or past the cut: nothing to split, whatever the minimum.
-    assert!(!split(40_000, tail_cut(40_000, BS), false, 0));
 }
 
 #[test]
@@ -232,4 +196,14 @@ fn write_floor_covers_the_matched_rows_of_a_recompute() {
     assert_eq!(glm(0, 20_000, 24_576, 100), 0);
     // A Marconi replay already floors at the match: the flag adds nothing.
     assert_eq!(glm(32, 4096, 4064, 500), 32);
+}
+
+// A Marconi replay keeps its rows under the match unwritten; a pass without a
+// restore takes the lookup's floor (0 for a full recompute).
+#[test]
+fn replay_floor_covers_the_replayed_matched_rows() {
+    assert_eq!(replay_floor(true, 320, 256, 256, 100), 64);
+    assert_eq!(replay_floor(true, 320, 256, 256, 40), 40);
+    assert_eq!(replay_floor(true, 256, 256, 256, 100), 0);
+    assert_eq!(replay_floor(false, 64, 0, 0, 70), 0);
 }

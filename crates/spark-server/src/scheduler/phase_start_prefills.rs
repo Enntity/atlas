@@ -12,6 +12,7 @@ use crate::grammar::GrammarEngine;
 
 mod initial_budget;
 mod packed;
+mod queue_first;
 mod queue_order;
 
 #[allow(clippy::too_many_arguments)]
@@ -263,6 +264,22 @@ pub(super) fn start_new_requests(
         })
         .collect();
     let mut packed_ps: Vec<PrefillInProgress> = Vec::new();
+    // ATLAS_QWEN4EXP_PREFILL_MULTI: defer the short prompts of a burst (two
+    // or more this tick, or some already waiting) to one multi-sequence pass.
+    let multi_eligible = |req: &InferenceRequest| {
+        chunked
+            && !req.has_image_pixels()
+            && req.num_beams() <= 1
+            && super::prefill_multi::eligible(
+                model,
+                req.prompt_len(),
+                req.prompt_len() <= max_prefill_tokens,
+                req.prompt_logprobs().is_some(),
+                req.adapter_slot(),
+            )
+    };
+    let multi_burst = new_reqs.iter().filter(|r| multi_eligible(r)).count() >= 2
+        || super::prefill_multi::pending(model, prefilling);
 
     for (req_idx, (req, pc_plant)) in new_reqs.into_iter().zip(pc_plants).enumerate() {
         let precomputed_beam_hyp = beam_hyps[req_idx].take();
@@ -270,7 +287,8 @@ pub(super) fn start_new_requests(
             let pack = packable[req_idx];
             let defer = pack
                 || want_codispatch
-                || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
+                || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels())
+                || (multi_burst && multi_eligible(&req));
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -292,6 +310,20 @@ pub(super) fn start_new_requests(
                 active.is_empty() && prefilling.is_empty(),
                 glm_c4_sparse,
             );
+            // ATLAS_PREFILL_QUEUE_FIRST_CHUNK: behind a prefill in flight, a
+            // prompt longer than one chunk waits for its turn (`queue_first`);
+            // `start_chunked_prefill`'s first chunk is the whole prompt
+            // exactly when it fits `budget` (the granule rounding only cuts a
+            // chunk short of the prompt's end).
+            let first_chunk = queue_first::first_chunk(
+                defer,
+                sched.levers.prefill_queue_first_chunk,
+                model.is_ep(),
+                !prefilling.is_empty(),
+                req.has_image_pixels(),
+                req.num_beams() > 1,
+                req.prompt_len() <= budget,
+            );
             match start_chunked_prefill(
                 sched,
                 think_end_token,
@@ -306,7 +338,7 @@ pub(super) fn start_new_requests(
                 prefill_event,
                 grammar_engine,
                 spontaneous_think_budget,
-                defer,
+                first_chunk,
                 pack,
                 vision_slice,
                 precomputed_beam_hyp,
@@ -337,6 +369,12 @@ pub(super) fn start_new_requests(
                         .collect();
                     let left = p.prompt_tokens.len() - p.chunk_offset;
                     let at = queue_order::position(&queued, left, sched.levers.prefill_srpt);
+                    if p.queued_first_chunk.is_some() {
+                        tracing::info!(
+                            "Prefill queued for its first chunk at {at} of {} in flight",
+                            queued.len(),
+                        );
+                    }
                     prefilling.insert(at, p);
                 }
                 Ok(StartPrefillResult::Finished) => {} // EOS on first token

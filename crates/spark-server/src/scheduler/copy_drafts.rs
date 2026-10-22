@@ -59,8 +59,13 @@
 //! Each request's `Done:` line is followed by a `COPY DRAFTS` line with its
 //! copy rounds, drafts and accepted drafts, of the prompt and of the reply.
 //! They count the verifies that settle through `verify_dflash_tail` (the
-//! per-sequence and GLM owner-batched paths); the single-GPU batched eager
-//! verify drops confidences, the drafter's as well, and books neither.
+//! per-sequence and GLM owner-batched paths) and, on the MTP lane, every
+//! MTP verify ([`mtp::settle`]); the single-GPU batched eager DFlash verify
+//! drops confidences, the drafter's as well, and books neither.
+//!
+//! The MTP lane (`ATLAS_QWEN_COPY_DRAFTS=1`, qwen4_exp's exact lane only)
+//! uses the same index, proposal and knobs in place of the MTP head's
+//! propose rather than over its drafts: see [`mtp`].
 //!
 //! Prior art: the policy (match length, latest occurrence with a full
 //! continuation, copy over the drafter's block, the reply-match and
@@ -80,6 +85,8 @@ use std::sync::OnceLock;
 use super::ActiveSeq;
 use super::dflash_conf_width::{COPY_CONF, COPY_REPLY_CONF, is_copy};
 use super::dflash_width::MAX_DRAFTS;
+
+pub(super) mod mtp;
 
 /// Positions indexed at most: the 512K context limit (a longer context
 /// copies from its first 512K positions).
@@ -104,12 +111,17 @@ struct Settings {
 }
 
 impl Settings {
-    /// Parse the knobs from `var` (an environment lookup); out-of-range
-    /// values take their defaults.
+    /// The knobs with DFlash2's copy drafts on, from `var` (an environment
+    /// lookup); `None` unless `ATLAS_DFLASH_COPY_DRAFTS=1`.
     fn parse(var: impl Fn(&str) -> Option<String>) -> Option<Self> {
         if var("ATLAS_DFLASH_COPY_DRAFTS").as_deref() != Some("1") {
             return None;
         }
+        Some(Self::knobs(var))
+    }
+
+    /// Parse the knobs from `var`; out-of-range values take their defaults.
+    fn knobs(var: impl Fn(&str) -> Option<String>) -> Self {
         let num = |name: &str, default: usize, ok: &dyn Fn(usize) -> bool| {
             var(name)
                 .and_then(|v| v.trim().parse().ok())
@@ -120,14 +132,14 @@ impl Settings {
         let max = num("ATLAS_DFLASH_COPY_MAX", MAX_DRAFTS, &|v| {
             (1..=MAX_DRAFTS).contains(&v)
         });
-        Some(Self {
+        Self {
             match_len,
             max,
             reply_match: num("ATLAS_DFLASH_COPY_REPLY_MATCH", 0, &|v| {
                 v > match_len && v <= 64
             }),
             miss_max: num("ATLAS_DFLASH_COPY_MISS_MAX", 0, &|v| v <= max),
-        })
+        }
     }
 }
 
@@ -135,6 +147,13 @@ fn settings() -> Option<&'static Settings> {
     static S: OnceLock<Option<Settings>> = OnceLock::new();
     S.get_or_init(|| Settings::parse(|name| std::env::var(name).ok()))
         .as_ref()
+}
+
+/// The knobs whichever lane reads them (the MTP lane is switched by its
+/// lever, [`mtp`]).
+fn knobs() -> &'static Settings {
+    static S: OnceLock<Settings> = OnceLock::new();
+    S.get_or_init(|| Settings::knobs(|name| std::env::var(name).ok()))
 }
 
 /// A request's context: the committed tokens, then the pending one.
@@ -332,6 +351,9 @@ pub(crate) struct CopyState {
     offered: usize,
     /// The last settled copy round kept fewer than all of its drafts.
     missed: bool,
+    /// The copy confidence of the drafts the running MTP verify carries,
+    /// `None` when the head drafted them ([`mtp::begin_verify`]).
+    verifying: Option<f32>,
     /// Copy rounds, drafts and accepted drafts: of the prompt, of the reply.
     rounds: [u64; 2],
     drafted: [u64; 2],
@@ -342,7 +364,18 @@ impl CopyState {
     /// The state a preempted request resumes with: the index and counters are
     /// host-side and its context is unchanged, so only the offer is renewed.
     pub(super) fn resumed(self) -> Self {
-        Self { offered: 0, ..self }
+        Self {
+            offered: 0,
+            verifying: None,
+            ..self
+        }
+    }
+
+    /// Copy rounds, drafts and accepted drafts (of the prompt, of the
+    /// reply), and whether the last round missed.
+    #[cfg(test)]
+    pub(super) fn tally(&self) -> ([u64; 2], [u64; 2], [u64; 2], bool) {
+        (self.rounds, self.drafted, self.accepted, self.missed)
     }
 }
 
@@ -358,30 +391,14 @@ fn offer_with(a: &mut ActiveSeq, s: &Settings) {
     if a.grammar_state.is_some() || a.pending_drafts.is_empty() {
         return;
     }
-    let ctx = Context {
-        history: &a.seq.tokens,
-        pending: a.last_token,
-    };
+    let len = a.seq.tokens.len() + 1;
     let state = &mut a.spec_adapt.copy;
-    if state.offered == ctx.len() {
+    if state.offered == len {
         return;
     }
-    state.offered = ctx.len();
-    let mut k = s.max.min(a.pending_drafts.len());
-    if state.missed && s.miss_max > 0 {
-        k = k.min(s.miss_max);
-    }
-    let prompt = ctx.len().saturating_sub(a.output_tokens.len());
-    let index = state
-        .index
-        .get_or_insert_with(|| Index::new(s.match_len, prompt));
-    if let Some(at) = index.find(ctx, k, s.reply_match) {
-        let copy_conf = if index.in_reply(at) {
-            COPY_REPLY_CONF
-        } else {
-            COPY_CONF
-        };
-        let copy = copy_after(ctx, at, k);
+    state.offered = len;
+    let k = s.max.min(a.pending_drafts.len());
+    if let Some((copy, copy_conf)) = copy_for(a, s, k) {
         merge(
             &copy,
             copy_conf,
@@ -389,6 +406,31 @@ fn offer_with(a: &mut ActiveSeq, s: &Settings) {
             &mut a.pending_draft_conf,
         );
     }
+}
+
+/// The copy of `k` drafts `a`'s context holds (fewer after a miss, under
+/// the miss knob) and the confidence its drafts carry; none when its last
+/// `match` tokens never occurred before.
+fn copy_for(a: &mut ActiveSeq, s: &Settings, mut k: usize) -> Option<(Vec<u32>, f32)> {
+    let ctx = Context {
+        history: &a.seq.tokens,
+        pending: a.last_token,
+    };
+    let state = &mut a.spec_adapt.copy;
+    if state.missed && s.miss_max > 0 {
+        k = k.min(s.miss_max);
+    }
+    let prompt = ctx.len().saturating_sub(a.output_tokens.len());
+    let index = state
+        .index
+        .get_or_insert_with(|| Index::new(s.match_len, prompt));
+    let at = index.find(ctx, k, s.reply_match)?;
+    let copy_conf = if index.in_reply(at) {
+        COPY_REPLY_CONF
+    } else {
+        COPY_CONF
+    };
+    Some((copy_after(ctx, at, k), copy_conf))
 }
 
 /// After `a`'s pending drafts were cut, cut a copy's confidences with them.

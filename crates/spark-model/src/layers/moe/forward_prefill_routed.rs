@@ -256,8 +256,8 @@ impl MoeLayer {
         // kernels write every row that can be referenced by unpermute_reduce.
         // Skipping the memset removes ~138 MB/layer of scratch clears on Holo.
         self.prepare_ep_prefill_outputs(total_expanded, inter, h, ctx, stream)?;
-        // ATLAS_QWEN4EXP_PREFILL_MOE: the whole chain below on the q38
-        // kernels, byte for byte (`forward_prefill_q38.rs`).
+        // ATLAS_QWEN4EXP_PREFILL_MOE: qwen4_exp's own routed chain
+        // (`forward_prefill_q38.rs`: W4A4, or W4A16 on the TC kernels).
         if max_m_tiles > 0
             && self.try_q38_routed_prefill(
                 expert_input,
@@ -812,7 +812,6 @@ impl MoeLayer {
             }
         }
         prof_step!("grouped_silu_down");
-        super::forward_prefill_q38::finish_q38_check(ctx, total_expanded, h, stream)?;
 
         Ok(e4m3_scales)
     }

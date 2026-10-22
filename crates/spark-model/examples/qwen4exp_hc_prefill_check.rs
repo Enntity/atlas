@@ -53,6 +53,14 @@ fn f32s(rng: &mut Lcg, n: usize, f: impl Fn(f32) -> f32) -> Vec<u8> {
     (0..n).flat_map(|_| f(rng.f()).to_le_bytes()).collect()
 }
 
+/// BF16 bytes widened exactly to F32 (`bits << 16`), as the loader's
+/// `f32_norm` does for a BF16 release: the norm kernels read F32.
+fn widen_bf16(b: &[u8]) -> Vec<u8> {
+    b.chunks_exact(2)
+        .flat_map(|c| ((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).to_le_bytes())
+        .collect()
+}
+
 fn up(g: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     let p = g.alloc(bytes.len().max(256))?;
     g.copy_h2d(bytes, p)?;
@@ -75,7 +83,7 @@ fn site(g: &dyn GpuBackend, rng: &mut Lcg, inject: bool) -> Result<HcSiteWeights
         hc_base: DevicePtr::NULL,
         hc_scale: DevicePtr::NULL,
         lowrank: Some(HcLowRank {
-            norm_w: up(g, &bf16s(rng, wide, 0.1))?,
+            norm_w: up(g, &widen_bf16(&bf16s(rng, wide, 0.1)))?,
             down_w: up(g, &bf16s(rng, RANK * wide, 0.02))?,
             up_w: up(g, &bf16s(rng, RANK * wide, 0.05))?,
             inject_w: if inject {

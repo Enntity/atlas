@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_comm::CommBackend;
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{GpuBackend, mock::MockGpuBackend};
 
 use super::*;
 
@@ -117,8 +117,21 @@ pub(crate) fn with_comm_ctx<R>(
     comm: &dyn CommBackend,
     f: impl FnOnce(&ForwardContext) -> R,
 ) -> R {
+    with_model_ctx(gpu, comm, None, f)
+}
+
+/// [`with_comm_ctx`] with an explicit model type for model-specific GPU tests.
+pub(crate) fn with_model_ctx<R>(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
+    model_type: Option<&str>,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.tp_world_size = 2;
+    if let Some(model_type) = model_type {
+        config.model_type = model_type.to_owned();
+    }
     let buffers = BufferArena::new(&config, 1, 256, 16, 1, gpu).unwrap();
     let dispatch = crate::layers::ops::GemmDispatch::defaults();
     let derived = crate::layers::ops::DerivedWeights::new();

@@ -55,7 +55,6 @@ pub struct MxW8a8 {
 /// checks it takes (taller passes run in chunks of it; the kernel computes
 /// each row alone, so the bytes are the same).
 pub const MX_PINNED_MAX_ROWS: usize = 8192;
-
 impl MxW8a8 {
     /// The W8A8 operand of an untiled `[n, k]` `twin`, its row buckets
     /// tuned up to `m_max` rows ([`mx_prepare`]; `0`, an unknown bound, leaves
@@ -127,7 +126,6 @@ impl MxW8a8 {
         }
         self.pinned()
     }
-
     /// Bytes this operand allocated (the tiled scales).
     pub fn owned_bytes(&self) -> usize {
         mx_lt_scale_bytes(self.n, self.k)

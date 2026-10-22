@@ -29,14 +29,22 @@ fn tokenizer(dir: &std::path::Path) -> crate::tokenizer::ChatTokenizer {
     let mut inner = tokenizers::Tokenizer::new(model);
     inner.with_decoder(Some(tokenizers::decoders::fuse::Fuse::new()));
     inner.save(dir.join("tokenizer.json"), false).unwrap();
-    crate::tokenizer::ChatTokenizer::from_model_dir(dir, 0, true, "glm5_next", "", None, false)
-        .unwrap()
+    crate::tokenizer::ChatTokenizer::from_model_dir(
+        dir,
+        0,
+        true,
+        "glm5_next",
+        "",
+        None,
+        false,
+        false,
+    )
+    .unwrap()
 }
 
 /// A minimal `AppState` — only the fields `build_choice_message` and the
 /// OpenAI encoder actually read are set to non-default values; the rest are
-/// the same neutral defaults the production server builds for a text-only,
-/// tool-free GLM serve.
+/// the neutral defaults of `api::test_app_state`.
 fn state(dir: &std::path::Path) -> AppState {
     AppState {
         model_name: "refusal-fixture".into(),

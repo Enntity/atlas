@@ -74,6 +74,7 @@ fn app(glm: bool) -> Arc<AppState> {
         "",
         None,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(

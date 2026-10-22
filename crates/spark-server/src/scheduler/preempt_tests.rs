@@ -30,6 +30,7 @@ mod chunk_retry;
 mod kv_refusal;
 mod min_tokens_ban;
 mod packed_prefill;
+mod queue_first_chunk;
 mod resume;
 mod shared_prefix_admit;
 mod victim_policy;
@@ -70,6 +71,8 @@ struct PreemptStubModel {
     packed: Option<(usize, usize)>,
     /// Prompts of every `prefill_packed` call.
     packed_calls: Mutex<Vec<Vec<Vec<u32>>>>,
+    /// A multi-rank world without shared-prefix admission.
+    ep: bool,
 }
 
 /// A token that marks a prompt as a prefix-cache hit for the packed stub.
@@ -333,7 +336,7 @@ impl Model for PreemptStubModel {
         self.inflight_min.map(|_| 16)
     }
     fn is_ep(&self) -> bool {
-        self.inflight_min.is_some()
+        self.ep || self.inflight_min.is_some()
     }
     fn reclaim_prefix_blocks(&self, num_blocks: usize) -> usize {
         let take = num_blocks.min(self.reclaimable.load(Ordering::SeqCst));

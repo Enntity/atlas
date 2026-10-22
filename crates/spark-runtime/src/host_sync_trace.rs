@@ -8,7 +8,9 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "cuda")]
+use std::time::Instant;
 
 /// Whether the trace is on. Read once.
 pub fn enabled() -> bool {
@@ -22,6 +24,7 @@ type Stats = HashMap<(&'static str, String), (u64, Duration)>;
 static STATS: Mutex<Option<Stats>> = Mutex::new(None);
 
 /// The first `spark_model` frame of `bt`, as `function (file:line)`.
+#[cfg(any(feature = "cuda", test))]
 fn site(bt: &str) -> String {
     let mut lines = bt.lines();
     while let Some(line) = lines.next() {
@@ -40,6 +43,7 @@ fn site(bt: &str) -> String {
 }
 
 /// Run `f`, a host wait of kind `what`, timing it when the trace is on.
+#[cfg(feature = "cuda")]
 pub(crate) fn traced<T>(what: &'static str, f: impl FnOnce() -> T) -> T {
     if !enabled() {
         return f();
@@ -67,7 +71,7 @@ pub fn take_report(top: usize) -> String {
         .take()
         .unwrap_or_default();
     let mut rows: Vec<_> = stats.into_iter().collect();
-    rows.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.1.1));
     let total: Duration = rows.iter().map(|r| r.1.1).sum();
     let calls: u64 = rows.iter().map(|r| r.1.0).sum();
     let mut out = if rows.is_empty() {

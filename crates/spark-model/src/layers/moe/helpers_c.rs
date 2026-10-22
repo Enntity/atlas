@@ -143,12 +143,18 @@ impl MoeLayer {
         self.bf16_shared_expert.is_some() && self.bf16_gate_weight_ptrs.is_none()
     }
 
-    /// Evaluate a checkpoint-native BF16 shared expert into `down_out`.
+    /// The shared expert runs apart from the fused routed kernels: mixed BF16 or MXFP8.
+    pub(super) fn has_unfused_shared_expert(&self) -> bool {
+        self.has_mixed_bf16_shared_expert() || self.mxfp8_shared_expert.is_some()
+    }
+
+    /// Evaluate a checkpoint-native shared expert into `down_out`: the MXFP8
+    /// one's decode tiers (SiLU * up in `gate_out`), else the BF16 one.
     ///
     /// Callers supply scratch buffers because the safe aliases differ between
-    /// decode and prefill. Returns `true` when BF16 weights were installed.
+    /// decode and prefill. Returns `true` when such weights were installed.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_bf16_shared_expert(
+    pub(super) fn run_unfused_shared_expert(
         &self,
         input: DevicePtr,
         num_tokens: u32,
@@ -160,6 +166,11 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if let Some(mx) = &self.mxfp8_shared_expert {
+            let rows = num_tokens as usize;
+            mx.decode(ctx.gpu, input, rows, gate_out, down_out, stream)?;
+            return Ok(true);
+        }
         let Some(shared) = self.bf16_shared_expert else {
             return Ok(false);
         };

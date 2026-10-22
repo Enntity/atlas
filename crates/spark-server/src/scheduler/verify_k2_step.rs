@@ -189,7 +189,9 @@ pub fn step_verify_k2(
         )
     };
     let accepted = drafts[0] == v0;
-    if !dflash_verify_raw_argmax {
+    // A copy round (`copy_drafts::mtp`) says nothing about the head.
+    let copied = crate::scheduler::copy_drafts::mtp::settle(a, 1, usize::from(accepted));
+    if !dflash_verify_raw_argmax && !copied {
         a.mtp_acct
             .record_depth_verify(1, usize::from(accepted), num_drafts, sched.levers.depth());
     }
@@ -257,6 +259,7 @@ pub fn step_verify_k2(
         // Same row, the other input shape: a drafter reading the PRE-mixer
         // stream highway needs row 1 staged into row 0, or it proposes from
         // the first verify row instead of the accepted one.
+        super::verify_k4_verdict::stage_absorb(model, a, 0, &drafts[..1]);
         if let Err(e) = model.select_mtp_stream_row(1) {
             tracing::error!("select_mtp_stream_row(1): {e:#}");
             if native_mtp {
@@ -277,7 +280,7 @@ pub fn step_verify_k2(
         }
         sched.timing.record(Phase::SaveHidden, t_save);
         let t_trim = Instant::now();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 1, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 1) {
             tracing::error!("trim_proposer_state: {e:#}");
             if native_mtp {
                 a.abort_on_engine_error(format_args!(
@@ -302,29 +305,32 @@ pub fn step_verify_k2(
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
         let t_propose = Instant::now();
-        match model.run_mtp_propose_multi(
-            v1,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {
-                if native_mtp {
-                    a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
-                    return;
+        // A Qwen copy draft is optional; native MTP failures remain fatal.
+        if !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            match model.run_mtp_propose_multi(
+                v1,
+                a.seq.seq_len,
+                crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {
+                    if native_mtp {
+                        a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                        return;
+                    }
                 }
-            }
-            Err(e) => {
-                if native_mtp {
-                    a.abort_on_engine_error(format_args!(
-                        "native GLM MTP re-propose failed: {e:#}"
-                    ));
-                    return;
+                Err(e) => {
+                    if native_mtp {
+                        a.abort_on_engine_error(format_args!(
+                            "native GLM MTP re-propose failed: {e:#}"
+                        ));
+                        return;
+                    }
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
                 }
-                tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
         sched.timing.record(Phase::Propose, t_propose);
@@ -351,7 +357,7 @@ pub fn step_verify_k2(
         a.seq.tokens.pop();
 
         let t_trim = Instant::now();
-        if let Err(e) = model.trim_proposer_state(&mut a.seq, 0, 0) {
+        if let Err(e) = crate::scheduler::copy_drafts::mtp::trim_proposer(model, a, 0) {
             tracing::error!("trim_proposer_state: {e:#}");
             if native_mtp {
                 a.abort_on_engine_error(format_args!(
@@ -407,29 +413,32 @@ pub fn step_verify_k2(
         let _mtp_grammar_mask = mtp_grammar_mask_for(a);
         sched.timing.record(Phase::ProposeMask, t_mask);
         let t_propose = Instant::now();
-        match model.run_mtp_propose_multi(
-            v0,
-            a.seq.seq_len,
-            crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
-            &mut a.seq,
-            0,
-            _mtp_grammar_mask.as_deref(),
-        ) {
-            Ok(d) if !d.is_empty() => a.pending_drafts = d,
-            Ok(_) => {
-                if native_mtp {
-                    a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
-                    return;
+        // A Qwen copy draft is optional; native MTP failures remain fatal.
+        if !crate::scheduler::copy_drafts::mtp::propose(model, sched, a, num_drafts) {
+            match model.run_mtp_propose_multi(
+                v0,
+                a.seq.seq_len,
+                crate::scheduler::spec_step::effective_drafts_under_grammar(a, next_drafts),
+                &mut a.seq,
+                0,
+                _mtp_grammar_mask.as_deref(),
+            ) {
+                Ok(d) if !d.is_empty() => a.pending_drafts = d,
+                Ok(_) => {
+                    if native_mtp {
+                        a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                        return;
+                    }
                 }
-            }
-            Err(e) => {
-                if native_mtp {
-                    a.abort_on_engine_error(format_args!(
-                        "native GLM MTP re-propose failed: {e:#}"
-                    ));
-                    return;
+                Err(e) => {
+                    if native_mtp {
+                        a.abort_on_engine_error(format_args!(
+                            "native GLM MTP re-propose failed: {e:#}"
+                        ));
+                        return;
+                    }
+                    tracing::error!("run_mtp_propose_multi: {e:#}");
                 }
-                tracing::error!("run_mtp_propose_multi: {e:#}");
             }
         }
         sched.timing.record(Phase::Propose, t_propose);

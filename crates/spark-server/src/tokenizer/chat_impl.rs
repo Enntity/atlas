@@ -53,6 +53,10 @@ impl ChatTokenizer {
         template_override: &str,
         repo_root: Option<&Path>,
         disable_template_overrides: bool,
+        // `tojson` spaced like Python's `json.dumps`, as transformers renders
+        // it (MODEL.toml `[behavior].verbatim_prompt`); otherwise the
+        // process-wide `ATLAS_USE_HF_REF_JSON_DUMPS` choice.
+        hf_tool_json: bool,
     ) -> Result<Self> {
         Self::from_model_dir_with(
             model_dir,
@@ -62,7 +66,11 @@ impl ChatTokenizer {
             template_override,
             repo_root,
             disable_template_overrides,
-            super::jinja_helpers::ToolJsonStyle::from_env(),
+            if hf_tool_json {
+                super::jinja_helpers::ToolJsonStyle::HfSpaced
+            } else {
+                super::jinja_helpers::ToolJsonStyle::from_env()
+            },
         )
     }
 
@@ -166,7 +174,10 @@ impl ChatTokenizer {
             .map_err(anyhow::Error::msg)?,
             eos_token_id,
             supports_thinking,
-            glm_tool_markup_as_text: model_type == "glm5_next",
+            // GLM-5 and Qwen4_exp register their tool-envelope XML as added
+            // tokens. Keep the scope explicit: other Qwen variants may use
+            // different marker semantics and must retain their prompt bytes.
+            glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
             chat_encoding,
             chat_template,
             jinja_env,

@@ -10,10 +10,11 @@ use spark_runtime::gpu::DevicePtr;
 
 use super::super::Qwen3AttentionLayer;
 use crate::layer::ForwardContext;
-use crate::layers::ops;
+use crate::layers::ops::{self, MxAct};
 
 /// Identifies which projection (Q/K/V) — selects the correct weight bank
 /// from `Qwen3AttentionLayer`.
+#[derive(Clone, Copy)]
 pub(super) enum Proj {
     Q,
     K,
@@ -50,7 +51,7 @@ impl Qwen3AttentionLayer {
             && self.quantize_nvfp4_k.0 != 0
             && self.q_weight.as_ref().and_then(|w| w.as_nvfp4()).is_some()
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * (h as usize)
-            && std::env::var("ATLAS_ATTN_W4A4").is_ok();
+            && super::attn_w4a4_requested();
         let a4 = if w4a4 {
             let a4 = ctx.buffers.fp8_act();
             let a4_sf = a4.offset((n as usize) * (h as usize) / 2);
@@ -68,6 +69,18 @@ impl Qwen3AttentionLayer {
         } else {
             None
         };
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: q/k/v on `qwen4exp_fp8_gemm_w2` at
+        // every width (the first chunk's arm), the activations converted to
+        // E4M3 once into `attn_output`, which attention writes only later.
+        let a8 = (crate::layers::ops::qwen4exp_rowinv::active() && self.q_fp8.is_some())
+            .then(|| -> Result<DevicePtr> {
+                let a8 = ctx.buffers.attn_output();
+                ops::bf16_to_fp8(ctx.gpu, self.bf16_to_fp8_k, normed, a8, n * h, stream)?;
+                Ok(a8)
+            })
+            .transpose()?;
+        // ATLAS_QWEN4EXP_PREFILL_W8A8: one MXFP8 image for q, k and v.
+        let mx = self.w8a8_qkv_act(ctx, normed, n, stream)?;
         let qg_out = ctx.buffers.qkv_output();
         self.prefill_one_proj(
             Proj::Q,
@@ -76,7 +89,7 @@ impl Qwen3AttentionLayer {
             n,
             q_proj_dim as u32,
             h,
-            a4,
+            (a4, a8, mx),
             ctx,
             stream,
         )?;
@@ -103,7 +116,7 @@ impl Qwen3AttentionLayer {
             n,
             nkv * hd,
             h,
-            a4,
+            (a4, a8, mx),
             ctx,
             stream,
         )?;
@@ -125,7 +138,7 @@ impl Qwen3AttentionLayer {
             n,
             nkv * hd,
             h,
-            a4,
+            (a4, a8, mx),
             ctx,
             stream,
         )?;
@@ -150,10 +163,17 @@ impl Qwen3AttentionLayer {
         n: u32,
         out_dim: u32,
         h: u32,
-        a4: Option<(DevicePtr, DevicePtr)>,
+        (a4, a8, mx): (
+            Option<(DevicePtr, DevicePtr)>,
+            Option<DevicePtr>,
+            Option<MxAct>,
+        ),
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if let Some(act) = mx {
+            return self.w8a8_qkv(proj as usize, act, out, [n, out_dim], stream);
+        }
         let (fp8w_t, weight_opt, fp8, nvfp4_t, dense, label) = match proj {
             Proj::Q => (
                 self.q_fp8w_t.as_ref(),
@@ -181,6 +201,25 @@ impl Qwen3AttentionLayer {
             ),
         };
 
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: BF16 at decode's weight values,
+        // on the pass's row-invariant k-chain.
+        if crate::layers::ops::qwen4exp_rowinv::active()
+            && let Some(w) = self.rowinv_bf16[proj as usize]
+        {
+            return ops::bf16_gemm(normed, w.0, out, n, out_dim, h, stream);
+        }
+        if let (Some(a8), Some(fp8p)) = (a8, fp8) {
+            anyhow::ensure!(
+                ops::qwen4exp_prefill::launch_fp8_gemm_w2(
+                    ctx.gpu,
+                    [a8, fp8p, out],
+                    [n, out_dim, h],
+                    stream
+                )?,
+                "ATLAS_QWEN4EXP_PREFILL_ROWINV: qwen4exp_fp8_gemm_w2 does not serve {label}"
+            );
+            return Ok(());
+        }
         // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
         if let Some(r) = self.try_q2_prefill(ctx, weight_opt, normed, out, n, stream) {
             return r;
@@ -316,7 +355,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else if let Some(fp8p) = fp8 {
-            if n > 128 {
+            // ATLAS_QWEN4EXP_PREFILL_ROWINV: one arm at every width.
+            if n > 128 || crate::layers::ops::qwen4exp_rowinv::active() {
                 ops::fp8_gemm_n128_m128(
                     ctx.gpu,
                     self.fp8_gemm_t_m128_k,

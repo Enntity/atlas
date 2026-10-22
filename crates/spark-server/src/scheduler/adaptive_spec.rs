@@ -34,7 +34,8 @@ use crate::scheduler::ActiveSeq;
 pub(crate) struct AdaptState {
     /// Per-position draft acceptance for the verify width choice.
     pub(crate) survival: super::dflash_width::DraftSurvival,
-    /// Copy drafts' index and outcomes (`ATLAS_DFLASH_COPY_DRAFTS`).
+    /// Copy drafts' index and outcomes (`ATLAS_DFLASH_COPY_DRAFTS`,
+    /// `ATLAS_QWEN_COPY_DRAFTS`).
     pub(crate) copy: super::copy_drafts::CopyState,
     window: Vec<u32>,
     suspended: bool,

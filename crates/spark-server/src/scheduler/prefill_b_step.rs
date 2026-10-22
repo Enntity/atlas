@@ -260,11 +260,13 @@ pub fn prefill_request(
         return Ok(None);
     }
 
+    let mut image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&mut seq, &image_pixels)?;
+        if has_images {
+            model.prepare_vision_embed(&mut seq, std::mem::take(&mut image_pixels))?;
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
@@ -272,7 +274,7 @@ pub fn prefill_request(
         model.ep_broadcast_vision_state_for_seq(
             &seq,
             seq.slot_idx as u32,
-            !image_pixels.is_empty(),
+            has_images,
             0,
             0,
             0,
@@ -300,7 +302,7 @@ pub fn prefill_request(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             grammar_state.as_mut(),
             &sched.levers.sampling(),
         )
@@ -477,7 +479,8 @@ pub fn prefill_request(
     }
 
     // The min_tokens end-token ban, as on the chunked paths.
-    spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
+    spark_model::traits::EosBan::for_request(seq.prompt_len, req_min_tokens, eos_tokens)
+        .arm(&mut seq);
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,

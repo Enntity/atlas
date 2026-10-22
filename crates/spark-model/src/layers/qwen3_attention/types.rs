@@ -124,6 +124,9 @@ pub struct Qwen3AttentionLayer {
     /// The checkpoint's FP8 block q_a / q_b / kv_a / o (`ATLAS_GLM_FP4L_MLA_FP8`,
     /// `mla_native.rs`): every row of every call of these projections.
     pub(crate) mla_native: super::mla_native::MlaNative,
+    /// A checkpoint's own MXFP8 Q/K/V/O, read by every dense decode arm
+    /// instead of the BF16 copy, and their W8A8 prefill (`dense_mx.rs`).
+    pub(crate) dense_mx: super::dense_mx::DenseMx,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`
@@ -359,10 +362,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) w4a16_gemv_qg_batch3_k: KernelHandle,
     pub(super) w4a16_gemv_dual_batch3_k: KernelHandle,
     pub(super) w4a16_gemv_batch3_k: KernelHandle,
-    /// `w4a16_gemv_qg_batch4` — the qwen4_exp exact K=4 verify's Q+gate
-    /// projection (`multi_seq/qkv_exact4.rs`). Optional: 0 where the target
-    /// does not ship it, and the exact arm then runs `w4a16_gemv_qg` per row.
+    /// `w4a16_gemv_qg_batch4` (exact K=4 verify Q+gate, `qkv_exact4.rs`; 0: per row).
     pub(super) w4a16_gemv_qg_batch4_k: KernelHandle,
+    /// The lane's 16/32-row Q+gate tiers and K/V's batch16 (`qkv_exact4.rs`).
+    pub(super) wide_rows: crate::layers::ops::Qwen4ExpWideRows,
     /// Narrow `w4a16_gemv_batch{M}` family (M=4..8) for the K=4 verify and the
     /// K=5..8 chain verify q/k/v/o projections. SSOT for the M -> tier
     /// decision; individual tiers are 0-handles when the target lacks them.
@@ -489,6 +492,10 @@ pub struct Qwen3AttentionLayer {
     pub(super) k_fp8: Option<DevicePtr>,
     pub(super) v_fp8: Option<DevicePtr>,
     pub(super) o_fp8: Option<DevicePtr>,
+    /// `ATLAS_QWEN4EXP_PREFILL_ROWINV`: q (+gate), k, v, o as BF16, dequantized
+    /// from the NVFP4 weights decode reads (`prefill_weights.rs`), in place of
+    /// the FP8 copies.
+    pub(super) rowinv_bf16: [Option<DevicePtr>; 4],
     pub(super) fp8_gemm_k: KernelHandle,
     // FP8×FP8 GEMM
     pub(super) bf16_to_fp8_k: KernelHandle,

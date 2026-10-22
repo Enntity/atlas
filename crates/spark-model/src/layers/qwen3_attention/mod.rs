@@ -15,6 +15,8 @@
 //!   - `trait_impl`: `TransformerLayer` trait implementation
 
 mod decode;
+mod dense_mx;
+mod w8a8;
 // V4: `pub(crate)` so the DeepSeek-V4 weight loader (`weight_loader::deepseek_v4`)
 // and the V4 attention submodules can call `helpers::yarn_rope_mscale`. Non-V4
 // code paths are unaffected by the wider visibility.
@@ -41,6 +43,7 @@ mod op_dump;
 pub mod innerq_driver;
 mod prefill;
 mod prefill_weights;
+mod prefill_weights_rowinv;
 mod trait_impl;
 mod types;
 mod types_weights;
@@ -57,7 +60,7 @@ pub(crate) use hc_prefill::{
     hc_rows,
 };
 pub(crate) use hc_prefill_block::{SeamGather, hc_seam_overlapped};
-pub(crate) use prefill::{index_split_words, write_floor_legacy};
+pub(crate) use prefill::{attn_w4a4_requested, index_split_words, write_floor_legacy};
 pub(crate) use trait_impl::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
 };

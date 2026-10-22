@@ -161,6 +161,34 @@ pub fn bf16_gemm_act_weight_t_fixed(
     unreachable!("cublaslt::bf16_gemm_act_weight_t_fixed is cuda-only (not built for metal)")
 }
 
+/// The CUDA k-chain is an optional replacement for the regular BF16 tile
+/// kernel.  Returning `false` keeps the caller's portable tile fallback
+/// available on Metal; there is no cuBLASLt implementation to try.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_kchain(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// Row-invariant variant of [`bf16_gemm_act_weight_t_kchain`].
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_kchain_any(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<bool> {
+    Ok(false)
+}
+
 pub fn fp8_blkscaled_pinned_prepare(_weight_sf: u64, _act_sf: u64, _n: u32, _k: u32) -> Result<()> {
     unreachable!("cublaslt::fp8_blkscaled_pinned_prepare is cuda-only (not built for metal)")
 }

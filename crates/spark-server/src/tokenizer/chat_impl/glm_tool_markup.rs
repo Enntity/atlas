@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Preserve literal GLM-5 tool XML in incoming message prose.
+//! Preserve literal GLM-5 and Qwen4_exp tool XML in incoming message prose.
 //!
-//! GLM registers its tool-envelope spellings as added tokens. A user quoting
-//! `<tool_call>` would therefore put the native opener in the prompt even when
-//! tools are disabled. This module uses the same split-encode approach as the
-//! vision-markup path, with a separate tagged sentinel family so the two
-//! marker-index spaces cannot overlap.
+//! These models register their tool-envelope spellings as added tokens. A user
+//! quoting `<tool_call>` would therefore put the native opener in the prompt
+//! even when tools are disabled. This module uses the same split-encode
+//! approach as the vision-markup path, with a separate tagged sentinel family
+//! so the two marker-index spaces cannot overlap. The caller explicitly limits
+//! the shared mechanism to model types with the verified added-token contract.
 
 use super::super::ChatTokenizer;
 use super::vision_markup::SentinelFamily;
 
-/// The GLM tool spellings that are single added tokens in its tokenizer.
+/// Tool spellings that may be single added tokens in the supported GLM/Qwen
+/// tokenizers. `markers` filters this list against the active tokenizer, so a
+/// family only escapes spellings that are actually native tokens.
 const GLM_TOOL_MARKUP: &[&str] = &[
     "<tool_call>",
     "</tool_call>",
@@ -43,10 +46,10 @@ pub(super) fn markers(tokenizer: &ChatTokenizer) -> Vec<String> {
         .collect()
 }
 
-/// Escape GLM-5 native tool markup in incoming message prose. Structured
+/// Escape native GLM/Qwen tool markup in incoming message prose. Structured
 /// call names remain unchanged; literal argument values are escaped while
 /// the template still emits real native call boundaries. Returns the number of escaped markers;
-/// non-GLM tokenizers always return zero.
+/// unsupported model types always return zero.
 pub(crate) fn escape_glm_tool_markup<'a>(
     tokenizer: &ChatTokenizer,
     values: impl IntoIterator<Item = &'a mut serde_json::Value>,

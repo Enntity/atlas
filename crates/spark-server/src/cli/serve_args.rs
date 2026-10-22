@@ -459,7 +459,9 @@ pub struct ServeArgs {
     /// = 1/4x, 1/2x, 1x, 2x, 4x of this value). An explicit client token
     /// budget (`thinking.budget_tokens`, `thinking_token_budget`) still
     /// wins outright; the (max_tokens * 9 / 10) safety cap is enforced
-    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`.
+    /// unless MODEL.toml sets `cap_thinking_at_max_tokens = false`. 0 = no
+    /// server budget: effort levels are the template's alone and reasoning
+    /// runs until the model closes it (or `max_tokens`).
     #[arg(long)]
     pub max_thinking_budget: Option<u32>,
 
@@ -504,8 +506,9 @@ pub struct ServeArgs {
     /// or `enable_thinking` in the request body). A JSON object with
     /// optional keys: `enable_thinking` (bool), `thinking_budget` (u32),
     /// `reasoning_effort` (none|minimal|low|medium|high|xhigh|max — the
-    /// served default effort tier when clients are silent; unset = the
-    /// neutral "medium"), `preserve_thinking` (bool). Unknown keys or an
+    /// served default effort tier when clients are silent; unset = MODEL.toml
+    /// `[behavior].default_reasoning_effort`, else the template's own
+    /// default), `preserve_thinking` (bool). Unknown keys or an
     /// unknown `reasoning_effort` value abort startup (fail-fast; they
     /// were silently ignored before 2026-08-15).
     ///
@@ -917,6 +920,36 @@ pub struct ServeArgs {
     /// Also settable with `ATLAS_VISION_MAX_PIXELS`.
     #[arg(long, default_value_t = 0)]
     pub vision_max_pixels: usize,
+
+    /// Vision tokens (merged patches, one prompt placeholder each) one request
+    /// may carry across all its images and videos. A request over it, one of
+    /// more than 1024 items (the rank protocol's limit, applied on every world
+    /// size), or one whose prefill chunks could not encode their images (see
+    /// `spark_model::vision_limits`), is refused at admission with a 400
+    /// naming the counts, instead of failing in prefill where clients retry.
+    /// Images are sized from their headers first, so a refused request is
+    /// never decoded.
+    ///
+    /// The engine encodes each prefill chunk's images separately, so this is
+    /// not an encoder limit; it bounds one request's host memory. Rank 0 holds
+    /// a request's preprocessed pixels (f32) from admission until its prefill
+    /// ends: 24 KiB per vision token on the Qwen tower (18.4 KiB on GLM), so
+    /// the default 32768 (8 images of 2048x2048, or 32 of 1024x1024) is
+    /// 768 MiB. The context (`--max-seq-len`), the engine's own bound and
+    /// `--vision-max-inflight-rows` cap it too. 0 = no operator bound: half the
+    /// in-flight budget (so one request cannot need all of it), or the context.
+    #[arg(long, default_value_t = 32_768)]
+    pub vision_max_request_rows: usize,
+
+    /// Vision tokens whose pixels ALL requests may hold at once, queued and
+    /// prefilling (`spark_model::vision_budget`). Each image takes its share
+    /// before it is decoded and returns it when its prefill ends or the
+    /// request is dropped; while the budget is spent, new image requests get
+    /// a 503 with `Retry-After` (transient, unlike the 400 above). The default
+    /// 65536 is 1.5 GiB of f32 on the Qwen tower (1.15 GiB on GLM), the bound
+    /// on rank 0's pixel memory across the server. 0 = unbounded.
+    #[arg(long, default_value_t = 65_536)]
+    pub vision_max_inflight_rows: usize,
 
     /// Fetch `image_url` parts that carry an http(s) URL, instead of
     /// rejecting them.

@@ -44,6 +44,7 @@ mod logit_dump;
 mod logit_processors;
 mod logprobs;
 pub mod loop_steer;
+mod min_tokens_ban;
 mod mod_helpers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;
@@ -70,6 +71,7 @@ mod prefill_a_step;
 mod prefill_a_step_params;
 mod prefill_b_step;
 mod prefill_burst;
+mod prefill_multi;
 mod prefill_normalization;
 mod prefill_preempt;
 mod repetition;
@@ -102,6 +104,7 @@ mod verify_k4_batch_step;
 mod verify_k4_step;
 mod verify_k4_verdict;
 mod verify_pipeline_helper;
+mod vision_release;
 pub mod vocab_masks;
 
 use beam_prefill::resolve_beam_hyp;
@@ -667,6 +670,10 @@ pub fn run(
                 }
             }
         }
+
+        // Every finished prefill passed through `active`: its pixels (and
+        // their in-flight vision permits) are no longer needed.
+        vision_release::release_prefilled_pixels(&mut active);
 
         // ── Start new requests ──
         let t_loop = std::time::Instant::now();

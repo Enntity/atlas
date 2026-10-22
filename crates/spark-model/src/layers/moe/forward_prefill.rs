@@ -238,8 +238,9 @@ impl MoeLayer {
         // Sequence-parallel prefill (`layers::glm_sp`): routed experts run every
         // row; the shared expert and its blend run only this rank's rows, and
         // the EP all-reduce becomes a reduce-scatter into them.
-        let sp =
-            crate::layers::glm_sp::current().filter(|sp| is_ep_prefill && num_tokens == sp.total());
+        let sp = crate::layers::glm_sp::current()
+            .filter(|sp| is_ep_prefill && num_tokens == sp.total())
+            .map(|sp| self.q38_sp_rows(sp, h, shared_inter, ctx));
         // `full_shared` (qwen4_exp): every row, as unsplit; only the blend
         // takes the local rows (`forward_prefill_finish`).
         let (shared_in, shared_n) = match sp {
@@ -248,9 +249,14 @@ impl MoeLayer {
         };
         // Not in a packed prefill (`glm_packed_scope`): a choice made from the
         // pass height, kept off so a lone prompt and a pack run alike.
+        // An MXFP8 shared expert under EP is this rank's slice
+        // (`shared_mxfp8.rs`): its partial over every row joins the routed sum
+        // before the reduce (`split`).
+        let mx_split = has_shared && is_ep_prefill && self.mxfp8_shared_split();
         let overlap_shared_reduce = has_shared
             && is_ep_prefill
             && !crate::layers::glm_packed_scope::active()
+            && !mx_split
             && num_tokens > 64
             && !ctx.graph_capture
             && !ctx.profile
@@ -270,12 +276,18 @@ impl MoeLayer {
         let native_split = split_eligible && self.shared_native_split_ready(ctx, n, shared_inter);
         let split = native_split
             || (split_eligible && self.shared_native.is_none() && self.shared_split_ready(ctx, n));
+        let split = split || mx_split;
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
         if native_split {
             let touch = self.router_touch(n, h, inter, ctx);
             self.run_shared_native_split(input, n, h, shared_inter, touch, ctx, stream)?;
-        } else if split {
+        } else if split && !mx_split {
+            // Under SP with the reduce-scatter pipe, the shared expert of this
+            // rank's rows runs while that exchange is on the wire
+            // (`forward_prefill_finish`, `defer_shared_to_rs`).
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
-        } else if has_shared && !overlap_shared_reduce {
+        } else if has_shared && !overlap_shared_reduce && !defer_shared {
             self.run_shared_expert_prefill(
                 shared_in,
                 shared_n,
@@ -300,9 +312,18 @@ impl MoeLayer {
         // then gathered (sp_quant_gather.rs).
         let quant_gather = crate::layers::glm_sp::current()
             .filter(|&sp| num_tokens == sp.total() && self.sp_quant_gather(sp, ctx));
-        let routes = match quant_gather {
-            Some(sp) => self.route_sp_quantized(input, sp, ctx, stream)?,
-            None => self.route_and_sort(input, [n, h, inter], det, ctx, stream)?,
+        let quant_gathered = quant_gather.is_some();
+        let scratch = ctx.buffers.scratch();
+        let indices_dev = scratch;
+        let weights_dev = scratch.offset(total_expanded as usize * 4);
+        // ATLAS_QWEN4EXP_PREFILL_SP_ROUTE: this rank's rows were routed at the
+        // gather site; gather the peer's (`forward_prefill_route_sp`).
+        // GLM's quantized gather owns the complete route object and therefore
+        // takes precedence over the generic Qwen local-route probe.
+        let sp_routed = if quant_gather.is_some() {
+            false
+        } else {
+            self.take_local_routes(input, num_tokens, [indices_dev, weights_dev], ctx, stream)?
         };
         let super::route_fuse::Routes {
             indices: indices_dev,
@@ -311,7 +332,13 @@ impl MoeLayer {
             expert_offsets,
             token_to_perm,
             prerouted,
-        } = routes;
+        } = if let Some(sp) = quant_gather {
+            self.route_sp_quantized(input, sp, ctx, stream)?
+        } else if sp_routed {
+            self.sort_sp_routes(input, [n, h, inter], det, ctx, stream)?
+        } else {
+            self.route_and_sort(input, [n, h, inter], det, ctx, stream)?
+        };
         prof_step!("route");
 
         // 3.5. Pre-expert norm: norm the input for expert dispatch (Gemma-4 26B).
@@ -354,7 +381,7 @@ impl MoeLayer {
             num_tokens,
             num_experts as usize,
             prerouted,
-            quant_gather.is_some(),
+            quant_gathered,
             &mut t0,
             ctx,
             stream,

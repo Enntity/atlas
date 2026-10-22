@@ -69,13 +69,54 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
-        if let Some((sp, blocks)) = self.output_seam_blocks(
-            sp,
-            (split, use_overlap, defer_shared_hc),
-            has_shared.then_some(shared_n),
-            h,
-            ctx,
-        ) {
+        // Qwen's SP pipe can finish the unpermute and reduce-scatter in one
+        // staged operation. It is only offered when the route-side helper has
+        // established that the current layer/config is supported; the GLM
+        // seam below remains the fallback and retains its fused variants.
+        let defer_shared_rs =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
+        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+        let run_shared = |s: u64| {
+            self.run_shared_expert_prefill(shared_in, shared_n, h, shared_inter, s, s, false, ctx)
+        };
+        let mx_split = split && self.mxfp8_shared_split();
+        let rs_done = match sp {
+            Some(sp) if (!split || mx_split) && !overlap_shared_reduce && !use_overlap => self
+                .q38_unpermute_reduce_scatter(
+                    sp,
+                    [
+                        expert_down_out,
+                        output,
+                        token_to_perm,
+                        indices_dev,
+                        weights_dev,
+                    ],
+                    [h, top_k],
+                    mx_split.then_some(input),
+                    ctx,
+                    stream,
+                    |s| {
+                        if defer_shared_rs {
+                            run_shared(s)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )?,
+            _ => false,
+        };
+        if defer_shared_rs && !rs_done {
+            run_shared(stream)?;
+        }
+        if !rs_done
+            && let Some((sp, blocks)) = self.output_seam_blocks(
+                sp,
+                (split, use_overlap, defer_shared_hc),
+                has_shared.then_some(shared_n),
+                h,
+                ctx,
+            )
+        {
             // ATLAS_GLM_SP_GATHER_OVERLAP on the chain: unpermute a row
             // block of every part at a time, its reduce-scatter behind it,
             // and leave the blend and the post to the next attention seam
@@ -173,20 +214,21 @@ impl MoeLayer {
                 },
             );
         }
-        let blended = self.unpermute_ep_prefill(
-            expert_down_out,
-            e4m3_scales,
-            output,
-            token_to_perm,
-            indices_dev,
-            weights_dev,
-            h,
-            n,
-            top_k,
-            split.then_some(input),
-            ctx,
-            stream,
-        )?;
+        let blended = !rs_done
+            && self.unpermute_ep_prefill(
+                expert_down_out,
+                e4m3_scales,
+                output,
+                token_to_perm,
+                indices_dev,
+                weights_dev,
+                h,
+                n,
+                top_k,
+                split.then_some(input),
+                ctx,
+                stream,
+            )?;
 
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
@@ -239,9 +281,10 @@ impl MoeLayer {
             )?;
         }
 
-        // `ATLAS_GLM_SHARED_TP_SPLIT=1`: each rank already blended its partial
-        // shared-expert columns before this point (see forward_prefill).
-        if split && !blended {
+        // `ATLAS_GLM_SHARED_TP_SPLIT=1` (or an MXFP8 shared expert's slice):
+        // blend this rank's partial shared-expert columns before the reduce,
+        // unless the unpermute (or the reduce-scatter pipe) already did.
+        if split && !blended && !rs_done {
             ops::moe_batched_blend(
                 ctx.gpu,
                 self.moe_batched_blend,
@@ -270,7 +313,9 @@ impl MoeLayer {
             } else {
                 None
             };
-            if let Some(sp) = sp {
+            if rs_done {
+                // Reduce-scattered with the unpermute above.
+            } else if let Some(sp) = sp {
                 sp.reduce_scatter(output, h as usize, ctx, stream)?;
             } else if ctx.graph_capture {
                 comm.all_reduce(output.0, num_tokens * h as usize * 2)?;

@@ -62,27 +62,26 @@ pub(in crate::scheduler) fn pick_row(
 ) -> anyhow::Result<u32> {
     crate::scheduler::emit_step::PickEffects::clear(a);
     let greedy = a.temperature == 0.0 || ctx.sampling.force_temp_zero;
+    let fp32 = model.decode_logits_fp32();
     if greedy && raw_argmax_is_pick(a) {
-        let top1 = match gpu_argmax {
+        let mut top1 = [match gpu_argmax {
             Some(t) => t,
             None => model.argmax_on_device(logits, 0)?,
-        };
+        }];
+        // The min_tokens end-token ban: the masked row's argmax.
+        let served =
+            crate::scheduler::min_tokens_ban::fix_raw_picks(model, a, &mut top1, logits, fp32)?;
+        let [top1] = top1;
         // A terminated matcher masks nothing (`GrammarBitmaskApply`).
         let allowed = a
             .grammar_state
             .as_mut()
             .is_none_or(|gs| !gs.fill_bitmask() || gs.is_token_allowed(top1));
-        // A pick a content-loop steer could touch (`loop_steer`) is applied
-        // by the host pipeline.
-        if allowed
-            && !raw_pick_masked(a, top1)
-            && !crate::scheduler::loop_steer::span_may_steer(a, &[top1])
-        {
+        if served && allowed && !raw_pick_masked(a, top1) {
             return Ok(top1);
         }
     }
     let vocab = model.vocab_size();
-    let fp32 = model.decode_logits_fp32();
     let mut row = crate::scheduler::verify_pipeline_helper::HostRows::take(
         &ctx.scratch.host_bytes,
         vocab * if fp32 { 4 } else { 2 },
@@ -93,4 +92,31 @@ pub(in crate::scheduler) fn pick_row(
             &row, fp32, vocab, a, ctx,
         ),
     )
+}
+
+/// Bootstrap scores come from the same processed row that selected the token.
+/// Requests without scores retain the raw-argmax fast path unchanged.
+pub(in crate::scheduler) fn pick_row_scored(
+    model: &dyn Model,
+    logits: DevicePtr,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    gpu_argmax: Option<u32>,
+) -> anyhow::Result<(u32, Option<crate::api::TokenLogprobs>)> {
+    let Some(k) = a.top_logprobs else {
+        return pick_row(model, logits, a, ctx, gpu_argmax).map(|tok| (tok, None));
+    };
+    crate::scheduler::emit_step::PickEffects::clear(a);
+    let fp32 = model.decode_logits_fp32();
+    let vocab = model.vocab_size();
+    let mut bytes = crate::scheduler::verify_pipeline_helper::HostRows::take(
+        &ctx.scratch.host_bytes,
+        vocab * if fp32 { 4 } else { 2 },
+    );
+    model.copy_logits_to_host(logits, &mut bytes)?;
+    let mut row = Vec::with_capacity(vocab);
+    crate::scheduler::verify_pipeline_helper::dequant_into(&bytes, fp32, vocab, &mut row);
+    let tok = crate::scheduler::verify_pipeline_helper::pick_dequantized(&mut row, vocab, a, ctx);
+    let lp = crate::scheduler::logprobs::extract_logprobs_from_f32(&row, tok, k as usize);
+    Ok((tok, Some(lp)))
 }

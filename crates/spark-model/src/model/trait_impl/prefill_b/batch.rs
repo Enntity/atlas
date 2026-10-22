@@ -457,6 +457,7 @@ impl TransformerModel {
                         proc_count,
                         0,
                         row_base + stream_idx,
+                        None,
                         stream,
                     )?
                 } else {

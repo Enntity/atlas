@@ -8,7 +8,8 @@
 //! block-scaled copy), `w4a16_gemv[_sw]` (NVFP4) or `dense_gemv_bf16` (BF16),
 //! in that order of preference. Each has a batched GEMV whose rows are those
 //! bytes — `w8a16_gemv_batch4/16`, the `w4a16_gemv_batchN` tiers,
-//! `dense_gemv_bf16_batchm` — that reads the weight once per launch. The
+//! `dense_gemv_bf16_batchm` and its 16/32-row twins (`ops::Qwen4ExpWideRows`)
+//! — that reads the weight once per launch. The
 //! multi-sequence decode and the batched verifies take cuBLASLt / tile GEMMs
 //! at some widths instead, which are not; under the switch both come here.
 
@@ -21,7 +22,7 @@ use crate::layers::ops;
 
 /// Which projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GdnProj {
+pub(crate) enum GdnProj {
     /// `in_proj_qkvz`: `[rows, hidden] -> [rows, qkvz]` (sequential layout).
     Qkvz,
     /// `out_proj`: `[rows, value_dim] -> [rows, hidden]`.
@@ -31,10 +32,11 @@ pub(super) enum GdnProj {
 impl Qwen3SsmLayer {
     /// `rows` rows of `input` through projection `proj` into `output` (rows
     /// contiguous at the projection's width), each row byte-identical to
-    /// `ssm_forward`'s single-row GEMV. `Ok(false)`, nothing launched, when
-    /// the switch is off or serial decode would take an arm this has no
-    /// exact batched twin for (Q2, interleaved QKVZ, `ATLAS_GDN_FP8_DECODE`):
-    /// the caller keeps its own dispatch.
+    /// `ssm_forward`'s single-row GEMV. The MXFP8 copy (`init_mxfp8.rs`)
+    /// takes every call when installed. Otherwise `Ok(false)`, nothing
+    /// launched, when the switch is off or serial decode would take an arm
+    /// this has no exact batched twin for (Q2, interleaved QKVZ,
+    /// `ATLAS_GDN_FP8_DECODE`): the caller keeps its own dispatch.
     pub(super) fn exact_rows_proj(
         &self,
         proj: GdnProj,
@@ -44,6 +46,12 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        // The checkpoint's own MXFP8 copy (FP4-Local) is serial decode's arm
+        // whenever it is installed, and its tiers are row-invariant at every
+        // width, so it serves every batched caller, switch or not.
+        if self.mxfp8_rows_proj(ctx.gpu, proj, input, output, rows, stream)? {
+            return Ok(true);
+        }
         if !ctx.levers.qwen4exp_batch_fast
             || rows == 0
             || !self.sequential_qkvz
@@ -103,25 +111,15 @@ impl Qwen3SsmLayer {
             if !self.w4a16_batchm.has_base() {
                 return Ok(false);
             }
-            let chunk = if self.w4a16_batchm.width(8).is_some() {
-                8
-            } else {
-                4
-            };
-            for first in (0..rows).step_by(chunk) {
-                let m = (rows - first).min(chunk) as u32;
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    self.w4a16_batchm.kernel(m),
-                    input.offset(first * in_row),
-                    w,
-                    output.offset(first * out_row),
-                    m,
-                    n as u32,
-                    k as u32,
-                    stream,
-                )?;
-            }
+            self.wide_rows.w4a16_rows(
+                ctx.gpu,
+                &self.w4a16_batchm,
+                input,
+                w,
+                output,
+                (rows as u32, n as u32, k as u32),
+                stream,
+            )?;
             return Ok(true);
         }
         let dense = match proj {
@@ -136,16 +134,13 @@ impl Qwen3SsmLayer {
         if self.dense_gemv_batchm_k.0 == 0 {
             return Ok(false);
         }
-        ops::dense_gemv_batchm_chunked(
+        self.wide_rows.dense_rows(
             ctx.gpu,
             self.dense_gemv_batchm_k,
             input,
             w,
             output,
-            rows as u32,
-            n as u32,
-            k as u32,
-            n as u32,
+            (rows as u32, n as u32, k as u32, n as u32),
             stream,
         )?;
         Ok(true)

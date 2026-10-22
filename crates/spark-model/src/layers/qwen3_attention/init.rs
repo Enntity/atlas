@@ -181,6 +181,7 @@ impl Qwen3AttentionLayer {
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
             mla_native: Default::default(),
+            dense_mx: Default::default(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null
@@ -366,21 +367,27 @@ impl Qwen3AttentionLayer {
             ),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
-            glm_latent_dequant_k: if kv_dtype == KvCacheDtype::Fp8G128 {
-                gpu.kernel("reshape_and_cache", "glm_latent_dequant_fp8g128")?
-            } else {
-                KernelHandle(0)
-            },
-            glm_index_fill_causal_dev_k: if kv_dtype == KvCacheDtype::Fp8G128 {
-                gpu.kernel("glm_indexer", "glm_index_fill_causal_dev")?
-            } else {
-                KernelHandle(0)
-            },
-            glm_latent_qdq_k: if std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1") {
-                gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
-            } else {
-                KernelHandle(0)
-            },
+            // These are GLM's FP8-G128 latent-cache paths. Keep the lookup
+            // behind the same architecture gate as the dispatch fields below
+            // so a Qwen target never requires GLM-only modules during boot.
+            glm_latent_dequant_k: gate(
+                glm && kv_dtype == KvCacheDtype::Fp8G128,
+                gpu,
+                "reshape_and_cache",
+                "glm_latent_dequant_fp8g128",
+            ),
+            glm_index_fill_causal_dev_k: gate(
+                glm && kv_dtype == KvCacheDtype::Fp8G128,
+                gpu,
+                "glm_indexer",
+                "glm_index_fill_causal_dev",
+            ),
+            glm_latent_qdq_k: gate(
+                glm && std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1"),
+                gpu,
+                "reshape_and_cache",
+                "glm_latent_qdq_fp8g128",
+            ),
             fused_k_norm_rope_cache_write_bf16_k: super::super::try_kernel(
                 gpu,
                 "fused_k_norm_rope_cache",
@@ -659,6 +666,7 @@ impl Qwen3AttentionLayer {
                 "w4a16_gemv",
                 "w4a16_gemv_qg_batch4",
             ),
+            wide_rows: crate::layers::ops::Qwen4ExpWideRows::resolve(gpu, &config.model_type),
             w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
@@ -876,6 +884,7 @@ impl Qwen3AttentionLayer {
             ),
             sigmoid_gate_mul_batched_k: gpu.kernel("residual_add", "sigmoid_gate_mul_batched")?,
             q_fp8: None,
+            rowinv_bf16: [None; 4],
             k_fp8: None,
             v_fp8: None,
             o_fp8: None,

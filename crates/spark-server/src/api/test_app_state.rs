@@ -31,6 +31,8 @@ pub(crate) fn app_state(tokenizer: crate::tokenizer::ChatTokenizer) -> AppState 
         rotation_tx: None,
         vision_config: None,
         vision_max_pixels: None,
+        vision_limits: None,
+        vision_budget: None,
         remote_image_policy: Default::default(),
         video_ffmpeg: Default::default(),
         video_fps: 1.0,

@@ -149,6 +149,8 @@ impl TransformerModel {
         let dense_gemv_batchm_kernel = gpu
             .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
             .unwrap_or(spark_runtime::gpu::KernelHandle(0));
+        let qwen4exp_wide_rows =
+            crate::layers::ops::Qwen4ExpWideRows::resolve(gpu.as_ref(), &config.model_type);
         let argmax_kernel = gpu.kernel("argmax", "argmax_bf16")?;
         let argmax_batch_kernel = gpu
             .kernel("argmax", "argmax_bf16_batch")
@@ -168,9 +170,12 @@ impl TransformerModel {
         let mut levers = ops::ModelLevers::from_env();
         levers.max_decode_seqs = (max_batch_size as u32).max(1);
         levers.qwen4exp_exact_verify = super::qwen4exp_exact_verify::lever(&config.model_type)?;
-        levers.qwen4exp_mtp_depth =
-            super::qwen4exp_mtp_depth::lever(&config.model_type, levers.qwen4exp_exact_verify)?;
         levers.qwen4exp_batch_fast = super::qwen4exp_batch_fast::lever(&config.model_type)?;
+        levers.qwen4exp_mtp_depth = super::qwen4exp_mtp_depth::lever(
+            &config.model_type,
+            levers.qwen4exp_exact_verify,
+            levers.qwen4exp_batch_fast,
+        )?;
         if levers.qwen4exp_batch_fast {
             levers.qwen4exp_batch_small = super::qwen4exp_batch_fast::small_lever();
             levers.qwen4exp_batch_bisect = super::qwen4exp_batch_fast::bisect_requested();
@@ -691,6 +696,7 @@ impl TransformerModel {
             lm_head_dp4a_quant_kernel,
             dense_gemm_kernel,
             dense_gemv_batchm_kernel,
+            qwen4exp_wide_rows,
             argmax_kernel,
             argmax_batch_kernel,
             argmax_logits_kernel,
@@ -758,6 +764,7 @@ impl TransformerModel {
             // Nothing staged yet: the buffer was memset to zero above, and no
             // key describes zero, so the first verify step always uploads.
             verify_wy_cache: Mutex::new(None),
+            verify_bt_stage: Mutex::new(super::pinned_upload::PinnedUpload::EMPTY),
             verify_kgamma_graph: Mutex::new(std::collections::HashMap::new()),
             fused_graph: Mutex::new(std::collections::HashMap::new()),
             verify_pieces: Default::default(),
@@ -766,6 +773,7 @@ impl TransformerModel {
             warm,
             secondary_stream,
             secondary_event,
+            gdn_fuse: Default::default(),
             snapshot_event,
             comm,
             ep_cmd_buf,

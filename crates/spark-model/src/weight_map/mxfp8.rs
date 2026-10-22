@@ -60,7 +60,7 @@ impl Mxfp8Weight {
 }
 
 /// UE8M0 scale bytes as f32 multipliers, refusing any that would make the
-/// BF16 expansion inexact (see `EXACT_E8M0`; 0xFF is the NaN code).
+/// BF16 expansion inexact (see [`EXACT_E8M0`]; 0xFF is the NaN code).
 pub(crate) fn mxfp8_scales_f32(scales: &[u8]) -> Result<Vec<f32>> {
     if let Some(at) = scales.iter().position(|e| !EXACT_E8M0.contains(e)) {
         bail!(
@@ -107,7 +107,7 @@ pub(crate) fn mxfp8_to_bf16_host(
 
 /// Expand a checkpoint MXFP8 projection to a fresh BF16 `[n, k]` buffer.
 ///
-/// EXACT: every E4M3 value times a power of two in `EXACT_E8M0` is
+/// EXACT: every E4M3 value times a power of two in [`EXACT_E8M0`] is
 /// representable in BF16, so no rounding happens anywhere — the BF16 copy is
 /// the checkpoint's own math, not an approximation of it.
 ///

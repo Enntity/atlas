@@ -91,7 +91,14 @@ impl MoeLayer {
             } else {
                 16
             };
-        for expert in &self.weights.experts {
+        // qwen4_exp's prefill MoE: the routed experts stay in their
+        // checkpoint layout (`forward_prefill_w4a4`); the shared expert below
+        // is still transposed.
+        let routed = !super::skips_routed_transpose(config);
+        if !routed {
+            self.check_routed_planes()?;
+        }
+        for expert in self.weights.experts.iter().filter(|_| routed) {
             if expert.gate_proj.is_null() {
                 gate_t.push(QuantizedWeight::null());
                 up_t.push(QuantizedWeight::null());
@@ -119,11 +126,13 @@ impl MoeLayer {
             }
         }
 
-        self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
-        self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
-        if include_down {
-            self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
-            self.build_input_scales(gpu)?;
+        if routed {
+            self.gate_ptrs_t = Some(build_ptr_table_from_qw(&gate_t, gpu)?);
+            self.up_ptrs_t = Some(build_ptr_table_from_qw(&up_t, gpu)?);
+            if include_down {
+                self.down_ptrs_t = Some(build_ptr_table_from_qw(&down_t, gpu)?);
+                self.build_input_scales(gpu)?;
+            }
         }
 
         // Transpose shared expert weights (tiny: ~5 MB per layer).

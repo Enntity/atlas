@@ -91,9 +91,9 @@ extern "C" __global__ void ple_gate(
     const float* __restrict__ hidden,          // [T, hc*H] FP32 highway
     const __nv_bfloat16* __restrict__ key,     // [T, hc*H] key_proj out
     const __nv_bfloat16* __restrict__ value,   // [T, H]    value_proj out
-    const __nv_bfloat16* __restrict__ norm_query_w, // [hc*H]
-    const __nv_bfloat16* __restrict__ norm_key_w,   // [hc*H]
-    const __nv_bfloat16* __restrict__ norm_conv_w,  // [hc*H]
+    const float* __restrict__ norm_query_w, // [hc*H]
+    const float* __restrict__ norm_key_w,   // [hc*H]
+    const float* __restrict__ norm_conv_w,  // [hc*H]
     float* __restrict__ gated_out,             // [T, hc*H] FP32
     float* __restrict__ gated_normed,          // [T, hc*H] FP32 — see below
     const unsigned int hidden_size,            // H

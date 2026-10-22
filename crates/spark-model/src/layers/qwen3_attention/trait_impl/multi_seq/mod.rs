@@ -23,6 +23,7 @@ mod guard;
 mod hc_ffn;
 mod hc_generic;
 mod hc_pre_site;
+mod kv_only;
 mod mla;
 mod mla_gemv;
 mod mla_glm;
@@ -33,6 +34,7 @@ mod qkv;
 mod qkv_dp4a;
 mod qkv_exact4;
 mod qkv_fp8;
+mod qkv_mx;
 mod qsa_rows;
 #[cfg(test)]
 mod tests;

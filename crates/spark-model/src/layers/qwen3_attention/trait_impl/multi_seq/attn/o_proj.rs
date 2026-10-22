@@ -148,7 +148,20 @@ impl Qwen3AttentionLayer {
             // of every tile and it is a scalar FFMA kernel (~89 GB/s measured)
             // against a ~274 GB/s streaming GEMV. o_proj is N=h=3072, K=nq*hd,
             // i.e. the same weight bytes as q_proj -- worth the branch.
-            if (2..=8).contains(&n)
+            if self.mx_rows(
+                fwd.gpu,
+                attn_out,
+                o_bf16,
+                o_out,
+                n,
+                h as u32,
+                nq * hd,
+                h,
+                stream,
+            )? {
+                // The checkpoint's MXFP8 o_proj (`dense_mx.rs`): one weight
+                // pass, each row the serial token's bytes.
+            } else if (2..=8).contains(&n)
                 && self.dense_gemv_batchm_k.0 != 0
                 && super::super::qkv::bf16_batchm_enabled()
             {

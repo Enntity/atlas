@@ -102,6 +102,7 @@ base64 = "0.22"
 [dev-dependencies]
 tempfile = "3"
 ahash = "0.8"
+spark-model = { path = "../spark-model", default-features = false, features = ["test-fixtures"] }
 
 [lints]
 workspace = true

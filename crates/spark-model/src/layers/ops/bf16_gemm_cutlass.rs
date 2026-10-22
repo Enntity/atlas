@@ -56,6 +56,11 @@ pub fn bf16_gemm(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // Qwen row-invariant prefill gets first refusal so an active k-chain is
+    // never bypassed by the generic packed/CUTLASS path.
+    if super::qwen4exp_rowinv::try_bf16_gemm(act, weight, out, [m, n, k], stream)? {
+        return Ok(());
+    }
     // A packed prefill (`glm_packed_scope`): one row-invariant kernel for
     // every row count.
     if crate::layers::glm_packed_scope::active() {

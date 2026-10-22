@@ -33,6 +33,7 @@ pub(crate) mod remote_image;
 mod sampling_setup;
 mod template;
 mod thinking;
+mod vision_admit;
 
 use crate::main_modules::model_host::CurrentModel;
 use axum::extract::State;
@@ -359,10 +360,15 @@ pub(crate) async fn chat_completions_inner(
     let us_prepare = _t_seg.elapsed().as_micros();
 
     // ── Phase 4: generic loop / spinning detection + task pin ───
+    // Its verdict only steers `<tool_call>`: none without tool-call steering.
     let loop_detect::LoopDetectOut {
         suppress_tool_call,
         tool_call_repeat_count,
-    } = loop_detect::check_loops(&req.messages, tools_active, repeat_run);
+    } = loop_detect::check_loops(
+        &req.messages,
+        tools_active && state.behavior.tool_call_steering,
+        repeat_run,
+    );
     let us_loop_detect = _t_seg.elapsed().as_micros() - us_prepare;
 
     let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
@@ -521,3 +527,7 @@ pub(crate) async fn chat_completions_inner(
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "reference_prompt_tests.rs"]
+mod reference_prompt_tests;

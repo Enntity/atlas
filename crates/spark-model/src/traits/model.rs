@@ -249,6 +249,24 @@ pub trait Model: Send + Sync {
         })
     }
 
+    /// Whether [`Model::prefill_multi`] is served (`ATLAS_QWEN4EXP_PREFILL_MULTI`).
+    fn supports_prefill_multi(&self) -> bool {
+        false
+    }
+
+    /// Prefill every slice's WHOLE prompt (`chunk_start == 0`, last chunk) in
+    /// one forward over all their rows, each prompt's logits those of its
+    /// single prefill (`ATLAS_QWEN4EXP_PREFILL_MULTI`). On a multi-rank model
+    /// the head sends the other ranks the prompts itself: the caller sends
+    /// no per-request prefill command for them. Returns each slice's logits.
+    fn prefill_multi(
+        &self,
+        _streams: &mut [PrefillSlice<'_>],
+        _stream: u64,
+    ) -> Result<Vec<DevicePtr>> {
+        anyhow::bail!("this model has no multi-sequence prefill")
+    }
+
     /// Process N concurrent prefill chunks in one forward pass (same weight
     /// load amortised across N streams). The default implementation falls
     /// back to a per-stream loop calling `prefill_chunk` — implementors that
@@ -750,8 +768,10 @@ pub trait Model: Send + Sync {
 
     /// Whether [`Self::decode_verify_batched`] can run for `ks.len()`
     /// sequences at `ks[i]` verify rows each (one more than that sequence's
-    /// draft count; the K-vs-batch ladder passes 2..=4, and D-Cut makes the
-    /// vector RAGGED — uniform is just the special case).
+    /// draft count; the K-vs-batch ladder passes 2..=4, and D-Cut and the
+    /// drafter's confidence stop make the vector RAGGED — uniform is just the
+    /// special case). `ks[i] == 1` is a DECODE ROW, a sequence holding no
+    /// drafts; only a model whose verify row is its decode row admits it.
     ///
     /// Default `false`: the scheduler MUST fall back to the per-sequence
     /// `decode_verify_graphed_k{2,3,4}` loop. There is deliberately NO
@@ -1080,6 +1100,20 @@ pub trait Model: Send + Sync {
         Ok(())
     }
 
+    /// `ATLAS_QWEN4EXP_MTP_ABSORB`: hand `seq`'s proposer the live verify
+    /// forward's stream-highway rows `row .. row + accepted.len()` with the
+    /// drafts they accepted, so the drafter can rebuild those positions from
+    /// the target (`DraftProposer::stage_absorb`). Call after the verify and
+    /// before anything reuses its buffers. Default: no-op.
+    fn stage_mtp_absorb(
+        &self,
+        _seq: &mut SequenceState,
+        _row: usize,
+        _accepted: &[u32],
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// ATLAS_MTP_CATCHUP: ring-capture a serially decoded token's final
     /// hidden at `pos` for the drafter catch-up feed. Default no-op.
     fn save_hidden_for_catchup(&self, _token_idx: usize, _pos: usize) -> Result<()> {
@@ -1221,9 +1255,18 @@ pub trait Model: Send + Sync {
     fn prepare_vision_embed(
         &self,
         _seq: &mut crate::traits::SequenceState,
-        _images: &[crate::VisionItem],
+        _images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// `(window, request)`: the merged vision rows one encode may write (the
+    /// encoder output window, `VisionEncoder::output_rows`, which one prefill
+    /// chunk's items must fit) and the rows one request may carry. The API
+    /// admits only requests within both (`crate::vision_limits`). Default:
+    /// `(0, 0)`, no vision encoder.
+    fn vision_row_limits(&self) -> (usize, usize) {
+        (0, 0)
     }
 
     /// `prepare_vision_embed` for a request whose chunk 0 goes through
@@ -1233,7 +1276,7 @@ pub trait Model: Send + Sync {
     fn prepare_vision_embed_for_chunked(
         &self,
         seq: &mut crate::traits::SequenceState,
-        images: &[crate::VisionItem],
+        images: Vec<crate::VisionItem>,
     ) -> Result<()> {
         self.prepare_vision_embed(seq, images)
     }

@@ -27,6 +27,10 @@
 //!   single-row blend. Under `ATLAS_QWEN4EXP_BATCH_SMALL` the rows' top-k
 //!   and blends are one launch each (`moe_topk_softmax_rows`,
 //!   `moe_weighted_sum_blend_rows`: a block per row of the single-row body).
+//!   Under `ATLAS_QWEN4EXP_MOE_UNITS` gate/up and silu/down are the expert
+//!   units of `qwen4exp_moe_c8.cu` (up to 64 rows): each weight decoded once
+//!   for all the rows that picked its expert, SiLU in the gate/up epilogue,
+//!   the same output bytes.
 //! * **Per-row local** (anything else): each row's local part is
 //!   [`MoeLayer::forward_row_local`], the same calls on the same buffers.
 //!
@@ -49,7 +53,8 @@ impl MoeLayer {
     /// Whether `forward_row_local` takes the originals-layout NVFP4 arm with
     /// the plain softmax router — the arm the row pair reproduces — with no
     /// hook (LoRA, pre-expert norm, router pre-norm, mixed BF16 shared
-    /// expert) in between.
+    /// expert, whose multi-row GEMM is not the one-row GEMV) in between. An
+    /// MXFP8 shared expert's hook is row-invariant, and the pair runs it.
     fn rows_pair_eligible(&self, rows: usize, ctx: &ForwardContext) -> bool {
         let top_k = ctx.config.num_experts_per_tok;
         self.qwen4exp_moe_rows.ready()
@@ -119,9 +124,10 @@ impl MoeLayer {
             self.reject_decode_lora(ctx, "forward_rows")?;
         }
         let output = ctx.buffers.moe_output();
-        let shared_out = ctx.buffers.attn_output();
+        let side = self.fork_mxfp8_shared(input, rows, ctx, stream)?;
+        let shared_out = side.unwrap_or(ctx.buffers.attn_output());
         if self.rows_pair_eligible(rows, ctx) {
-            self.forward_rows_pair(input, rows, output, shared_out, ctx, stream)?;
+            self.forward_rows_pair(input, rows, output, shared_out, side.is_none(), ctx, stream)?;
         } else {
             for r in 0..rows {
                 let off = r * h * bf16;
@@ -129,6 +135,7 @@ impl MoeLayer {
                     input.offset(off),
                     output.offset(off),
                     shared_out.offset(off),
+                    side.is_none(),
                     single_seq_decode,
                     ctx,
                     stream,
@@ -143,12 +150,14 @@ impl MoeLayer {
     /// The row pair (module docs): `forward_row_local`'s originals arm for
     /// `rows` rows with the router, the experts and the shared expert read
     /// once. Same buffers as the single-row arm, `rows` deep.
+    #[allow(clippy::too_many_arguments)]
     fn forward_rows_pair(
         &self,
         input: DevicePtr,
         rows: usize,
         output: DevicePtr,
         shared_out: DevicePtr,
+        unfused_here: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -162,37 +171,24 @@ impl MoeLayer {
         let gate_logits = ctx.buffers.gate_logits();
         let router_n = self.router_logits_n;
         if let Some(ref nvfp4) = self.gate_nvfp4 {
-            // The widest resolved exact tier (batch8, else batch4).
-            let chunk = if self.w4a16_batchm.width(8).is_some() {
-                8
-            } else {
-                4
-            };
-            for first in (0..rows).step_by(chunk) {
-                let m = (rows - first).min(chunk) as u32;
-                ops::w4a16_gemv_batchm(
-                    ctx.gpu,
-                    self.w4a16_batchm.kernel(m),
-                    input.offset(first * h * bf16),
-                    nvfp4,
-                    gate_logits.offset(first * router_n as usize * bf16),
-                    m,
-                    router_n,
-                    h as u32,
-                    stream,
-                )?;
-            }
+            // The widest exact tier a launch (batch16 past 8 rows).
+            self.wide_rows.w4a16_rows(
+                ctx.gpu,
+                &self.w4a16_batchm,
+                input,
+                nvfp4,
+                gate_logits,
+                (rows as u32, router_n, h as u32),
+                stream,
+            )?;
         } else {
-            ops::dense_gemv_batchm_chunked(
+            self.wide_rows.dense_rows(
                 ctx.gpu,
                 self.dense_gemv_batchm,
                 input,
                 &self.weights.gate,
                 gate_logits,
-                rows as u32,
-                router_n,
-                h as u32,
-                router_n,
+                (rows as u32, router_n, h as u32, router_n),
                 stream,
             )?;
         }
@@ -229,51 +225,95 @@ impl MoeLayer {
                 stream,
             )?;
         }
-        k.plan(ctx.gpu, indices, order, slots, stream)?;
+        if let Some(path) = crate::model::qwen4exp_batch_fast::route_dump_path() {
+            let launch = super::route_dump::Launch {
+                indices,
+                weights,
+                input,
+                rows,
+                top_k,
+                hidden: h,
+                layer: self.gate_ptrs.packed_ptrs.0,
+            };
+            super::route_dump::append(ctx.gpu, &launch, path, stream)?;
+        }
 
         let expert_gate_out = ctx.buffers.expert_gate_out();
         let expert_up_out = ctx.buffers.expert_up_out();
         let expert_down_out = ctx.buffers.expert_down_out();
-        // The single-row arm's shared gate/up scratch, `rows` deep.
-        let shared_gate_scratch = ctx.buffers.logits();
-        let shared_up_scratch = ctx.buffers.ssm_qkvz();
         let (h32, inter32, top_k32, rows32) = (h as u32, inter as u32, top_k as u32, rows as u32);
         let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
-        k.gate_up(
-            ctx.gpu,
-            input,
-            table(&self.gate_ptrs),
-            expert_gate_out,
-            table(&self.up_ptrs),
-            expert_up_out,
-            indices,
-            order,
-            &self.weights.shared_expert.gate_proj,
-            shared_gate_scratch,
-            &self.weights.shared_expert.up_proj,
-            shared_up_scratch,
-            (inter32, h32, top_k32, rows32),
-            stream,
-        )?;
-        k.silu_down(
-            ctx.gpu,
-            expert_gate_out,
-            expert_up_out,
-            table(&self.down_ptrs),
-            expert_down_out,
-            indices,
-            order,
-            shared_gate_scratch,
-            shared_up_scratch,
-            &self.weights.shared_expert.down_proj,
-            shared_out,
-            (h32, inter32, top_k32, rows32),
-            stream,
-        )?;
+        let shared = &self.weights.shared_expert;
+        if k.units_ready() {
+            // A launch takes up to QWEN4EXP_MOE_UNITS_MAX_ROWS rows; each row's
+            // bytes are the same in any chunk (and under ATLAS_QWEN4EXP_MOE_TC
+            // the kernels are row-invariant).
+            for r0 in (0..rows).step_by(ops::QWEN4EXP_MOE_UNITS_MAX_ROWS) {
+                let n = ops::QWEN4EXP_MOE_UNITS_MAX_ROWS.min(rows - r0);
+                self.units_experts(input, indices, (r0, n), shared_out, ctx, stream)?;
+            }
+        } else {
+            k.plan(ctx.gpu, indices, order, slots, stream)?;
+            // The single-row arm's shared gate/up scratch, `rows` deep.
+            let shared_gate_scratch = ctx.buffers.logits();
+            let shared_up_scratch = ctx.buffers.ssm_qkvz();
+            k.gate_up(
+                ctx.gpu,
+                input,
+                table(&self.gate_ptrs),
+                expert_gate_out,
+                table(&self.up_ptrs),
+                expert_up_out,
+                indices,
+                order,
+                &shared.gate_proj,
+                shared_gate_scratch,
+                &shared.up_proj,
+                shared_up_scratch,
+                (inter32, h32, top_k32, rows32),
+                stream,
+            )?;
+            k.silu_down(
+                ctx.gpu,
+                expert_gate_out,
+                expert_up_out,
+                table(&self.down_ptrs),
+                expert_down_out,
+                indices,
+                order,
+                shared_gate_scratch,
+                shared_up_scratch,
+                &shared.down_proj,
+                shared_out,
+                (h32, inter32, top_k32, rows32),
+                stream,
+            )?;
+        }
+        // FP4-Local's MXFP8 shared expert (`shared_mxfp8.rs`; the kernels
+        // above ran without one): every row in one row-invariant pass, as
+        // `forward_row_local` runs it for one (unless it was forked).
+        if unfused_here && self.has_unfused_shared_expert() {
+            self.run_unfused_shared_expert(
+                input,
+                rows32,
+                h32,
+                ctx.config.shared_expert_intermediate_size as u32,
+                ctx.buffers.logits(),
+                ctx.buffers.ssm_qkvz(),
+                shared_out,
+                ctx,
+                stream,
+            )?;
+        }
 
         // Each row's blend, as `forward_row_local` runs it: under EP against a
-        // zeroed shared row (the EP reduce adds the shared expert once).
-        let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
+        // zeroed shared row (the EP reduce adds the shared expert once), but
+        // with an MXFP8 one's partial (joined first when it was forked).
+        let is_ep =
+            ctx.comm.is_some() && ctx.config.ep_world_size > 1 && !self.mxfp8_shared_split();
+        if !unfused_here && self.mxfp8_shared_split() {
+            self.join_mxfp8_shared(ctx, stream)?;
+        }
         let zero_row = if is_ep {
             self.ep_blend_zero_row(ctx, stream)?
         } else {
@@ -318,5 +358,48 @@ impl MoeLayer {
             )?;
         }
         Ok(())
+    }
+
+    /// The expert units (`ATLAS_QWEN4EXP_MOE_UNITS`, or on tensor cores under
+    /// `ATLAS_QWEN4EXP_MOE_TC`) for rows `[r0, r0 + rows)` of `input` routed at
+    /// `indices` (`[*, top_k]`): down into `expert_down_out` (`[*, top_k, h]`),
+    /// the shared expert's into `shared_out` (`[*, h]`), at those rows. The
+    /// gate/up rows are not materialized, so their buffers hold the
+    /// activations (FP32; BF16 under TC v3) and the plan. Serial decode's single row comes here too
+    /// under the tensor-core switch (`forward_row_local`).
+    pub(super) fn units_experts(
+        &self,
+        input: DevicePtr,
+        indices: DevicePtr,
+        (r0, rows): (usize, usize),
+        shared_out: DevicePtr,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        let (h, inter) = (ctx.config.hidden_size, ctx.config.moe_intermediate_size);
+        let top_k = ctx.config.num_experts_per_tok;
+        let slots = rows * top_k;
+        let sizes = ctx.buffers.sizes();
+        anyhow::ensure!(
+            (slots + rows) * inter * 4 <= sizes.expert_gate_out
+                && ops::QWEN4EXP_MOE_UNITS_WS_BYTES <= sizes.expert_up_out,
+            "qwen4exp MoE units: {rows} rows overrun the expert gate/up buffers"
+        );
+        let table = |t: &ExpertPtrTable| (t.packed_ptrs, t.scale_ptrs, t.scale2_vals);
+        let shared = &self.weights.shared_expert;
+        self.qwen4exp_moe_rows.units(
+            ctx.gpu,
+            input.offset(r0 * h * 2),
+            table(&self.gate_ptrs),
+            table(&self.up_ptrs),
+            table(&self.down_ptrs),
+            indices.offset(r0 * top_k * 4),
+            (ctx.buffers.expert_up_out(), ctx.buffers.expert_gate_out()),
+            (&shared.gate_proj, &shared.up_proj, &shared.down_proj),
+            ctx.buffers.expert_down_out().offset(r0 * top_k * h * 2),
+            shared_out.offset(r0 * h * 2),
+            (h as u32, inter as u32, top_k as u32, rows as u32),
+            stream,
+        )
     }
 }

@@ -32,6 +32,12 @@ impl FastSafetensorsLoader {
     /// CSF-compressed scale is deferred as its components (judged by the
     /// scale's name), decoded per slice by `with_deferred_slice`.
     pub(super) fn should_defer_tensor(&self, name: &str) -> bool {
+        // W4A4 activation scales are read from disk by the qwen4_exp loader,
+        // including for experts owned by another EP rank. Keep them in the
+        // deferred map instead of silently dropping the scalar.
+        if self.skip_activation_scales && name.ends_with(".input_scale") {
+            return true;
+        }
         let name = csf_part(name).map_or(name, |(scale, _)| scale);
         self.expert_tp
             && !name.starts_with("mtp.")
@@ -47,6 +53,9 @@ impl FastSafetensorsLoader {
     }
 
     pub(super) fn should_skip_tensor(&self, name: &str) -> bool {
+        if debug_layer_dropped(name) {
+            return true;
+        }
         if self
             .skip_layer_prefix
             .as_ref()
@@ -83,11 +92,11 @@ impl FastSafetensorsLoader {
         if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
-        // W4A4 activation scales: never read on the w4a16 path (the NVFP4
-        // loader falls back to `DevicePtr::NULL`), and 4-byte allocations are
-        // almost pure granule padding at expert scale.
+        // W4A4 activation scales are not uploaded (4-byte allocations are
+        // almost pure granule padding at expert scale), but the deferral
+        // predicate above records them for qwen4_exp's row quantizer.
         if self.skip_activation_scales && name.ends_with(".input_scale") {
-            return true;
+            return false;
         }
         if self.ep_world_size <= 1 {
             return false;
@@ -125,4 +134,26 @@ impl FastSafetensorsLoader {
             false
         }
     }
+}
+
+/// `ATLAS_QWEN4EXP_DEBUG_LAYERS=<n>` (debug harness, unset in serving): keep
+/// the first `n` decoder layers while retaining the independent MTP numbering.
+fn debug_layer_dropped(name: &str) -> bool {
+    static KEEP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let Some(keep) = *KEEP.get_or_init(|| {
+        std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    }) else {
+        return false;
+    };
+    if name.starts_with("mtp.") {
+        return false;
+    }
+    let Some(at) = name.find(".layers.") else {
+        return false;
+    };
+    let rest = &name[at + ".layers.".len()..];
+    let digits = rest.split('.').next().unwrap_or("");
+    digits.parse::<usize>().is_ok_and(|i| i >= keep)
 }

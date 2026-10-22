@@ -48,6 +48,10 @@ const BLOCK: usize = 4096;
 #[path = "ngram_cache_fault.rs"]
 mod fault;
 
+mod fault_pool;
+mod keepalive;
+pub use keepalive::keepalive_from_env;
+
 /// One table's on-NVMe backing file plus its resident row cache.
 pub struct NgramRowCache {
     /// Flat pinned, GPU-addressable `[slots, row_stride]` region.
@@ -70,6 +74,9 @@ pub struct NgramRowCache {
     segments: Option<Segments>,
     /// Per-row scale file mirror (FP8 tables), `None` for BF16 tables.
     scales: Option<ScaleCache>,
+    /// NVFP4 rows (`set_nvfp4_global_scale`): each row carries its own block
+    /// scales, and this one f32 multiplies them all. `None` otherwise.
+    nvfp4_global: Option<f32>,
     row_stride: usize,
     slots: usize,
     rows_total: u64,
@@ -85,6 +92,10 @@ pub struct NgramRowCache {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    /// `ATLAS_PLE_NVME_KEEPALIVE_MS` ticker, `None` when off. See `keepalive`.
+    keepalive: Option<keepalive::KeepAlive>,
+    /// `ATLAS_PLE_FAULT_POOL=1` workers, built on the first multi-row fault.
+    fault_pool: Option<fault_pool::FaultPool>,
 }
 
 /// A table split across equal-sized shards at scattered file offsets, which
@@ -205,6 +216,7 @@ impl NgramRowCache {
             base_offset,
             segments: None,
             scales,
+            nvfp4_global: None,
             row_stride,
             slots,
             rows_total,
@@ -216,7 +228,39 @@ impl NgramRowCache {
             hits: 0,
             misses: 0,
             evictions: 0,
+            keepalive: None,
+            fault_pool: None,
         })
+    }
+
+    /// Start the NVMe keep-awake ticker (see `keepalive`): one 4 KiB read of
+    /// a backing file every `period` while a resolve happened within `idle`.
+    /// Never touches the cache's rows. Replaces a running ticker.
+    pub fn start_keepalive(
+        &mut self,
+        period: std::time::Duration,
+        idle: std::time::Duration,
+    ) -> Result<()> {
+        let file = match &self.segments {
+            Some(seg) => &seg.files[0],
+            None => &self.file,
+        };
+        let file = file
+            .try_clone()
+            .context("NgramRowCache keepalive: dup backing file")?;
+        self.keepalive = Some(keepalive::KeepAlive::spawn(file, period, idle)?);
+        Ok(())
+    }
+
+    /// Keepalive reads issued so far (0 when the ticker is off).
+    pub fn keepalive_reads(&self) -> u64 {
+        self.keepalive.as_ref().map_or(0, |k| k.reads())
+    }
+
+    /// The backing file of a flat (non-segmented) table, so a caller can
+    /// check it is the file it validated (`ngram_pack::PackedTable`).
+    pub(crate) fn backing_file(&self) -> &File {
+        &self.file
     }
 
     /// Device VA of the cache's row table — the `embed_table` argument of the

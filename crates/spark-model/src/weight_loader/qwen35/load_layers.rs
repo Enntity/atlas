@@ -3,6 +3,7 @@
 pub(crate) mod attention_arms;
 pub(crate) mod linear_attn_arms;
 mod tq_plus_weight_rotation;
+pub(crate) use tq_plus_weight_rotation::weight_rotation_enabled;
 
 use anyhow::Result;
 use atlas_core::config::{LayerType, ModelConfig};
@@ -277,6 +278,7 @@ pub(super) fn load_layers(
             quantize_k,
             stream,
             skip_nvfp4_experts,
+            true,
         )?;
         // 2026-05-25 (final): gate stays in BF16 for `native_fp8` —
         // routes through `dense_gemm` BF16 fallback path.

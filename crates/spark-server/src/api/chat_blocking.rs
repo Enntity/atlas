@@ -82,7 +82,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         num_beams,
         length_penalty,
         early_stopping,
-        image_pixels,
+        mut image_pixels,
         max_tokens,
         temperature,
         top_k,
@@ -135,8 +135,11 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
+            // Moved, not copied, into choice 0: the scheduler holds the only
+            // copy of the pixels (and their in-flight permits), and drops it
+            // when that choice's prefill ends, not when every choice is done.
             image_pixels: if choice_idx == 0 {
-                image_pixels.clone()
+                std::mem::take(&mut image_pixels)
             } else {
                 Vec::new()
             },

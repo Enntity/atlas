@@ -125,6 +125,9 @@ pub struct MoeLayer {
     /// `ATLAS_GLM_FP4L_INPUT_SCALES`: the calibrated activation scales and
     /// their folded tables (`input_scales.rs`).
     pub(super) input_scales: Option<super::InputScales>,
+    /// qwen4_exp's W4A4 routed prefill: the checkpoint's activation scales
+    /// and their alpha tables (`w4a4_scales.rs`).
+    pub(super) w4a4: Option<super::W4a4Scales>,
     /// CUTLASS grouped-NVFP4 host tables (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`).
     /// Per-expert packed/SFB pointer values + scale2, snapshotted ONCE at load
     /// by `build_cutlass_grouped_sfb` (the SFB swizzle is built there from the
@@ -197,6 +200,8 @@ pub struct MoeLayer {
     /// `ATLAS_QWEN4EXP_BATCH_FAST`: the expert-sorted row grid of the
     /// originals-layout pair (`forward_rows.rs`). All 0 otherwise.
     pub(super) qwen4exp_moe_rows: ops::Qwen4ExpMoeRows,
+    /// The router's 16-row tier under the lane (`forward_rows.rs`).
+    pub(super) wide_rows: ops::Qwen4ExpWideRows,
     pub(super) moe_expert_gate_up_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_gate_up_shared_fp8_batch2_t_k: KernelHandle,
@@ -434,6 +439,9 @@ pub struct MoeLayer {
     // Checkpoint-native BF16 shared expert. Independent of routed-expert
     // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
     pub(super) bf16_shared_expert: Option<Bf16SharedExpert>,
+    // Checkpoint-native MXFP8 shared expert (FP4-Local), likewise outside the
+    // fused routed kernels: `shared_mxfp8.rs`.
+    pub(super) mxfp8_shared_expert: Option<Mxfp8SharedExpert>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     pub(super) fp8_shared_expert: Option<Fp8ExpertWeight>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>

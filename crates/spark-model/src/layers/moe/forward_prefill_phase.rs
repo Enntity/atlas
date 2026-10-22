@@ -55,6 +55,19 @@ impl MoeLayer {
         let shared_gate_out = ctx.buffers.ssm_deinterleaved();
         let shared_up_out = ctx.buffers.ssm_qkvz();
         let shared_down_out = ctx.buffers.attn_output();
+        // FP4-Local's MXFP8 shared expert has this one prefill arm.
+        if self.try_mxfp8_shared_prefill(
+            input,
+            n,
+            [shared_gate_out, shared_up_out, shared_down_out],
+            ctx,
+            aux,
+        )? {
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         // ATLAS_GLM_CANONICAL_VERIFY: the tensor-core tier of `n` rows for
         // every verify width (the family the 9..32-row branch below runs).
         let canonical = ctx.config.model_type == "glm5_next"
@@ -130,7 +143,7 @@ impl MoeLayer {
             }
             return Ok(());
         }
-        if self.run_bf16_shared_expert(
+        if self.run_unfused_shared_expert(
             input,
             n,
             h,
@@ -206,6 +219,19 @@ impl MoeLayer {
             return Ok(());
         }
 
+        // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: the decode shared expert's TC numerics.
+        if self.try_tcp_shared(
+            input,
+            (n, h, shared_inter),
+            [shared_gate_out, shared_down_out],
+            ctx,
+            aux,
+        )? {
+            if use_overlap {
+                ctx.gpu.record_event(self.event_b, aux)?;
+            }
+            return Ok(());
+        }
         // ATLAS_QWEN4EXP_PREFILL_MOE: the transposed w4a16_gemm_t arm below,
         // byte for byte, on the q38 kernels (`forward_prefill_q38.rs`).
         if self.try_q38_shared(
