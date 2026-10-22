@@ -7,6 +7,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod glm_tool_markup;
 mod vision_markup;
 
 use super::{
@@ -165,6 +166,7 @@ impl ChatTokenizer {
             .map_err(anyhow::Error::msg)?,
             eos_token_id,
             supports_thinking,
+            glm_tool_markup_as_text: model_type == "glm5_next",
             chat_encoding,
             chat_template,
             jinja_env,

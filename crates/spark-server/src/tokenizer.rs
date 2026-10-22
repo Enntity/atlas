@@ -87,6 +87,10 @@ pub struct ChatTokenizer {
     ids_only: bool,
     eos_token_id: u32,
     supports_thinking: bool,
+    /// GLM-5 registers its tool-envelope XML as added tokens. Incoming prose
+    /// needs the tokenizer-side sentinel escape; other model families must
+    /// retain their existing prompt bytes.
+    pub(crate) glm_tool_markup_as_text: bool,
     chat_encoding: ChatEncoding,
     /// Compiled Jinja chat template (from tokenizer_config.json).
     #[allow(dead_code)]

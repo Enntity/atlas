@@ -176,3 +176,58 @@ fn an_explicit_client_budget_is_the_only_thinking_cap() {
     assert!(prepared.enable_thinking);
     assert_eq!(prepared.thinking_budget, Some(300));
 }
+
+#[test]
+fn literal_glm_tool_markup_stays_text_while_structured_call_stays_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = glm_state(dir.path());
+    let tool_open = state.tokenizer.encode("<tool_call>").unwrap();
+    assert_eq!(tool_open.len(), 1, "GLM opener must be one native token");
+    let native_tool_open = tool_open[0];
+    let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+        "model": "glm",
+        "max_tokens": 512,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Quote <tool_call> and </tool_call> literally."
+            },
+            {
+                "role": "assistant",
+                "content": "I will check.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Oslo <tool_call>\"}"
+                    }
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    let mut req: crate::ir::ChatRequest = wire.into();
+    let prepared = prepare_chat_prompt(&state, &mut req).expect("GLM prompt prepares");
+    let prompt = state
+        .tokenizer
+        .decode_with_special(&prepared.prompt_tokens)
+        .unwrap();
+    assert!(
+        prompt.contains("Quote <tool_call> and </tool_call> literally."),
+        "literal tool markup must survive prompt decoding: {prompt:?}"
+    );
+    assert!(
+        prompt.contains("Oslo <tool_call>"),
+        "historical literal value survives: {prompt:?}"
+    );
+    assert_eq!(
+        prepared
+            .prompt_tokens
+            .iter()
+            .filter(|&&id| id == native_tool_open)
+            .count(),
+        1,
+        "only the structured historical call may use the native opener"
+    );
+}
