@@ -180,7 +180,7 @@ fn decode_seam(g: &dyn GpuBackend) -> Result<bool> {
         let scale: Vec<f32> = vec![0.7, 0.9, 1.1];
         let base: Vec<f32> = (0..24).map(|_| r.f()).collect();
         let (hw_a, hw_b) = (up(g, &bf(&highway))?, up(g, &bf(&highway))?);
-        let (blk, fnd, sc, bs) = (
+        let (blk, find_ptr, sc, bs) = (
             up(g, &bf(&block))?,
             up(g, &f32b(&fn_))?,
             up(g, &f32b(&scale))?,
@@ -207,7 +207,7 @@ fn decode_seam(g: &dyn GpuBackend) -> Result<bool> {
                 .grid([t.div_ceil(32), 1, 1])
                 .block([256, 1, 1])
                 .arg_ptr(hw)
-                .arg_ptr(fnd)
+                .arg_ptr(find_ptr)
                 .arg_ptr(scratch)
                 .arg_ptr(scratch.offset(tokens * 96))
                 .arg_u32(t)
@@ -236,7 +236,7 @@ fn decode_seam(g: &dyn GpuBackend) -> Result<bool> {
                 .arg_ptr(hw)
                 .arg_ptr(post_b)
                 .arg_ptr(comb_b)
-                .arg_ptr(fnd)
+                .arg_ptr(find_ptr)
                 .arg_ptr(scratch)
                 .arg_u32(t)
                 .launch(0)?;

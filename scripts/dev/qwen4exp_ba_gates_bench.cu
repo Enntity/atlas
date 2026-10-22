@@ -34,14 +34,14 @@ int main(int argc, char** argv) {
             std::vector<unsigned short> a((size_t)M * K), b((size_t)N * K);
             for (auto& x : a) x = f2bf(nd(rng));
             for (auto& x : b) x = f2bf(0.05f * nd(rng));
-            std::vector<float> alog(nv), dtb(nv);
-            for (auto& x : alog) x = 0.5f * nd(rng);
+            std::vector<float> a_log(nv), dtb(nv);
+            for (auto& x : a_log) x = 0.5f * nd(rng);
             for (auto& x : dtb) x = 0.5f * nd(rng);
             Buf<unsigned short> da, db;
             Buf<float> dal, ddt, o1, o2;
             da.alloc(a.size()); da.put(a);
             db.alloc(b.size()); db.put(b);
-            dal.alloc(nv); dal.put(alog);
+            dal.alloc(nv); dal.put(a_log);
             ddt.alloc(nv); ddt.put(dtb);
             o1.alloc((size_t)M * gs); o2.alloc((size_t)M * gs);
             o1.fill(0x11); o2.fill(0x22);

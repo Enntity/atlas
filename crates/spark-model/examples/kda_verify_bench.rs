@@ -73,7 +73,7 @@ fn main() -> Result<()> {
         let states: Vec<u8> = (0..owners * STATE)
             .flat_map(|_| (rng.f() * 0.1).to_le_bytes())
             .collect();
-        let (d_qkv, d_gate, d_beta, d_alog, d_dt) = (
+        let (d_qkv, d_gate, d_beta, d_a_log, d_dt) = (
             up(g, &qkv)?,
             up(g, &gate)?,
             up(g, &beta)?,
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
                     .arg_ptr(d_qkv.offset(o * rows * 3 * HEADS * DIM * 2))
                     .arg_ptr(d_gate.offset(o * rows * HEADS * DIM * 2))
                     .arg_ptr(d_beta.offset(o * rows * HEADS * 2))
-                    .arg_ptr(d_alog)
+                    .arg_ptr(d_a_log)
                     .arg_ptr(d_dt)
                     .arg_ptr(s_a.offset(o * STATE * 4))
                     .arg_ptr(o_a.offset(o * rows * HEADS * DIM * 2))
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
                 .arg_ptr(d_qkv)
                 .arg_ptr(d_gate)
                 .arg_ptr(d_beta)
-                .arg_ptr(d_alog)
+                .arg_ptr(d_a_log)
                 .arg_ptr(d_dt)
                 .arg_ptr(o_b);
             for o in 0..4 {

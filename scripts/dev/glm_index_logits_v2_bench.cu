@@ -76,7 +76,7 @@ static Cache make_cache(unsigned bs, unsigned tokens, std::mt19937& rng) {
     return c;
 }
 
-struct Bufs { __nv_bfloat16 *dq, *dw; float *dout0, *dout1; };
+struct Bufs { __nv_bfloat16 *dq, *dw; float *device_output0, *device_output1; };
 
 // One scorer launch over rows [r0, r0 + rows) of a piece starting at `start`,
 // exactly as the runtime's row-tile loop offsets query, weights and position.
@@ -89,11 +89,11 @@ static void launch(const Variant* v, unsigned gx, const Bufs& b, const Cache& c,
     const auto* table = (const unsigned*)c.dtable;
     if (!v) {
         glm_index_logits_bf16_wmma_row8_pool32<<<dim3((stride + 31) / 32, (rows + 7) / 8), 256>>>(
-            q, w, cache, b.dout0 + (size_t)r0 * stride, table, rows, start + r0, stride, 32, 128,
+            q, w, cache, b.device_output0 + (size_t)r0 * stride, table, rows, start + r0, stride, 32, 128,
             4, c.bs, c.stride);
     } else {
         v->k<<<dim3(gx, (rows + v->warps - 1) / v->warps), v->warps * 32, v->smem>>>(
-            q, w, cache, b.dout1 + (size_t)r0 * stride, table, rows, start + r0, stride, 32, 128,
+            q, w, cache, b.device_output1 + (size_t)r0 * stride, table, rows, start + r0, stride, 32, 128,
             4, c.bs, c.stride);
     }
 }
@@ -112,8 +112,8 @@ static size_t compare(const Bufs& b, unsigned rows, unsigned stride, std::vector
     const size_t n = (size_t)rows * stride;
     h0.resize(n);
     h1.resize(n);
-    CK(cudaMemcpy(h0.data(), b.dout0, n * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(h1.data(), b.dout1, n * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h0.data(), b.device_output0, n * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h1.data(), b.device_output1, n * 4, cudaMemcpyDeviceToHost));
     size_t diff = 0;
     for (size_t i = 0; i < n; i++) diff += h0[i] != h1[i];
     return diff;
@@ -149,8 +149,8 @@ int main(int argc, char** argv) {
     const size_t out_bytes = (size_t)max_rows * ((max_extent + 3) / 4) * 4;
     CK(cudaMalloc(&b.dq, q.size() * 2));
     CK(cudaMalloc(&b.dw, w.size() * 2));
-    CK(cudaMalloc(&b.dout0, out_bytes));
-    CK(cudaMalloc(&b.dout1, out_bytes));
+    CK(cudaMalloc(&b.device_output0, out_bytes));
+    CK(cudaMalloc(&b.device_output1, out_bytes));
     CK(cudaMemcpy(b.dq, q.data(), q.size() * 2, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(b.dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice));
     const Cache c16 = make_cache(16, max_extent, rng);
@@ -191,14 +191,14 @@ int main(int argc, char** argv) {
             }
             const unsigned stride = (cs.start + cs.rows + 3) / 4;
             if (mode == "small" && (size_t)cs.rows * stride > 2000000) continue;
-            CK(cudaMemset(b.dout0, 0xFF, (size_t)cs.rows * stride * 4));
+            CK(cudaMemset(b.device_output0, 0xFF, (size_t)cs.rows * stride * 4));
             launch(nullptr, 0, b, *cs.c, 0, cs.rows, cs.start, stride);
             CK(cudaGetLastError());
             for (const auto& v : kVariants) {
                 const unsigned chunks = (stride + v.pools - 1) / v.pools;
                 const unsigned gxs[] = {1, 2, 3, 7, chunks, default_gx(v, cs.rows, stride)};
                 for (unsigned gx : gxs) {
-                    CK(cudaMemset(b.dout1, 0xEE, (size_t)cs.rows * stride * 4));
+                    CK(cudaMemset(b.device_output1, 0xEE, (size_t)cs.rows * stride * 4));
                     launch(&v, gx, b, *cs.c, 0, cs.rows, cs.start, stride);
                     CK(cudaGetLastError());
                     CK(cudaDeviceSynchronize());
@@ -222,12 +222,12 @@ int main(int argc, char** argv) {
         for (const Variant* v : {&bad_block, &bad_smem}) {
             const unsigned rows = 9, start = 2047, stride = (start + rows + 3) / 4;
             const size_t n = (size_t)rows * stride;
-            CK(cudaMemset(b.dout1, 0xEE, n * 4));
+            CK(cudaMemset(b.device_output1, 0xEE, n * 4));
             launch(v, 1, b, c16, 0, rows, start, stride);
             CK(cudaGetLastError());
             CK(cudaDeviceSynchronize());
             h1.resize(n);
-            CK(cudaMemcpy(h1.data(), b.dout1, n * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(h1.data(), b.device_output1, n * 4, cudaMemcpyDeviceToHost));
             const size_t written = n - std::count(h1.begin(), h1.end(), 0xEEEEEEEEu);
             total_diff += written;
             printf("unsupported %s: %zu logits written (want 0)\n",

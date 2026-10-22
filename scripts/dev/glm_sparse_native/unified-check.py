@@ -123,10 +123,10 @@ def main(opt):
         torch.cuda.synchronize()
         require(bool(torch.isfinite(out).all()) and bool(torch.isfinite(m['final_lse']).all()),'unwritten/nonfinite unified')
         equal(out,ref,'unified output');equal(m['final_lse'],rl,'unified LSE')
-        aout=torch.full_like(out,float('nan'))
+        atlas_output=torch.full_like(out,float('nan'))
         def baseline():
-            require(atlas.atlas_sparse_run(q.data_ptr(),kv.data_ptr(),selected.data_ptr(),aout.data_ptr(),table.data_ptr(),rows,heads,2051,16,.0625,stream)==0,'Atlas dispatch')
-        baseline();torch.cuda.synchronize();require(bool(torch.isfinite(aout).all()),'Atlas nonfinite output')
+            require(atlas.atlas_sparse_run(q.data_ptr(),kv.data_ptr(),selected.data_ptr(),atlas_output.data_ptr(),table.data_ptr(),rows,heads,2051,16,.0625,stream)==0,'Atlas dispatch')
+        baseline();torch.cuda.synchronize();require(bool(torch.isfinite(atlas_output).all()),'Atlas nonfinite output')
         def checks():
             for n,h in hashes.items():require(tensor_sha(data[n])==h,'input changed '+n)
             for n,r in raw.items():require(bool((r[:256]==0xa5).all()) and bool((r[-256:]==0xa5).all()),'guard '+n)

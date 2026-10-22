@@ -986,7 +986,7 @@ __device__ __forceinline__ void pqw_mma_stage(
     const unsigned int sfa_m = (lane_id & 1) * 8 + (lane_id >> 2);
     const unsigned short tid_a = 0, bid_a = 0, bid_b = 0;
     // B scales of this stage: quad thread s holds slice s's four for
-    // column group_id of each n8 subtile.
+    // column group_id of each n8 sub-tile.
     unsigned int sfb[2 * NB];
     #pragma unroll
     for (int nb = 0; nb < NB; ++nb) {
@@ -1071,7 +1071,7 @@ __device__ __forceinline__ void pqw_store_c(
             const unsigned int r = group_id + half * 8;
             unsigned char* srow = scratch + r * PQW_STAGE_PITCH;
             if constexpr (E4M3) {
-                // A quad holds the row's 64 columns: 2 per n8 subtile per thread.
+                // A quad holds the row's 64 columns: 2 per n8 sub-tile per thread.
                 float amax = 0.0f;
                 #pragma unroll
                 for (int nt = 0; nt < 2 * PQW_NB; nt++)
@@ -1123,7 +1123,7 @@ __device__ __forceinline__ void pqw_epilogue(
     const unsigned int warp_n_offset = (warp_id >> 1) * (PQW_NT / 4);
     const unsigned int group_id = lane_id >> 2, tid = lane_id & 3;
     if constexpr (GATE_UP) {
-        // Gate subtile j pairs with up subtile j + 4 (same columns); each
+        // Gate sub-tile j pairs with up sub-tile j + 4 (same columns); each
         // 16-column group spans two subtiles, i.e. one quad of threads.
         const float scale2_up = up.scale2_vals[expert_id];
         const float a2g = up.a2_gscale != nullptr ? up.a2_gscale[expert_id] : 1.0f;

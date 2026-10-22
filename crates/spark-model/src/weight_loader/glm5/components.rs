@@ -438,7 +438,9 @@ pub(super) fn load_kda_weights(
                 .map(|rank| shard_dense_bf16(source.dense.weight, n, k, kind, rank, 2, gpu))
                 .transpose()?;
             let dense = source.replaced(local, local_n * local_k * 2, gpu)?;
-            let scale_source = pair.map_or((local, local_n * local_k), |(p, pn, pk)| (p, pn * pk));
+            let scale_source = pair.map_or((local, local_n * local_k), |(p, pair_n, pair_k)| {
+                (p, pair_n * pair_k)
+            });
             let decode_nvfp4 = quantize_to_nvfp4_scaled_by(
                 &dense.dense,
                 local_n,
