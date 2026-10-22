@@ -88,10 +88,10 @@ mod tests {
     #[test]
     fn failed_or_panicking_encode_releases_its_permit() {
         let gate = configured(Some("1")).unwrap().unwrap();
-        let result = (|| -> Result<(), ()> {
+        let result: Result<(), ()> = {
             let _permit = gate.acquire(LARGE_INPUT_BYTES).expect("error permit");
             Err(())
-        })();
+        };
         assert!(result.is_err());
         let result = std::panic::catch_unwind(|| {
             let _permit = gate.acquire(LARGE_INPUT_BYTES).expect("panic permit");

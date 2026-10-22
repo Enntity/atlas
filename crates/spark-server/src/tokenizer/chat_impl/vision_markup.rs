@@ -133,7 +133,7 @@ pub(super) fn encode_with_sentinel_families(
         let body_start = open + family.open.len_utf8();
         let tag_len = family.tag.map_or(0, char::len_utf8);
         if let Some(tag) = family.tag
-            && rendered[body_start..].chars().next() != Some(tag)
+            && !rendered[body_start..].starts_with(tag)
         {
             search_from = body_start;
             continue;
