@@ -161,12 +161,7 @@ pub fn bf16_gemm_act_weight_t_fixed(
     unreachable!("cublaslt::bf16_gemm_act_weight_t_fixed is cuda-only (not built for metal)")
 }
 
-pub fn fp8_blkscaled_pinned_prepare(
-    _weight_sf: u64,
-    _act_sf: u64,
-    _n: u32,
-    _k: u32,
-) -> Result<()> {
+pub fn fp8_blkscaled_pinned_prepare(_weight_sf: u64, _act_sf: u64, _n: u32, _k: u32) -> Result<()> {
     unreachable!("cublaslt::fp8_blkscaled_pinned_prepare is cuda-only (not built for metal)")
 }
 
@@ -179,7 +174,9 @@ pub fn fp8_gemm_act_weight_t_blkscaled_pinned(
     [_m, _n, _k]: [u32; 3],
     _stream: u64,
 ) -> Result<()> {
-    unreachable!("cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned is cuda-only (not built for metal)")
+    unreachable!(
+        "cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned is cuda-only (not built for metal)"
+    )
 }
 
 pub fn fp8_gemm_act_weight_t_mx(

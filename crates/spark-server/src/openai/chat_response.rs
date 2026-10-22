@@ -29,8 +29,7 @@ pub struct ChatChoice {
     pub finish_reason: String,
     /// #55: set when a server-side guard cut this response short
     /// (e.g. `inter_tool_prose_budget`), instead of the model. An
-    /// extension field: unknown fields are ignored by every SDK, unlike
-    /// a non-standard finish_reason value, which typed clients reject.
+    /// extension field that preserves the standard finish_reason values.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guard_stop: Option<&'static str>,
     pub logprobs: Option<ChoiceLogprobs>,

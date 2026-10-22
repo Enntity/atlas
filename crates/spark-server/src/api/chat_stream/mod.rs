@@ -220,7 +220,6 @@ pub(crate) async fn run_chat_stream(
         model: model_name.clone(),
         id: chunk_id.clone(),
         prompt_len,
-        session_hash,
         enable_thinking,
         tool_defs_for_backfill: tool_defs,
         cwd_for_normalize: cwd_hint,

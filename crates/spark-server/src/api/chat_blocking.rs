@@ -220,10 +220,6 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         let (output_text_i, matched_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
 
-        // #55: remember that this assistant turn was ENGINE-generated,
-        // so the spinning scan (loop_detect) can ignore harness-injected
-        // filler in later requests of the same session.
-        crate::api::chat::loop_detect::register_engine_turn(session_hash, &output_text_i);
         let mut choice = build_choice_message(
             &state,
             &req,

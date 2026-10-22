@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::{DeltaVec, StreamCtx, StreamDelta, StreamState, resolve_wire_finish_reason};
+use super::{DeltaVec, StreamDelta, StreamState, resolve_wire_finish_reason};
 
 fn output_rejected(state: &StreamState) -> bool {
     state.guard_stop.is_some()
@@ -12,7 +12,6 @@ fn output_rejected(state: &StreamState) -> bool {
 /// The callback is the existing detector/sanitizer flush body.
 pub(super) fn finalize_done<'a>(
     state: &mut StreamState,
-    ctx: &StreamCtx,
     finish_reason: &'a str,
     usage: crate::ir::Usage,
     return_token_ids: bool,
@@ -32,14 +31,6 @@ pub(super) fn finalize_done<'a>(
         deltas.clear();
         state.pending_token_ids.clear();
     }
-    // #55: remember that this assistant turn was ENGINE-generated, so the
-    // spinning scan (loop_detect) can ignore harness-injected filler in
-    // later requests of the same session. Registered BEFORE the rejection
-    // decision: even a guard-cut turn was produced by the engine.
-    crate::api::chat::loop_detect::register_engine_turn(
-        ctx.session_hash,
-        &state.accumulated_content,
-    );
     let fr = resolve_wire_finish_reason(
         finish_reason,
         state.tool_loop_capped,

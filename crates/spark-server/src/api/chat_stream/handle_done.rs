@@ -51,7 +51,6 @@ pub(super) fn handle_done(
 
     let (deltas, fr) = finalization::finalize_done(
         state,
-        ctx,
         &finish_reason,
         usage,
         ctx.req_return_token_ids,

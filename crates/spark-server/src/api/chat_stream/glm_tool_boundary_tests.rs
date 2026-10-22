@@ -180,7 +180,6 @@ fn stream_tokens_with_context(
         model: "fixture".into(),
         id: "fixture".into(),
         prompt_len: 1,
-        session_hash: 0,
         enable_thinking: true,
         tool_defs_for_backfill: defs.clone(),
         cwd_for_normalize: None,

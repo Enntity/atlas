@@ -9,59 +9,8 @@
 // into the downstream sampling-bias logic.
 
 use crate::ir::{Message, Role};
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
-use std::sync::{LazyLock, Mutex};
-
-/// #55: the assistant turns the ENGINE itself generated, per session.
-/// Context-pressure harnesses (tool-eval-bench `--context-pressure`)
-/// inject short pure-text ASSISTANT turns — filler — into the request
-/// history. The spinning scan counts only turns registered here, so
-/// injected filler can never trip `recent_short` and hard-mask the
-/// `<tool_call>` opener of a turn that is about to make its first tool call
-/// (the TC-07 loop: 47% pass at 10/33/57/80% pressure with the old
-/// scan, 100% with the suppression off — the signal was pure noise).
-///
-/// Registered from the two completion sites that hold the final
-/// assistant text (`chat_blocking` and the stream Done path); the
-/// per-session map is bounded so a long-lived server cannot grow it.
-static ENGINE_TURNS: LazyLock<Mutex<HashMap<u64, HashSet<u64>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn hash_turn_text(text: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Record that THIS session's engine just produced the assistant turn
-/// `text`. Called after a response is finalized; never by the client.
-pub(crate) fn register_engine_turn(session_hash: u64, text: &str) {
-    let mut map = ENGINE_TURNS.lock().expect("ENGINE_TURNS poisoned");
-    let set = map.entry(session_hash).or_default();
-    set.insert(hash_turn_text(text));
-    // Bound: 512 turn hashes per session is far past any real spinning
-    // window (the scan looks back 8); evict arbitrary members.
-    while set.len() > 512 {
-        let Some(k) = set.iter().next().copied() else { break };
-        set.remove(&k);
-    }
-    // Sessions themselves are bounded the same way; a wholesale drop is
-    // acceptable (the scan is per-request, loss is benign).
-    if map.len() > 1024 {
-        map.clear();
-    }
-}
-
-fn is_engine_turn(session_hash: u64, text: &str) -> bool {
-    let map = ENGINE_TURNS.lock().expect("ENGINE_TURNS poisoned");
-    map.get(&session_hash)
-        .is_some_and(|set| set.contains(&hash_turn_text(text)))
-}
-
-
 pub(super) struct LoopDetectOut {
-    /// True when the verdict was Suppress OR spinning detection
+    /// True when the repeated-call verdict was Suppress
     /// fired. Caller flips the `<tool_call>` token bias to avoid
     /// re-emitting tool calls for one turn.
     pub(super) suppress_tool_call: bool,
@@ -87,7 +36,6 @@ pub(super) fn check_loops(
     messages: &[Message],
     tools_active: bool,
     repeat_run: usize,
-    session_hash: u64,
 ) -> LoopDetectOut {
     let mut suppress_tool_call = false;
     let mut tool_call_repeat_count: usize = 0;
@@ -186,13 +134,9 @@ pub(super) fn check_loops(
     // Spinning detection — independent signal: if the model has
     // produced ≥5 consecutive short, low-content responses,
     // something is structurally wrong even if no two are similar.
-    // #55: only turns the ENGINE generated count. Context-pressure
-    // harnesses inject short pure-text ASSISTANT turns (filler) into
-    // the history; under the old scan those alone tripped
-    // recent_short>=5 on the FIRST real turn and hard-masked the
-    // tool-call opener the model had just announced (TC-07: zero tool
-    // calls, 47% pass across the sweep, 100% with the mask off). A
-    // foreign turn breaks the run.
+    // #55: short prose turns are diagnostic only.
+    // Client-supplied history is not provenance and reply length does not
+    // establish that tool use is repeating or should be discouraged.
     let mut recent_short: usize = 0;
     for m in messages.iter().rev() {
         if m.role != Role::Assistant {
@@ -215,10 +159,7 @@ pub(super) fn check_loops(
         // `loop_detector::detect` (the Suppress verdict above); spinning here
         // should only fire on consecutive short PURE-TEXT turns (no action).
         let made_tool_call = !m.tool_calls.is_empty();
-        let is_substantial = made_tool_call
-            || m.text().len() >= 500
-            || tool_args_len >= 100
-            || !is_engine_turn(session_hash, &m.text());
+        let is_substantial = made_tool_call || m.text().len() >= 500 || tool_args_len >= 100;
         if is_substantial {
             break;
         }
@@ -333,21 +274,10 @@ pub(super) fn check_loops(
     }
 
     if spinning {
-        // #55: spinning NO LONGER hard-masks <tool_call>. Suppression that
-        // fires before the model has produced anything blocks its only
-        // escape action and creates the loop it exists to prevent
-        // (Quinn, tool-eval-bench: the model announces two parallel
-        // calls, the mask eats the opener, it re-announces until
-        // finish_reason=length; with the mask off the sweep is 100%).
-        // Spinning now drives only the soft <tool_call> bias decay — the
-        // same path the HINT verdict uses — via tool_call_repeat_count
-        // (sampling_setup::tool_call_bias). The Suppress verdict keeps
-        // its hard mask with its P1-5 carve-outs (failing/progressing).
-        tracing::warn!(
+        tracing::debug!(
             recent_short,
-            "Spinning detection fired — soft <tool_call> bias decay only (no hard-mask)"
+            "Short prose history detected; tool availability unchanged"
         );
-        tool_call_repeat_count = tool_call_repeat_count.max(recent_short);
     }
 
     // An identical call answered by an identical result got a repeat
