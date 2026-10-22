@@ -108,6 +108,7 @@ pub fn prefill_request(
             req_tools_present,
             tool_call_start_token,
         ),
+        tool_call_start_token,
         &mut sink,
     )?;
 

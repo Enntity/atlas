@@ -36,6 +36,7 @@ fn qwen_union(opens_in_thinking: bool) -> GrammarState {
         &[EOS],
         opens_in_thinking,
         None,
+        None,
         &mut sink,
     )
     .unwrap()

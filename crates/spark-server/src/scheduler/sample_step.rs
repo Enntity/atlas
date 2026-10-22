@@ -599,11 +599,15 @@ pub fn sample_first_token(
     grammar_state: Option<&mut GrammarState>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
-    // A strict grammar whose response opens inside `<think>` starts after
+    // A grammar whose response opens with explicit `<think>` starts after
     // `</think>`: this token is reasoning (GrammarState::masks_first_token).
     let gs = match grammar_state {
         Some(gs) if gs.masks_first_token() => gs,
         reasoning => {
+            let suppressed = reasoning
+                .as_ref()
+                .and_then(|gs| gs.first_token_suppress())
+                .map(|opener| [suppress_ids, &[opener]].concat());
             let tok = sample_token(
                 model,
                 logits,
@@ -611,7 +615,7 @@ pub fn sample_first_token(
                 top_k,
                 top_p,
                 min_p,
-                suppress_ids,
+                suppressed.as_deref().unwrap_or(suppress_ids),
                 levers,
             )?;
             // A native tool opener ends that reasoning as the grammar's first

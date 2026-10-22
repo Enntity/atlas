@@ -39,6 +39,7 @@ pub(super) fn union(opens_in_thinking: bool) -> GrammarState {
         &[EOS],
         opens_in_thinking,
         Some(TOOL_CALL),
+        None,
         &mut sink,
     )
     .unwrap()
@@ -72,6 +73,7 @@ fn the_union_is_a_strict_grammar_that_knows_the_native_opener() {
         &[EOS],
         false,
         Some(TOOL_CALL),
+        None,
         &mut sink,
     )
     .unwrap()
