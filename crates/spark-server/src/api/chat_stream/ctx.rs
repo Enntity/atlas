@@ -20,6 +20,10 @@ pub(super) struct StreamCtx {
     pub(super) model: String,
     pub(super) id: String,
     pub(super) prompt_len: usize,
+    /// #55: identifies the session for the engine-generated turn registry
+    /// (`loop_detect::register_engine_turn`) — filler turns injected by a
+    /// harness must not trip the spinning scan.
+    pub(super) session_hash: u64,
     pub(super) enable_thinking: bool,
     pub(super) tool_defs_for_backfill: Vec<tool_parser::ToolDefinition>,
     pub(super) cwd_for_normalize: Option<String>,

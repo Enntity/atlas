@@ -24,7 +24,10 @@
 
 pub(crate) mod echo;
 pub(crate) mod levers;
-mod loop_detect;
+pub(crate) mod loop_detect;
+#[cfg(test)]
+#[path = "loop_detect_tests.rs"]
+mod loop_detect_tests;
 mod msg_entry;
 pub(crate) mod prepare;
 pub(crate) mod remote_image;
@@ -357,13 +360,15 @@ pub(crate) async fn chat_completions_inner(
     let us_prepare = _t_seg.elapsed().as_micros();
 
     // ── Phase 4: generic loop / spinning detection + task pin ───
+    // #55: the spinning scan keys off the session, so the hash must
+    // exist before detection (moved up from its old spot below).
+    let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
     let loop_detect::LoopDetectOut {
         suppress_tool_call,
         tool_call_repeat_count,
-    } = loop_detect::check_loops(&req.messages, tools_active, repeat_run);
+    } = loop_detect::check_loops(&req.messages, tools_active, repeat_run, session_hash);
     let us_loop_detect = _t_seg.elapsed().as_micros() - us_prepare;
 
-    let session_hash = crate::session_manager::compute_session_hash(&prompt_tokens);
     let us_session_hash = _t_seg.elapsed().as_micros() - us_prepare - us_loop_detect;
     let tools_count = req.tools.len();
     tracing::info!(

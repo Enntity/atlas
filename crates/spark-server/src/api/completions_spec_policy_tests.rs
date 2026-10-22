@@ -80,6 +80,7 @@ async fn completion_disable_mtp_reaches_scheduler_for_blocking_and_streaming() {
                             cached_prompt_tokens: 0,
                             accepted_prediction_tokens: 0,
                             prompt_logprobs: vec![],
+                            guard_stop: None,
                         }));
                         assert!(result.is_ok());
                     }
@@ -143,6 +144,7 @@ async fn completion_token_ids_handler_preserves_ids_usage_and_default_omission()
                         cached_prompt_tokens: 0,
                         accepted_prediction_tokens: 0,
                         prompt_logprobs: vec![],
+                        guard_stop: None,
                     }))
                     .is_ok()
             );

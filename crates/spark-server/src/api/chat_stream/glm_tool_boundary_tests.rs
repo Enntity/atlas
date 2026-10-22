@@ -105,6 +105,7 @@ fn response(tokens: Vec<u32>) -> crate::api::inference_types::InferenceResponse 
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
+        guard_stop: None,
     }
 }
 
@@ -179,6 +180,7 @@ fn stream_tokens_with_context(
         model: "fixture".into(),
         id: "fixture".into(),
         prompt_len: 1,
+        session_hash: 0,
         enable_thinking: true,
         tool_defs_for_backfill: defs.clone(),
         cwd_for_normalize: None,

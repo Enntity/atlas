@@ -366,6 +366,13 @@ pub struct InferenceResponse {
     /// i+1. Empty unless requested. The handler prepends the null entry
     /// for the first prompt token (no preceding context).
     pub prompt_logprobs: Vec<TokenLogprobs>,
+    /// #55: the server-side guard that cut this response, if any
+    /// (`ActiveSeq::guard_stop`, e.g. `inter_tool_prose_budget`). The
+    /// API surfaces it as a `guard_stop` extension field on the choice
+    /// — unknown fields are ignored by every SDK (cf. vLLM's
+    /// `stop_reason`), unlike a non-standard finish_reason, which typed
+    /// clients hard-fail on.
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Events sent during streaming generation.
