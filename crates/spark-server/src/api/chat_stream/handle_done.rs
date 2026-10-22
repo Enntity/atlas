@@ -6,8 +6,8 @@
 use crate::ir::StreamDelta;
 use crate::tool_parser;
 
-use super::super::sanitizer::sanitize_content_chunk;
-use super::super::stream_guards::flush_content_sanitizer;
+use super::super::sanitizer::sanitize_content_chunk_with_literal_state;
+use super::super::stream_guards::flush_content_sanitizer_with_literal_state;
 use super::ctx::StreamCtx;
 use super::state::StreamState;
 use super::tool_handlers::{
@@ -126,9 +126,10 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
     // channel instead of losing it or treating it as final answer content.
     // finalize_done skips this entire flush for rejected output.
     if ctx.enable_thinking && !state.reasoning_xml_leak_detected {
-        let tail = flush_content_sanitizer(
+        let tail = flush_content_sanitizer_with_literal_state(
             &mut state.reasoning_tag_scan_buf,
             &mut state.reasoning_suppressing_leak,
+            &mut state.reasoning_literal_xml_state,
             &ctx.leak_markers,
         );
         if !tail.is_empty() {
@@ -161,11 +162,12 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                 for output in outputs {
                     match output {
                         tool_parser::DetectorOutput::Content(text) => {
-                            let sanitized = sanitize_content_chunk(
+                            let sanitized = sanitize_content_chunk_with_literal_state(
                                 &text,
                                 &mut state.tag_scan_buf,
                                 &mut state.suppressing_param_leak,
                                 &mut state.inside_envelope,
+                                &mut state.literal_xml_state,
                                 &ctx.leak_markers,
                             );
                             if !sanitized.is_empty() {
@@ -197,11 +199,12 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
                     }
                 }
             } else {
-                let sanitized = sanitize_content_chunk(
+                let sanitized = sanitize_content_chunk_with_literal_state(
                     &tail,
                     &mut state.tag_scan_buf,
                     &mut state.suppressing_param_leak,
                     &mut state.inside_envelope,
+                    &mut state.literal_xml_state,
                     &ctx.leak_markers,
                 );
                 if !sanitized.is_empty() {
@@ -226,11 +229,12 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
         for output in outputs {
             match output {
                 tool_parser::DetectorOutput::Content(text) => {
-                    let sanitized = sanitize_content_chunk(
+                    let sanitized = sanitize_content_chunk_with_literal_state(
                         &text,
                         &mut state.tag_scan_buf,
                         &mut state.suppressing_param_leak,
                         &mut state.inside_envelope,
+                        &mut state.literal_xml_state,
                         &ctx.leak_markers,
                     );
                     if !sanitized.is_empty() {
@@ -264,9 +268,10 @@ fn flush_pending_output(state: &mut StreamState, ctx: &StreamCtx) -> DeltaVec {
     }
 
     // ── Sanitizer tail flush ────────────────────────────────────────
-    let tail = flush_content_sanitizer(
+    let tail = flush_content_sanitizer_with_literal_state(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     if !tail.is_empty() {
