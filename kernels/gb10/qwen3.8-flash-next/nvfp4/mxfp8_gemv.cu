@@ -25,21 +25,21 @@ extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc8_
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
-    mxfp8_gemv_tc_cta<1, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x);
+    mxfp8_gemv_tc_cta<1, false, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x);
 }
 
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc16_swiglu(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
-    mxfp8_gemv_tc_cta<2, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x);
+    mxfp8_gemv_tc_cta<2, false, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x);
 }
 
 extern "C" __global__ void __launch_bounds__(MX_WARPS * MX_WARP) mxfp8_gemv_tc32_swiglu(
     const __nv_bfloat16* __restrict__ A, const unsigned char* __restrict__ W,
     const unsigned char* __restrict__ S, __nv_bfloat16* __restrict__ C,
     unsigned int M, unsigned int N, unsigned int K, unsigned int out_stride) {
-    mxfp8_gemv_tc_cta<4, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x);
+    mxfp8_gemv_tc_cta<4, false, false, true>(A, W, S, C, M, N, K, K, out_stride, blockIdx.x);
 }
 
 extern "C" __global__ void __launch_bounds__(256) mxfp8_swiglu_quant_act(
