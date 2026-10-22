@@ -200,7 +200,7 @@ fn literal_glm_tool_markup_stays_text_while_structured_call_stays_native() {
                     "type": "function",
                     "function": {
                         "name": "get_weather",
-                        "arguments": "{\"city\":\"Oslo\"}"
+                        "arguments": "{\"city\":\"Oslo <tool_call>\"}"
                     }
                 }]
             }
@@ -216,6 +216,10 @@ fn literal_glm_tool_markup_stays_text_while_structured_call_stays_native() {
     assert!(
         prompt.contains("Quote <tool_call> and </tool_call> literally."),
         "literal tool markup must survive prompt decoding: {prompt:?}"
+    );
+    assert!(
+        prompt.contains("Oslo <tool_call>"),
+        "historical literal value survives: {prompt:?}"
     );
     assert_eq!(
         prepared

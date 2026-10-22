@@ -200,7 +200,11 @@ impl ChatTokenizer {
             return self.encode(rendered);
         }
         let vision_markup = self.vision_markup();
-        let glm_tool_markup = super::glm_tool_markup::markers(self);
+        let glm_tool_markup = if has_glm_tool_sentinel {
+            super::glm_tool_markup::markers(self)
+        } else {
+            Vec::new()
+        };
         let mut families = vec![SentinelFamily {
             open: OPEN,
             tag: None,
