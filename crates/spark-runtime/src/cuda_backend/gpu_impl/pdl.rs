@@ -178,6 +178,7 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "moe_build_tile_worklist",
     "moe_build_tile_worklist_scan",
     "quantize_bf16_to_nvfp4",
+    "quantize_bf16_to_nvfp4_weight_rne",
     "glm_moe_router_quant",
     "glm_moe_route_select",
     "glm_moe_route_one",
@@ -240,6 +241,9 @@ pub(super) const PDL_KERNELS: &[&str] = &[
 /// QSA indexer and cuBLASLt. A kernel after an unlisted one (or after a copy
 /// or memset) simply launches when its predecessor completes.
 pub(super) const QWEN4EXP_PDL_KERNELS: &[&str] = &[
+    // Shared activation and RNE weight converters enter before reading inputs.
+    "quantize_bf16_to_nvfp4",
+    "quantize_bf16_to_nvfp4_weight_rne",
     // mHC (ATLAS_QWEN4EXP_HC_FAST) and the fused seam.
     "hc_pre_stage_vec",
     "hc_pre_down_vec",

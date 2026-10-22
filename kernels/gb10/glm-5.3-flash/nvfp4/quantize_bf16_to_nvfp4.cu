@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-// GLM-only shadow: retain the shared activation quantizer and add a weight
+// Shared by GLM and Qwen: retain the activation quantizer and add a weight
 // entry point with CUDA's nearest-even E4M3 and E2M1 conversion contract.
 #include "../../common/quantize_bf16_to_nvfp4.cu"
 #include <cuda_fp4.h>

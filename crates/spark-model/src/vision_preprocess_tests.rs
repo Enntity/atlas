@@ -96,7 +96,7 @@ fn glm_large_photo_fits_the_bounded_encoder_capacity() {
     let (h, w) = glm_target_size(&cfg, 1080, 1920, 2, None, false).unwrap();
     assert_eq!(h % 28, 0);
     assert_eq!(w % 28, 0);
-    assert!(h as usize / 14 * (w as usize / 14) <= GLM_FALLBACK_MAX_PATCHES);
+    assert!(h as usize / 14 * (w as usize / 14) <= glm_max_sequence_patches(&cfg));
 }
 
 #[test]
@@ -105,7 +105,7 @@ fn glm_panorama_fits_without_unbounded_encoder_growth() {
     let (h, w) = glm_target_size(&cfg, 512, 8192, 2, None, false).unwrap();
     assert_eq!(h % 28, 0);
     assert_eq!(w % 28, 0);
-    assert!(h as usize / 14 * (w as usize / 14) <= GLM_FALLBACK_MAX_PATCHES);
+    assert!(h as usize / 14 * (w as usize / 14) <= glm_max_sequence_patches(&cfg));
 }
 
 #[test]
@@ -117,26 +117,23 @@ fn glm_video_total_rows_fit_the_bounded_encoder_capacity() {
         let per_group_patches = h as usize / 14 * (w as usize / 14);
         let output_rows = groups * (h as usize / 14 / 2) * (w as usize / 14 / 2);
         assert!(
-            per_group_patches <= GLM_FALLBACK_MAX_PATCHES,
+            per_group_patches <= glm_max_sequence_patches(&cfg),
             "frames={frames}: per-group patches={per_group_patches}"
         );
         assert!(
-            output_rows <= GLM_FALLBACK_MAX_PATCHES,
+            output_rows <= glm_max_item_tokens(&cfg),
             "frames={frames}: output rows={output_rows}"
         );
     }
-    assert!(glm_runtime_max_pixels(&cfg, None, true) > 0);
 }
 
 #[test]
-fn glm_explicit_budget_counts_temporal_volume_for_encoder_capacity() {
+fn glm_explicit_budget_counts_temporal_volume() {
     let cfg = glm_budget_cfg();
-    let volume =
-        GLM_FALLBACK_MAX_PATCHES * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-    let (patches, _) =
-        derive_glm_max_patches(Some(volume), cfg.patch_size, cfg.temporal_patch_size);
-    assert_eq!(patches, GLM_FALLBACK_MAX_PATCHES);
-    assert_eq!(glm_runtime_max_pixels(&cfg, Some(volume), false), volume);
+    let volume = 6_400 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let (h, w) = glm_target_size(&cfg, 4096, 4096, 2, Some(volume), false).unwrap();
+    assert_eq!(glm_pixel_budget(&cfg, Some(volume), false).1, volume);
+    assert!(2 * h as usize * w as usize <= volume);
 }
 
 /// A `vision_config` for the shipped Qwen3-VL geometry.

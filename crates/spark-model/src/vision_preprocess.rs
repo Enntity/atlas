@@ -13,8 +13,6 @@ use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
 mod glm_sizing;
 mod qwen_sizing;
 use glm_sizing::glm_pixel_budget;
-#[cfg(test)]
-use glm_sizing::{GLM_FALLBACK_MAX_PATCHES, derive_glm_max_patches, glm_runtime_max_pixels};
 pub(crate) use glm_sizing::{
     glm_max_item_tokens, glm_max_sequence_patches, glm_resize_or_pad, glm_target_size,
 };

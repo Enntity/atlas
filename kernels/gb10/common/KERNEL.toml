@@ -62,7 +62,7 @@ extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS", "--expt-relaxed-constexpr
 #       own header warned that a fix to the SiLU originals "should be re-derived
 #       here", which is a maintenance trap. Keeping one copy means the twins and
 #       their originals cannot drift. qwen3.8-flash-next does not shadow
-#       rms_norm.cu, so it always gets these; the ten targets that DO shadow it
+#       rms_norm.cu, so it always gets these; the eleven targets that DO shadow it
 #       are none of them qwen4_exp.
 #
 #       The safety net is unchanged: if a target that needs them ever forks
@@ -70,14 +70,22 @@ extra_nvcc_flags = ["--fmad=false", "-DTQ_PLUS_SIGNS", "--expt-relaxed-constexpr
 #       `try_kernel`) and the fail-closed startup audit hard-errors by name.
 #       `scripts/dev/check_qwen4exp_kernel_names.py` also asserts all four
 #       resolve for this target specifically.
+# The FP32-input grouped MTP norm is also Qwen4Exp-only. Non-Qwen shadows
+# retain their own weight semantics; Qwen inherits the common implementation.
+# The unclamped shared-expert twin is selected only for qwen4_exp with
+# ATLAS_QWEN4EXP_MOE_NO_CLAMP. Gemma's shadow intentionally retains its clamp.
+# Exemptions only describe unused entry points; runtime lookup still refuses
+# a missing kernel if a model requests it.
 [shadow_exempt]
 w4a16 = ["w4a16_dequant"]
 moe_w4a16 = ["moe_w4a16_grouped_gemm"]
+moe_shared_expert_fused = ["moe_expert_silu_down_shared_noclamp"]
 norm = [
     "rms_norm_residual_vanilla",
     "residual_add_rms_norm_vanilla",
     "rms_norm_offset_warp_row",
     "rms_norm_grouped",
+    "rms_norm_f32_grouped",
     "gated_rms_norm_sigmoid",
     "gated_rms_norm_f32_input_sigmoid",
     "gated_rms_norm_prefill_sigmoid",

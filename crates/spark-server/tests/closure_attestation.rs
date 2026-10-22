@@ -52,14 +52,23 @@ fn the_baked_attestation_reproduces_from_the_tree() {
     // 21 of 22 entries verified, the test passed, and the one target the whole
     // scheme exists to spare had no attestation at all. A silently absent entry
     // is fail-closed, which is why nothing else catches it.
-    let gb10: Vec<_> = taxon::walk(&root)
-        .into_iter()
-        .filter(|t| t.hardware == "gb10" && t.quant == "nvfp4")
+    // The recipe may compile one model. Enumerating every model directory
+    // would demand attestations for kernels that are not in this binary.
+    // Use the compiled registry, not the baked map, so a missing attestation
+    // for a compiled target still fails this completeness check.
+    let hardware: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("kernels/gb10/HARDWARE.toml")).unwrap())
+            .unwrap();
+    let arch = hardware["hardware"]["arch"].as_str().unwrap();
+    let compiled = atlas_kernels::available_targets();
+    let gb10: Vec<_> = compiled
+        .iter()
+        .filter(|set| set.target.arch == arch && set.target.quant == "nvfp4")
+        .map(|set| format!("gb10/{}/{}", set.target.model, set.target.quant))
         .collect();
     let missing: Vec<String> = gb10
-        .iter()
-        .map(|t| t.to_string())
-        .filter(|k| !baked.contains_key(k))
+        .into_iter()
+        .filter(|key| !baked.contains_key(key))
         .collect();
     assert!(
         missing.is_empty(),
