@@ -138,7 +138,7 @@ fn head(gpu: &MockGpuBackend, c: &ModelConfig) -> (Qwen4ExpMtpHead, Calls) {
             hc_base: p(256),
             hc_scale: p(256),
             lowrank: Some(HcLowRank {
-                norm_w: p(c.hc_mult * h * 2),
+                norm_w: p(c.hc_mult * h * 4),
                 down_w: p(c.hc_mult * h * 64),
                 up_w: p(c.hc_mult * h * 64),
                 inject_w: DevicePtr::NULL,

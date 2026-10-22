@@ -13,30 +13,26 @@ use spark_runtime::weights::{WeightDtype, WeightStore};
 
 use crate::weight_map::DenseWeight;
 
-/// A norm weight as the BF16 the mHC and PLE kernels read.
+/// A norm weight as the F32 the mHC and PLE kernels read.
 ///
-/// The FP8 and NVFP4 releases ship these BF16 (passed through untouched). The
+/// The FP8 and NVFP4 releases ship these BF16; they are widened exactly
+/// (`bits << 16`), so those releases compute bit-identically to before. The
 /// FP4-Local release ships the 97 `hc_norm`s and the three PLE norms as F32
-/// ("original bytes preserved"), and every kernel that reads them takes
-/// `const __nv_bfloat16*` — the mHC ones across a dozen entry points, so F32
-/// is not a cheap change there — so they are ROUNDED here, to nearest even.
+/// ("original bytes preserved"); they are passed through untouched. Every
+/// consumer kernel already forms `1 + w` in FP32, so only the argument type
+/// changed (`const float*`), not the arithmetic.
 ///
-/// Round-to-nearest, not the truncation `dense_f32_safe` does: checked against
-/// the NVFP4 release's BF16 copies of the same tensors (layer 5 attn
-/// `hc_norm`, layer 1 `norm_key`, the model mixer's `hc_norm`), RNE of the
-/// F32 reproduces 97-99% of their elements and truncation 3-56%. (The rest
-/// differ by the retraining, not the rounding.)
-///
-/// Anything else is refused: `dense` would hand an F32 buffer to a BF16 read
-/// and the model would run on garbage.
-pub(super) fn bf16_norm(
+/// Anything else is refused: a norm read through the wrong element type
+/// would run the model on garbage.
+pub(super) fn f32_norm(
     store: &WeightStore,
     name: &str,
     gpu: &dyn GpuBackend,
 ) -> Result<DenseWeight> {
     match store.get(name)?.dtype {
-        WeightDtype::BF16 => crate::weight_map::dense(store, name),
-        WeightDtype::FP32 => crate::weight_map::dense_f32_as_bf16(store, name, gpu),
+        WeightDtype::BF16 | WeightDtype::FP32 => {
+            crate::weight_map::dense_keep_f32(store, name, gpu)
+        }
         other => bail!("{name}: norm weight is {other:?}, expected BF16 or F32"),
     }
 }
