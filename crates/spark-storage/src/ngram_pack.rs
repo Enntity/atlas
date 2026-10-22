@@ -62,7 +62,7 @@ const SAMPLE_CHUNKS: usize = 16;
 /// How much of a packed file's checksummed body an open re-reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verify {
-    /// [`SAMPLE_CHUNKS`] random chunks.
+    /// A fixed number of random chunks.
     Sample,
     /// Every chunk: the whole table is read once (`ATLAS_PLE_PACKED_VERIFY=full`
     /// for the PLE table).
