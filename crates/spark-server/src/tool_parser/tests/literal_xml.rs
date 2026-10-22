@@ -222,3 +222,27 @@ fn blocking_malformed_opener_skips_quoted_marker_before_later_call() {
             .is_some_and(|text| text.contains("\"<tool_call>\" then"))
     );
 }
+
+#[test]
+fn whitespace_before_ambiguous_markup_is_preserved_until_the_tag_is_known() {
+    for text in [
+        "The delimiter <tool_call> opens a tool invocation. END.",
+        "```xml\n<tool_call>\n```\nEND",
+    ] {
+        let mut detector = StreamingToolDetector::new();
+        let mut outputs = Vec::new();
+        for ch in text.chars() {
+            outputs.extend(detector.process(&ch.to_string()));
+        }
+        outputs.extend(detector.flush());
+        let content: String = outputs
+            .into_iter()
+            .filter_map(|output| match output {
+                DetectorOutput::Content(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(content, text);
+        assert!(!detector.has_tool_calls());
+    }
+}
