@@ -49,6 +49,7 @@ fn app(glm: bool) -> Arc<AppState> {
         LITERAL_CONTENT[1],
         LITERAL_CONTENT[2],
         LITERAL_CONTENT[3],
+        "The closing tag is `</tool_call>`. </tool_call> END.",
     ];
     let vocab = words
         .iter()

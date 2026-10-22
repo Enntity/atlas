@@ -300,8 +300,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                     while let Some((start, len)) =
                         first_marker_outside_literal(&cleaned, reasoning_literal_before, &[*tag])
                     {
-                        cleaned =
-                            strip_all_preserving_boundary(&cleaned, &cleaned[start..start + len]);
+                        cleaned = strip_preserving_boundary(&cleaned, start, start + len);
                     }
                 }
                 // Collapse role-word repetition loops (Qwen3.5/3.6
@@ -349,9 +348,9 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                         state.reasoning_xml_scan_state,
                         &["<tool_call>", "<function=", "<parameter=", "<invoke "],
                     )
-                    .and_then(|(at, len)| {
+                    .map(|(at, len)| {
                         let marker = state.reasoning_xml_scan_buf[at..at + len].to_string();
-                        Some((at, marker))
+                        (at, marker)
                     });
                     if let Some((at, op)) = opener {
                         // Snapshot the log tail BEFORE consuming the match,
