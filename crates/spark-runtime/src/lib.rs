@@ -13,6 +13,9 @@ pub mod cublaslt;
 pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(not(feature = "cuda"))]
+#[path = "cuda_backend_metal_stub.rs"]
+pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub mod cutlass;
 #[cfg(not(feature = "cuda"))]

@@ -27,6 +27,11 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: String,
+    /// #55: set when a server-side guard cut this response short
+    /// (e.g. `inter_tool_prose_budget`), instead of the model. An
+    /// extension field that preserves the standard finish_reason values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guard_stop: Option<&'static str>,
     pub logprobs: Option<ChoiceLogprobs>,
 }
 
@@ -183,6 +188,7 @@ impl ChatCompletionResponse {
                 },
                 finish_reason: finish_reason.to_string(),
                 logprobs: None,
+                guard_stop: None,
             }],
             usage,
             service_tier: None,
@@ -215,6 +221,7 @@ impl ChatCompletionResponse {
                 },
                 finish_reason: "tool_calls".to_string(),
                 logprobs: None,
+                guard_stop: None,
             }],
             usage,
             service_tier: None,

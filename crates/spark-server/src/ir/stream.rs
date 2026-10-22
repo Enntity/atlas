@@ -39,6 +39,11 @@ pub enum StreamDelta {
         reason: super::response::FinishReason,
         usage: super::response::Usage,
         token_ids: Vec<u32>,
+        /// #55: the server-side guard that cut this response, when one
+        /// did (`ActiveSeq::guard_stop`, e.g. `inter_tool_prose_budget`).
+        /// Surfaced as a `guard_stop` extension field on the final wire
+        /// chunk; additive, ignored by every SDK.
+        guard_stop: Option<&'static str>,
     },
     /// Stream-level error payload, sent verbatim as SSE data.
     Error { message: String },

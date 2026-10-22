@@ -261,6 +261,7 @@ mod token_ids_tests {
             cached_prompt_tokens: 0,
             accepted_prediction_tokens: 0,
             prompt_logprobs: Vec::new(),
+            guard_stop: None,
         }
     }
 

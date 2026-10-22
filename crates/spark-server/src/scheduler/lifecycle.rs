@@ -197,6 +197,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                             top: p.top,
                         })
                         .collect(),
+                    guard_stop: a.guard_stop,
                 };
                 // A blocking client gets the engine error as an error (HTTP
                 // 500), not a completion carrying an odd finish reason.

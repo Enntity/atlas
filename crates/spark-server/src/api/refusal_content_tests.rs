@@ -60,6 +60,7 @@ fn response(finish_reason: &str) -> crate::api::inference_types::InferenceRespon
         cached_prompt_tokens: 0,
         accepted_prediction_tokens: 0,
         prompt_logprobs: vec![],
+        guard_stop: None,
     }
 }
 

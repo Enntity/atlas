@@ -193,6 +193,7 @@ pub(super) fn build_choice_message(
         finish_reason: ir::FinishReason::from(finish_reason_i.as_str()),
         matched_stop: None, // caller fills
         logprobs: None,     // caller fills
+        guard_stop: response.guard_stop,
     }
 }
 
