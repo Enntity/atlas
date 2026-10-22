@@ -263,6 +263,23 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                 } else if let Some(rest) = cleaned.strip_prefix("assistant") {
                     cleaned = rest.to_string();
                 }
+                // Qwen4 treats tool markup as ordinary text until the explicit
+                // think-end token. A bare or split XML example in reasoning is
+                // therefore not an attempted call: stripping it or cancelling
+                // on its opener makes streaming disagree with blocking. GLM's
+                // native opener transition above and legacy leak guards stay
+                // separate; the startup carriers select this path.
+                if ctx.state.tokenizer.glm_tool_markup_as_text
+                    && ctx.state.glm_tool_boundary.is_none()
+                {
+                    if !state.reasoning_suppressing_leak && !cleaned.is_empty() {
+                        deltas.push(StreamDelta::Reasoning {
+                            text: cleaned,
+                            token_ids: state.take_ids_if(ctx.req_return_token_ids),
+                        });
+                    }
+                    return deltas;
+                }
                 // Boundary-preserving strip: see `strip_preserving_boundary`
                 // doc — prevents `the<tool_call>...</tool_call>project`
                 // from collapsing to `theproject`.

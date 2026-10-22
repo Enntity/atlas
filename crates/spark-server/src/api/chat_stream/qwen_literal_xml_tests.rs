@@ -154,3 +154,87 @@ fn qwen_literal_xml_unsupported_closed_and_unclosed_envelopes_are_content() {
         );
     }
 }
+
+#[test]
+fn qwen_literal_xml_reasoning_preserves_bare_and_split_tags_until_think_end() {
+    for tools in [false, true] {
+        for reasoning_tokens in [vec![19], vec![28, 30, 25, 26, 29], vec![33]] {
+            let expected = qwen().tokenizer.decode(&reasoning_tokens).unwrap();
+            let mut tokens = reasoning_tokens;
+            tokens.extend([END, ORDINARY]);
+            let deltas = run(tools, tokens);
+            let reasoning: String = deltas
+                .iter()
+                .filter_map(|d| match d {
+                    ir::StreamDelta::Reasoning { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let content: String = deltas
+                .iter()
+                .filter_map(|d| match d {
+                    ir::StreamDelta::Content { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasoning, expected, "{deltas:?}");
+            assert_eq!(content, "ordinary", "{deltas:?}");
+            assert!(
+                !deltas
+                    .iter()
+                    .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. }))
+            );
+        }
+    }
+}
+
+#[test]
+fn qwen_literal_xml_reasoning_survives_done_without_think_end() {
+    let tokens = vec![28, 30, 25, 26, 29];
+    let expected = qwen().tokenizer.decode(&tokens).unwrap();
+    let deltas = run(true, tokens);
+    let reasoning: String = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, expected, "{deltas:?}");
+    assert!(
+        !deltas
+            .iter()
+            .any(|d| matches!(d, ir::StreamDelta::Content { .. }))
+    );
+}
+
+#[test]
+fn qwen_literal_xml_reasoning_keeps_legacy_leak_guard() {
+    let (_, stream, _) = stream_for_app(app(false), true, vec![28, 30, 25, 26, 29]);
+    assert!(stream.cancel_flag.load(Ordering::Acquire));
+    assert_eq!(stream.guard_stop, Some("in_think_tool_leak"));
+}
+
+#[test]
+fn qwen_literal_xml_reasoning_does_not_consume_a_later_real_call() {
+    let deltas = run(true, vec![28, 30, 25, 26, 29, END, TOOL, 31, 11]);
+    let reasoning: String = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasoning, LITERAL_CONTENT[2]);
+    let names: Vec<_> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ir::StreamDelta::ToolCallStart { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, ["get_weather"]);
+    assert!(deltas.iter().any(
+        |d| matches!(d, ir::StreamDelta::Finish { reason, .. } if reason.as_wire() == "tool_calls")
+    ));
+}
