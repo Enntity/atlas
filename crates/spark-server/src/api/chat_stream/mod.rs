@@ -190,7 +190,10 @@ pub(crate) async fn run_chat_stream(
     let leak_markers: tool_parser::LeakMarkers = state
         .tool_call_parser
         .as_ref()
-        .map(|p| p.leak_markers())
+        .map(|p| {
+            p.leak_markers()
+                .for_literal_xml(state.tokenizer.glm_tool_markup_as_text)
+        })
         .unwrap_or(tool_parser::LeakMarkers::EMPTY);
 
     let max_tool_calls_per_response: usize = std::env::var("ATLAS_MAX_TOOL_CALLS_PER_RESPONSE")
@@ -226,11 +229,7 @@ pub(crate) async fn run_chat_stream(
         stop_strings,
         stop_string_buffer_len,
         leak_markers,
-        role_literal_leaks: state
-            .tokenizer
-            .inner()
-            .token_to_id("<|im_start|>")
-            .is_some(),
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         wants_typed_arguments: state
             .tool_call_parser
             .as_ref()

@@ -48,6 +48,14 @@ impl ChatTokenizer {
         &self.tokenizer
     }
 
+    /// Legacy ChatML output filtering is not compatible with literal XML:
+    /// an ordinary BPE token "tool" may be part of a quoted tag or prose.
+    /// GLM and Qwen4 preserve these bytes; native role delimiters still stop
+    /// generation in the scheduler. Keep other ChatML models unchanged.
+    pub(crate) fn filters_bare_role_literals(&self) -> bool {
+        !self.glm_tool_markup_as_text && self.tokenizer.token_to_id("<|im_start|>").is_some()
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         // HF's normalized splits/offsets can consume hundreds of MiB for a
         // long prompt. Acquire before touching the tokenizer and retain the

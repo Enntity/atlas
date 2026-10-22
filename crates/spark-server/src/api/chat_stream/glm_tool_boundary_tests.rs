@@ -22,10 +22,19 @@ const LITERAL_CONTENT: [&str; 4] = [
     "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
 ];
 
+#[path = "qwen_literal_xml_tests.rs"]
+mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
+    app_for_model(
+        if glm { "glm5_next" } else { "qwen3" },
+        tool_parser::ToolCallFormat::PoolsideV1,
+    )
+}
+
+fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<AppState> {
     let dir = tempfile::tempdir().unwrap();
     let words = [
         "[UNK]",
@@ -50,6 +59,19 @@ fn app(glm: bool) -> Arc<AppState> {
         LITERAL_CONTENT[2],
         LITERAL_CONTENT[3],
         "The closing tag is `</tool_call>`. </tool_call> END.",
+        "<|im_start|>",
+        "The tag is `",
+        "</",
+        "tool",
+        "_call>",
+        "` and this is prose. END.",
+        "The delimiter ",
+        " opens a tool invocation. END.",
+        "<",
+        "<function=get_weather><parameter=city>Oslo</parameter></function>",
+        "`<tool_call><function=get_weather><parameter=not_a_parameter>BAD</parameter></function></tool_call>` END.",
+        "<tool_call><function=not_registered><parameter=value>42</parameter></function></tool_call> END.",
+        "<tool_call><function=not_registered><parameter=value>42",
     ];
     let vocab = words
         .iter()
@@ -70,7 +92,7 @@ fn app(glm: bool) -> Arc<AppState> {
         dir.path(),
         0,
         true,
-        "glm5_next",
+        model_type,
         "",
         None,
         false,
@@ -83,18 +105,12 @@ fn app(glm: bool) -> Arc<AppState> {
     );
     Arc::new(AppState {
         model_name: "display-name-is-not-model-type".into(),
-        tool_call_parser: Some(Arc::from(
-            tool_parser::ToolCallFormat::PoolsideV1.into_parser(),
-        )),
+        tool_call_parser: Some(Arc::from(format.into_parser())),
         reasoning_parser: Some(crate::reasoning_parser::ReasoningFormat::Qwen.into_parser()),
         think_end_token_id: Some(END),
         think_start_token_id: Some(13),
         tool_call_start_token_id: Some(TOOL),
-        glm_tool_boundary: crate::glm_tool_boundary::native_opener(
-            if glm { "glm5_next" } else { "qwen3" },
-            true,
-            Some(TOOL),
-        ),
+        glm_tool_boundary: crate::glm_tool_boundary::native_opener(model_type, true, Some(TOOL)),
         ..crate::api::test_app_state::app_state(tokenizer)
     })
 }
@@ -188,7 +204,14 @@ fn stream_tokens_with_context(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    let state = app(glm);
+    stream_for_app(app(glm), tools, tokens)
+}
+
+fn stream_for_app(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
     let defs = if tools { request().tools } else { vec![] };
     let ctx = StreamCtx {
         _active_guard: crate::metrics::ActiveRequestGuard::new(),
@@ -207,8 +230,13 @@ fn stream_tokens_with_context(
         max_tokens: 192,
         timeout_at: None,
         stop_string_buffer_len: 0,
-        leak_markers: state.tool_call_parser.as_ref().unwrap().leak_markers(),
-        role_literal_leaks: false,
+        leak_markers: state
+            .tool_call_parser
+            .as_ref()
+            .unwrap()
+            .leak_markers()
+            .for_literal_xml(state.tokenizer.glm_tool_markup_as_text),
+        role_literal_leaks: state.tokenizer.filters_bare_role_literals(),
         wants_typed_arguments: true,
         max_tool_calls_per_response: 12,
         min_tokens: 0,
@@ -219,7 +247,12 @@ fn stream_tokens_with_context(
     let cancel = Arc::new(AtomicBool::new(false));
     let mut stream = StreamState::new(tools, true, cancel, defs);
     if let Some(detector) = stream.detector.as_mut() {
-        detector.set_promote_bare_names(true);
+        detector.set_promote_bare_names(
+            state
+                .tool_call_parser
+                .as_ref()
+                .is_some_and(|p| p.name() == "poolside_v1"),
+        );
     }
     let mut deltas = vec![];
     for token in tokens {
