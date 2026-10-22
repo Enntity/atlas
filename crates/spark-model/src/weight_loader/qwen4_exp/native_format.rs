@@ -221,12 +221,24 @@ pub(super) fn validate_target(store: &WeightStore, config: &ModelConfig) -> Resu
     for index in 0..config.num_hidden_layers {
         validate_layer(store, &config.layer_prefix(index), config, index)?;
     }
-    // The head is a BF16 target projection, never a runtime FP4 copy.
-    require_bf16(
-        store,
-        "lm_head.weight",
-        &[config.vocab_size, config.hidden_size],
-    )?;
+    // Serving caps the usable vocabulary to the tokenizer. The checkpoint
+    // keeps its padded output rows; the projection reads only that vocabulary
+    // prefix. Require enough rows, exact hidden width and native BF16 storage.
+    let head = store.get("lm_head.weight")?;
+    ensure!(
+        head.dtype == WeightDtype::BF16,
+        "lm_head.weight: expected BF16, got {:?}",
+        head.dtype
+    );
+    ensure!(
+        head.shape.len() == 2
+            && head.shape[0] >= config.vocab_size
+            && head.shape[1] == config.hidden_size,
+        "lm_head.weight: expected at least {} rows of width {}, got {:?}",
+        config.vocab_size,
+        config.hidden_size,
+        head.shape
+    );
     // Vision remains the checkpoint's existing path; the decoder's per-layer
     // audit above includes the indexer, which must not fall back to NVFP4.
     Ok(())

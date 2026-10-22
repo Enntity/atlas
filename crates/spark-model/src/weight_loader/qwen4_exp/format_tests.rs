@@ -255,6 +255,9 @@ fn native_modes_audit_late_layers_and_local_experts() {
 #[test]
 fn native_modes_validate_every_layer_on_both_ep_ranks() {
     let mut config = config();
+    // Serving caps the usable vocabulary to the tokenizer; tensors stay padded.
+    assert_eq!(config.vocab_size, 248_320);
+    config.vocab_size = 248_077;
     config.num_experts = 2;
     config.ep_world_size = 2;
     for rank in 0..2 {
@@ -368,5 +371,28 @@ fn native_modes_validate_mtp_before_conversion() {
             super::super::native_format::validate_mtp(&build(data), &drafter_config).is_err(),
             "{name}"
         );
+    }
+}
+
+#[test]
+fn native_modes_reject_truncated_or_reformatted_target_head() {
+    let mut c = config();
+    c.num_experts = 2;
+    c.ep_world_size = 2;
+    c.vocab_size = 248_077;
+    for (dtype, shape) in [
+        (WeightDtype::BF16, vec![248_076, c.hidden_size]),
+        (WeightDtype::BF16, vec![248_320, c.hidden_size - 1]),
+        (WeightDtype::BF16, vec![248_320]),
+        (WeightDtype::FP32, vec![248_320, c.hidden_size]),
+    ] {
+        let mut tensors = two_experts();
+        let head = tensors
+            .iter_mut()
+            .find(|t| t.0 == "lm_head.weight")
+            .unwrap();
+        head.1 = dtype;
+        head.2 = shape;
+        assert!(super::super::native_format::validate_target(&build(tensors), &c).is_err());
     }
 }
