@@ -26,8 +26,8 @@
 //! thread-local slots, like the pass state of `qwen4exp_rowinv`:
 //!
 //! * a layer arms a [`Producer`] around its attention-site collapse; the
-//!   collapse (`hc_pre_gemm`) takes the target ([`take_target`]) and, when
-//!   every slab ran the fused kernel, reports it ([`mark_produced`]);
+//!   collapse (`hc_pre_gemm`) takes the target (`take_target`) and, when
+//!   every slab ran the fused kernel, reports it (`mark_produced`);
 //! * [`Producer::finish`] leaves the produced rows PENDING for the first
 //!   [`activation`] call, which keeps them only if it quantizes exactly the
 //!   buffer, height and width the producer named, and quantizes the rest.
