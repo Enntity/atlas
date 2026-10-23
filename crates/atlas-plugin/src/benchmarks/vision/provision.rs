@@ -105,10 +105,8 @@ pub const FIXTURES: &[(&str, &[u8], u32, u32)] = &[
     //
     // GEOMETRY EXTREMES. Two shapes the ladder above never reaches.
     //
-    // 8x8 snaps UP to a single 32px grid unit -> exactly ONE merged token,
-    // the smallest output the preprocessor can produce. It is the rung where
-    // a rounding change becomes a 0x0 target and a division by zero rather
-    // than a wrong number, so it fails loudly instead of subtly.
+    // A tiny image exercises minimum-area upscaling. Its expected count
+    // comes from the served processor policy (64 at Qwen's 65536px floor).
     (
         "10_tiny_8x8.png",
         include_bytes!("../../../assets/vision/10_tiny_8x8.png"),
@@ -116,8 +114,8 @@ pub const FIXTURES: &[(&str, &[u8], u32, u32)] = &[
         8,
     ),
     // 64x2048 is the aspect ratio the AREA bound alone cannot contain: a
-    // strip has few pixels but an enormous long side, so this is what
-    // exercises the absolute long-side ceiling. 128 tokens, measured.
+    // strip has few pixels but an enormous long side. It detects a stale
+    // long-side clamp even when the image fits the area bound.
     (
         "11_strip_64x2048.png",
         include_bytes!("../../../assets/vision/11_strip_64x2048.png"),
@@ -125,7 +123,7 @@ pub const FIXTURES: &[(&str, &[u8], u32, u32)] = &[
         2048,
     ),
     // ── DECODE VARIANTS. Same 224x224 geometry as rung 01, so each asserts
-    // the SAME 49 tokens; what differs is only the pixel format reaching the
+    // the SAME processor-derived token count; what differs is only the pixel format reaching the
     // decoder. Every one of these is something users actually send and the
     // ladder above never did — a decoder regression on any of them either
     // errors (visible) or silently produces the wrong pixels (not).
@@ -156,7 +154,7 @@ pub const FIXTURES: &[(&str, &[u8], u32, u32)] = &[
 
 /// The EXIF-orientation pair, kept OUT of the geometry ladder because they
 /// assert a behavior rather than a token count — their geometry is an
-/// unremarkable 49.
+/// identical between the two fixtures.
 ///
 /// Both images are the same pixels — red on the top half, blue on the bottom.
 /// One carries `Orientation = 6` ("rotate 90 CW to display"), the other

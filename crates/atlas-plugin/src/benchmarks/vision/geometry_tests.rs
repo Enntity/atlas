@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+//! Legacy bound-free arithmetic only. Checkpoint still-image expectations
+//! live in image_geometry tests (224 square = 64, 336 square = 100).
+
 use super::*;
 
 #[test]

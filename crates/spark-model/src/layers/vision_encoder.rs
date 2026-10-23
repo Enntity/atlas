@@ -130,7 +130,7 @@ pub struct VisionEncoder {
 }
 
 mod enc_impl;
-pub(crate) use enc_impl::init::derive_max_patches;
+pub use enc_impl::init::derive_max_patches;
 
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_oracle_tests.rs"]

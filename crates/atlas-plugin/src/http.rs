@@ -20,6 +20,9 @@ use tokio::net::TcpStream;
 
 use crate::plugin::TargetEndpoint;
 
+mod model_profile;
+pub use model_profile::image_processor;
+
 /// A tool call assembled from streamed deltas.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolCall {

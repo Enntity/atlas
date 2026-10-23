@@ -142,6 +142,9 @@ pub struct ModelInfo {
     /// would read as "zero context" rather than "unknown".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<usize>,
+    /// Resolved still-image policy; omitted for unsupported processor families.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atlas_image_processor: Option<serde_json::Value>,
 }
 
 impl ModelInfo {
@@ -158,6 +161,7 @@ impl ModelInfo {
             created: crate::ids::unix_timestamp(),
             owned_by: "atlas-spark".to_string(),
             max_model_len: Some(max_seq_len),
+            atlas_image_processor: None,
         }
     }
 }
