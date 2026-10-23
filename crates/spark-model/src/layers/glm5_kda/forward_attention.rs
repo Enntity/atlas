@@ -48,33 +48,100 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         }
-        self.hc_pre(&self.hc.attn, hidden, m_hc, ctx, stream)?;
+        // ATLAS_GLM_HC_PREFILL_FUSE2: a prefill's pre-site finalizers also
+        // write the block input norms.
+        let normed = ctx.buffers.norm_output();
+        let fuse_norm = |weight: &DenseWeight| {
+            (!decode
+                && !capture_verify_intermediates
+                && crate::layers::qwen3_attention::hc_prefill_fuse2_enabled())
+            .then_some(crate::layers::qwen3_attention::HcNorm {
+                weight: weight.weight,
+                out: local(normed),
+            })
+        };
         // ATLAS_GLM_DET_TRACE stages; `det_rows` are the seam (local) rows.
         let det = crate::det_trace::on_stream(ctx.gpu, stream);
         let (det_rows, row) = (
             (sp.map_or(0, |sp| sp.row0), m_hc as usize),
             h as usize * bf16,
         );
-        det.tap("in", hidden, det_rows, row);
-        let normed = ctx.buffers.norm_output();
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
+        // ATLAS_GLM_SP_KDA_QUANT_GATHER: the rows are gathered cast and
+        // side-projected below instead (`sp_quant_gather.rs`).
+        let quant_gather = sp.filter(|&sp| self.sp_kda_quant_gather(sp, ctx));
+        let projected = ctx.buffers.qkv_output();
+        let plane_bytes = tokens * p * bf16;
+        // ... cast, side-projected and gathered a seam block at a time, as
+        // the seam norms each block, when the seam overlaps.
+        let blocks = quant_gather.and_then(|sp| crate::layers::glm_sp_overlap::blocks(sp, ctx));
+        let block_staging = match (quant_gather, &blocks) {
+            (Some(sp), Some(blocks)) => self.sp_kda_block_staging(sp, blocks, ctx)?,
+            _ => None,
+        };
+        let stage = |block| match quant_gather {
+            Some(sp) => {
+                self.sp_kda_stage_rows(normed, projected, plane_bytes, sp, block, ctx, stream)
+            }
+            None => Ok(()),
+        };
+        let extra = block_staging.map(|(ptr, width)| crate::layers::qwen3_attention::SeamGather {
+            ptr,
+            width,
+            also: None,
+            group: crate::layers::ffn_glm_gather_group(),
+            rows: &stage,
+        });
+        // ATLAS_GLM_SP_GATHER_OVERLAP: pre, norm and gather a row block at a time.
+        let overlapped = self.sp_seam_overlapped(
+            &self.hc.attn,
             &self.input_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
+            (false, quant_gather.is_none()),
+            false,
+            extra,
+            hidden,
+            normed,
+            sp,
+            ctx,
             stream,
         )?;
-        if let Some(sp) = sp {
-            sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+        if !overlapped {
+            let attn_normed = self.hc_pre(
+                &self.hc.attn,
+                hidden,
+                m_hc,
+                fuse_norm(&self.input_norm),
+                ctx,
+                stream,
+            )?;
+            det.tap("in", hidden, det_rows, row);
+            if !attn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    hidden,
+                    &self.input_norm,
+                    local(normed),
+                    m_hc,
+                    h,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+            }
+            if let Some(sp) = sp.filter(|_| quant_gather.is_none()) {
+                sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_attn_norm")?;
 
-        let projected = ctx.buffers.qkv_output();
-        let plane_bytes = tokens * p * bf16;
+        match (quant_gather, &blocks) {
+            (Some(sp), Some(blocks)) if overlapped && block_staging.is_some() => {
+                self.sp_kda_unstage(projected, plane_bytes, sp, blocks, ctx, stream)?
+            }
+            (Some(sp), _) => {
+                self.sp_kda_gather_quantized(normed, projected, plane_bytes, sp, ctx, stream)?
+            }
+            (None, _) => {}
+        }
         self.forward_attention_qkv(
             normed,
             projected,
@@ -84,281 +151,31 @@ impl Glm5KdaLayer {
             h,
             decode,
             verify_proj,
+            quant_gather.is_some(),
             &mut profile_timer,
             ctx,
             stream,
         )?;
         det.tap("x_qkv", projected, (0, tokens), 3 * p * bf16);
-        let beta = projected.offset(3 * plane_bytes);
-        let fa = beta.offset(tokens * self.heads * bf16);
-        let ga = fa.offset(tokens * self.dim * bf16);
-        let fused_dense_pairs = capture_verify_intermediates
-            && !canonical
-            && m == 5
-            && self.dense_gemv_batch5_dual_k.0 != 0
-            && verify_fused_dense_pairs_enabled();
-        let fused_dense_triple = capture_verify_intermediates
-            && !canonical
-            && m == 5
-            && self.dense_gemv_batch5_triple_n_k.0 != 0
-            && verify_fused_dense_triple_enabled();
-        // Verify rows 2..=8 otherwise: the same batchm body per plane, one grid.
-        let batchm_fused = capture_verify_intermediates
-            && !canonical
-            && (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(&m)
-            && self.dense_gemv_batchm_triple_n_k.0 != 0
-            && self.dense_gemv_batchm_dual_k.0 != 0;
-        if canonical && verify_proj {
-            // One canonical launch for the three side projections.
-            let (heads, dim) = (self.heads as u32, self.dim as u32);
-            crate::layers::canonical_verify::dense_planes(
-                ctx.gpu,
-                &[
-                    (normed, &self.weights.b_proj, beta, heads, h),
-                    (normed, &self.weights.f_a_proj, fa, dim, h),
-                    (normed, &self.weights.g_a_proj, ga, dim, h),
-                ],
-                m,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if batchm_fused && !fused_dense_triple {
-            ops::dense_gemv_batchm_triple_n(
-                ctx.gpu,
-                self.dense_gemv_batchm_triple_n_k,
-                normed,
-                [
-                    &self.weights.b_proj,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                ],
-                [beta, fa, ga],
-                m,
-                [self.heads as u32, self.dim as u32],
-                h,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if fused_dense_triple {
-            ops::dense_gemv_batch5_triple_n(
-                ctx.gpu,
-                self.dense_gemv_batch5_triple_n_k,
-                normed,
-                &self.weights.b_proj,
-                &self.weights.f_a_proj,
-                &self.weights.g_a_proj,
-                beta,
-                fa,
-                ga,
-                self.heads as u32,
-                self.dim as u32,
-                h,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else if !verify_proj
-            && m > 1
-            && self.dense_gemm_pipelined_k.0 != 0
-            && self.dense_gemm_pipelined_triple_n_k.0 != 0
-        {
-            // The three pipelined launches `project_dense` would make, in one grid.
-            ops::dense_gemm_pipelined_triple_n(
-                ctx.gpu,
-                self.dense_gemm_pipelined_triple_n_k,
-                normed,
-                [
-                    &self.weights.b_proj,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                ],
-                [beta, fa, ga],
-                m,
-                [self.heads as u32, self.dim as u32],
-                h,
-                stream,
-            )?;
-            profile::step(ctx, stream, &mut profile_timer, "beta_f_a_g_a")?;
-        } else {
-            if verify_proj {
-                self.project_dense_verify(
-                    normed,
-                    &self.weights.b_proj,
-                    beta,
-                    m,
-                    self.heads as u32,
-                    h,
-                    ctx,
-                    stream,
-                )?;
-            } else {
-                self.project_dense(
-                    normed,
-                    &self.weights.b_proj,
-                    beta,
-                    m,
-                    self.heads as u32,
-                    h,
-                    ctx,
-                    stream,
-                )?;
-            }
-            profile::step(ctx, stream, &mut profile_timer, "kv_beta_proj")?;
-            if fused_dense_pairs {
-                ops::dense_gemv_batch5_dual(
-                    ctx.gpu,
-                    self.dense_gemv_batch5_dual_k,
-                    normed,
-                    normed,
-                    &self.weights.f_a_proj,
-                    &self.weights.g_a_proj,
-                    fa,
-                    ga,
-                    self.dim as u32,
-                    h,
-                    stream,
-                )?;
-            } else {
-                if verify_proj {
-                    self.project_dense_verify(
-                        normed,
-                        &self.weights.f_a_proj,
-                        fa,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                } else {
-                    self.project_dense(
-                        normed,
-                        &self.weights.f_a_proj,
-                        fa,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                }
-                profile::step(ctx, stream, &mut profile_timer, "f_a_proj")?;
-                if verify_proj {
-                    self.project_dense_verify(
-                        normed,
-                        &self.weights.g_a_proj,
-                        ga,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                } else {
-                    self.project_dense(
-                        normed,
-                        &self.weights.g_a_proj,
-                        ga,
-                        m,
-                        self.dim as u32,
-                        h,
-                        ctx,
-                        stream,
-                    )?;
-                }
-            }
-            if fused_dense_pairs {
-                profile::step(ctx, stream, &mut profile_timer, "f_a_g_a")?;
-            }
-        }
-
-        let g1 = ctx.buffers.ssm_deinterleaved();
-        let g2 = g1.offset(plane_bytes);
-        if canonical && verify_proj {
-            let dim = self.dim as u32;
-            crate::layers::canonical_verify::dense_planes(
-                ctx.gpu,
-                &[
-                    (fa, &self.weights.f_b_proj, g1, p as u32, dim),
-                    (ga, &self.weights.g_b_proj, g2, p as u32, dim),
-                ],
-                m,
-                stream,
-            )?;
-        } else if batchm_fused && !fused_dense_pairs {
-            ops::dense_gemv_batchm_dual(
-                ctx.gpu,
-                self.dense_gemv_batchm_dual_k,
-                [fa, ga],
-                [&self.weights.f_b_proj, &self.weights.g_b_proj],
-                [g1, g2],
-                m,
-                p as u32,
-                self.dim as u32,
-                stream,
-            )?;
-        } else if fused_dense_pairs {
-            ops::dense_gemv_batch5_dual(
-                ctx.gpu,
-                self.dense_gemv_batch5_dual_k,
-                fa,
-                ga,
-                &self.weights.f_b_proj,
-                &self.weights.g_b_proj,
-                g1,
-                g2,
-                p as u32,
-                self.dim as u32,
-                stream,
-            )?;
-        } else if verify_proj {
-            self.project_dense_verify(
-                fa,
-                &self.weights.f_b_proj,
-                g1,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-            self.project_dense_verify(
-                ga,
-                &self.weights.g_b_proj,
-                g2,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-        } else {
-            self.project_dense(
-                fa,
-                &self.weights.f_b_proj,
-                g1,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-            self.project_dense(
-                ga,
-                &self.weights.g_b_proj,
-                g2,
-                m,
-                p as u32,
-                self.dim as u32,
-                ctx,
-                stream,
-            )?;
-        }
-        profile::step(ctx, stream, &mut profile_timer, "g_a_f_b_g_b")?;
+        let (beta, g1, g2) = self.forward_side_projections(
+            normed,
+            projected,
+            plane_bytes,
+            m,
+            decode,
+            verify_proj,
+            capture_verify_intermediates,
+            quant_gather.is_some(),
+            &mut profile_timer,
+            ctx,
+            stream,
+        )?;
         det.tap("x_g", g1, (0, tokens), 2 * p * bf16);
 
         let core_out = recurrent(projected, g1, beta)?;
-        profile::step(ctx, stream, &mut profile_timer, "pack_conv")?;
-        profile::step(ctx, stream, &mut profile_timer, "recurrent")?;
+        // Pack, convolution and recurrence (single-sequence prefill also logs
+        // them as `core.*` sub-steps).
+        profile::step(ctx, stream, &mut profile_timer, "core")?;
         let gated = projected;
         ops::kda_sigmoid_gated_norm(
             ctx.gpu,
@@ -375,7 +192,13 @@ impl Glm5KdaLayer {
         )?;
         profile::step(ctx, stream, &mut profile_timer, "gated_norm")?;
         det.tap("x_gated", gated, (0, tokens), p * bf16);
-        if verify_proj {
+        // ATLAS_GLM_SP_KDA_OPROJ_A2A: this rank's rows over every head, whole.
+        let whole = match sp.filter(|&sp| !verify_proj && self.sp_oproj_a2a(sp, ctx)) {
+            Some(sp) => self.sp_oproj_all_to_all(gated, local(normed), sp, ctx, stream)?,
+            None => false,
+        };
+        if whole {
+        } else if verify_proj {
             self.project_hot_verify(
                 gated,
                 &self.weights.o_proj,
@@ -411,7 +234,42 @@ impl Glm5KdaLayer {
             && ctx
                 .comm
                 .is_some_and(|comm| comm.world_size() == 2 && comm.supports_peer_exchange_async());
-        if fused_tp_hc {
+        // ATLAS_GLM_SP_GATHER_OVERLAP: reduce, post + pre, norm and (MoE)
+        // gather a row block at a time; all of it is timed as `tp_reduce`.
+        let moe = matches!(self.ffn, crate::layers::FfnComponent::Moe(_));
+        // The routed MoE needs every row, unless it gathers them itself.
+        let gather = moe && !sp.is_some_and(|sp| self.ffn.sp_gathers_own_input(sp, ctx));
+        // Its quantized rows instead, gathered as each block is normed.
+        let route = |block| match sp {
+            Some(sp) => self.ffn.sp_route_rows(normed, sp, block, ctx, stream),
+            None => Ok(()),
+        };
+        let staging = match sp.filter(|_| moe && !gather) {
+            Some(sp) => self.ffn.sp_route_staging(sp, ctx)?,
+            None => None,
+        };
+        let extra = staging.map(|(ptr, width)| crate::layers::qwen3_attention::SeamGather {
+            ptr,
+            width,
+            also: None,
+            group: crate::layers::ffn_glm_gather_group(),
+            rows: &route,
+        });
+        let overlapped = !fused_tp_hc
+            && self.sp_seam_overlapped(
+                &self.hc.ffn,
+                &self.post_attn_norm,
+                (true, gather),
+                whole,
+                extra,
+                hidden,
+                normed,
+                sp,
+                ctx,
+                stream,
+            )?;
+        if overlapped {
+        } else if fused_tp_hc {
             // `moe_output` is a registered, caller-owned [M,H] BF16 arena.
             // The preceding KDA work is done with it, and FFN overwrites it
             // only after this immediate mHC post consumes the peer payload.
@@ -421,68 +279,82 @@ impl Glm5KdaLayer {
                 tokens * self.hidden_size * 2,
                 stream,
             )?;
-        } else if let Some(sp) = sp {
+        } else if let Some(sp) = sp.filter(|_| !whole) {
             sp.reduce_scatter(normed, self.hidden_size, ctx, stream)?;
+        } else if whole {
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
             comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
         }
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
-        if !fused_tp_hc {
-            det.tap("attn_red", local(normed), det_rows, row);
-        }
-        let mut seam = false;
-        if fused_tp_hc {
-            ops::hc_post_bf16_add(
-                ctx.gpu,
-                self.hc_post_bf16_add_k,
-                normed,
-                ctx.buffers.moe_output(),
-                ctx.buffers.hc_streams(),
-                ctx.buffers.hc_post(),
-                ctx.buffers.hc_comb(),
-                ctx.buffers.hc_streams(),
-                m,
-                h,
-                self.hc.hc_mult as u32,
-                stream,
-            )?;
-        } else {
-            seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
-                &self.hc.ffn,
-                Some(local(normed)),
-                hidden,
-                m_hc,
-                self.hc.hc_mult as u32,
-                self.hc.sinkhorn_iters as u32,
-                self.hc.hc_eps,
-                ctx,
-                stream,
-            )?;
-            if !seam {
-                self.hc_post(local(normed), m_hc, ctx, stream)?;
+        if !overlapped {
+            if !fused_tp_hc {
+                det.tap("attn_red", local(normed), det_rows, row);
             }
-        }
-        profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
+            let mut seam = crate::layers::qwen3_attention::HcSeam::Skipped;
+            if fused_tp_hc {
+                ops::hc_post_bf16_add(
+                    ctx.gpu,
+                    self.hc_post_bf16_add_k,
+                    normed,
+                    ctx.buffers.moe_output(),
+                    ctx.buffers.hc_streams(),
+                    ctx.buffers.hc_post(),
+                    ctx.buffers.hc_comb(),
+                    ctx.buffers.hc_streams(),
+                    m,
+                    h,
+                    self.hc.hc_mult as u32,
+                    stream,
+                )?;
+            } else {
+                seam = crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
+                    &self.hc.ffn,
+                    Some(local(normed)),
+                    hidden,
+                    m_hc,
+                    self.hc.hc_mult as u32,
+                    self.hc.sinkhorn_iters as u32,
+                    self.hc.hc_eps,
+                    fuse_norm(&self.post_attn_norm),
+                    ctx,
+                    stream,
+                )?;
+                if !seam.ran() {
+                    self.hc_post(local(normed), m_hc, ctx, stream)?;
+                }
+            }
+            profile::step(ctx, stream, &mut profile_timer, "hc_attn_post")?;
 
-        if !seam {
-            self.hc_pre(&self.hc.ffn, hidden, m_hc, ctx, stream)?;
-        }
-        ops::rms_norm(
-            ctx.gpu,
-            self.rms_norm_k,
-            hidden,
-            &self.post_attn_norm,
-            local(normed),
-            m_hc,
-            h,
-            ctx.config.rms_norm_eps as f32,
-            stream,
-        )?;
-        // The routed MoE needs every row; a dense FFN runs only the local ones.
-        if let Some(sp) = sp.filter(|_| matches!(self.ffn, crate::layers::FfnComponent::Moe(_))) {
-            sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            let ffn_normed = match seam.ran() {
+                true => seam.normed(),
+                false => self.hc_pre(
+                    &self.hc.ffn,
+                    hidden,
+                    m_hc,
+                    fuse_norm(&self.post_attn_norm),
+                    ctx,
+                    stream,
+                )?,
+            };
+            if !ffn_normed {
+                ops::rms_norm(
+                    ctx.gpu,
+                    self.rms_norm_k,
+                    hidden,
+                    &self.post_attn_norm,
+                    local(normed),
+                    m_hc,
+                    h,
+                    ctx.config.rms_norm_eps as f32,
+                    stream,
+                )?;
+            }
+            // The routed MoE needs every row; a dense FFN runs only the local ones.
+            if let Some(sp) = sp.filter(|_| gather) {
+                sp.all_gather(normed, self.hidden_size, ctx, stream)?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "hc_ffn_norm")?;
         Ok(FfnPhase {

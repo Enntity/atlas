@@ -132,11 +132,10 @@ impl TransformerModel {
         // faulted-back spilled anchor; see `ssm_fault_in::eff_ssm_snapshot`.
         let (eff_snapshot, eff_snapshot_tokens) =
             self.eff_ssm_snapshot(&prefix_match, seq.session_hash, stream);
-        let marconi_skip = if let Some(snap_id) = eff_snapshot {
-            let snap_tok = eff_snapshot_tokens;
-            // Below `marconi_min_tokens()` the snapshot restore costs more in lost
-            // drafter acceptance than the skipped prefill saves — see the helper.
-            if snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
+        let native_restore_end = eff_snapshot
+            .filter(|&snap_id| {
+                let snap_tok = eff_snapshot_tokens;
+                snap_tok >= crate::model::mtp_carry::marconi_min_tokens()
                 && snap_tok > 0
                 && kv_write_start <= n
                 && self
@@ -146,7 +145,16 @@ impl TransformerModel {
                 // mid-chunk tail capture, or a snapshot from before this
                 // feature — rather than restore a stale lexical state.
                 && (!self.requires_aux_state() || self.ssm_snapshots.has_aux(snap_id))
-            {
+            })
+            .map_or(0, |_| eff_snapshot_tokens);
+        // Both ranks participate, even if one rank lacks a target snapshot.
+        let native_prefix_ready =
+            self.restore_native_mtp_prefix(tokens, seq, native_restore_end, stream)?;
+        let marconi_skip = if let Some(snap_id) = eff_snapshot {
+            let snap_tok = eff_snapshot_tokens;
+            // Below `marconi_min_tokens()` the snapshot restore costs more in lost
+            // drafter acceptance than the skipped prefill saves — see the helper.
+            if native_restore_end > 0 && native_prefix_ready {
                 self.ssm_snapshots.restore(
                     snap_id,
                     seq.slot_idx,
@@ -498,7 +506,8 @@ impl TransformerModel {
 
         // ATLAS_MTP_DRAFTER_PREFILL: capture the processed rows' final-layer
         // hiddens for the whole-prompt drafter prefill. No-op when disabled.
-        self.try_mtp_prefill_capture(seq, seq_len_start, proc_count, stream)?;
+        self.capture_native_mtp_prefill(seq, tokens, seq_len_start, proc_count, hidden, stream)?;
+        self.mtp_prefill_capture_rows(seq, seq_len_start, proc_count, None, stream)?;
 
         // ── 5. Final norm on LAST token only ──
         let last_hidden = hidden.offset((proc_count - 1) * h * fp32);

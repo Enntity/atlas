@@ -96,7 +96,7 @@ impl MoeLayer {
             && self.per_token_group_quant_fp8_k.0 != 0;
         let has_shared = shared_inter > 0;
         let bf16_shared = has_shared
-            && self.run_bf16_shared_expert(
+            && self.run_unfused_shared_expert(
                 input,
                 n,
                 h,
@@ -334,7 +334,14 @@ impl MoeLayer {
             )?;
         }
 
-        super::dump::dump_gate_logits(ctx.gpu, stream, gate_logits, n, num_experts)?;
+        super::dump::dump_gate_logits(
+            ctx.gpu,
+            stream,
+            gate_logits,
+            n,
+            num_experts,
+            self.router_f32,
+        )?;
 
         // Feature-1: fold the router (`mlp.gate`) LoRA delta onto the routing
         // logits BEFORE top-k (device-clean, no capture guard). No-op unless a

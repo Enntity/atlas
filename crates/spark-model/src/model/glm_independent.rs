@@ -168,11 +168,12 @@ pub fn ffn_rows_selected(ctx: &ForwardContext, rows: usize) -> Result<bool> {
     if selected(ctx, rows)? {
         return Ok(true);
     }
-    Ok(crate::speculative::glm_repair_policy::dflash_enabled()
-        && ctx.config.model_type == "glm5_next"
-        && ctx.config.tp_world_size == 2
-        && ctx.config.ep_world_size == 2
-        && (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS).contains(&rows))
+    Ok(
+        crate::speculative::glm_repair_policy::canonical_target_enabled()
+            && ctx.config.model_type == "glm5_next"
+            && crate::layers::moe::glm_tp_ep(ctx.config)
+            && (2..=crate::speculative::glm_repair_policy::MAX_DFLASH_VERIFY_ROWS).contains(&rows),
+    )
 }
 
 /// The indexed view is produced only by the actual independent model path.

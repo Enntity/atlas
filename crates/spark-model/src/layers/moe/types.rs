@@ -44,13 +44,25 @@ pub struct MoeLayer {
     pub(super) w4a16_gemv_sw: KernelHandle,
     pub(super) w4a16_gemm: KernelHandle,
     pub(super) dense_gemm: KernelHandle,
-    /// Order-preserving register-blocked router GEMM (`dense_gemm_bf16_router`):
+    /// The router keeps FP32 logits (`ModelConfig::router_logits_f32`, GLM-5):
+    /// every router GEMM below writes, and every top-k reads, FP32 logits.
+    pub(super) router_f32: bool,
+    /// The router's single-row GEMV and its scalar-order GEMM:
+    /// `dense_gemv` / `dense_gemm`, or their FP32-output twins
+    /// (`dense_gemv_bf16_fp32out` / `dense_gemm_bf16_f32out`, the same
+    /// accumulators unrounded) under [`Self::router_f32`].
+    pub(super) router_gemv: KernelHandle,
+    pub(super) router_gemm: KernelHandle,
+    /// Order-preserving register-blocked router GEMM (`dense_gemm_bf16_router`,
+    /// `_f32out` under [`Self::router_f32`]):
     /// bit-identical to the scalar `dense_gemm` (same per-output FP32 k-order,
     /// `--fmad=false` build) at ~2x speed. `KernelHandle(0)` on miss → the
     /// pinned scalar kernel. Used ONLY by `router_gate_gemm_dense`.
     pub(super) dense_gemm_router: KernelHandle,
     pub(super) router_prefill_bn32: KernelHandle,
     /// Exact-M=5, scalar-order router specialization for GLM verification.
+    /// It, the rows router and the BN32 prefill router are GLM's (FP32
+    /// logits): zero unless [`Self::router_f32`].
     pub(super) dense_gemm_router_m5: KernelHandle,
     pub(super) dense_gemm_router_rows: KernelHandle,
     pub(super) dense_gemm_pipelined: KernelHandle,
@@ -110,6 +122,12 @@ pub struct MoeLayer {
     pub(super) gate_ptrs_t: Option<ExpertPtrTable>,
     pub(super) up_ptrs_t: Option<ExpertPtrTable>,
     pub(super) down_ptrs_t: Option<ExpertPtrTable>,
+    /// `ATLAS_GLM_FP4L_INPUT_SCALES`: the calibrated activation scales and
+    /// their folded tables (`input_scales.rs`).
+    pub(super) input_scales: Option<super::InputScales>,
+    /// qwen4_exp's W4A4 routed prefill: the checkpoint's activation scales
+    /// and their alpha tables (`w4a4_scales.rs`).
+    pub(super) w4a4: Option<super::W4a4Scales>,
     /// CUTLASS grouped-NVFP4 host tables (`ATLAS_HOLO_MOE_GROUPED_CUTLASS`).
     /// Per-expert packed/SFB pointer values + scale2, snapshotted ONCE at load
     /// by `build_cutlass_grouped_sfb` (the SFB swizzle is built there from the
@@ -182,6 +200,8 @@ pub struct MoeLayer {
     /// `ATLAS_QWEN4EXP_BATCH_FAST`: the expert-sorted row grid of the
     /// originals-layout pair (`forward_rows.rs`). All 0 otherwise.
     pub(super) qwen4exp_moe_rows: ops::Qwen4ExpMoeRows,
+    /// The router's 16-row tier under the lane (`forward_rows.rs`).
+    pub(super) wide_rows: ops::Qwen4ExpWideRows,
     pub(super) moe_expert_gate_up_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_silu_down_shared_fp8_t_k: KernelHandle,
     pub(super) moe_expert_gate_up_shared_fp8_batch2_t_k: KernelHandle,
@@ -243,6 +263,9 @@ pub struct MoeLayer {
     pub(super) shared_gate_up_receipt: Option<helpers_a::SharedGateUpReceipt>,
     pub(super) shared_up_t: Option<QuantizedWeight>,
     pub(super) shared_down_t: Option<QuantizedWeight>,
+    /// The checkpoint's FP8 block shared expert (`ATLAS_GLM_FP4L_SHARED_FP8`,
+    /// `shared_native.rs`): when set, the NVFP4 shared copies are gone.
+    pub(crate) shared_native: Option<shared_native::SharedNative>,
     pub(super) moe_grouped_gemm_t: KernelHandle,
     pub(super) moe_grouped_gemm_t_k64: KernelHandle,
     /// Optional M=32 NVFP4 twin of `moe_grouped_gemm_t_k64`.
@@ -266,6 +289,9 @@ pub struct MoeLayer {
     /// CTAs of the persistent K128W twins when `ATLAS_GLM_MOE_PREFILL_PERSIST=1`
     /// resolved every needed one above, else 0 (row-tile grid only).
     pub(super) k128w_persist_ctas: u32,
+    /// `ATLAS_GLM_MOE_DOWN_E4M3=1` (lossy): the K128W down's E4M3 twins and
+    /// the sparse EP reduce that reads them, when all resolved.
+    pub(super) down_e4m3: Option<super::init_optional::DownE4m3>,
     /// Compact-worklist twins of the prequantized native-FP4 MoE kernel.
     /// Optional and used only for guarded K=5 gate/up verification.
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,
@@ -335,8 +361,9 @@ pub struct MoeLayer {
     /// `None` = Atlas's default softmax path. When `Some`, every top-k
     /// dispatch site branches to `moe_topk_sigmoid` with this bias arg.
     pub(super) correction_bias_dev: Option<DevicePtr>,
-    /// Handle to `moe_topk_sigmoid` kernel. Lazy-loaded in `new()` even
-    /// when bias is `None` (harmless if kernel isn't used).
+    /// Handle to `moe_topk_sigmoid` kernel (`_f32` under
+    /// [`Self::router_f32`]). Lazy-loaded in `new()` even when bias is `None`
+    /// (harmless if kernel isn't used).
     pub(super) moe_topk_sigmoid_k: KernelHandle,
     /// Batched variant for prefill / MTP-verify (one block per token).
     /// Loaded via `try_kernel` — returns KernelHandle(0) on models whose
@@ -412,6 +439,9 @@ pub struct MoeLayer {
     // Checkpoint-native BF16 shared expert. Independent of routed-expert
     // precision so mixed NVFP4-routed/BF16-shared checkpoints stay faithful.
     pub(super) bf16_shared_expert: Option<Bf16SharedExpert>,
+    // Checkpoint-native MXFP8 shared expert (FP4-Local), likewise outside the
+    // fused routed kernels: `shared_mxfp8.rs`.
+    pub(super) mxfp8_shared_expert: Option<Mxfp8SharedExpert>,
     // FP8 shared expert weights (None when shared expert is NVFP4)
     pub(super) fp8_shared_expert: Option<Fp8ExpertWeight>,
     /// FP4 down kernel handle (`moe_w4a16_down_t_k64_fp4`). `try_kernel` =>

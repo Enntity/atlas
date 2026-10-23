@@ -41,6 +41,7 @@
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include "../../common/atlas_pdl.cuh"
+#include "../../common/mxfp8_act_quant.cuh"
 
 #define QHC_BLOCK 256
 #define QHC_MAX_MULT 8
@@ -144,7 +145,7 @@ extern "C" __global__ void hc_expand(
 
 __device__ __forceinline__ void qhc_collapse(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ up_w,
     const __nv_bfloat16* __restrict__ inject_w,
@@ -252,7 +253,7 @@ __device__ __forceinline__ void qhc_collapse(
 // streams [T, hc, H] -> y_out [T, H] collapsed, inj_out [T, hc].
 extern "C" __global__ void hc_pre(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,  // [hc*H]
+    const float* __restrict__ hc_norm_w,  // [hc*H]
     const __nv_bfloat16* __restrict__ down_w,     // [rank, hc*H]
     const __nv_bfloat16* __restrict__ up_w,       // [rank, hc*H]
     const __nv_bfloat16* __restrict__ inject_w,   // [hc, hc*H]
@@ -274,7 +275,7 @@ extern "C" __global__ void hc_pre(
 // role.
 extern "C" __global__ void hc_head(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     const __nv_bfloat16* __restrict__ down_w,
     const __nv_bfloat16* __restrict__ up_w,
     __nv_bfloat16* __restrict__ y_out,
@@ -345,7 +346,7 @@ extern "C" __global__ void hc_post(
 // Stage 1: normed = x * rms * (1 + w) -> global scratch [T, hc*H].
 extern "C" __global__ void hc_pre_stage(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     float* __restrict__ normed_out,            // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -848,7 +849,7 @@ extern "C" __global__ void hc_pre_finish_x4(
 
 extern "C" __global__ void hc_pre_stage_bf16(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     __nv_bfloat16* __restrict__ normed_out,    // [T, hc*H] BF16
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -918,7 +919,7 @@ extern "C" __global__ void __launch_bounds__(QHC_WBLOCK, 1) hc_post_stage_bf16(
     const __nv_bfloat16* __restrict__ block_out, // [T, H]
     float* streams,                              // [T, hc, H]: residual in, post out
     const float* __restrict__ inj,               // [T, hc]
-    const __nv_bfloat16* __restrict__ hc_norm_w, // [hc*H]
+    const float* __restrict__ hc_norm_w, // [hc*H]
     __nv_bfloat16* __restrict__ normed_out,      // [T, hc*H] BF16
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -1078,6 +1079,8 @@ extern "C" __global__ void hc_pre_mix(
 #ifndef HUM_BD
 #define HUM_BD 32
 #endif
+// The MX epilogue quantizes a CTA's columns as whole 32-value MXFP8 blocks.
+static_assert(HUM_BD % 32 == 0, "HUM_BD must be a whole number of MXFP8 blocks");
 #ifndef HUM_MINB
 #define HUM_MINB 2
 #endif
@@ -1093,17 +1096,27 @@ __device__ __forceinline__ void hum_cp16(void* smem_ptr, const void* gmem_ptr) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sp), "l"(gmem_ptr));
 }
 
-extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
+// MX: the epilogue also (or, with y_out null, only) writes `y` as MXFP8 for
+// the cuBLASLt W8A8 GEMM -- E4M3 [T, H] plus UE8M0 scales in cuBLASLt's tiled
+// layout (`common/mxfp8_act_quant.cuh`), each value the quantization of the
+// BF16 `y` the plain kernel writes, so the bytes equal hc_up_mix_bf16_nt then
+// mxfp8_quant_act_bf16. A CTA's HUM_BD columns are whole 32-value blocks, and
+// a block's 32 values of a row sit in the quad of lanes sharing `g` (8 each).
+template <bool MX>
+__device__ __forceinline__ void hc_up_mix_body(
     const __nv_bfloat16* __restrict__ low,     // [T, rank] silu'd low-rank vector
     const __nv_bfloat16* __restrict__ up_wt,   // [hc*H, rank] transposed up_w
     const __nv_bfloat16* __restrict__ normed,  // [T, hc*H]
     const __nv_bfloat16* __restrict__ inj_pre, // [T, hc] or null
-    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    __nv_bfloat16* __restrict__ y_out,         // [T, H] (MX: may be null)
     float* __restrict__ inj_out,               // [T, hc]
     const unsigned int T,
     const unsigned int hidden_size,
     const unsigned int rank,
-    const float inv_hc
+    const float inv_hc,
+    unsigned char* __restrict__ y_q,           // MX: E4M3 [T, H]
+    unsigned char* __restrict__ y_sf,          // MX: tiled UE8M0 scales
+    const unsigned int sf_inner_pad            // MX: round_up(H / 32, 4)
 ) {
     __shared__ __align__(16) __nv_bfloat16 smem_A[HUM_STAGES][HUM_BM][HUM_STRIDE];
     __shared__ __align__(16) __nv_bfloat16 smem_B[HUM_STAGES][HUM_BN][HUM_STRIDE];
@@ -1211,7 +1224,10 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
     #pragma unroll
     for (unsigned int half = 0; half < 2; ++half) {
         const unsigned int row = m0 + warp * 16 + g + half * 8;
-        if (row >= T) continue;
+        // MX: rows past T still run (on row 0's `normed`, zero `low`) so the
+        // whole warp reaches the quad shuffles; only their stores are skipped.
+        if (!MX && row >= T) continue;
+        unsigned int ybits[HUM_BD / 8];
         #pragma unroll
         for (unsigned int q = 0; q < HUM_BD / 8; ++q) {
             const unsigned int d = d0 + q * 8 + t4 * 2;
@@ -1228,7 +1244,45 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
             const unsigned int packed =
                   (unsigned int)__bfloat16_as_ushort(__float2bfloat16(mixed0 * inv_hc))
                 | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(mixed1 * inv_hc)) << 16);
-            *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+            if (!MX) {
+                *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+            } else {
+                if (y_out != nullptr && row < T) {
+                    *reinterpret_cast<unsigned int*>(y_out + (size_t)row * H + d) = packed;
+                }
+                ybits[q] = packed;
+            }
+        }
+        if (MX) {
+            #pragma unroll
+            for (unsigned int b = 0; b < HUM_BD / 32; ++b) {
+                float v[8];
+                float amax = 0.0f;
+                #pragma unroll
+                for (unsigned int j = 0; j < 4; ++j) {
+                    const unsigned int w = ybits[b * 4 + j];
+                    v[2 * j] = __uint_as_float(w << 16);
+                    v[2 * j + 1] = __uint_as_float(w & 0xFFFF0000u);
+                    amax = fmaxf(amax, fmaxf(mx_abs_clamped(v[2 * j]), mx_abs_clamped(v[2 * j + 1])));
+                }
+                const int e = mx_quad_exponent(amax);
+                const float inv = mx_inv_scale(e);
+                if (row < T) {
+                    #pragma unroll
+                    for (unsigned int j = 0; j < 4; ++j) {
+                        const unsigned int d = d0 + (b * 4 + j) * 8 + t4 * 2;
+                        const unsigned short pair =
+                            (unsigned short)mx_e4m3(v[2 * j], inv)
+                            | (unsigned short)((unsigned short)mx_e4m3(v[2 * j + 1], inv) << 8);
+                        *reinterpret_cast<unsigned short*>(y_q + (size_t)row * H + d) = pair;
+                    }
+                    if (t4 == 0) {
+                        const unsigned int blk = d0 / 32 + b;
+                        y_sf[mx_sf_offset(row, blk, sf_inner_pad)] = (unsigned char)(e + 127);
+                        if (blk + 1 == H / 32) mx_sf_zero_pad(y_sf, row, blk + 1, sf_inner_pad);
+                    }
+                }
+            }
         }
     }
     if (inj_pre != nullptr && blockIdx.x == 0) {
@@ -1240,6 +1294,44 @@ extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
             }
         }
     }
+}
+
+extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt(
+    const __nv_bfloat16* __restrict__ low,
+    const __nv_bfloat16* __restrict__ up_wt,
+    const __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ inj_pre,
+    __nv_bfloat16* __restrict__ y_out,
+    float* __restrict__ inj_out,
+    const unsigned int T,
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const float inv_hc
+) {
+    hc_up_mix_body<false>(low, up_wt, normed, inj_pre, y_out, inj_out, T, hidden_size, rank,
+                          inv_hc, nullptr, nullptr, 0);
+}
+
+// hc_up_mix_bf16_nt with `y` (also) emitted as MXFP8 (see hc_up_mix_body),
+// for ATLAS_QWEN4EXP_PREFILL_W8A8 (`qwen4exp_prefill_hc.rs` launches it when
+// a W8A8 producer is armed). Same grid and block.
+extern "C" __global__ void __launch_bounds__(256, HUM_MINB) hc_up_mix_bf16_nt_mx(
+    const __nv_bfloat16* __restrict__ low,
+    const __nv_bfloat16* __restrict__ up_wt,
+    const __nv_bfloat16* __restrict__ normed,
+    const __nv_bfloat16* __restrict__ inj_pre,
+    __nv_bfloat16* __restrict__ y_out,         // null: MXFP8 only
+    float* __restrict__ inj_out,
+    unsigned char* __restrict__ y_q,
+    unsigned char* __restrict__ y_sf,
+    const unsigned int T,
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const float inv_hc,
+    const unsigned int sf_inner_pad
+) {
+    hc_up_mix_body<true>(low, up_wt, normed, inj_pre, y_out, inj_out, T, hidden_size, rank,
+                         inv_hc, y_q, y_sf, sf_inner_pad);
 }
 
 // Transpose a BF16 matrix `[R, C] -> [C, R]`. Exists for one caller: the
@@ -1628,7 +1720,10 @@ __device__ __forceinline__ void qhc_down_vec(
     float* __restrict__ inj_out,
     const unsigned int hc_dim,
     const unsigned int hc,
-    const unsigned int rank
+    const unsigned int rank,
+    // Tokens actually written: `_wide` runs a padded NT over scratch rows
+    // past the batch and drops their outputs. NT everywhere else.
+    const unsigned int nt_live = NT
 ) {
     static_assert(DN >= 1 && DN <= U && U % DN == 0, "normed ring must tile the weight ring");
     constexpr unsigned int LPR = 32u / CPT;    // lanes per row
@@ -1706,7 +1801,7 @@ __device__ __forceinline__ void qhc_down_vec(
                 for (unsigned int j = 0; j < off; ++j) acc[t][j] = acc[t][j] + acc[t][j + off];
             }
         }
-        if (live && p == 0) {
+        if (live && p == 0 && t < nt_live) {
             const float v = acc[t][0];
             if (row < rank) {
                 low_out[(size_t)t * rank + row] = qhc_silu(v * inv_hc);
@@ -1965,13 +2060,141 @@ extern "C" __global__ void hc_pre_finish_vec8(
         normed, low, up_w, y_out, hidden_size, rank, num_tokens);
 }
 
+// ── T = 9..HC_V_ROWS_MAX in one launch (ATLAS_QWEN4EXP_BATCH_FAST) ─────────
+//
+// A batched verify of C4..C8 sequences x K=4 rows ran the collapse in 8-token
+// launches: 2..4 back-to-back passes over the site's 13.1 MB. These run them
+// as ONE launch whose blockIdx.y is a group of HC_V_MAX tokens: the CTAs of
+// every group are co-resident and walk the same weight rows together, so the
+// weights stream from DRAM about once. Each group IS the `_vec`/`_vec8`
+// body on its own (up to 8) tokens -- the same per-token chains, the same
+// ring scheduling as the T = 5..8 twin -- so every token's bytes are the
+// T = 1 kernel's (scripts/dev/qwen4exp_hc_rows_bench.cu checks T = 1..32).
+#ifndef HC_V_ROWS_MAX
+#define HC_V_ROWS_MAX 32u
+#endif
+
+// Grid: (as `hc_pre_down_vec`, ceil(num_tokens / HC_V_MAX), 1).
+extern "C" __global__ void hc_pre_down_vec_rows(
+    const float* __restrict__ normed,          // [T, hc*H]
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    float* __restrict__ low_out,               // [T, rank]
+    float* __restrict__ inj_out,               // [T, hc] (unused without inject_w)
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens              // 1..HC_V_ROWS_MAX (host checks)
+) {
+    atlas_pdl_enter();
+    const unsigned int t0 = blockIdx.y * HC_V_MAX;
+    const unsigned int nt = min(HC_V_MAX, num_tokens - t0);
+    const unsigned int hc_dim = hc * hidden_size;
+    const float* nx = normed + (size_t)t0 * hc_dim;
+    float* lo = low_out + (size_t)t0 * rank;
+    float* inj = inject_w != nullptr ? inj_out + (size_t)t0 * hc : inj_out;
+#define QHC_DOWN_ROWS(T_) \
+    qhc_down_vec<HC_V_DOWN_CPT, HC_V_DOWN_UNROLL, HC_V_DOWN_DN8, T_>( \
+        nx, down_w, inject_w, lo, inj, hc_dim, hc, rank)
+    switch (nt) {
+    case 1: QHC_DOWN_ROWS(1); break;
+    case 2: QHC_DOWN_ROWS(2); break;
+    case 3: QHC_DOWN_ROWS(3); break;
+    case 4: QHC_DOWN_ROWS(4); break;
+    case 5: QHC_DOWN_ROWS(5); break;
+    case 6: QHC_DOWN_ROWS(6); break;
+    case 7: QHC_DOWN_ROWS(7); break;
+    default: QHC_DOWN_ROWS(8); break;
+    }
+#undef QHC_DOWN_ROWS
+}
+
+// Grid: (as `hc_pre_finish_vec`, ceil(num_tokens / HC_V_MAX), 1).
+// Dynamic shared: HC_V_MAX * rank floats (one group's `low`).
+extern "C" __global__ void hc_pre_finish_vec_rows(
+    const float* __restrict__ normed,          // [T, 4*H]
+    const float* __restrict__ low,             // [T, rank]
+    const __nv_bfloat16* __restrict__ up_w,    // [rank, 4*H]
+    __nv_bfloat16* __restrict__ y_out,         // [T, H]
+    const unsigned int hidden_size,
+    const unsigned int rank,
+    const unsigned int num_tokens              // 1..HC_V_ROWS_MAX (host checks)
+) {
+    atlas_pdl_enter();
+    const unsigned int t0 = blockIdx.y * HC_V_MAX;
+    const unsigned int nt = min(HC_V_MAX, num_tokens - t0);
+    const float* nx = normed + (size_t)t0 * 4u * hidden_size;
+    const float* lo = low + (size_t)t0 * rank;
+    __nv_bfloat16* y = y_out + (size_t)t0 * hidden_size;
+#define QHC_FIN_ROWS(T_) \
+    qhc_finish_vec<HC_V_FIN_DPT, HC_V_FIN_UNROLL8, T_>(nx, lo, up_w, y, hidden_size, rank)
+    switch (nt) {
+    case 1: QHC_FIN_ROWS(1); break;
+    case 2: QHC_FIN_ROWS(2); break;
+    case 3: QHC_FIN_ROWS(3); break;
+    case 4: QHC_FIN_ROWS(4); break;
+    case 5: QHC_FIN_ROWS(5); break;
+    case 6: QHC_FIN_ROWS(6); break;
+    case 7: QHC_FIN_ROWS(7); break;
+    default: QHC_FIN_ROWS(8); break;
+    }
+#undef QHC_FIN_ROWS
+}
+
+// ── T = 25..HC_V_ROWS_MAX down walk, re-tiled (ATLAS_QWEN4EXP_HC_WIDE) ─────
+//
+// `hc_pre_down_vec_rows` at 32 tokens is four 8-token groups of 41 CTAs at
+// 150 registers: more CTAs than one wave holds, so the last group runs alone
+// (~105 us against ~65 at 25..28 tokens). This is the same walk with FOUR
+// chains per thread (the tree replay covers any CPT), which halves the CTAs
+// a group needs and the normed loads per FLOP, so every group fits one wave.
+// Groups of HC_V_WIDE_G tokens on blockIdx.y; the last group is padded, its
+// padding tokens computing on scratch rows past the batch (host checks the
+// scratch holds 64 rows) that are never written (`nt_live`). Every written
+// token's chains are the T = 1 kernel's, in the same order, so the bytes are
+// too (scripts/dev/qwen4exp_hc_wide_bench.cu checks T = 9..32). The finish
+// kernel stays `hc_pre_finish_vec_rows`: no finish tile measured faster.
+#ifndef HC_V_WIDE_G
+#define HC_V_WIDE_G 8u
+#endif
+#ifndef HC_V_WIDE_DOWN_CPT
+#define HC_V_WIDE_DOWN_CPT 4u
+#endif
+#ifndef HC_V_WIDE_DOWN_UNROLL
+#define HC_V_WIDE_DOWN_UNROLL 16u
+#endif
+#ifndef HC_V_WIDE_DOWN_DN
+#define HC_V_WIDE_DOWN_DN 2u
+#endif
+// Grid: (ceil((rank + hc) * 32 / HC_V_WIDE_DOWN_CPT / block),
+//        ceil(num_tokens / HC_V_WIDE_G), 1).
+extern "C" __global__ void hc_pre_down_vec_wide(
+    const float* __restrict__ normed,          // [64, hc*H] scratch, T live rows
+    const __nv_bfloat16* __restrict__ down_w,  // [rank, hc*H]
+    const __nv_bfloat16* __restrict__ inject_w,// [hc, hc*H] or null
+    float* __restrict__ low_out,               // [T, rank]
+    float* __restrict__ inj_out,               // [T, hc]
+    const unsigned int hidden_size,
+    const unsigned int hc,
+    const unsigned int rank,
+    const unsigned int num_tokens              // 9..HC_V_ROWS_MAX (host checks)
+) {
+    atlas_pdl_enter();
+    const unsigned int t0 = blockIdx.y * HC_V_WIDE_G;
+    const unsigned int hc_dim = hc * hidden_size;
+    qhc_down_vec<HC_V_WIDE_DOWN_CPT, HC_V_WIDE_DOWN_UNROLL, HC_V_WIDE_DOWN_DN, HC_V_WIDE_G>(
+        normed + (size_t)t0 * hc_dim, down_w, inject_w, low_out + (size_t)t0 * rank,
+        inject_w != nullptr ? inj_out + (size_t)t0 * hc : inj_out, hc_dim, hc, rank,
+        min(HC_V_WIDE_G, num_tokens - t0));
+}
+
 // Stage 1 over a (T, S) grid, block 1024 (host checks: the RMS below is
 // `hc_pre_stage`'s 1024-thread reduction and is only bit-identical at that
 // width). Every block recomputes the token's hc RMS values and writes
 // columns [y * hc_dim / S, (y + 1) * hc_dim / S) of `normed`.
 extern "C" __global__ void hc_pre_stage_vec(
     const float* __restrict__ streams,
-    const __nv_bfloat16* __restrict__ hc_norm_w,
+    const float* __restrict__ hc_norm_w,
     float* __restrict__ normed_out,            // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -2030,13 +2253,13 @@ extern "C" __global__ void hc_pre_stage_vec(
     const unsigned int c1 = blockIdx.y + 1 == gridDim.y ? hc_dim : c0 + span;
     for (unsigned int i = c0 + 4u * tid; i < c1; i += 4u * QHC_WBLOCK) {
         const float4 xv = *reinterpret_cast<const float4*>(x + i);
-        const uint2 wv = *reinterpret_cast<const uint2*>(hc_norm_w + i);
+        const float4 wv = *reinterpret_cast<const float4*>(hc_norm_w + i);
         const float rms = smem_rms[i / H];
         float4 o;
-        o.x = xv.x * rms * (1.0f + qhc_bf_lo(wv.x));
-        o.y = xv.y * rms * (1.0f + qhc_bf_hi(wv.x));
-        o.z = xv.z * rms * (1.0f + qhc_bf_lo(wv.y));
-        o.w = xv.w * rms * (1.0f + qhc_bf_hi(wv.y));
+        o.x = xv.x * rms * (1.0f + wv.x);
+        o.y = xv.y * rms * (1.0f + wv.y);
+        o.z = xv.z * rms * (1.0f + wv.z);
+        o.w = xv.w * rms * (1.0f + wv.w);
         *reinterpret_cast<float4*>(out + i) = o;
     }
 }
@@ -2103,7 +2326,7 @@ hc_post_stage_vec(
     const __nv_bfloat16* __restrict__ block_out, // [T, H]
     float* streams,                              // [T, hc, H]: residual in, post out
     const float* __restrict__ inj,               // [T, hc]
-    const __nv_bfloat16* __restrict__ hc_norm_w, // [hc*H]
+    const float* __restrict__ hc_norm_w, // [hc*H]
     float* __restrict__ normed_out,              // [T, hc*H]
     const unsigned int hidden_size,
     const unsigned int hc,
@@ -2176,13 +2399,13 @@ hc_post_stage_vec(
         v.z = r.z + qhc_bf_lo(xv.y) * ws;
         v.w = r.w + qhc_bf_hi(xv.y) * ws;
         *reinterpret_cast<float4*>(x + i) = v;
-        const uint2 nw = *reinterpret_cast<const uint2*>(hc_norm_w + i);
+        const float4 nw = *reinterpret_cast<const float4*>(hc_norm_w + i);
         const float rms = smem_rms[s];
         float4 o;
-        o.x = v.x * rms * (1.0f + qhc_bf_lo(nw.x));
-        o.y = v.y * rms * (1.0f + qhc_bf_hi(nw.x));
-        o.z = v.z * rms * (1.0f + qhc_bf_lo(nw.y));
-        o.w = v.w * rms * (1.0f + qhc_bf_hi(nw.y));
+        o.x = v.x * rms * (1.0f + nw.x);
+        o.y = v.y * rms * (1.0f + nw.y);
+        o.z = v.z * rms * (1.0f + nw.z);
+        o.w = v.w * rms * (1.0f + nw.w);
         *reinterpret_cast<float4*>(out + i) = o;
     }
 }

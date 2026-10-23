@@ -20,7 +20,7 @@ use crate::params::{ParamKind, ParamSpec, ParamValue, ParamValues};
 use crate::plugin::{Plugin, PluginHandle};
 use crate::result::{BenchmarkResult, LogLine, RunStatus, Stat, Verdict as RunVerdict};
 
-use super::geometry::expected_vision_tokens;
+use super::image_geometry::ImageProcessor;
 use super::probes::{CONTROL, PROBES, Probe};
 use super::provision::{FIXTURES, provision};
 use super::request;
@@ -40,19 +40,17 @@ pub const DESCRIPTOR: BenchmarkDescriptor = BenchmarkDescriptor {
     detail: "Two legs. GEOMETRY sends a ladder of committed fixtures (224² through 1280×720, \
              square, wide and portrait, deliberately mixing grid-exact sizes with ones that \
              must snap) and asserts the EXACT vision-token count from usage.prompt_tokens \
-             against patch/merge arithmetic — the observable that moves when preprocessing \
+             against the resolved still-image processor policy — the observable that moves when preprocessing \
              changes, and the one a capability check cannot see. CAPABILITY asks unambiguous \
              questions about those images. A no-image CONTROL runs last: if it answers as \
              though it saw a picture, the capability leg proved nothing and the run reports \
-             VACUOUS rather than PASS. Images above the server's encoder capacity report \
-             UNMEASURED, never FAIL — that is a deployment setting, not a defect.",
+             VACUOUS rather than PASS. Requires a bounded Qwen processor profile; unsupported profiles fail explicitly.",
     duration_hint: "~1-2 min",
-    updated: "2026-08-14",
+    updated: "2026-10-22",
     needs_confirmation: false,
     // Vision correctness is a property of the ENGINE plus the checkpoint's own
-    // declared geometry, not of one model, so any vision-capable checkpoint is
-    // a valid subject. A model without a vision tower fails at the first
-    // request with a clear error rather than being silently skipped.
+    // declared geometry. The current independent reference supports bounded
+    // Qwen still-image profiles; other profiles fail explicitly during load.
     intended_for: None,
     threshold_params: &[],
     // Image fidelity does not change with clock.
@@ -82,8 +80,8 @@ pub struct VisionFidelity {
     /// assertion subtracts it, so it is measured rather than assumed — it is a
     /// property of the checkpoint's template and moves when the template does.
     overhead: Option<usize>,
-    /// Encoder capacity in patches, inferred from the first over-capacity
-    /// rejection. `None` until something is rejected.
+    processor: Option<ImageProcessor>,
+    /// Every fixture remains an asserted geometry cell.
     geom: Vec<GeomCell>,
     probes: Vec<ProbeCell>,
     control_held: bool,
@@ -97,6 +95,13 @@ pub struct VisionFidelity {
 impl VisionFidelity {
     fn handle(&self) -> Result<&PluginHandle> {
         self.handle.as_ref().context("benchmark was not loaded")
+    }
+
+    fn expected_tokens(&self, w: u32, h: u32) -> Result<usize> {
+        self.processor
+            .as_ref()
+            .context("image processor was not loaded")?
+            .tokens(w, h)
     }
 
     fn elapsed(&self) -> Duration {
@@ -180,6 +185,13 @@ impl Plugin for VisionFidelity {
         // provisioning failure is reported where the user can act on it
         // rather than mid-run.
         provision(handle.artifacts()).context("provisioning vision fixtures")?;
+        let profile = http::image_processor(handle.target(), Duration::from_secs(30)).await?;
+        let processor: ImageProcessor = serde_json::from_value(profile.clone())?;
+        for &(_, _, w, h) in FIXTURES {
+            processor.tokens(w, h)?;
+        }
+        handle.info(format!("resolved still-image processor: {profile}"));
+        self.processor = Some(processor);
         self.handle = Some(handle);
         Ok(())
     }
@@ -240,12 +252,11 @@ impl Benchmark for VisionFidelity {
                 let out = http::chat_stream(handle.target(), &body, self.timeout())
                     .await
                     .context("calibration request failed — is this a vision-capable model?")?;
-                let want = expected_vision_tokens(w, h, 16, 2) as usize;
+                let want = self.expected_tokens(w, h)?;
                 let overhead = out.prompt_tokens.checked_sub(want).with_context(|| {
                     format!(
                         "calibration: {name} reported {} prompt tokens but its {want} vision \
-                         tokens alone exceed that — the served geometry is not patch 16 / \
-                         merge 2, so this benchmark's arithmetic does not apply",
+                         tokens alone exceed that — the served tokens disagree with the resolved processor policy",
                         out.prompt_tokens
                     )
                 })?;
@@ -264,7 +275,7 @@ impl Benchmark for VisionFidelity {
             Phase::Geometry => {
                 let (name, bytes, w, h) = FIXTURES[self.cursor];
                 let overhead = self.overhead.context("geometry ran before calibration")?;
-                let want = expected_vision_tokens(w, h, 16, 2) as usize;
+                let want = self.expected_tokens(w, h)?;
                 let body = request::body(&handle.target().model, &[bytes], "Colour?", 8);
                 let cell = match http::chat_stream(handle.target(), &body, self.timeout()).await {
                     Ok(o) => match request::vision_tokens(o.prompt_tokens, overhead) {
@@ -558,11 +569,12 @@ impl Benchmark for VisionFidelity {
                     //    comparison cannot tell an envelope difference from a
                     //    vision one.
                     7 => {
-                        let (_, small, sw, sh) = FIXTURES[0]; // 224 -> 49
-                        let (_, large, lw, lh) = FIXTURES[1]; // 336 -> 121
-                        let delta = (expected_vision_tokens(lw, lh, 16, 2)
-                            - expected_vision_tokens(sw, sh, 16, 2))
-                            as usize;
+                        let (_, small, sw, sh) = FIXTURES[0];
+                        let (_, large, lw, lh) = FIXTURES[1];
+                        let delta = self
+                            .expected_tokens(lw, lh)?
+                            .checked_sub(self.expected_tokens(sw, sh)?)
+                            .context("processor reversed integrity fixture sizes")?;
                         let q = "Reply with exactly one word: YES if this image contains a \
                                  white rectangle, NO otherwise.";
                         mi::responses_parity(
@@ -578,11 +590,12 @@ impl Benchmark for VisionFidelity {
                     // 9. Thinking ON — the configuration these checkpoints
                     //    ship in, and the one every other leg turns off.
                     8 => {
-                        let (_, small, sw, sh) = FIXTURES[0]; // 224 -> 49
-                        let (_, large, lw, lh) = FIXTURES[1]; // 336 -> 121
-                        let delta = (expected_vision_tokens(lw, lh, 16, 2)
-                            - expected_vision_tokens(sw, sh, 16, 2))
-                            as usize;
+                        let (_, small, sw, sh) = FIXTURES[0];
+                        let (_, large, lw, lh) = FIXTURES[1];
+                        let delta = self
+                            .expected_tokens(lw, lh)?
+                            .checked_sub(self.expected_tokens(sw, sh)?)
+                            .context("processor reversed integrity fixture sizes")?;
                         let q = "Reply with exactly one word: YES if this image contains a \
                                  white rectangle, NO otherwise.";
                         mi::thinking_parity(

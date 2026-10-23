@@ -307,6 +307,10 @@ impl Qwen3AttentionLayer {
         attn: crate::layers::ops::lora_delta::LoraAttnWeights,
         ffn: Option<crate::layers::ops::lora_delta::LoraFfnWeights>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.dense_mx.w8a8.is_none() || !super::w8a8::adapts_projections(Some(&attn)),
+            super::w8a8::LORA
+        );
         self.lora = Some(attn);
         if let Some(f) = ffn {
             match &mut self.ffn {
@@ -405,6 +409,9 @@ impl Qwen3AttentionLayer {
         // `TransformerModel` exists to carry the config. Resolved at the point
         // of use rather than cached in a static: the resolution logic stays
         // SSOT in `GemmDispatch`, and one getenv per layer at load is free.
+        if crate::layers::ops::qwen4exp_rowinv::bf16_proj() && config.model_type == "qwen4_exp" {
+            return self.dequant_bf16_for_rowinv(gpu, config, stream);
+        }
         if crate::layers::ops::GemmDispatch::from_env().cutlass_nvfp4_gemm {
             tracing::info!(
                 "Skipping attention FP8 prefill predequant because ATLAS_CUTLASS_NVFP4_GEMM=1"

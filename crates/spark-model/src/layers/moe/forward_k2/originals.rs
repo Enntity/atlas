@@ -26,7 +26,7 @@ impl MoeLayer {
         h: u32,
         top_k: u32,
         is_ep: bool,
-        mixed_bf16_shared: bool,
+        unfused_shared: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -46,13 +46,13 @@ impl MoeLayer {
             self.up_ptrs.scale2_vals,
             expert_up_out,
             indices_dev,
-            if mixed_bf16_shared {
+            if unfused_shared {
                 &null_shared
             } else {
                 &self.weights.shared_expert.gate_proj
             },
             shared_gate_scratch,
-            if mixed_bf16_shared {
+            if unfused_shared {
                 &null_shared
             } else {
                 &self.weights.shared_expert.up_proj
@@ -76,7 +76,7 @@ impl MoeLayer {
             indices_dev,
             shared_gate_scratch,
             shared_up_scratch,
-            if mixed_bf16_shared {
+            if unfused_shared {
                 &null_shared
             } else {
                 &self.weights.shared_expert.down_proj
@@ -90,9 +90,9 @@ impl MoeLayer {
         )?;
         // Mixed config: one batched BF16 shared-expert pass for both tokens,
         // replacing the placeholder the kernel was told (via NULL) to skip.
-        if mixed_bf16_shared {
+        if unfused_shared {
             let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-            self.run_bf16_shared_expert(
+            self.run_unfused_shared_expert(
                 input,
                 2,
                 h,

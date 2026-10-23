@@ -191,7 +191,8 @@ pub fn spec_think_for(
 /// [`spec_dispatch_eligible`] for one active sequence. A strict
 /// (`response_format`) grammar bars speculation like `disable_mtp` (see
 /// `ActiveSeq::strict_grammar`) unless `strict_spec`: the run masks every
-/// verify row of a strict sequence (`scheduler::strict_spec`).
+/// verify row of a strict sequence (`scheduler::strict_spec`), except the
+/// union's branch token (`ActiveSeq::grammar_branch_pending`).
 pub(super) fn seq_spec_eligible(
     a: &super::ActiveSeq,
     spec_think: bool,
@@ -204,7 +205,7 @@ pub(super) fn seq_spec_eligible(
         a.post_think_emitted,
         a.output_tokens.len() as u32,
         a.suppress_tool_call,
-        a.disable_mtp || (a.strict_grammar() && !strict_spec),
+        a.disable_mtp || (a.strict_grammar() && !strict_spec) || a.grammar_branch_pending(),
         spec_think,
         resume_guard,
         dflash_raw_argmax,
@@ -290,6 +291,9 @@ pub struct MtpGate {
     win_tokens: f64,
     win_wall: f64,
     win_steps: usize,
+    /// A new batch width needs a full window before cadence can shorten it.
+    /// Bootstrap/capture cost stays charged, but cannot become a one-step EWMA.
+    require_full_window: bool,
     /// Consecutive closed windows where the other mode beat this one by
     /// more than the margin.
     losing_windows: usize,
@@ -348,6 +352,7 @@ impl MtpGate {
             win_tokens: 0.0,
             win_wall: 0.0,
             win_steps: 0,
+            require_full_window: false,
             losing_windows: 0,
             tokens_since_event: 0,
             observed_depth: 0,
@@ -455,6 +460,7 @@ impl MtpGate {
             self.win_tokens = 0.0;
             self.win_wall = 0.0;
             self.win_steps = 0;
+            self.require_full_window = true;
             self.losing_windows = 0;
             // In the NEW regime's units (`event_interval` scales with it).
             self.tokens_since_event = self.tokens_since_event.max(self.event_interval());
@@ -494,7 +500,10 @@ impl MtpGate {
         }
         if self.win_steps >= WINDOW_STEPS {
             self.close_window();
-        } else if !self.probing && self.tokens_since_event >= self.event_interval() {
+        } else if !self.probing
+            && !self.require_full_window
+            && self.tokens_since_event >= self.event_interval()
+        {
             // Time to look at the other mode: finish the current window
             // early so the probe starts on a clean accumulator.
             self.close_window();
@@ -515,6 +524,7 @@ impl MtpGate {
         self.win_tokens = 0.0;
         self.win_wall = 0.0;
         self.win_steps = 0;
+        self.require_full_window = false;
 
         if self.probing {
             self.probe_windows_left = self.probe_windows_left.saturating_sub(1);
@@ -611,3 +621,6 @@ pub mod qsa_latch;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod regime_tests;

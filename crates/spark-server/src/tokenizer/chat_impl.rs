@@ -3,10 +3,10 @@
 //! `impl ChatTokenizer` body.
 
 use anyhow::Result;
-use std::path::Path;
-use tokenizers::Tokenizer;
 
 mod glm5_vision;
+mod glm_tool_markup;
+mod load;
 mod vision_markup;
 
 use super::{
@@ -42,110 +42,29 @@ pub(crate) fn preprocess_for_render(
 }
 
 impl ChatTokenizer {
-    pub fn from_model_dir(
-        model_dir: &Path,
-        eos_token_id: u32,
-        supports_thinking: bool,
-        model_type: &str,
-        // MODEL.toml `[behavior].jinja_template`; empty = derive from
-        // `model_type`.
-        template_override: &str,
-        repo_root: Option<&Path>,
-        disable_template_overrides: bool,
-    ) -> Result<Self> {
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-        tokenizer
-            .with_truncation(None)
-            .map_err(|e| anyhow::anyhow!("Failed to disable tokenizer truncation: {e}"))?;
-
-        // Template-source priority.
-        //
-        // Conceptually the default is now MODEL-FIRST: render off the
-        // model's OWN `chat_template.jinja` / `tokenizer_config.json`.
-        // Atlas's cross-cutting behaviors (autoclose-think,
-        // think-control, F76 arg-parse) are applied in Rust
-        // message-preprocessing (see `preprocess_for_render`), so a model
-        // no longer needs a bespoke `jinja-templates/{model_type}.jinja`
-        // override that is otherwise a byte-copy of its own template.
-        // This is what makes `holo3_1_moe.jinja` REDUNDANT: Holo renders
-        // correctly off its own template + Rust behaviors. (The override
-        // file itself is still present for now only because
-        // `tokenizer/tests.rs::render_holo_template_*` reads it directly;
-        // it goes away together with those tests.)
-        //
-        // A `jinja-templates/{model_type}.jinja` override is OPT-IN by
-        // FILE PRESENCE: dropping the file in is the explicit signal that
-        // this model genuinely needs a template fix the Rust preprocessing
-        // can't express (MiniMax's `_args.items()`, Gemma-4's
-        // `strip_thinking`, etc.). We deliberately do NOT prefer the
-        // model's own template when such a file exists — that would
-        // silently undo those fixes. Instead, the operator opts OUT of all
-        // overrides with `--disable-template-overrides`, which forces
-        // every model onto its own template (relying purely on the Rust
-        // behaviors).
-        //
-        // Priority (high → low):
-        //   1. jinja-templates/<template> override, where <template> is
-        //      MODEL.toml [behavior].jinja_template when set and
-        //      {model_type}.jinja otherwise
-        //      (opt-in: file present AND overrides not disabled)
-        //   2. tokenizer_config.json / chat_template.jinja (the MODEL's own)
-        //   3. Default ChatML fallback
-        let override_tmpl = if disable_template_overrides {
-            None
-        } else {
-            super::jinja_helpers::load_override_template(model_type, template_override, repo_root)
-        };
-        let chat_template = if let Some(override_tmpl) = override_tmpl {
-            override_tmpl
-        } else if let Some(config_tmpl) = super::jinja_helpers::load_config_template(model_dir)? {
-            config_tmpl
-        } else {
-            tracing::warn!("No chat template found — using default ChatML");
-            super::jinja_helpers::default_chatml_template(supports_thinking)
-        };
-
-        let jinja_env = super::jinja_helpers::build_jinja_env(&chat_template)?;
-
-        // Load OpenAI-variant template if it exists (jinja-templates/openai/{model_type}.jinja).
-        // This variant gates historical <think> wrappers on enable_thinking, preventing
-        // spontaneous thinking during tool-use when thinking is disabled.
-        let openai_jinja_env = super::jinja_helpers::load_openai_template(model_type, repo_root)
-            .and_then(|tmpl| {
-                tracing::info!("Loaded OpenAI-variant Jinja template for {model_type}");
-                super::jinja_helpers::build_jinja_env(&tmpl).ok()
-            });
-        let chat_encoding = if model_type == "deepseek_v4" {
-            tracing::info!("Using checkpoint-native DeepSeek-V4 message encoding");
-            ChatEncoding::DeepseekV4
-        } else {
-            ChatEncoding::Jinja
-        };
-
-        tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
-        Ok(Self {
-            tokenizer,
-            eos_token_id,
-            supports_thinking,
-            chat_encoding,
-            chat_template,
-            jinja_env,
-            openai_jinja_env,
-        })
-    }
-
     /// Returns a borrowed reference to the underlying HF tokenizer (for
     /// callers that need to drive low-level encode/decode directly).
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.tokenizer
     }
 
+    /// Legacy ChatML output filtering is not compatible with literal XML:
+    /// an ordinary BPE token "tool" may be part of a quoted tag or prose.
+    /// GLM and Qwen4 preserve these bytes; native role delimiters still stop
+    /// generation in the scheduler. Keep other ChatML models unchanged.
+    pub(crate) fn filters_bare_role_literals(&self) -> bool {
+        !self.glm_tool_markup_as_text && self.tokenizer.token_to_id("<|im_start|>").is_some()
+    }
+
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, false)
+        // HF's normalized splits/offsets can consume hundreds of MiB for a
+        // long prompt. Acquire before touching the tokenizer and retain the
+        // permit until the Encoding is dropped, including on error/unwind.
+        let _permit = self
+            .large_encode_gate
+            .as_ref()
+            .and_then(|gate| gate.acquire(text.len()));
+        let encoding = super::ids_only::encode(&self.tokenizer, text, self.ids_only)
             .map_err(|e| anyhow::anyhow!("Tokenizer encode error: {e}"))?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -270,7 +189,6 @@ impl ChatTokenizer {
                 reasoning_effort,
                 preserve_thinking,
                 allow_continue_final: true,
-                empty_think_off: false,
             },
         )?;
 
@@ -305,12 +223,9 @@ impl ChatTokenizer {
             disable_tool_steering,
             None,
             None,
-            false,
         )
     }
 
-    /// `empty_think_off`: see `chat_render::RenderFlags::empty_think_off`
-    /// (OpenAI-variant templates only).
     pub fn apply_chat_template_openai_with_effort(
         &self,
         messages: &[serde_json::Value],
@@ -319,7 +234,6 @@ impl ChatTokenizer {
         disable_tool_steering: bool,
         reasoning_effort: Option<&str>,
         preserve_thinking: Option<bool>,
-        empty_think_off: bool,
     ) -> Result<Vec<u32>> {
         if self.chat_encoding == ChatEncoding::DeepseekV4 {
             return self.apply_chat_template_jinja_with_effort(
@@ -345,7 +259,6 @@ impl ChatTokenizer {
                     reasoning_effort,
                     preserve_thinking,
                     allow_continue_final: false,
-                    empty_think_off,
                 },
             )
             .map_err(|e| anyhow::anyhow!("Failed to render OpenAI Jinja template: {e}"))?;

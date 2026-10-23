@@ -103,6 +103,7 @@ pub(super) fn try_fused_chunk(
         spec.num_drafts,
         verify_ctx,
         spec.dflash_verify_raw_argmax,
+        &[],
         &mut |rows, tokens, seqs| {
             let (logits, ids) = model.prefill_chunk_with_glm_owner_rows(
                 &p.prompt_tokens,
@@ -129,7 +130,10 @@ pub(super) fn try_fused_chunk(
                     p.top_k,
                     p.top_p,
                     p.min_p,
-                    &p.eos_tokens,
+                    &crate::scheduler::min_tokens_ban::first_token_suppress(
+                        &p.eos_tokens,
+                        p.min_tokens,
+                    ),
                     p.grammar_state.as_mut(),
                     &sched.levers.sampling(),
                 ));

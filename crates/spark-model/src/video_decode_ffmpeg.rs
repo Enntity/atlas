@@ -57,7 +57,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::video_sample::{grid_step, sample_plan, wanted_frames};
 
+mod frames;
 mod probe;
+pub use frames::{decode_frame_indices, probe_frames};
 use probe::probe_duration;
 
 /// Operator policy for subprocess decoding.
@@ -179,8 +181,31 @@ pub struct ClipTiming {
     /// Duration in seconds, from the container.
     pub duration_secs: f32,
     /// The video stream's own rate: an average when the container declares
-    /// one, otherwise the instantaneous rate. Used only to plan coverage.
-    pub native_fps: f32,
+    /// one, otherwise the instantaneous rate.
+    pub native_fps: f64,
+    /// The stream's declared frame count (`nb_frames`), when it has one.
+    pub frame_count: Option<u64>,
+}
+
+/// Refuse before probing when subprocess decoding is off or its binary
+/// cannot run. Checked BEFORE the clip is probed: otherwise a missing binary
+/// surfaces as an unprobeable clip, which sends the operator hunting for a
+/// corrupt video when the real fix is to install ffmpeg. `probe` names the
+/// binary and the remedy.
+fn ensure_decoder(policy: &FfmpegPolicy) -> Result<()> {
+    ensure!(
+        policy.enabled,
+        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
+         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
+    );
+    if let Availability::Missing(detail) = probe(policy) {
+        anyhow::bail!(
+            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
+             could not run) — install ffmpeg with its ffprobe companion, or point \
+             --video-ffmpeg-path at a usable build"
+        );
+    }
+    Ok(())
 }
 
 /// Decode `bytes` to RGB frames spanning the clip, plus the plan that
@@ -195,22 +220,7 @@ pub fn decode_with_plan(
     target_fps: f32,
     policy: &FfmpegPolicy,
 ) -> Result<(Vec<RgbImage>, Vec<f32>)> {
-    ensure!(
-        policy.enabled,
-        "this container needs ffmpeg to decode and subprocess decoding is disabled; \
-         pass --video-allow-ffmpeg to enable it, or send an animated GIF"
-    );
-    // Check the decoder BEFORE probing the clip. Otherwise a missing binary
-    // surfaces as an unprobeable clip, which sends the operator hunting for a
-    // corrupt video when the real fix is to install ffmpeg. `probe` names the
-    // binary and the remedy.
-    if let Availability::Missing(detail) = probe(policy) {
-        anyhow::bail!(
-            "the ffmpeg decoder is not usable: {detail} (no ffmpeg installed at that path, or it \
-             could not run) — install ffmpeg with its ffprobe companion, or point \
-             --video-ffmpeg-path at a usable build"
-        );
-    }
+    ensure_decoder(policy)?;
     // A caller that passes a usable rate wins; anything else falls back to the
     // policy's, which is the operator's SSOT for video sampling.
     let policy_fps = crate::video_sample::finite_positive(policy.fps)
@@ -224,7 +234,7 @@ pub fn decode_with_plan(
     let timing = probe_duration(bytes, policy)?;
     let want = wanted_frames(
         timing.duration_secs,
-        timing.native_fps,
+        timing.native_fps as f32,
         fps,
         policy.max_frames,
         fps,
@@ -238,7 +248,7 @@ pub fn decode_with_plan(
     // bound the operator's `fps` represents is enforced by how MANY samples
     // the plan asks for, not by ffmpeg dropping the rest — which is exactly
     // the distinction the old `fps=` filter could not make.
-    let native = crate::video_sample::finite_positive(timing.native_fps).unwrap_or(fps);
+    let native = crate::video_sample::finite_positive(timing.native_fps as f32).unwrap_or(fps);
     let step = grid_step(native, fps, fps);
     // `fps=A/B` samples one frame every `B/A` seconds, so the frame the
     // selector names for index K is the grid frame at time `K × B/A`.
@@ -271,26 +281,57 @@ fn run_ffmpeg(
         plan.select_filter(),
         px = policy.max_decoded_pixels.max(1),
     );
+    let out = spawn_ffmpeg(
+        bytes,
+        &filter,
+        plan.len(),
+        &["-vcodec", "png"],
+        policy,
+        |stdout| {
+            // Read with a hard cap. `take` bounds it without trusting the child.
+            let mut out = Vec::new();
+            stdout
+                .take(policy.max_output_bytes as u64 + 1)
+                .read_to_end(&mut out)
+                .context("reading decoded frames")?;
+            ensure!(
+                out.len() <= policy.max_output_bytes,
+                "decoded output exceeded the {}-byte cap",
+                policy.max_output_bytes
+            );
+            Ok(out)
+        },
+    )?;
+    let frames = split_png_stream(&out)?;
+    ensure!(
+        !frames.is_empty(),
+        "the container decoded to zero frames (is there a video stream?)"
+    );
+    Ok(frames)
+}
 
+/// Run ffmpeg over `bytes` with `filter`, at most `frames` frames out in the
+/// `output` codec on an image pipe, and hand its stdout to `read`.
+///
+/// A `read` error kills the child before anything else: once the reader
+/// stops, the child blocks writing into a full pipe and never closes stderr,
+/// and a `read_to_string` on stderr would then wait for an EOF only the
+/// watchdog causes. Killing turns a 120-second hang into an immediate error.
+fn spawn_ffmpeg<T>(
+    bytes: &[u8],
+    filter: &str,
+    frames: usize,
+    output: &[&str],
+    policy: &FfmpegPolicy,
+    read: impl FnOnce(&mut std::process::ChildStdout) -> Result<T>,
+) -> Result<T> {
     let mut child = Command::new(&policy.binary)
-        .args([
-            "-v",
-            "error",
-            // Never touch a terminal: without this ffmpeg can block on a
-            // prompt when it thinks stdin is interactive.
-            "-nostdin",
-            "-i",
-            "pipe:0",
-            "-vf",
-            &filter,
-            "-frames:v",
-            &plan.len().to_string(),
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ])
+        // Never touch a terminal: without `-nostdin` ffmpeg can block on a
+        // prompt when it thinks stdin is interactive.
+        .args(["-v", "error", "-nostdin", "-i", "pipe:0", "-vf", filter])
+        .args(["-frames:v", &frames.to_string()])
+        .args(output)
+        .args(["-f", "image2pipe", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -343,21 +384,10 @@ fn run_ffmpeg(
         })
     };
 
-    // Read with a hard cap. `take` bounds it without trusting the child.
-    let mut out = Vec::new();
-    let read_res = (&mut stdout)
-        .take(policy.max_output_bytes as u64 + 1)
-        .read_to_end(&mut out);
-
-    // KILL FIRST, then drain stderr. Order matters and getting it wrong
-    // deadlocks: once the cap is hit we stop reading stdout, so the child
-    // blocks writing into a full pipe and never closes stderr — and a
-    // `read_to_string` on stderr then waits for an EOF that only the watchdog
-    // will ever cause. Killing here turns a 120-second hang into an immediate
-    // error. (Draining stdout instead would defeat the cap, which is the
-    // thing being enforced.)
-    let over_cap = out.len() > policy.max_output_bytes;
-    if over_cap && let Ok(mut g) = child.lock() {
+    let read_res = read(&mut stdout);
+    if read_res.is_err()
+        && let Ok(mut g) = child.lock()
+    {
         let _ = g.kill();
     }
 
@@ -373,28 +403,17 @@ fn run_ffmpeg(
     };
     let timed_out = watchdog.join().unwrap_or(false);
 
-    read_res.context("reading decoded frames")?;
     ensure!(
         !timed_out,
         "decoding exceeded {}s and was stopped",
         policy.timeout_secs
     );
-    ensure!(
-        !over_cap,
-        "decoded output exceeded the {}-byte cap",
-        policy.max_output_bytes
-    );
+    let out = read_res?;
     if !status.success() {
         let why = err_text.lines().next_back().unwrap_or("no detail").trim();
         bail!("decoder failed: {why}");
     }
-
-    let frames = split_png_stream(&out)?;
-    ensure!(
-        !frames.is_empty(),
-        "the container decoded to zero frames (is there a video stream?)"
-    );
-    Ok(frames)
+    Ok(out)
 }
 
 /// Split a concatenated PNG stream into images.

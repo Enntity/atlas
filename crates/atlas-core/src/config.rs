@@ -527,6 +527,12 @@ pub struct ModelConfig {
     /// per MoE layer).
     #[serde(default)]
     pub use_routing_bias: bool,
+    /// The MoE router's logits stay FP32 into top-k (`moe_router_dtype:
+    /// "float32"`, GLM-5): BF16 operands, FP32 accumulation and an unrounded
+    /// FP32 logit, as the reference's `GateLinear(out_dtype=float32)`.
+    /// False: the router stores BF16 logits.
+    #[serde(default)]
+    pub router_logits_f32: bool,
     /// QK normalization granularity. "" = none (Qwen3-Next default).
     /// "per_layer" = each attention layer has its own learned q_layernorm /
     /// k_layernorm weight of shape `[head_dim]`, applied after Q/K projection
@@ -735,11 +741,21 @@ pub struct QuantizationConfig {
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
-/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (`"NVFP4"`, `"MXFP8"`, `"W4A16_NVFP4"`, `"FP8_PB_WO"`, …) plus its scaling
+/// group when given.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
+    /// How the block scales are STORED, when not plainly: `"csf"` means each
+    /// `weight_scale` ships as a compressed `nvfp4_csf_fixed` +
+    /// `nvfp4_csf_exceptions` pair (nvidia Qwen FP4-Local's routed experts);
+    /// `"csf_32x2_v1"` as five `csf32_{bases,codes,page_bases,offsets,
+    /// exceptions}` components (nvidia GLM-5.3-Flash-FP4-Local's). The
+    /// safetensors loaders decode both at upload regardless of this field
+    /// (`spark_runtime::weights::nvfp4_csf`, `nvfp4_csf32`); it is read to
+    /// REPORT the format. Empty for plain scales.
+    pub weight_scale_encoding: String,
 }
 
 /// Whether a ModelOpt `quant_algo` label means NVFP4-packed weights.
@@ -803,7 +819,7 @@ pub(crate) use parsers::{
     parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
     parse_vision_config,
 };
-pub use vision::VisionConfig;
+pub use vision::{PixelBounds, VisionConfig, VisionTokenBudgets};
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
     if config.quantization_config.is_none() {

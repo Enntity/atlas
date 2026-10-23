@@ -8,7 +8,9 @@
 use crate::ir::StreamDelta;
 use crate::tool_parser;
 
-use super::super::stream_guards::{bump_f12_tool_call_count, flush_content_sanitizer};
+use super::super::stream_guards::{
+    bump_f12_tool_call_count, flush_content_sanitizer_with_literal_state,
+};
 use super::ctx::StreamCtx;
 use super::state::{PendingRetry, StreamState};
 
@@ -75,9 +77,10 @@ pub(super) fn handle_complete_tool_call(
     deltas: &mut DeltaVec,
 ) {
     // Content → Tool boundary: flush sanitiser tail.
-    let pre_tool_tail = flush_content_sanitizer(
+    let pre_tool_tail = flush_content_sanitizer_with_literal_state(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     if !pre_tool_tail.is_empty() {
@@ -245,9 +248,10 @@ pub(super) fn handle_tool_call_start(
     idx: usize,
     deltas: &mut DeltaVec,
 ) {
-    let pre_tool_tail = flush_content_sanitizer(
+    let pre_tool_tail = flush_content_sanitizer_with_literal_state(
         &mut state.tag_scan_buf,
         &mut state.suppressing_param_leak,
+        &mut state.literal_xml_state,
         &ctx.leak_markers,
     );
     if !pre_tool_tail.is_empty() {

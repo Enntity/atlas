@@ -9,7 +9,7 @@
 //! `glm_index_tail_write_bf16`, `glm_index_kpool_finalize_bf16` and
 //! `glm_kv_shard_localize_compact`) at GLM-5.3's shape, for every block of
 //! 1..=32 rows, starting mid-pool and mid-block, unsharded and on each rank
-//! of a sharded pair: the same q and kv latents, index keys and gates, fp8
+//! of a sharded pair or four-rank topology: the same q and kv latents, index keys and gates, fp8
 //! latent pool, raw tails, pooled keys and localized IDs, byte for byte.
 //!
 //!   cargo test --release -p spark-model --lib glm_mla_fuse -- --ignored --nocapture
@@ -29,7 +29,7 @@ const WIDTH: u32 = 2051;
 /// Logical blocks of the test sequence ([`physical`] places them): a
 /// whole dense-selection context (2048 tokens).
 const BLOCKS: u32 = 128;
-const PHYS: u32 = 3 * BLOCKS + 2;
+const PHYS: u32 = 5 * BLOCKS + 8;
 const TAIL_STRIDE: u64 = (2 * BS * ID * 2) as u64;
 const POOL_STRIDE: u64 = (BS / 4 * ID * 2) as u64;
 const LATENT_BLOCK: usize = (BS * 528) as usize;
@@ -37,7 +37,7 @@ const LATENT_BLOCK: usize = (BS * 528) as usize;
 /// Logical block `l`'s physical block: distinct, and with the residue of `l`
 /// (the shard allocator's invariant).
 fn physical(l: u32) -> u32 {
-    3 * l + 2 * (l % 2)
+    5 * l + 4 * (l % 3)
 }
 
 struct Rng(u64);
@@ -105,6 +105,7 @@ fn mx(gpu: &dyn GpuBackend, rng: &mut Rng, n: u32) -> Result<(DevicePtr, DeviceP
 
 /// The layer's weights, shared by both runs.
 struct Weights {
+    fp8_block: bool,
     q_a: (DevicePtr, DevicePtr),
     kv_a: (DevicePtr, DevicePtr),
     wk: DevicePtr,
@@ -117,10 +118,12 @@ struct Weights {
 }
 
 impl Weights {
-    fn new(gpu: &dyn GpuBackend, rng: &mut Rng) -> Result<Self> {
+    fn new(gpu: &dyn GpuBackend, rng: &mut Rng, fp8_block: bool) -> Result<Self> {
+        let weight = if fp8_block { native::weight } else { mx };
         Ok(Self {
-            q_a: mx(gpu, rng, QL)?,
-            kv_a: mx(gpu, rng, KVL)?,
+            fp8_block,
+            q_a: weight(gpu, rng, QL)?,
+            kv_a: weight(gpu, rng, KVL)?,
             wk: upload(gpu, &bf16_bytes((ID * H) as usize, rng, 0.02, 0.0))?,
             gate: upload(gpu, &bf16_bytes((ID * H) as usize, rng, 0.02, 0.0))?,
             q_norm: upload(gpu, &bf16_bytes(QL as usize, rng, 0.25, 1.0))?,
@@ -274,126 +277,9 @@ fn kernel(gpu: &dyn GpuBackend, module: &str, name: &str) -> Result<KernelHandle
     Ok(k)
 }
 
-/// The twelve launches, as the canonical verify runs them.
-fn unfused(
-    gpu: &dyn GpuBackend,
-    w: &Weights,
-    run: &Run,
-    meta: &Meta,
-    input: DevicePtr,
-    rows: u32,
-    owner: ShardRank,
-    s: u64,
-) -> Result<()> {
-    let tier = |m: u32| match m {
-        1..=8 => "8",
-        9..=16 => "16",
-        _ => "32",
-    };
-    let mxk = kernel(gpu, "mxfp8_gemv", &format!("mxfp8_gemv_tc{}", tier(rows)))?;
-    let dk = kernel(
-        gpu,
-        "dense_gemv_bf16_batchm",
-        &format!("dense_gemv_bf16_tc{}", tier(rows)),
-    )?;
-    let norm = kernel(gpu, "glm_rms_norm_regs", "rms_norm_vanilla_regs")?;
-    let idx = |name| kernel(gpu, "glm_indexer", name);
-    let dw = |weight| DenseWeight { weight };
-    ops::mxfp8_gemv(gpu, mxk, input, w.q_a.0, w.q_a.1, run.q, rows, QL, H, QL, s)?;
-    ops::rms_norm(gpu, norm, run.q, &dw(w.q_norm), run.q, rows, QL, 1e-6, s)?;
-    ops::mxfp8_gemv(
-        gpu, mxk, input, w.kv_a.0, w.kv_a.1, run.kv, rows, KVL, H, KVL, s,
-    )?;
-    ops::rms_norm(
-        gpu,
-        norm,
-        run.kv,
-        &dw(w.kv_norm),
-        run.kv,
-        rows,
-        KVL,
-        1e-6,
-        s,
-    )?;
-    let v_entries = run.entries.offset(rows as usize * KVL as usize * 2);
-    let assemble = kernel(gpu, "mla_absorbed", "mla_cache_assemble_batched")?;
-    ops::mla_cache_assemble_batched(
-        gpu,
-        assemble,
-        run.kv,
-        DevicePtr::NULL,
-        run.entries,
-        v_entries,
-        rows,
-        KVL,
-        0,
-        KVL,
-        s,
-    )?;
-    let slots = if owner.world > 1 {
-        ops::glm_kv_shard_map_slots(gpu, meta.slots, run.local, rows, BS, owner, s)?;
-        run.local
-    } else {
-        meta.slots
-    };
-    let write = kernel(gpu, "reshape_and_cache", "glm_latent_cache_write_fp8g128")?;
-    ops::glm_latent_cache_write_fp8g128(
-        gpu,
-        write,
-        run.entries,
-        run.latent,
-        slots,
-        rows,
-        BS,
-        KVL,
-        s,
-    )?;
-    ops::dense_gemv_bf16_tc(gpu, dk, input, &dw(w.wk), run.keys, rows, ID, H, ID, s)?;
-    let ln = idx("glm_index_layernorm_bf16")?;
-    ops::glm_index_layernorm(gpu, ln, run.keys, w.k_norm_w, w.k_norm_b, rows, ID, 1e-6, s)?;
-    ops::dense_gemv_bf16_tc(gpu, dk, input, &dw(w.gate), run.gates, rows, ID, H, ID, s)?;
-    let tail = idx("glm_index_tail_write_bf16")?;
-    let (keys, gates, tm) = (run.keys, run.gates, DevicePtr::NULL);
-    ops::glm_index_tail_write(
-        gpu,
-        tail,
-        keys,
-        gates,
-        run.tail,
-        tm,
-        meta.slots,
-        rows,
-        BS,
-        4,
-        ID,
-        TAIL_STRIDE,
-        s,
-    )?;
-    let fin = idx("glm_index_kpool_finalize_bf16")?;
-    ops::glm_index_kpool_finalize(
-        gpu,
-        fin,
-        run.tail,
-        tm,
-        w.ape,
-        run.pool,
-        meta.slots,
-        rows,
-        BS,
-        4,
-        ID,
-        TAIL_STRIDE,
-        POOL_STRIDE,
-        s,
-    )?;
-    if owner.world > 1 {
-        let (ids, counts) = (run.ids, run.counts);
-        ops::glm_kv_shard_localize(
-            gpu, None, ids, counts, meta.table, rows, WIDTH, BS, owner, meta.start, s,
-        )?;
-    }
-    Ok(())
-}
+#[path = "glm_mla_fuse_test_reference.rs"]
+mod reference;
+use reference::unfused;
 
 /// The two launches.
 fn fused(
@@ -414,6 +300,7 @@ fn fused(
         n,
     };
     let down = DownArgs {
+        fp8_block: w.fp8_block,
         input,
         rows,
         k: H,
@@ -464,17 +351,25 @@ fn fused(
 #[test]
 #[ignore = "needs a GB10 and the glm-5.3-flash kernels"]
 fn fused_front_matches_the_twelve_launches() -> Result<()> {
+    compare_front(false)
+}
+
+fn compare_front(fp8_block: bool) -> Result<()> {
     let gpu = backend()?;
     let f = MlaFuse::load(gpu).context("glm_mla_fuse kernels")?;
     let s = gpu.default_stream();
     let mut rng = Rng(0x6d6c_6166_7573_6501);
-    let w = Weights::new(gpu, &mut rng)?;
+    let w = Weights::new(gpu, &mut rng, fp8_block)?;
     let owners = [
         ShardRank { rank: 0, world: 1 },
         ShardRank { rank: 0, world: 2 },
         ShardRank { rank: 1, world: 2 },
+        ShardRank { rank: 0, world: 4 },
+        ShardRank { rank: 1, world: 4 },
+        ShardRank { rank: 2, world: 4 },
+        ShardRank { rank: 3, world: 4 },
     ];
-    for rows in (1..=32).filter(|r| *r <= 8 || r % 4 == 0 || [9, 17, 31].contains(r)) {
+    for rows in 1..=32 {
         let (a, b) = (Run::new(gpu, rows)?, Run::new(gpu, rows)?);
         // Mid-pool and mid-block starts, and a block ending at 2048.
         for start in [29u32, 64, 126, 2016 - rows.min(16)] {
@@ -519,7 +414,10 @@ fn fused_front_matches_the_twelve_launches() -> Result<()> {
         b.free(gpu)?;
     }
     eprintln!(
-        "fused MLA front == twelve launches: rows 1..=32 x 4 starts x unsharded/rank 0/rank 1"
+        "fused MLA front == twelve launches: rows 1..=32 x 4 starts x unsharded/all TP2 ranks/all TP4 ranks"
     );
     Ok(())
 }
+
+#[path = "glm_mla_fuse_test_native.rs"]
+mod native;

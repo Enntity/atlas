@@ -7,6 +7,22 @@ use super::*;
 mod vision_dispatch;
 use vision_dispatch::dispatch_chunk0_vision;
 
+/// What `start_chunked_prefill` does with a request's first chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstChunk {
+    /// Run it now, and sample the first token when it is the whole prompt.
+    Inline,
+    /// Co-dispatch, VARLEN, always-mixed fuse or multi-prompt prefill: set
+    /// up, and send the EP worker its chunk-0 command now (the batched step
+    /// does not; the multi pass sends its own), but leave the chunk to a
+    /// batched step.
+    Defer,
+    /// `ATLAS_PREFILL_QUEUE_FIRST_CHUNK`: set up, but send no prefill
+    /// command; the continue phase sends and runs the chunk when the prompt
+    /// reaches the head of the queue (`phase_continue_prefills::queued_first`).
+    Queue,
+}
+
 /// Start a chunked prefill: process chunk 0, return result.
 pub fn start_chunked_prefill(
     sched: &crate::scheduler::sched_ctx::SchedCtx,
@@ -22,12 +38,15 @@ pub fn start_chunked_prefill(
     prefill_event: u64,
     grammar_engine: &mut Option<GrammarEngine>,
     spontaneous_think_budget: u32,
-    // Co-dispatch: when true, do all per-request setup (grammar/sink/seq
-    // alloc/EP broadcast) but SKIP the inline chunk-0 prefill + first-token
-    // sampling, returning `InProgress { chunk_offset: 0 }` so >=2 concurrent
-    // streams batch into one `run_batched_prefill_step` forward. Vision is
-    // excluded upstream (PrefillInProgress carries no pixel state).
-    defer: bool,
+    // Not `Inline`: do all per-request setup (grammar/sink/seq alloc/EP
+    // setup broadcast) but SKIP the inline chunk-0 prefill + first-token
+    // sampling, returning `InProgress { chunk_offset: 0 }` — `Defer` so >=2
+    // concurrent streams batch into one `run_batched_prefill_step` forward,
+    // `Queue` so the chunk waits for its turn. Vision is excluded upstream
+    // (PrefillInProgress carries no pixel state).
+    first_chunk: FirstChunk,
+    // Packed GLM passes own the worker prompt dispatch.
+    packed: bool,
     // Vision co-dispatch: when Some, this request's images were already encoded
     // (batched with other requests) into the shared buf_out; skip the per-request
     // encode and instead set the per-stream slice base around the chunk-0 splice.
@@ -125,13 +144,30 @@ pub fn start_chunked_prefill(
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
         req_enable_thinking && think_end_token.is_some(),
+        first_token_thinking::native_opener(
+            sched.limits.glm_tool_boundary,
+            req_tools_present,
+            tool_call_start_token,
+        ),
+        tool_call_start_token,
         &mut sink,
     )?;
 
     let request_start = Instant::now();
     let total = prompt_tokens.len();
-    let chunk_len = total.min(max_prefill_tokens);
-    let is_last = chunk_len >= total;
+    let mut chunk_len = total.min(max_prefill_tokens);
+    let mut is_last = chunk_len >= total;
+    if is_last {
+        (chunk_len, is_last) = super::sp_final_cut(chunk_len, model.prefill_row_multiple());
+    }
+    // A first chunk that is not the prompt's last lands on the GDN WY4
+    // boundary like every later one (`run_standard`): the idle budget is the
+    // arena, `max_prefill_tokens + max_batch_size`, and an odd one (TP4's
+    // one sequence: 8193) would keep sequence-parallel prefill, which splits
+    // the rows over every rank, off the chunk.
+    if !is_last {
+        chunk_len = super::chunk_align(chunk_len, model.prefill_row_multiple());
+    }
 
     tracing::info!(
         "Chunked prefill start: {} prompt tokens, chunk_size={}, max_tokens={max_tokens}",
@@ -151,6 +187,7 @@ pub fn start_chunked_prefill(
             return Err(e);
         }
     };
+    super::ttft_trace::admit(&prompt_tokens, seq.slot_idx);
     // Carry the request-local native-decode fence into model-owned state so
     // prefill hooks cannot touch shared MTP capture/eager-drafter state.
     seq.disable_mtp = req_disable_mtp;
@@ -288,14 +325,28 @@ pub fn start_chunked_prefill(
     // Deferred co-dispatch: setup + EP broadcast, then return InProgress at
     // chunk 0 WITHOUT prefilling — the batched step packs >=2 streams into one
     // forward. Vision is excluded upstream, so no chunk-0 embedding injection.
-    if defer {
+    if first_chunk != FirstChunk::Inline {
         debug_assert!(
             image_pixels.is_empty(),
             "vision must be excluded from co-dispatch"
         );
+        // ATLAS_QWEN4EXP_PREFILL_MULTI: the multi pass sends the worker this
+        // prompt (`super::prefill_multi`), so no prefill command here.
+        let multi = first_chunk == FirstChunk::Defer
+            && super::prefill_multi::eligible(
+                model,
+                prompt_tokens.len(),
+                is_last,
+                req_prompt_logprobs.is_some(),
+                req_adapter_slot,
+            );
+        // Queued: the command goes out when the chunk runs, so the worker
+        // sees every chunk command in the order the head runs the chunks.
+        let queue = first_chunk == FirstChunk::Queue;
         if let Err(e) = (|| -> Result<()> {
             // EP: broadcast chunk 0 to worker (no-op on single-GPU; the batched
-            // step does NOT re-broadcast, so this stays the only broadcast site).
+            // step does NOT re-broadcast, so this stays the only broadcast site
+            // for a deferred chunk; a queued one sends it when it runs).
             model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
             model.ep_broadcast_vision_state_for_seq(
                 &seq,
@@ -307,74 +358,82 @@ pub fn start_chunked_prefill(
                 0,
             )?;
             plant_chunk0(model, &mut seq, pc_plant)?;
-            model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-            model.ep_broadcast_cmd(chunk_len as u32)?;
-            model.ep_broadcast_cmd(0)?; // chunk_start
-            model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-            model.ep_broadcast_tokens(&prompt_tokens)?;
-            Ok(())
+            if packed || multi || queue {
+                return Ok(());
+            }
+            send_first_chunk(model, &seq, chunk_len, &prompt_tokens)
         })() {
             let msg = format!("deferred prefill EP broadcast failed: {e:#}");
             send_error_to_sink(&mut sink, &msg);
             if let Err(fe) = model.free_sequence(&mut seq) {
                 tracing::error!("prefill_a_step: free_sequence (deferred broadcast error): {fe:#}");
             }
+            // The worker may hold part of the setup: free its slot too, as
+            // the inline path does after a failed chunk.
+            if let Err(be) = model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF1) {
+                tracing::error!("prefill_a_step: ep_broadcast (deferred broadcast error): {be:#}");
+            }
             return Err(e);
         }
         // chunk_offset = 0 (deferred co-dispatch: nothing prefilled yet).
-        return Ok(StartPrefillResult::InProgress(
-            super::prefill_a_step_params::build_prefill_in_progress(
-                prompt_tokens,
-                req_session_hash,
-                seq,
-                0,
-                max_tokens,
-                req_min_tokens,
-                eos_tokens.to_vec(),
-                sink,
-                cancel_flag,
-                request_start,
-                temperature,
-                top_k,
-                top_p,
-                top_n_sigma,
-                min_p,
-                repetition_penalty,
-                presence_penalty,
-                frequency_penalty,
-                req_lz_penalty,
-                dry_multiplier,
-                dry_base,
-                dry_allowed_length,
-                logit_bias,
-                req_enable_thinking,
-                req_thinking_budget,
-                req_repetition_detection,
-                spontaneous_think_budget,
-                req_require_tool_call,
-                req_tools_present,
-                req_suppress_tool_call,
-                req_disable_mtp,
-                grammar_state,
-                req_seed,
-                req_top_logprobs,
-                req_timeout_at,
-            ),
-        ));
+        let mut p = super::prefill_a_step_params::build_prefill_in_progress(
+            prompt_tokens,
+            req_session_hash,
+            seq,
+            0,
+            max_tokens,
+            req_min_tokens,
+            eos_tokens.to_vec(),
+            sink,
+            cancel_flag,
+            request_start,
+            temperature,
+            top_k,
+            top_p,
+            top_n_sigma,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            frequency_penalty,
+            req_lz_penalty,
+            dry_multiplier,
+            dry_base,
+            dry_allowed_length,
+            logit_bias,
+            req_enable_thinking,
+            req_thinking_budget,
+            req_repetition_detection,
+            spontaneous_think_budget,
+            req_require_tool_call,
+            req_tools_present,
+            req_suppress_tool_call,
+            req_disable_mtp,
+            grammar_state,
+            req_seed,
+            req_top_logprobs,
+            req_timeout_at,
+        );
+        p.multi = multi;
+        p.queued_first_chunk = queue.then_some(chunk_len);
+        return Ok(StartPrefillResult::InProgress(p));
     }
 
+    let mut image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     // Guard: free SSM slot on any error after allocation.
     let prefill_result = (|| -> Result<DevicePtr> {
         // Vision: encode images and store embeddings for chunk 0 token overwrite.
         // Skipped when the images were already batch-encoded by the co-dispatch
         // pre-pass (vision_slice.is_some()) — that path runs ONE encode + fence
         // for the whole tick; here we only set the per-stream slice base below.
-        if vision_slice.is_none() && !image_pixels.is_empty() {
+        if vision_slice.is_none() && has_images {
             // A model that caches vision prompts encodes inside the chunk-0
             // prefix lookup instead, and only the items it does not cover.
             // The images move onto `seq` (per-sequence vision state): two
             // image prompts can now interleave prefill chunks.
-            model.prepare_vision_embed_for_chunked(&mut seq, &image_pixels)?;
+            // Moved, not copied: the sequence holds the request's only copy
+            // of the pixels (and the in-flight permits they carry).
+            model.prepare_vision_embed_for_chunked(&mut seq, std::mem::take(&mut image_pixels))?;
             // prepare_vision_embed() runs the vision encoder asynchronously on
             // the default stream, writing this request's patch embeddings into
             // the encoder's buf_out. The chunk-0 embedding injection inside
@@ -398,25 +457,11 @@ pub fn start_chunked_prefill(
             seq.vision.rows_base = 0;
         }
 
-        dispatch_chunk0_vision(
-            model,
-            &mut seq,
-            vision_slice,
-            &image_pixels,
-            req_disable_mtp,
-        )?;
+        dispatch_chunk0_vision(model, &mut seq, vision_slice, has_images, req_disable_mtp)?;
         plant_chunk0(model, &mut seq, pc_plant)?;
-        // EP: broadcast chunk 0 tokens to worker.
-        // Send full prompt length + all tokens so worker can do
-        // identical Marconi prefix-cache lookups (bug #33 fix).
-        // Uses bulk broadcast (single NCCL op) instead of per-token broadcast
-        // which caused NCCL timeouts on long prompts (6K+ tokens = 6K+ broadcasts).
-        model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
-        model.ep_broadcast_cmd(chunk_len as u32)?;
-        model.ep_broadcast_cmd(0)?; // chunk_start
-        model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
-        model.ep_broadcast_tokens(&prompt_tokens)?;
+        send_first_chunk(model, &seq, chunk_len, &prompt_tokens)?;
 
+        super::ttft_trace::mark(seq.slot_idx, super::ttft_trace::Mark::PrefillStart);
         let _pt0 = std::time::Instant::now();
         let chunk_res = model.prefill_chunk(
             &prompt_tokens,
@@ -426,12 +471,13 @@ pub fn start_chunked_prefill(
             is_last,
             prefill_stream,
         );
+        super::ttft_trace::mark(seq.slot_idx, super::ttft_trace::Mark::PrefillSubmitted);
         if std::env::var("ATLAS_VISION_TIMING").is_ok() {
             let _ = model.synchronize(prefill_stream);
             tracing::info!(
                 "VIT_TIMING prefill_chunk {} tok (img={}): {:.1}ms",
                 chunk_len,
-                vision_slice.is_some() || !image_pixels.is_empty(),
+                vision_slice.is_some() || has_images,
                 _pt0.elapsed().as_secs_f64() * 1000.0
             );
         }
@@ -526,7 +572,7 @@ pub fn start_chunked_prefill(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             p.grammar_state.as_mut(),
             &sched.levers.sampling(),
         ) {
@@ -554,6 +600,10 @@ pub fn start_chunked_prefill(
         };
 
         let spontaneous_think = !req_enable_thinking && think_start_token == Some(first);
+        super::ttft_trace::mark(
+            p.seq.slot_idx,
+            super::ttft_trace::Mark::FirstSampled(!spontaneous_think && max_tokens > 0),
+        );
         // Legacy echo+logprobs: hand prompt logprobs to a streaming client
         // BEFORE any token event (blocking carries them via finish_sequence).
         if req_prompt_logprobs.is_some()
@@ -596,6 +646,9 @@ pub fn start_chunked_prefill(
             req_require_tool_call && p.grammar_state.is_none() && tool_call_start_token.is_some();
         let immediate_finish =
             !spontaneous_think && (eos_tokens.contains(&first) || max_tokens <= 1);
+        if !spontaneous_think {
+            super::ttft_trace::visible_at_prefill(p.seq.slot_idx);
+        }
         let cached_prompt_tok = p.seq.cached_prefix_tokens as u32;
         // The promotion constructor builds the ActiveSeq, so a prompt that
         // fits one chunk decodes under the same min_tokens end-token ban as a
@@ -624,6 +677,25 @@ pub fn start_chunked_prefill(
     } else {
         Ok(StartPrefillResult::InProgress(p))
     }
+}
+
+/// EP: send the worker a prompt's chunk-0 command (a no-op on one GPU).
+/// Sends the full prompt length + all tokens so the worker can do identical
+/// Marconi prefix-cache lookups (bug #33 fix). Uses bulk broadcast (single
+/// NCCL op) instead of per-token broadcast, which caused NCCL timeouts on
+/// long prompts (6K+ tokens = 6K+ broadcasts).
+pub(super) fn send_first_chunk(
+    model: &dyn Model,
+    seq: &SequenceState,
+    chunk_len: usize,
+    prompt_tokens: &[u32],
+) -> Result<()> {
+    model.ep_broadcast_cmd_for_seq(seq.slot_idx as u32, 0xFFFFFFF0)?;
+    model.ep_broadcast_cmd(chunk_len as u32)?;
+    model.ep_broadcast_cmd(0)?; // chunk_start
+    model.ep_broadcast_cmd(prompt_tokens.len() as u32)?; // full prompt length
+    model.ep_broadcast_tokens(prompt_tokens)?;
+    Ok(())
 }
 
 /// Plant the requested shared-prefix checkpoint (`shared_prefix`) in a

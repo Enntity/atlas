@@ -9,9 +9,9 @@
 //! the verify forward of that one token (`decode_verify_graphed_kgamma_dispatch`:
 //! the MLA prefill lane, the verify KDA recurrence and the canonical kernels),
 //! commits it (`commit_accepted_prefix(1, 1)`, a no-op unless KDA records),
-//! and completes the split head's half-vocabulary logits row with the peer's
-//! half, so the sampler's first-index argmax picks the verify's token. Both
-//! ranks take it: the EP worker's decode runs the same function.
+//! and completes the split head's vocabulary row with every rank's shard,
+//! so the sampler's first-index argmax picks the verify's token. Every rank
+//! takes it: each EP worker's decode runs the same function.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
@@ -20,14 +20,51 @@ use super::super::types::TransformerModel;
 use crate::traits::SequenceState;
 
 impl TransformerModel {
-    /// Whether this model's plain decode is the canonical one-row verify:
-    /// GLM on the DFlash prefill-verify lane, the canonical kernels on, BF16
-    /// logits and the MXFP8 split verify head serving.
-    pub(super) fn decode_is_canonical_verify(&self) -> bool {
+    /// Native GLM MTP is admitted from rank-symmetric factory validation and
+    /// uses the same target arithmetic as DFlash without inheriting DFlash's
+    /// environment switches.
+    pub(super) fn native_glm_mtp_enabled(&self) -> bool {
+        self.native_glm_mtp
+    }
+
+    pub(super) fn canonical_glm_target_enabled(&self) -> bool {
+        if self.native_glm_mtp {
+            return self.native_canonical_target_ready();
+        }
         self.config.model_type == "glm5_next"
-            && crate::layers::canonical_verify::enabled()
             && crate::speculative::glm_repair_policy::dflash_enabled()
-            && crate::speculative::glm_repair_policy::dflash_prefill_verify()
+    }
+
+    /// Native MTP is a target lane, not a license to use the generic GLM
+    /// decode path. The target arithmetic requires the partitioned MXFP8
+    /// vocabulary projection and BF16 mHC highway on matching TP2/EP2 or
+    /// TP4/EP4 ranks. Factory startup validates the environment before NCCL; this runtime predicate keeps
+    /// every rank's dispatch fail-closed if a model is constructed directly.
+    pub(super) fn native_canonical_target_ready(&self) -> bool {
+        self.native_glm_mtp
+            && self.config.model_type == "glm5_next"
+            && self.comm.as_ref().is_some_and(|comm| {
+                crate::layers::glm_native::topology::supported_parallelism(
+                    comm.world_size(),
+                    self.config.tp_world_size,
+                    self.config.ep_world_size,
+                ) && comm.rank() < comm.world_size()
+                    && self.config.tp_rank == comm.rank()
+                    && self.config.ep_rank == comm.rank()
+            })
+            && crate::layers::canonical_verify::enabled()
+            && crate::layers::ops::hc_bf16_for("glm5_next")
+            && self.glm_split_head_mxfp8()
+    }
+
+    /// Whether this model's plain decode is the canonical one-row verify:
+    /// native GLM or DFlash on the canonical prefill-verify lane, both with
+    /// the released target MXFP8 split-head arithmetic.
+    pub(super) fn decode_is_canonical_verify(&self) -> bool {
+        self.canonical_glm_target_enabled()
+            && crate::layers::canonical_verify::enabled()
+            && (self.native_glm_mtp
+                || crate::speculative::glm_repair_policy::dflash_prefill_verify())
             && !self.use_fp32_logits
             && self.glm_split_head_mxfp8()
     }
@@ -40,13 +77,25 @@ impl TransformerModel {
         seq: &mut SequenceState,
         stream: u64,
     ) -> Result<Option<DevicePtr>> {
+        anyhow::ensure!(
+            !self.native_glm_mtp || self.native_canonical_target_ready(),
+            "native GLM MTP plain decode requires the canonical target path"
+        );
         if !self.decode_is_canonical_verify() {
             return Ok(None);
         }
         self.decode_verify_graphed_kgamma_dispatch(&[token], seq, stream, None)?;
         self.commit_accepted_prefix_dispatch(seq, 1, 1)?;
+        self.capture_native_mtp_serial(
+            seq,
+            token,
+            self.buffers.norm_output(),
+            self.gpu.default_stream(),
+        )?;
         self.sync_secondary_dispatch()?;
-        self.glm_split_head_full_row(self.gpu.default_stream())?;
+        if !self.native_glm_mtp {
+            self.glm_split_head_full_rows(1, self.gpu.default_stream())?;
+        }
         Ok(Some(self.buffers.logits()))
     }
 }

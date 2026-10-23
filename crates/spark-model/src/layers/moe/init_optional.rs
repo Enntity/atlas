@@ -7,6 +7,7 @@ use super::*;
 /// Kernels a target may not ship; each is `KernelHandle(0)` when absent or
 /// gated off, and the dispatch sites check the handle before launching.
 pub(super) struct OptionalKernels {
+    pub(super) w4a16_batch5_dual_k: KernelHandle,
     pub(super) moe_grouped_gemm_t_k64_m32: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale: KernelHandle,
@@ -16,6 +17,7 @@ pub(super) struct OptionalKernels {
     /// Persistent CTAs of the K128W `_persist` twins above when resolved,
     /// else 0.
     pub(super) k128w_persist_ctas: u32,
+    pub(super) down_e4m3: Option<DownE4m3>,
     pub(super) moe_mtile_prefix_k: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_compact: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale_compact: KernelHandle,
@@ -63,22 +65,26 @@ pub(super) fn router_gemv_batchm(
     config: &atlas_core::config::ModelConfig,
 ) -> KernelHandle {
     let module = "dense_gemv_bf16_batchm";
+    // FP32 router logits: the FP32-output twins.
+    let f32 = if config.router_logits_f32 { "_f32" } else { "" };
     let ahead = super::super::try_kernel_gated(
         config.model_type == "glm5_next"
             && config.num_experts.div_ceil(4) <= ops::DENSE_GEMV_AHEAD_MAX_CTAS as usize,
         gpu,
         module,
-        "dense_gemv_bf16_batchm_ahead",
+        &format!("dense_gemv_bf16_batchm_ahead{f32}"),
     );
     if ahead.0 != 0 {
         return ahead;
     }
-    super::super::try_kernel(gpu, module, "dense_gemv_bf16_batchm")
+    super::super::try_kernel(gpu, module, &format!("dense_gemv_bf16_batchm{f32}"))
 }
 
 impl OptionalKernels {
     pub(super) fn resolve(gpu: &dyn GpuBackend, config: &atlas_core::config::ModelConfig) -> Self {
-        let k128w = config.model_type == "glm5_next"
+        // These optional tiers are compiled only by the GLM target.
+        let glm = config.model_type == "glm5_next";
+        let k128w = glm
             && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
             && std::env::var("ATLAS_MOE_PREQUANT_K128W").as_deref() != Ok("0");
         let (t_k128w, gate_up_silu, k128w_persist_ctas) = k128w_kernels(
@@ -88,23 +94,32 @@ impl OptionalKernels {
             std::env::var("ATLAS_GLM_MOE_PREFILL_PERSIST").as_deref() == Ok("1"),
         );
         Self {
-            moe_grouped_gemm_t_k64_m32: super::super::try_kernel(
+            w4a16_batch5_dual_k: super::super::try_kernel_gated(
+                glm,
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch5_dual",
+            ),
+            moe_grouped_gemm_t_k64_m32: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_grouped_gemm_ptrtable_t_k64_m32",
             ),
-            moe_w4a4_prequant_t_k64: super::super::try_kernel(
+            moe_w4a4_prequant_t_k64: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_w4a16",
                 "moe_w4a4_grouped_gemm_prequant_t_k64",
             ),
-            moe_w4a4_prequant_t_k64_vecscale: super::super::try_kernel(
+            moe_w4a4_prequant_t_k64_vecscale: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_w4a16",
                 "moe_w4a4_grouped_gemm_prequant_t_k64_vecscale",
             ),
-            moe_w4a4_prequant_t_k128: if std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref()
-                == Ok("1")
+            moe_w4a4_prequant_t_k128: if glm
+                && std::env::var("ATLAS_MOE_PREQUANT_K128").as_deref() == Ok("1")
             {
                 super::super::try_kernel(gpu, "moe_w4a16", "moe_w4a4_grouped_gemm_prequant_t_k128")
             } else {
@@ -113,6 +128,7 @@ impl OptionalKernels {
             moe_w4a4_prequant_t_k128w: t_k128w,
             moe_w4a4_prequant_gate_up_silu: gate_up_silu,
             k128w_persist_ctas,
+            down_e4m3: down_e4m3(gpu, k128w && down_e4m3_requested(), k128w_persist_ctas > 0),
             moe_mtile_prefix_k: if k128w {
                 super::super::try_kernel(gpu, "moe_w4a16", "moe_mtile_prefix")
             } else {
@@ -154,47 +170,56 @@ impl OptionalKernels {
             } else {
                 KernelHandle(0)
             },
-            moe_nvfp4_mmq_gate_up_k: super::super::try_kernel(
+            moe_nvfp4_mmq_gate_up_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_mmq64_gate_up",
             ),
-            moe_nvfp4_mmq_down_k: super::super::try_kernel(
+            moe_nvfp4_mmq_down_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_mmq64_down",
             ),
-            moe_nvfp4_mmq_quantize_k: super::super::try_kernel(
+            moe_nvfp4_mmq_quantize_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_quantize_bf16",
             ),
-            moe_nvfp4_mmq_repack_k: super::super::try_kernel(
+            moe_nvfp4_mmq_repack_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_repack_batched",
             ),
-            moe_nvfp4_mmq_silu_scale2_k: super::super::try_kernel(
+            moe_nvfp4_mmq_silu_scale2_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_silu_scale2",
             ),
-            moe_nvfp4_mmq_scale2_rows_k: super::super::try_kernel(
+            moe_nvfp4_mmq_scale2_rows_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_nvfp4_mmq",
                 "atlas_moe_nvfp4_scale2_rows",
             ),
-            moe_expert_gate_up_shared_mmq_k: super::super::try_kernel(
+            moe_expert_gate_up_shared_mmq_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_shared_expert_fused_mmq",
                 "moe_expert_gate_up_shared_mmq",
             ),
-            moe_expert_silu_down_shared_mmq_k: super::super::try_kernel(
+            moe_expert_silu_down_shared_mmq_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_shared_expert_fused_mmq",
                 "moe_expert_silu_down_shared_mmq",
             ),
-            silu_mul_quant_nvfp4_k: super::super::try_kernel(
+            silu_mul_quant_nvfp4_k: super::super::try_kernel_gated(
+                glm,
                 gpu,
                 "moe_silu_mul",
                 "silu_mul_quant_nvfp4",
@@ -327,6 +352,54 @@ impl OptionalKernels {
     }
 }
 
+/// The lossy E4M3 routed down (`ATLAS_GLM_MOE_DOWN_E4M3`): the K128W down's
+/// `_e4m3` grid (and `_persist_e4m3` twin when the persistent schedule is
+/// on), which write E4M3 rows and per-64-column FP32 scales, and the sparse
+/// EP reduce that reads them.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DownE4m3 {
+    pub(super) down: ops::K128wKernel,
+    pub(super) unpermute: KernelHandle,
+}
+
+/// `ATLAS_GLM_MOE_DOWN_E4M3=1`.
+pub(crate) fn down_e4m3_requested() -> bool {
+    std::env::var("ATLAS_GLM_MOE_DOWN_E4M3").as_deref() == Ok("1")
+}
+
+fn down_e4m3(gpu: &dyn GpuBackend, on: bool, persist: bool) -> Option<DownE4m3> {
+    if !on {
+        return None;
+    }
+    let name = "moe_w4a4_grouped_gemm_prequant_t_k128w_compact";
+    let e4m3 = DownE4m3 {
+        down: ops::K128wKernel {
+            grid: super::super::try_kernel(gpu, "moe_w4a16", &format!("{name}_e4m3")),
+            persist: super::super::try_kernel_gated(
+                persist,
+                gpu,
+                "moe_w4a16",
+                &format!("{name}_persist_e4m3"),
+            ),
+        },
+        unpermute: super::super::try_kernel(
+            gpu,
+            "moe",
+            "moe_unpermute_reduce_indexed_ep_vec8_e4m3",
+        ),
+    };
+    let ok =
+        e4m3.down.grid.0 != 0 && (e4m3.down.persist.0 != 0 || !persist) && e4m3.unpermute.0 != 0;
+    if gpu.op_cache().once("moe:down_e4m3") {
+        if ok {
+            tracing::info!("ATLAS_GLM_MOE_DOWN_E4M3: E4M3 routed down rows (lossy)");
+        } else {
+            tracing::warn!("ATLAS_GLM_MOE_DOWN_E4M3=1 ignored: E4M3 down kernels unavailable");
+        }
+    }
+    ok.then_some(e4m3)
+}
+
 /// The K128W down and fused gate/up kernels (gate/up only with `silu`),
 /// with `persist` (`ATLAS_GLM_MOE_PREFILL_PERSIST=1`) also their `_persist`
 /// twins, which write the same bytes, and the CTAs those launch: two per SM,
@@ -371,24 +444,5 @@ fn k128w_kernels(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::k128w_kernels;
-    use spark_runtime::gpu::mock::MockGpuBackend;
-
-    fn handles(k128w: bool, silu: bool, persist: bool) -> ([u64; 4], u32) {
-        let (down, gate_up, ctas) = k128w_kernels(&MockGpuBackend::new(), k128w, silu, persist);
-        let ids = [down.grid, down.persist, gate_up.grid, gate_up.persist].map(|h| h.0);
-        (ids.map(|h| u64::from(h != 0)), ctas)
-    }
-
-    #[test]
-    fn k128w_persist_adds_the_twins_and_keeps_the_grid_kernels() {
-        // Flag off: the base grid kernels only.
-        assert_eq!(handles(true, true, false), ([1, 0, 1, 0], 0));
-        // Flag on: both sets, two CTAs per SM (the mock's 48 SMs).
-        assert_eq!(handles(true, true, true), ([1, 1, 1, 1], 96));
-        assert_eq!(handles(true, false, true), ([1, 1, 0, 0], 96));
-        // K128W off: nothing, whatever the flag.
-        assert_eq!(handles(false, true, true), ([0, 0, 0, 0], 0));
-    }
-}
+#[path = "init_optional_tests.rs"]
+mod tests;

@@ -61,13 +61,19 @@ impl Qwen3SsmLayer {
     /// reproduces: FP32 conv output, FP32 recurrence state and output, the
     /// sigmoid gated norm, no fused GDN+norm kernel.
     pub(super) fn four_kernel_f32_arm(&self, ctx: &ForwardContext) -> bool {
+        self.four_kernel_f32_arm_for(ctx.config)
+    }
+
+    /// [`Self::four_kernel_f32_arm`] from the config alone, for host-side
+    /// predicates that run before a forward context exists.
+    pub(super) fn four_kernel_f32_arm_for(&self, config: &atlas_core::config::ModelConfig) -> bool {
         let fused_norm = self.gdn_f32_norm_k.0 != 0 && super::gdn_fused_norm_enabled();
         self.conv1d_l2norm_f32_k.0 != 0
             && self.gdn_f32_k.0 != 0
             && self.gated_rms_norm_f32_k.0 != 0
             && !fused_norm
             && !super::ssm_h_fp16_enabled()
-            && ctx.config.output_gate_type == "sigmoid"
+            && config.output_gate_type == "sigmoid"
     }
 
     /// Step 8 of [`Self::ssm_forward`]: the out projection of the gated-norm
@@ -84,7 +90,16 @@ impl Qwen3SsmLayer {
         let value_dim = ctx.config.linear_num_value_heads * ctx.config.linear_value_head_dim;
         // ── 8. Output projection: [value_dim → hidden_size] ──
         let out = ctx.buffers.moe_output();
-        if let Some(ref fp8) = self.out_proj_fp8w {
+        if self.mxfp8_rows_proj(
+            ctx.gpu,
+            super::exact_rows::GdnProj::Out,
+            normed_out,
+            out,
+            1,
+            stream,
+        )? {
+            // The checkpoint's own MXFP8 copy (FP4-Local; `init_mxfp8.rs`).
+        } else if let Some(ref fp8) = self.out_proj_fp8w {
             // `w8a16_gemv` consumes `[N/BS,K/BS] BF16` block scales —
             // the canonical Qwen FP8 release format.
             fp8.scale_format.expect(

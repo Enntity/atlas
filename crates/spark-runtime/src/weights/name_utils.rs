@@ -44,6 +44,9 @@ pub fn is_vision_tower_tensor(name: &str) -> bool {
 ///                       I16 tensor, ~39 GB) or `...ngram_embedding.shard_{i}
 ///                       .trellis` (128 × I16), next to a small F16
 ///                       `head_bias` and I64 aux tensors that stay resident
+///   NVFP4 (FP4-Local)   `...ngram_embedding.shard_{i}.weight` U8 codes AND
+///                       `...shard_{i}.weight_scale` E4M3 block scales
+///                       (128 × 25 MB = 3.2 GB) — both planes of a row
 ///
 /// Matching is by TENSOR NAME rather than by file, deliberately: RadixArk
 /// isolates the Qwen shards in dedicated `model-plefp8-*` files, but Inferact
@@ -53,11 +56,14 @@ pub fn is_vision_tower_tensor(name: &str) -> bool {
 ///
 /// What must NOT match, because the loader needs these resident:
 ///   - LongCat's small `post_projs`
-///   - Qwen's `ngram_embedding.weight_scale` (one BF16 scalar)
+///   - Qwen's `ngram_embedding.weight_scale` (one BF16 scalar) and
+///     `ngram_embedding.weight_scale_2` (one F32 scalar, NVFP4)
 ///   - Qwen's `ngram_heads_offsets` / `ngram_heads_vocab_sizes` (I64, 16 each)
 pub fn is_ngram_table(name: &str) -> bool {
     if name.contains("ngram_embeddings.embedders.") || name.contains("ngram_embedding.shard_") {
-        return name.ends_with(".weight") || exl3_trellis_tail(name);
+        return name.ends_with(".weight")
+            || exl3_trellis_tail(name)
+            || (name.contains("ngram_embedding.shard_") && name.ends_with(".weight_scale"));
     }
     name.ends_with(".ngram_embedding.trellis")
 }
@@ -107,6 +113,15 @@ mod ngram_defer_tests {
         // The per-table scalar scale (RadixArk's FP8 release) must stay
         // resident — the row cache needs it to dequantize.
         assert!(!is_ngram_table(&format!("{base}.weight_scale")));
+        // NVFP4 (FP4-Local): each shard's E4M3 scale plane is part of the
+        // table (3.2 GB over 128 shards); the one F32 global stays resident.
+        assert!(is_ngram_table(&format!("{base}.shard_0.weight_scale")));
+        assert!(is_ngram_table(&format!("{base}.shard_127.weight_scale")));
+        assert!(!is_ngram_table(&format!("{base}.weight_scale_2")));
+        // LongCat's embedders keep their existing rule: `.weight` only.
+        assert!(!is_ngram_table(
+            "model.ngram_embeddings.embedders.0.weight_scale"
+        ));
         // The head range tables are 16 I64 values the loader reads directly.
         assert!(!is_ngram_table(
             "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets"

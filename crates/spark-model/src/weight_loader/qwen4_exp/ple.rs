@@ -44,6 +44,17 @@ use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
 use crate::weight_map::dense;
 
+/// The decoder layers that carry PLE. `ple_layer_ids` is ONE-indexed — the
+/// reference selects with `ple_layer_ids.index(layer_idx + 1)` — so `[2]`
+/// means decoder layer 1, `layers.1.ple`. Reading an id as a layer index
+/// probes one layer late (it once reported 0 shards on every checkpoint).
+pub(super) fn ple_decoder_layers(config: &ModelConfig) -> impl Iterator<Item = usize> + '_ {
+    config
+        .ple_layer_ids
+        .iter()
+        .filter_map(|&id| id.checked_sub(1))
+}
+
 /// Resident rows in the pinned arena. A forward's gather pins at most one
 /// scratch span of rows at once — `scratch_tokens * ngram_heads` — because
 /// the chunked pipeline resolves and releases a span at a time, so the
@@ -191,9 +202,7 @@ pub(super) fn load(
     if config.ple_layer_ids.is_empty() {
         return Ok(None);
     }
-    // `ple_layer_ids` is 1-INDEXED — the reference selects with
-    // `ple_layer_ids.index(layer_idx + 1)` — so `[2]` means MODEL LAYER 1.
-    if !config.ple_layer_ids.contains(&(layer_idx + 1)) {
+    if !ple_decoder_layers(config).any(|l| l == layer_idx) {
         return Ok(None);
     }
     let lp = format!("{}.ple", config.layer_prefix(layer_idx));
@@ -323,6 +332,7 @@ pub(super) fn load(
         // cache copies those bytes; host dequant expands each row to 160
         // BF16 before the GEMM. See `layers/ple/ngram_trellis.rs`.
         spark_runtime::weights::WeightDtype::Int16 => 2,
+        spark_runtime::weights::WeightDtype::UInt8 => 1, // NVFP4 code pairs: ple_nvfp4.rs
         other => anyhow::bail!(
             "PLE: n-gram table is {other:?}; the row cache gathers BF16, \
              F8_E4M3, or I16 rows (`batched_embed` / `batched_embed_fp8`)"
@@ -334,7 +344,10 @@ pub(super) fn load(
     let chunk = chunk_from_env();
     let span = crate::layers::ple::bounded_scratch(chunk, max_tokens);
     let (slots, slots_from) = slots_from_env(span, heads);
-    let mut cache = if single.is_some() {
+    let nvfp4 = matches!(dtype, spark_runtime::weights::WeightDtype::UInt8);
+    let mut cache = if nvfp4 {
+        nvfp4::open(store, &lp, &shards, rows_per as u64, head_dim, slots, gpu)
+    } else if single.is_some() {
         let (path, off) = &shards[0];
         spark_storage::NgramRowCache::open_at(
             path,
@@ -354,11 +367,20 @@ pub(super) fn load(
         )
     }
     .context("PLE: n-gram row cache")?;
+    if let Some((period, idle)) = spark_storage::ngram_cache::keepalive_from_env() {
+        cache
+            .start_keepalive(period, idle)
+            .context("PLE: NVMe keepalive")?;
+        tracing::info!(
+            "PLE NVMe keepalive: one 4 KiB read every {period:?} while rows were \
+             resolved within {idle:?} (ATLAS_PLE_NVME_KEEPALIVE_MS)"
+        );
+    }
 
     // FP8 rows need their dequant scale, or the gather returns raw E4M3
     // magnitudes and the whole n-gram contribution is off by a constant
     // factor — fluent output, wrong logits.
-    if elem == 1 {
+    if elem == 1 && !nvfp4 {
         let name = format!("{lp}.ple_embedding.ngram_embedding.weight_scale");
         let scale = bf16_scalar(store, &name, gpu)?;
         cache
@@ -370,17 +392,28 @@ pub(super) fn load(
     let weights = PleWeights {
         key_proj: dense(store, &format!("{lp}.key_proj.weight"))?,
         value_proj: dense(store, &format!("{lp}.value_proj.weight"))?,
-        norm_key: dense(store, &format!("{lp}.norm_key.weight"))?,
-        norm_query: dense(store, &format!("{lp}.norm_query.weight"))?,
-        norm_conv: dense(store, &format!("{lp}.norm_conv.weight"))?,
+        // F32 as the kernel reads it; BF16 releases widen exactly (see `f32_norm`).
+        norm_key: super::helpers::f32_norm(store, &format!("{lp}.norm_key.weight"), gpu, h * hc)?,
+        norm_query: super::helpers::f32_norm(
+            store,
+            &format!("{lp}.norm_query.weight"),
+            gpu,
+            h * hc,
+        )?,
+        norm_conv: super::helpers::f32_norm(store, &format!("{lp}.norm_conv.weight"), gpu, h * hc)?,
         conv1d: dense(store, &format!("{lp}.conv1d.weight"))?,
     };
 
     let dilation = config.emb_neighbor_num; // conv dilation IS ngram_size
+    // What a row holds and what the cache reads per row: an NVFP4 row is 160
+    // values in 80 code bytes + 10 scale bytes, read as one 96-byte packed
+    // row; the other formats read `head_dim * elem` bytes in place.
+    let values = if nvfp4 { head_dim * 2 } else { head_dim };
+    let row_bytes = cache.row_stride();
     tracing::info!(
         "PLE at MODEL LAYER {layer_idx} (ple_layer_ids={:?}, 1-indexed): \
-         {} shards over {} file(s) x {rows_per} rows x {head_dim} dims = {} rows \
-         ({:.1} GB {dtype:?}) \
+         {} shards over {} file(s) x {rows_per} rows x {values} values = {} rows \
+         of {row_bytes} B ({:.1} GB {dtype:?}) \
          served off NVMe with {slots} cached slots ({:.1} MB, {slots_from}: \
          span {span} x {heads} heads, floored at 65536); \
          scratch {span} tokens = {:.2} GB (ATLAS_PLE_CHUNK={chunk}); \
@@ -389,8 +422,8 @@ pub(super) fn load(
         shards.len(),
         distinct_files,
         shards.len() * rows_per,
-        (shards.len() * rows_per * head_dim * elem) as f64 / 1e9,
-        (slots * head_dim * 2) as f64 / 1e6,
+        (shards.len() * rows_per * row_bytes) as f64 / 1e9,
+        (slots * row_bytes) as f64 / 1e6,
         (span * 10240 * 14) as f64 / 1e9,
         config.ple_conv_kernel_size,
         (config.ple_conv_kernel_size - 1) * dilation,
@@ -420,7 +453,7 @@ pub(super) fn load(
             }),
         )
     } else {
-        (head_dim, None)
+        (if nvfp4 { head_dim * 2 } else { head_dim }, None)
     };
 
     PleLayer::new(
@@ -441,6 +474,10 @@ pub(super) fn load(
     .map(Some)
     .context("PLE: layer construction")
 }
+
+#[cfg(feature = "cuda")]
+#[path = "ple_nvfp4.rs"]
+mod nvfp4;
 
 /// Non-CUDA builds have no NVMe row cache — it serves rows out of a pinned,
 /// GPU-addressable arena — so a PLE model cannot be served here. REFUSE

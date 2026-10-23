@@ -10,12 +10,38 @@ use anyhow::Result;
 
 use super::types::TransformerModel;
 use super::vision_transport::{
-    EP_CMD_VISION_STATE, VISION_HEADER_WORDS, VisionWireState, grid_words, parse_grid_words,
-    parse_state_header, payload_bytes, validate_state,
+    EP_CMD_VISION_STATE, VISION_HEADER_WORDS, VisionRowBounds, VisionWireState, grid_words,
+    parse_grid_words, parse_state_header, payload_bytes, validate_state,
 };
 use crate::traits::SequenceState;
 
 impl TransformerModel {
+    /// The row bounds both ranks apply to the vision wire state. Derived from
+    /// the shared configuration only (encoder geometry, `max_batch_tokens`,
+    /// `max_seq_len`; `startup_parity` checks the vision pixel bound), so the
+    /// head and the worker agree.
+    ///
+    /// The native GLM tower on a multi-rank world keeps a deferred request
+    /// inside its window: that is what the rank protocol admitted before
+    /// (the header was checked against `GLM_MAX_OUTPUT_ROWS`), and the
+    /// per-chunk encode past it is not measured on GLM. A single GLM rank
+    /// never checked the header, so it keeps the context bound (its chunks
+    /// are still checked against the window). Follow-up: size
+    /// `GLM_MAX_OUTPUT_ROWS` like the Qwen window.
+    pub(crate) fn vision_row_bounds(&self) -> VisionRowBounds {
+        let ve = self.vision_encoder.as_ref();
+        let window = ve.map_or(0, |ve| ve.output_rows());
+        let glm = ve.is_some_and(|ve| ve.glm.is_some());
+        VisionRowBounds {
+            window,
+            request: if glm && self.multi_rank_protocol_active() {
+                window
+            } else {
+                self.config.max_seq_len
+            },
+        }
+    }
+
     /// Broadcast the rank-0 vision encoder result and its MRoPE metadata before
     /// a worker enters the matching prefill command. The payload uses the
     /// encoder's own device buffer, so it never aliases the small command or
@@ -65,11 +91,11 @@ impl TransformerModel {
                 slice_rows: if owned_images == 0 { rows } else { slice_rows },
                 deferred: seq.vision.deferred,
             };
-            let state = validate_state(&state, ve.output_rows())?;
+            let state = validate_state(&state, self.vision_row_bounds())?;
             let payload = if seq.vision.deferred {
                 0
             } else {
-                let payload = payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?;
+                let payload = payload_bytes(&state, ve.out_hidden_size, self.vision_row_bounds())?;
                 anyhow::ensure!(
                     payload > 0,
                     "vision request produced an empty encoder payload"
@@ -138,11 +164,7 @@ impl TransformerModel {
     /// model holds none between requests).
     pub(super) fn ep_worker_recv_vision_state(&self, seq: &mut SequenceState) -> Result<()> {
         let header = self.ep_broadcast_tokens(&[0; VISION_HEADER_WORDS])?;
-        let max_rows = self
-            .vision_encoder
-            .as_ref()
-            .map_or(0, |ve| ve.output_rows());
-        let state = parse_state_header(&header, max_rows)?;
+        let state = parse_state_header(&header, self.vision_row_bounds())?;
         let grid_words = if state.grid_count > 0 {
             self.ep_broadcast_tokens(&vec![
                 0;
@@ -156,7 +178,7 @@ impl TransformerModel {
         let payload = if state.deferred {
             0
         } else if let Some(ve) = &self.vision_encoder {
-            payload_bytes(&state, ve.out_hidden_size, ve.output_rows())?
+            payload_bytes(&state, ve.out_hidden_size, self.vision_row_bounds())?
         } else {
             anyhow::ensure!(
                 state.rows == 0,

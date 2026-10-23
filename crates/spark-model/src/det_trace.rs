@@ -37,6 +37,16 @@
 //! (absorbed queries), `x_attn_lat` (attention output before W_uv/`o_proj`);
 //! MoE `x_gate` (router logits).
 //!
+//! `ATLAS_GLM_DET_DUMP=<dir>` also writes every traced tensor's bytes to
+//! `<dir>/r<rank>_q<request>_c<chunk start>_L<layer>_<stage>_r<first row>_n<rows>.bin`,
+//! so runs whose bytes cannot match (another TP size, say) compare by value
+//! (`scripts/dev/det_dump_compare.py`).
+//!
+//! A DFlash verify block is traced too, as the chunk at its first row's
+//! position: per layer its MLA prefill taps and `v_out` (the layer's output
+//! rows), then `v_final` (normed hidden) and, where the whole vocab head runs
+//! here, `v_logits`.
+//!
 //! Every tap synchronizes the stream and copies the tensor to the host, so
 //! a traced prefill is several times slower and its stream timing differs.
 //! Unset, the taps return on one cached flag and nothing else changes.
@@ -267,6 +277,14 @@ pub fn set_layer(layer: usize) {
     }
 }
 
+/// The following taps' rows start at sequence position `chunk_start` (a
+/// multi-sequence pass's per-sequence blocks).
+pub fn set_chunk_start(chunk_start: usize) {
+    if on() {
+        CURRENT.with(|c| c.set(c.get().map(|at| At { chunk_start, ..at })));
+    }
+}
+
 fn current(stage: &str) -> Option<At> {
     if !on() || !stage_selected(stage) {
         return None;
@@ -314,6 +332,36 @@ fn device_line(
     format_line(at, stage, rows, bytes, hash)
 }
 
+/// `ATLAS_GLM_DET_DUMP`: the directory traced tensors are written to.
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("ATLAS_GLM_DET_DUMP").map(Into::into))
+        .as_deref()
+}
+
+/// Write `bytes` at `ptr` (read after `stream`) as `stage` of `at`, rows from
+/// `row0`, into the dump directory. Best effort: a debugging aid.
+fn dump(
+    at: At,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    stage: &str,
+    ptr: DevicePtr,
+    rows: (usize, usize),
+    bytes: usize,
+) {
+    let Some(dir) = dump_dir() else { return };
+    let mut host = vec![0u8; bytes];
+    if gpu.synchronize(stream).is_err() || gpu.copy_d2h(ptr, &mut host).is_err() {
+        return;
+    }
+    let name = format!(
+        "r{}_q{}_c{}_L{}_{stage}_r{}_n{}.bin",
+        at.rank, at.request, at.chunk_start, at.layer, rows.0, rows.1
+    );
+    let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(name), host));
+}
+
 /// Taps reading after `stream` (see [`on_stream`]).
 #[derive(Clone, Copy)]
 pub struct Taps<'a> {
@@ -336,6 +384,18 @@ impl Taps<'_> {
             return;
         }
         if let Some(at) = current(stage) {
+            if rows_mode() {
+                emit(row_line(
+                    at,
+                    self.gpu,
+                    self.stream,
+                    stage,
+                    ptr,
+                    rows,
+                    row_bytes,
+                ));
+                return;
+            }
             emit(device_line(
                 at,
                 self.gpu,
@@ -345,8 +405,53 @@ impl Taps<'_> {
                 rows,
                 row_bytes,
             ));
+            dump(
+                at,
+                self.gpu,
+                self.stream,
+                stage,
+                ptr,
+                rows,
+                rows.1 * row_bytes,
+            );
         }
     }
+}
+
+/// `ATLAS_GLM_DET_TRACE_ROWS=1`: one hash a ROW, keyed by sequence position,
+/// so passes of other shapes (chunked, restored, batched) compare row by row:
+/// `DETR r= q= L= s= p=<position of the first row> h=<hash>,<hash>,..`.
+fn rows_mode() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_GLM_DET_TRACE_ROWS").as_deref() == Ok("1"))
+}
+
+fn row_line(
+    at: At,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    stage: &str,
+    ptr: DevicePtr,
+    (row0, rows): (usize, usize),
+    row_bytes: usize,
+) -> String {
+    let mut host = vec![0u8; rows * row_bytes];
+    let ok = gpu.synchronize(stream).is_ok() && gpu.copy_d2h(ptr, &mut host).is_ok();
+    let hashes: Vec<String> = if ok {
+        host.chunks(row_bytes.max(1))
+            .map(|r| format!("{:08x}", hash_bytes(r) as u32))
+            .collect()
+    } else {
+        vec!["ERR".to_owned()]
+    };
+    format!(
+        "DETR r={} q={} L={} s={stage} p={} h={}",
+        at.rank,
+        at.request,
+        at.layer,
+        at.chunk_start + row0,
+        hashes.join(",")
+    )
 }
 
 /// Log a `hash` of `bytes` host bytes already read for `stage`.

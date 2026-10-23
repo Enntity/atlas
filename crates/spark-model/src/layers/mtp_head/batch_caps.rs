@@ -165,9 +165,7 @@ impl MtpHead {
         // Rows each capacity-bound buffer can hold for THIS forward's use of
         // it. `ssm_ba` holds the [n, 2h] concat; `ssm_gates` the [n, h]
         // normed hidden. Everything else is arena-row-sized (>= h per row).
-        let rows = |bytes: usize, per_row: usize| {
-            if per_row == 0 { 0 } else { bytes / per_row }
-        };
+        let rows = |bytes: usize, per_row: usize| bytes.checked_div(per_row).unwrap_or(0);
         let mut cap = PROPOSE_META_SEQS
             .min(rows(sizes.ssm_ba, 2 * h * bf16))
             .min(rows(sizes.ssm_gates, h * bf16))

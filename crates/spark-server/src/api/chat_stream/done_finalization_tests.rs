@@ -38,7 +38,7 @@ fn flush_sanitizer(state: &mut StreamState) -> DeltaVec {
 
 fn assert_finish_only(deltas: &[StreamDelta], expected: &str) {
     assert!(
-        matches!(deltas, [StreamDelta::Finish { reason, usage: actual, token_ids }]
+        matches!(deltas, [StreamDelta::Finish { reason, usage: actual, token_ids, .. }]
             if reason.as_wire() == expected && *actual == usage() && token_ids.is_empty()),
         "guard must emit metadata/finish only, got {deltas:?}"
     );
@@ -169,4 +169,32 @@ fn terminal_done_refusal_annotation_preserves_full_content() {
         StreamDelta::Refusal { text: refusal },
         StreamDelta::Finish { reason: crate::ir::FinishReason::Stop, .. }
     ] if content == text && refusal == "I cannot help with that request."));
+}
+
+fn fix_tokenizer() -> crate::tokenizer::ChatTokenizer {
+    let dir = tempfile::tempdir().unwrap();
+    let model = tokenizers::models::wordlevel::WordLevel::builder()
+        .vocab({
+            let mut v = std::collections::HashMap::with_hasher(ahash::RandomState::default());
+            v.insert("[UNK]".to_string(), 0u32);
+            ahash::AHashMap::from_iter(v)
+        })
+        .unk_token("[UNK]".into())
+        .build()
+        .unwrap();
+    let inner = tokenizers::Tokenizer::new(model);
+    inner
+        .save(dir.path().join("tokenizer.json"), false)
+        .unwrap();
+    crate::tokenizer::ChatTokenizer::from_model_dir(
+        dir.path(),
+        0,
+        true,
+        "glm5_next",
+        "",
+        None,
+        false,
+        false,
+    )
+    .unwrap()
 }

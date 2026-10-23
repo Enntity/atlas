@@ -232,44 +232,6 @@ pub fn dense_gemv_batchm(
         .launch(stream)
 }
 
-/// [`dense_gemv_batchm`] over any row count: `DENSE_GEMV_BATCHM_MAX_M` rows a
-/// launch, the weight read once per launch. Every row is still byte-identical
-/// to a `dense_gemv` on that row (the per-row arithmetic does not depend on
-/// the launch's row count). `input` rows are `k` apart, output rows
-/// `out_stride` apart (BF16 elements).
-#[allow(clippy::too_many_arguments)]
-pub fn dense_gemv_batchm_chunked(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    input: DevicePtr,
-    weight: &DenseWeight,
-    output: DevicePtr,
-    m: u32,
-    n: u32,
-    k: u32,
-    out_stride: u32,
-    stream: u64,
-) -> Result<()> {
-    let mut first = 0u32;
-    while first < m {
-        let rows = (m - first).min(DENSE_GEMV_BATCHM_MAX_M);
-        dense_gemv_batchm(
-            gpu,
-            kernel,
-            input.offset(first as usize * k as usize * 2),
-            weight,
-            output.offset(first as usize * out_stride as usize * 2),
-            rows,
-            n,
-            k,
-            out_stride,
-            stream,
-        )?;
-        first += rows;
-    }
-    Ok(())
-}
-
 /// Dense FP8-weight GEMV (M=1): C = A @ (dequant(B_fp8) * row_scale).
 ///
 /// A: `[1, K]` BF16, B: `[N, K]` FP8 E4M3, row_scale: `[N]` f32, C: `[1, N]` BF16.
@@ -430,6 +392,35 @@ pub fn per_token_group_quant_fp8(
     KernelLaunch::new(gpu, kernel)
         .grid([m, k / 128, 1])
         .block([128, 1, 1])
+        .arg_ptr(input_bf16)
+        .arg_ptr(output_fp8)
+        .arg_ptr(a_scale)
+        .arg_u32(m)
+        .arg_u32(k)
+        .launch(stream)
+}
+
+/// [`per_token_group_quant_fp8`] on its warp-per-group twin
+/// (`per_token_group_quant_fp8_warp`, eight groups a CTA instead of one; the
+/// same bytes). `k % 128 == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn per_token_group_quant_fp8_warp(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input_bf16: DevicePtr,
+    output_fp8: DevicePtr,
+    a_scale: DevicePtr,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
+    ensure!(
+        k.is_multiple_of(128),
+        "per_token_group_quant_fp8_warp: K {k} is not whole 128-groups"
+    );
+    KernelLaunch::new(gpu, kernel)
+        .grid([(m * (k / 128)).div_ceil(8), 1, 1])
+        .block([256, 1, 1])
         .arg_ptr(input_bf16)
         .arg_ptr(output_fp8)
         .arg_ptr(a_scale)

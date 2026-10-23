@@ -46,7 +46,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
             "-select_streams",
             "v:0",
             "-show_entries",
-            "format=duration:stream=avg_frame_rate,r_frame_rate",
+            "format=duration:stream=avg_frame_rate,r_frame_rate,nb_frames",
             "-of",
             "default=nw=1",
             "pipe:0",
@@ -137,20 +137,24 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         .into_iter()
         .find_map(field)
         .and_then(|v| parse_rate(&v))
-        .and_then(crate::video_sample::finite_positive)
-        .unwrap_or(policy.fps);
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(policy.fps as f64);
+    let frame_count = field("nb_frames")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&frames| frames > 0);
 
     Ok(ClipTiming {
         duration_secs,
         native_fps,
+        frame_count,
     })
 }
 
 /// Parse ffprobe's `num/den` frame-rate form. Returns `None` for `0/0` and
 /// other degenerate rates rather than dividing by zero.
-fn parse_rate(s: &str) -> Option<f32> {
+fn parse_rate(s: &str) -> Option<f64> {
     let (num, den) = s.trim().split_once('/')?;
-    let num: f32 = num.trim().parse().ok()?;
-    let den: f32 = den.trim().parse().ok()?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
     (den != 0.0).then(|| num / den)
 }

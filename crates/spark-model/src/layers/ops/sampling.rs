@@ -194,6 +194,38 @@ pub fn batched_embed_fp8(
         .launch(stream)
 }
 
+/// NVFP4-table variant of [`batched_embed`]: each row is `row_stride` bytes
+/// of packed E2M1 codes followed by their E4M3 block scales (one per 16
+/// values; `spark_storage::ngram_pack` layout), times one global f32. Writes
+/// BF16 rows of `head_dim`.
+///
+/// Kernel: `batched_embed_nvfp4(ids, table, out, global, head_dim, stride)`
+/// Grid: (num_rows, 1, 1)  Block: (256, 1, 1)
+#[allow(clippy::too_many_arguments)]
+pub fn batched_embed_nvfp4(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    token_ids_dev: DevicePtr,
+    embed_table: DevicePtr,
+    output: DevicePtr,
+    global_scale: f32,
+    num_rows: u32,
+    head_dim: u32,
+    row_stride: u32,
+    stream: u64,
+) -> Result<()> {
+    KernelLaunch::new(gpu, kernel)
+        .grid([num_rows, 1, 1])
+        .block([256, 1, 1])
+        .arg_ptr(token_ids_dev)
+        .arg_ptr(embed_table)
+        .arg_ptr(output)
+        .arg_f32(global_scale)
+        .arg_u32(head_dim)
+        .arg_u32(row_stride)
+        .launch(stream)
+}
+
 /// XGrammar bitmask row width: `ceil(vocab / 32)` i32 words; bit `t` of
 /// word `t >> 5` set = allowed (grammar/state.rs `bitmask_data` layout).
 pub fn grammar_bitmask_words(vocab: u32) -> usize {
@@ -296,14 +328,29 @@ pub fn dflash2_selector_topk(
         .launch(stream)
 }
 
-/// Steps 2-4 of the selector over the lists of two complementary shares of
-/// the vocabulary (`lists`, from `dflash2_selector_topk`): the walk of one
-/// `gamma`-row block, as `dflash2_candidate_selector` walks it.
+/// Where the selector's walk reads the ranks' candidate lists.
+#[derive(Clone, Copy, Debug)]
+pub enum SelectorLists {
+    /// The pair's two lists (`dflash2_selector_walk`).
+    Pair([DevicePtr; 2]),
+    /// `count` ranks' lists, rank k's `stride` bytes after rank 0's
+    /// (`dflash2_selector_walk_ranks`, at most four).
+    Ranks {
+        base: DevicePtr,
+        stride: usize,
+        count: u32,
+    },
+}
+
+/// Steps 2-4 of the selector over the lists of complementary shares of the
+/// vocabulary (`lists`, from `dflash2_selector_topk`): the walk of one
+/// `gamma`-row block, as `dflash2_candidate_selector` walks it. `kernel` is
+/// the walk entry of `lists`' kind.
 #[allow(clippy::too_many_arguments)]
 pub fn dflash2_selector_walk(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
-    lists: [DevicePtr; 2],
+    lists: SelectorLists,
     projected_hidden: DevicePtr,
     pred_codebook: DevicePtr,
     succ_codebook: DevicePtr,
@@ -317,11 +364,28 @@ pub fn dflash2_selector_walk(
     top_k: u32,
     stream: u64,
 ) -> Result<()> {
-    let mut launch = KernelLaunch::new(gpu, kernel)
-        .grid([1, 1, 1])
-        .block([DFLASH2_SELECTOR_THREADS, 1, 1])
-        .arg_ptr(lists[0])
-        .arg_ptr(lists[1])
+    let launch =
+        KernelLaunch::new(gpu, kernel)
+            .grid([1, 1, 1])
+            .block([DFLASH2_SELECTOR_THREADS, 1, 1]);
+    let launch = match lists {
+        SelectorLists::Pair([a, b]) => launch.arg_ptr(a).arg_ptr(b),
+        SelectorLists::Ranks {
+            base,
+            stride,
+            count,
+        } => {
+            anyhow::ensure!(
+                stride.is_multiple_of(4) && (1..=4).contains(&count),
+                "dflash2_selector_walk_ranks: {count} lists {stride} bytes apart"
+            );
+            launch
+                .arg_ptr(base)
+                .arg_u32((stride / 4) as u32)
+                .arg_u32(count)
+        }
+    };
+    let mut launch = launch
         .arg_ptr(projected_hidden)
         .arg_ptr(pred_codebook)
         .arg_ptr(succ_codebook)

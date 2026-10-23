@@ -171,12 +171,12 @@ int main(int argc, char** argv) {
             }
     }
 
-    void *dq, *dpo, *dpl, *dlse, *dout;
+    void *dq, *dpo, *dpl, *dlse, *device_output;
     CK(cudaMalloc(&dq, qn * 2));
     CK(cudaMalloc(&dpo, 16 * qn * 4));
     CK(cudaMalloc(&dpl, 16 * rh * 4));
     CK(cudaMalloc(&dlse, rh * 4));
-    CK(cudaMalloc(&dout, qn * 2));
+    CK(cudaMalloc(&device_output, qn * 2));
     typedef void (*Kern)(GLM_KV_PAD_ARGS, float*, float*);
     const Kern kern[2] = {glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad_split,
                           glm_sparse_mla_prefill_bf16_head32_tc_kv_pad_split};
@@ -196,7 +196,7 @@ int main(int argc, char** argv) {
         if (splits == WHOLE || splits == PIPED) {
             const bool pipe = splits == PIPED;
             (pipe ? piped : whole[dt])<<<dim3(1, rows, 1), 256, pipe ? GLM_PIPE_SMEM : SMEM>>>(
-                (const bf*)dq, cache[dt], cache[dt], sel, (bf*)dout, (const unsigned*)dtable, rows,
+                (const bf*)dq, cache[dt], cache[dt], sel, (bf*)device_output, (const unsigned*)dtable, rows,
                 HEADS, DIM, WIDTH, BS, 0.0625f);
             return;
         }
@@ -205,15 +205,15 @@ int main(int argc, char** argv) {
             nullptr, (const unsigned*)dtable, rows, HEADS, DIM, WIDTH, BS, 0.0625f,
             (float*)dpo, (float*)dpl);
         glm_sparse_decode_split_merge<<<rows * HEADS, 256>>>(
-            (const float*)dpo, (const float*)dpl, (bf*)dout, (float*)dlse, rows, HEADS, DIM, splits);
+            (const float*)dpo, (const float*)dpl, (bf*)device_output, (float*)dlse, rows, HEADS, DIM, splits);
     };
     auto output = [&](int dt, unsigned rows, unsigned splits) {
-        CK(cudaMemset(dout, 0xEE, qn * 2));
+        CK(cudaMemset(device_output, 0xEE, qn * 2));
         run(dt, rows, splits, 0);
         CK(cudaDeviceSynchronize());
         CK(cudaGetLastError());
         std::vector<unsigned short> o((size_t)rows * HEADS * DIM);
-        CK(cudaMemcpy(o.data(), dout, o.size() * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(o.data(), device_output, o.size() * 2, cudaMemcpyDeviceToHost));
         return o;
     };
     auto time_us = [&](int dt, unsigned rows, unsigned splits) {

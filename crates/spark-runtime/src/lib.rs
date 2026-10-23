@@ -13,6 +13,9 @@ pub mod cublaslt;
 pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(not(feature = "cuda"))]
+#[path = "cuda_backend_metal_stub.rs"]
+pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub mod cutlass;
 #[cfg(not(feature = "cuda"))]
@@ -29,11 +32,13 @@ pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
 mod gpu_pitched;
+pub mod host_sync_trace;
 pub mod kernel_args;
 pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
+pub mod lane;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod op_cache;
@@ -76,6 +81,28 @@ pub fn ssm_tail_boundary(total_tokens: usize, block_size: usize) -> Option<usize
 /// clear win only once the SSM state can be captured MID-CHUNK (in the GDN prefill
 /// kernel) instead of via an extra pass. Until then it stays off by default and
 /// ungated for accuracy.
+/// `ATLAS_QWEN4EXP_PREFILL_ROWINV=1` (default off): the row-invariant
+/// qwen4_exp prefill (`spark_model::layers::ops::qwen4exp_rowinv`). Read once.
+/// Here, not in the model crate, because the scheduler aligns its chunk
+/// boundaries to it too ([`prefill_chunk_granule`]).
+pub fn qwen4exp_prefill_rowinv() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("ATLAS_QWEN4EXP_PREFILL_ROWINV").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
+
+/// Rows an intermediate prefill chunk is a multiple of: the GDN WY4 group
+/// (4), or under [`qwen4exp_prefill_rowinv`] the FLA chunk (64) -- the
+/// chunked GDN scan groups rows by 64 from the pass start, so a pass that
+/// starts off that grid computes the later rows in other groups.
+pub fn prefill_chunk_granule() -> usize {
+    if qwen4exp_prefill_rowinv() { 64 } else { 4 }
+}
+
 pub fn ssm_tail_ckpt_enabled() -> bool {
     matches!(std::env::var("ATLAS_SSM_TAIL_CKPT").as_deref(), Ok("1"))
 }

@@ -11,6 +11,12 @@ use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, SparseIndexCacheConfig, TailSlotPlan};
 use spark_runtime::weights::WeightStore;
 
+#[path = "glm_native_mtp.rs"]
+mod native_mtp;
+pub(super) use native_mtp::{
+    ensure_native_mtp_target_prerequisites, native_mtp_capability, native_mtp_requested,
+};
+
 use crate::layer::TransformerLayer;
 use crate::layers::glm_kv_shard as shard;
 use crate::layers::moe::SharedFp8Reserve;
@@ -20,9 +26,10 @@ pub(super) fn ensure_expert_tp_drafter(
     config: &ModelConfig,
     use_speculative: bool,
     no_dflash: bool,
+    native_glm_mtp: bool,
 ) -> Result<()> {
     anyhow::ensure!(
-        !(config.expert_tp && use_speculative && no_dflash),
+        !(config.expert_tp && use_speculative && no_dflash && !native_glm_mtp),
         "ATLAS_GLM_EXPERT_TP=1 serves with the DFlash drafter only: sliced routed \
          experts have no whole-expert MTP path"
     );
@@ -100,8 +107,16 @@ pub(super) fn init_arena_consumers(
     // Both ranks initialize HC's TF32 library path before state construction
     // and the actual-free KV snapshot; the optional helper reuses dead scratch.
     super::super::glm_hc_prewarm::initialize(config, gpu, buffers, max_batch_tokens)?;
-    crate::model::prepare_glm_head_mxfp8(config, gpu, lm_head, bf16_head)?;
+    crate::model::prepare_glm_head_mxfp8(config, gpu, store, lm_head, bf16_head)?;
+    // FP4-Local's MXFP8 lm_head: its last reader was the shard above; every
+    // other head path reads the exact BF16 expansion the loader made. A BF16
+    // head is the head itself and stays. Every model passes through here, and
+    // another loader may read its own FP8 lm_head natively: GLM only.
+    if config.model_type == "glm5_next" {
+        crate::weight_loader::glm5::release_expanded(store, gpu, "lm_head", false)?;
+    }
     crate::model::prepare_glm_verify_masks(config, gpu, buffers)?;
+    crate::model::prepare_glm_verify_sample(config, gpu)?;
     crate::layers::moe::bind_resident_btile_arenas(config, store, gpu, layers, buffers)?;
     Ok(())
 }
@@ -195,15 +210,24 @@ pub(super) fn shard_plan(
     }
     let plan = plan.context("ATLAS_GLM_KV_SHARD=1 shards the GLM-5 NoPE MLA latent cache only")?;
     let comm = comm
-        .filter(|c| c.world_size() == 2)
-        .context("ATLAS_GLM_KV_SHARD=1 needs a two-rank communicator")?;
+        .filter(|c| matches!(c.world_size(), 2 | 4))
+        .context("ATLAS_GLM_KV_SHARD=1 needs a two- or four-rank communicator")?;
+    let world = comm.world_size();
     ensure!(
         // Serving topology has already converted this to local heads.
-        config.tp_world_size == 2 && config.num_attention_heads == 32,
-        "ATLAS_GLM_KV_SHARD=1 needs TP2 over 64 attention heads (32 per rank); \
+        config.tp_world_size == world
+            && config.num_attention_heads as u32 == shard::local_heads(world),
+        "ATLAS_GLM_KV_SHARD=1 needs TP{world} over {} attention heads ({} per rank); \
          got tp_world_size={} num_attention_heads={}",
+        shard::TOTAL_HEADS,
+        shard::local_heads(world),
         config.tp_world_size,
         config.num_attention_heads
+    );
+    ensure!(
+        world == 2 || !tuning.overlap,
+        "ATLAS_GLM_KV_SHARD_OVERLAP=1 overlaps the pair's swaps; beyond two ranks the shard \
+         all-gathers on the compute stream"
     );
     ensure!(
         kv_config.cache_blocks_per_seq.is_none(),
@@ -234,23 +258,32 @@ pub(super) fn shard_plan(
     // A cache write carries at most one chunk of rows (plus verify slack).
     let spec = spark_runtime::kv_cache::LatentShardSpec {
         lane: tuning.overlap,
-        ..shard::spec(comm.rank(), kv_config, max_seq_len, max_batch_tokens + 64)
+        ..shard::spec(
+            (comm.rank(), world),
+            kv_config,
+            max_seq_len,
+            max_batch_tokens + 64,
+        )
     };
     Ok(Some(plan.latent_sharded(kv_config, spec)))
 }
 
 /// The paged cache `plan` describes: latent-sharded, V aliasing K (GLM), or
-/// the generic layout.
+/// the generic layout, with `placement`'s pools in the carveout
+/// (`kv_carveout::plan`, which sizes a shard's pools at its local slots).
 pub(super) fn new_kv_cache(
     kv_config: KvCacheConfig,
     num_blocks: usize,
     gpu: &dyn GpuBackend,
     plan: Option<GlmCachePlan>,
+    placement: spark_runtime::kv_cache::KvPlacement,
 ) -> Result<spark_runtime::kv_cache::PagedKvCache> {
     use spark_runtime::kv_cache::PagedKvCache;
     match plan.and_then(GlmCachePlan::shard) {
-        Some(spec) => PagedKvCache::new_latent_sharded(kv_config, num_blocks, gpu, spec),
-        None => PagedKvCache::new_with_v_alias(kv_config, num_blocks, gpu, plan.is_some()),
+        Some(spec) => {
+            PagedKvCache::new_latent_sharded_placed(kv_config, num_blocks, gpu, spec, placement)
+        }
+        None => PagedKvCache::new_placed(kv_config, num_blocks, gpu, plan.is_some(), placement),
     }
 }
 

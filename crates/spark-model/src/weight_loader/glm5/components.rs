@@ -10,8 +10,8 @@ use crate::layers::qwen3_attention::{HcSiteWeights, HcWeights};
 use crate::layers::{DenseFfnLayer, FfnComponent, Glm5KdaWeights, Glm5Projection, MoeLayer};
 use crate::tp_shard::{TpGdnDims, TpShardKind, shard_dense_bf16, shard_gdn_value_vector};
 use crate::weight_map::{
-    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, dense_auto,
-    quantize_to_nvfp4, quantized_any,
+    DenseWeight, ExpertWeight, MoeWeights, Nvfp4Variant, QuantizeCtx, QuantizedWeight, dense_auto,
+    quantize_to_nvfp4_scaled_by, quantized_any,
 };
 
 pub(super) fn load_hc(
@@ -60,6 +60,9 @@ pub(super) fn load_hc(
     })
 }
 
+/// The layer's FFN; `host_experts`: its expert-TP slices when already read
+/// ([`super::expert_tp::read_layer_experts`]), else they are read here.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_ffn(
     store: &WeightStore,
     lp: &str,
@@ -69,6 +72,7 @@ pub(super) fn load_ffn(
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
     allow_prefill_layout: bool,
+    host_experts: Option<super::expert_tp::HostExperts>,
 ) -> Result<FfnComponent> {
     if config.mlp_only_layers.contains(&layer_idx) {
         return load_dense_ffn(store, lp, config, gpu, variant, qctx);
@@ -82,6 +86,7 @@ pub(super) fn load_ffn(
         variant,
         qctx,
         allow_prefill_layout,
+        host_experts,
     )
 }
 
@@ -96,6 +101,35 @@ fn load_dense_ffn(
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.intermediate_size;
+    // ATLAS_GLM_FP4L_DENSE_MXFP8: the checkpoint's MXFP8 projections and no
+    // NVFP4 copy at all (null placeholders).
+    if let Some(native) = super::dense::native_dense(
+        crate::layers::glm_native::NativePolicy::from_env(),
+        store,
+        &p,
+        [h, inter],
+        gpu,
+    )? {
+        let weights = DenseFfnWeights {
+            gate_proj: QuantizedWeight::null(),
+            up_proj: QuantizedWeight::null(),
+            down_proj: QuantizedWeight::null(),
+            gate_proj_t: None,
+            up_proj_t: None,
+            down_proj_t: None,
+        };
+        let installed = DenseFfnLayer::new(weights, gpu).and_then(|mut layer| {
+            layer.install_native(native)?;
+            Ok(layer)
+        });
+        return match installed {
+            Ok(layer) => Ok(FfnComponent::Dense(layer)),
+            Err(e) => {
+                native.free(gpu)?;
+                Err(e)
+            }
+        };
+    }
     let weights = DenseFfnWeights {
         gate_proj: super::dense::load_projection(
             store,
@@ -141,73 +175,63 @@ fn load_moe(
     variant: Nvfp4Variant,
     qctx: QuantizeCtx,
     allow_prefill_layout: bool,
+    host_experts: Option<super::expert_tp::HostExperts>,
 ) -> Result<FfnComponent> {
     let p = format!("{lp}.mlp");
     let h = config.hidden_size;
     let inter = config.moe_intermediate_size;
-    let mut experts = Vec::with_capacity(config.num_experts);
     anyhow::ensure!(
         !config.expert_tp || matches!(variant, Nvfp4Variant::Standard),
         "expert TP slices ModelOpt NVFP4 experts only, got {variant:?}"
     );
-    for expert in 0..config.num_experts {
-        if config.expert_tp {
-            let ep = format!("{p}.experts.{expert}");
-            let slice = |name: &str, n: usize, k: usize, kind: TpShardKind| {
-                super::expert_tp::load_expert_slice(
-                    store,
-                    &format!("{ep}.{name}"),
-                    n,
-                    k,
-                    kind,
-                    config,
-                    gpu,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} {name} (expert TP)"))
-            };
-            experts.push(ExpertWeight {
-                gate_proj: slice("gate_proj", inter, h, TpShardKind::ColumnParallel)?,
-                up_proj: slice("up_proj", inter, h, TpShardKind::ColumnParallel)?,
-                down_proj: slice("down_proj", h, inter, TpShardKind::RowParallel)?,
-            });
-        } else if config.is_local_expert(expert) {
-            let ep = format!("{p}.experts.{expert}");
-            experts.push(ExpertWeight {
-                gate_proj: quantized_any(
-                    store,
-                    &format!("{ep}.gate_proj"),
-                    inter,
-                    h,
-                    gpu,
-                    variant,
-                    qctx,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} gate_proj"))?,
-                up_proj: quantized_any(
-                    store,
-                    &format!("{ep}.up_proj"),
-                    inter,
-                    h,
-                    gpu,
-                    variant,
-                    qctx,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} up_proj"))?,
-                down_proj: quantized_any(
-                    store,
-                    &format!("{ep}.down_proj"),
-                    h,
-                    inter,
-                    gpu,
-                    variant,
-                    qctx,
-                )
-                .with_context(|| format!("GLM-5 expert {expert} down_proj"))?,
-            });
-        } else {
-            experts.push(ExpertWeight::null());
-        }
-    }
+    let experts = if config.expert_tp {
+        let host = match host_experts {
+            Some(host) => host,
+            None => super::expert_tp::read_layer_experts(store, &p, config)?,
+        };
+        super::expert_tp::upload_experts(store, &p, host, gpu)?
+    } else {
+        (0..config.num_experts)
+            .map(|expert| -> Result<ExpertWeight> {
+                if !config.is_local_expert(expert) {
+                    return Ok(ExpertWeight::null());
+                }
+                let ep = format!("{p}.experts.{expert}");
+                Ok(ExpertWeight {
+                    gate_proj: quantized_any(
+                        store,
+                        &format!("{ep}.gate_proj"),
+                        inter,
+                        h,
+                        gpu,
+                        variant,
+                        qctx,
+                    )
+                    .with_context(|| format!("GLM-5 expert {expert} gate_proj"))?,
+                    up_proj: quantized_any(
+                        store,
+                        &format!("{ep}.up_proj"),
+                        inter,
+                        h,
+                        gpu,
+                        variant,
+                        qctx,
+                    )
+                    .with_context(|| format!("GLM-5 expert {expert} up_proj"))?,
+                    down_proj: quantized_any(
+                        store,
+                        &format!("{ep}.down_proj"),
+                        h,
+                        inter,
+                        gpu,
+                        variant,
+                        qctx,
+                    )
+                    .with_context(|| format!("GLM-5 expert {expert} down_proj"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     let shared = format!("{p}.shared_experts");
     let (shared_gate, gate_origin) = crate::layers::moe::load_glm_shared_fp8_weight(
         store,
@@ -288,16 +312,51 @@ fn load_moe(
         // remain transposed-only to avoid hybrid layout's memory cost.
         layer.transpose_for_prefill_unified_keep_shared(gpu, config)?;
     }
+    // ATLAS_GLM_FP4L_SHARED_FP8: the checkpoint's FP8 block shared expert
+    // replaces the NVFP4 copies just built (and the deferred FP8 cache).
+    if let Some(native) = super::shared_native::shared_native_twins(
+        crate::layers::glm_native::NativePolicy::from_env(),
+        store,
+        &shared,
+        config,
+        gpu,
+    )? && let Err(e) = prepare_shared_prefill(&native, config, gpu)
+        .and_then(|()| layer.install_shared_native(gpu, native))
+    {
+        native.free(gpu)?;
+        return Err(e);
+    }
     // The factory installs optional shared FP8 caches only after all target,
     // MTP and head loading has released replaced checkpoint allocations.
     Ok(FfnComponent::Moe(layer))
+}
+
+/// Pick the native shared expert's W8A8 prefill GEMMs at load (cuBLASLt block
+/// FP8, else the in-tree kernel): fail here, never mid-prefill.
+fn prepare_shared_prefill(
+    native: &crate::layers::moe::shared_native::SharedNative,
+    config: &ModelConfig,
+    gpu: &dyn GpuBackend,
+) -> Result<()> {
+    if native.prefill != crate::layers::ops::Fp8bPrefill::W8a8 {
+        return Ok(());
+    }
+    let (h, inter) = (config.hidden_size, config.shared_expert_intermediate_size);
+    for (w, n, k) in [
+        (&native.gate, inter, h),
+        (&native.up, inter, h),
+        (&native.down, h, inter),
+    ] {
+        crate::layers::ops::fp8b_w8a8_prepare(gpu, w, n, k)?;
+    }
+    Ok(())
 }
 
 fn unified_moe_layout_enabled(value: Option<&str>) -> bool {
     value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
-fn env_flag(name: &str) -> bool {
+pub(super) fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .ok()
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -331,42 +390,94 @@ pub(super) fn load_kda_weights(
             )?;
             source.replaced(local, local_n * local_k * 2, gpu)
         };
+    let mx_policy = super::kda_mx::KdaMxPolicy::from_env();
     let load_hot = |name: &str,
                     n: usize,
                     k: usize,
                     kind: TpShardKind,
                     transpose_prefill: bool|
      -> Result<Glm5Projection> {
-        let dense = load_tp_dense(name, n, k, kind)?;
-        let local_n = if kind == TpShardKind::ColumnParallel {
-            n / dims.tp_size
-        } else {
-            n
-        };
-        let local_k = if kind == TpShardKind::RowParallel {
-            k / dims.tp_size
-        } else {
-            k
-        };
-        let decode_nvfp4 = quantize_to_nvfp4(
-            &dense.dense,
-            local_n,
-            local_k,
+        // Opt-in: FP4-Local's own MXFP8 bytes as the decode/verify twin
+        // and/or the W8A8 prefill operand (`kda_mx`).
+        let mx = super::kda_mx::kda_twin(
+            mx_policy,
+            store,
+            &format!("{p}.{name}"),
+            [n, k],
+            kind,
+            dims.tp_rank,
+            dims.tp_size,
             gpu,
-            qctx.absmax_k,
-            qctx.quantize_k,
-            qctx.stream,
-        )?;
-        // Quantization synchronizes internally, so the checkpoint-native BF16
-        // source is no longer needed. Releasing it keeps the safe 92% memory
-        // budget viable on GB10 instead of retaining two projection copies.
-        dense.release(gpu)?;
-        let prefill_nvfp4_t = transpose_prefill
-            .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
-            .transpose()?;
+        )?
+        .unwrap_or_default();
+        if mx.serves_all() {
+            // Decode, verify and prefill all read the MXFP8 twin: no BF16
+            // expansion, no NVFP4 copies.
+            return Ok(Glm5Projection {
+                nvfp4: crate::weight_map::QuantizedWeight::null(),
+                prefill_nvfp4_t: None,
+                mxfp8: mx.decode,
+                w8a8: mx.w8a8,
+            });
+        }
+        let nvfp4 = || -> Result<(QuantizedWeight, Option<QuantizedWeight>)> {
+            let source =
+                LoadedDense::load(store, &format!("{p}.{name}.weight"), gpu, retirement, false)?;
+            let (local, local_n, local_k) = shard_dense_bf16(
+                source.dense.weight,
+                n,
+                k,
+                kind,
+                dims.tp_rank,
+                dims.tp_size,
+                gpu,
+            )?;
+            // Beyond two ranks the NVFP4 global scale is the TP2 shard's
+            // (`tp_shard::pair_scale_rank`): the bytes serving proved at TP2.
+            let pair = crate::tp_shard::pair_scale_rank(dims.tp_rank, dims.tp_size)
+                .map(|rank| shard_dense_bf16(source.dense.weight, n, k, kind, rank, 2, gpu))
+                .transpose()?;
+            let dense = source.replaced(local, local_n * local_k * 2, gpu)?;
+            let scale_source = pair.map_or((local, local_n * local_k), |(p, pair_n, pair_k)| {
+                (p, pair_n * pair_k)
+            });
+            let decode_nvfp4 = quantize_to_nvfp4_scaled_by(
+                &dense.dense,
+                local_n,
+                local_k,
+                scale_source,
+                gpu,
+                qctx.absmax_k,
+                qctx.quantize_k,
+                qctx.stream,
+            );
+            if let Some((p, _, _)) = pair {
+                gpu.free(p)?;
+            }
+            let decode_nvfp4 = decode_nvfp4?;
+            // Quantization synchronizes internally, so the checkpoint-native BF16
+            // source is no longer needed. Releasing it keeps the safe 92% memory
+            // budget viable on GB10 instead of retaining two projection copies.
+            dense.release(gpu)?;
+            // W8A8 serves every prefill row, so no transposed prefill twin.
+            let prefill_nvfp4_t = (transpose_prefill && mx.w8a8.is_none())
+                .then(|| decode_nvfp4.transpose_for_gemm(gpu, local_n, local_k))
+                .transpose()?;
+            Ok((decode_nvfp4, prefill_nvfp4_t))
+        };
+        let (nvfp4, prefill_nvfp4_t) = match nvfp4() {
+            Ok(built) => built,
+            Err(e) => {
+                // Do not leave the MXFP8 twin behind a failed load.
+                mx.free(gpu)?;
+                return Err(e);
+            }
+        };
         Ok(Glm5Projection {
-            nvfp4: decode_nvfp4,
+            nvfp4,
             prefill_nvfp4_t,
+            mxfp8: mx.decode,
+            w8a8: mx.w8a8,
         })
     };
     let width = config.linear_conv_kernel_dim;
@@ -395,6 +506,26 @@ pub(super) fn load_kda_weights(
     let dt_bias = dt_bias_full
         .replaced(dt_bias, dt_len * 4, gpu)?
         .into_dense();
+    // ATLAS_GLM_SP_KDA_QUANT_GATHER: beta is per head, so the gather moves
+    // every head's beta of each rank's rows: an owned copy of the whole
+    // b_proj, taken before the shard's load releases the checkpoint bytes.
+    let b_proj_full = if dims.tp_size == 4
+        && std::env::var("ATLAS_GLM_SP_KDA_QUANT_GATHER").as_deref() == Ok("1")
+    {
+        let whole = load("b_proj")?;
+        let bytes = dims.full_nk * dims.h * 2;
+        let copy = gpu.alloc(bytes)?;
+        gpu.copy_d2d(whole.weight, copy, bytes)?;
+        Some(DenseWeight { weight: copy })
+    } else {
+        None
+    };
+    let b_proj = load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?;
+    let [b_proj, f_a_proj, g_a_proj] = if crate::layers::kda_side_proj_lt_enabled() {
+        super::kda_side_pack::pack_side(store, &p, gpu, retirement, b_proj, &dims)?
+    } else {
+        [b_proj.into_dense(), load("f_a_proj")?, load("g_a_proj")?]
+    };
     Ok(Glm5KdaWeights {
         q_proj: load_hot(
             "q_proj",
@@ -417,9 +548,8 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
             true,
         )?,
-        b_proj: load_tp_dense("b_proj", dims.full_nk, dims.h, TpShardKind::ColumnParallel)?
-            .into_dense(),
-        f_a_proj: load("f_a_proj")?,
+        b_proj,
+        f_a_proj,
         f_b_proj: load_tp_dense(
             "f_b_proj",
             dims.full_key_dim(),
@@ -427,7 +557,7 @@ pub(super) fn load_kda_weights(
             TpShardKind::ColumnParallel,
         )?
         .into_dense(),
-        g_a_proj: load("g_a_proj")?,
+        g_a_proj,
         g_b_proj: load_tp_dense(
             "g_b_proj",
             dims.full_key_dim(),
@@ -445,6 +575,15 @@ pub(super) fn load_kda_weights(
             dims.full_value_dim(),
             TpShardKind::RowParallel,
             true,
+        )?,
+        b_proj_full,
+        o_proj_full: super::kda_mx::kda_oproj_full(
+            mx_policy,
+            store,
+            &format!("{p}.o_proj"),
+            [dims.h, dims.full_value_dim()],
+            dims.tp_size,
+            gpu,
         )?,
     })
 }

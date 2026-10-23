@@ -5,14 +5,21 @@
 //! the verified-step verdict.
 //!
 //! EP worker protocol extensions (see `ep_worker_step_impl`):
-//! - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts
+//! - 0xFFFFFFF5: generic verify → K, K tokens, then num accepted drafts (after
+//!   any sampled-verify requests, `glm_verify_sample`)
 //! - 0xFFFFFFF6: set request-local native-only fence → disabled (0/1)
 //! - 0xFFFFFFF7: synchronize vision metadata and BF16 encoder rows
 //! - 0xFFFFFFE1: distributed GLM MTP propose → token, position, drafts, hidden row
 //! - 0xFFFFFFEB: prefill chunk carrying DFlash verify owners (`glm_fused_chunk`)
 //! - 0xFFFFFFEC: serve this rank's half of a split DFlash propose (`draft_assist`)
+//! - 0xFFFFFFE7: multi-sequence prefill (`prefill_b::multi`)
 
 use anyhow::Result;
+
+/// Head -> worker: a multi-sequence prefill (`ATLAS_QWEN4EXP_PREFILL_MULTI`,
+/// `prefill_b::multi`): n, slots[n], lengths[n], then every prompt's tokens
+/// back to back.
+pub(in crate::model) const EP_CMD_PREFILL_MULTI: u32 = 0xFFFF_FFE7;
 
 use super::types::TransformerModel;
 use crate::traits::{Model, SequenceState};
@@ -89,13 +96,28 @@ impl TransformerModel {
         }
         self.sync_secondary()?;
         self.decode_verify_graphed_kgamma(&tokens, seq, stream)?;
-        let num_accepted = self.ep_broadcast_u32(0)? as usize;
+        let num_accepted = self.ep_worker_verdict()?;
         anyhow::ensure!(
             num_accepted < k,
             "EP generic verify accepted {num_accepted} drafts for K={k}"
         );
         self.ep_worker_apply_verdict(seq, &tokens, num_accepted)?;
         Ok(())
+    }
+
+    /// A verify's verdict word: the head's accepted-draft count, after
+    /// serving any sampled-verify requests the head sends before it
+    /// (`glm_verify_sample`).
+    pub(super) fn ep_worker_verdict(&self) -> Result<usize> {
+        loop {
+            match self.ep_broadcast_u32(0)? {
+                w @ (super::glm_verify_sample::EP_VERIFY_CANDIDATES
+                | super::glm_verify_sample::EP_VERIFY_FULL_ROWS) => {
+                    self.glm_verify_sample_serve(w)?
+                }
+                accepted => return Ok(accepted as usize),
+            }
+        }
     }
 
     /// Worker side of a verified K-row step once the head's accepted-draft
@@ -123,7 +145,9 @@ impl TransformerModel {
                 seq.tokens.pop();
             }
         }
-        self.trim_proposer_state(seq, num_accepted, 0)?;
+        if super::trait_impl::verify_rows::verdict_trims_drafter(k) {
+            self.trim_proposer_state(seq, num_accepted, 0)?;
+        }
         self.commit_accepted_prefix(seq, committed, k)?;
         Ok(())
     }
@@ -136,11 +160,19 @@ impl TransformerModel {
         cmd: u32,
         slots: &mut [Option<SequenceState>],
     ) -> Result<Option<bool>> {
+        if cmd == super::native_mtp_prefix::EP_CMD_NATIVE_PREFIX_PROBE {
+            return self
+                .native_prefix_receive_probe(slots.get(seq_id as usize).and_then(Option::as_ref))
+                .map(Some);
+        }
         if cmd == super::glm_long_verify::EP_CMD_GLM_LONG_VERIFY {
             return self.glm_long_receive_verify(slots).map(Some);
         }
         if cmd == super::glm_fused_chunk::EP_CMD_GLM_FUSED_CHUNK {
             return self.glm_fused_receive(seq_id, slots).map(Some);
+        }
+        if cmd == super::glm_packed_prefill::EP_CMD_GLM_PACKED_PREFILL {
+            return self.glm_packed_receive(slots).map(Some);
         }
         if cmd == super::draft_assist::EP_CMD_DRAFT_ASSIST {
             return self.draft_assist_serve(seq_id).map(Some);

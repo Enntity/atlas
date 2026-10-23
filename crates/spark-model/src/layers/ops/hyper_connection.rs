@@ -8,13 +8,19 @@
 
 use anyhow::Result;
 
-/// GLM keeps its mHC highway BF16 (`ATLAS_GLM_HC_BF16=1`, the storage vLLM
-/// serves) on the DFlash lane; every other model and lane stays FP32.
+#[path = "hc_precision_policy.rs"]
+mod precision_policy;
+
+/// GLM's explicitly requested BF16 highway serves both validated target
+/// lanes: DFlash and strict native MTP. Other lanes retain their prior format.
 pub fn hc_bf16_for(model_type: &str) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    model_type == "glm5_next"
-        && *ON.get_or_init(|| std::env::var("ATLAS_GLM_HC_BF16").as_deref() == Ok("1"))
-        && crate::speculative::glm_repair_policy::dflash_enabled()
+    precision_policy::bf16_highway(
+        model_type,
+        *ON.get_or_init(|| std::env::var("ATLAS_GLM_HC_BF16").as_deref() == Ok("1")),
+        crate::speculative::glm_repair_policy::dflash_enabled(),
+        crate::layers::glm_native::mode::strict_native_mtp(),
+    )
 }
 
 /// Bytes per highway element for `model_type`.

@@ -53,6 +53,14 @@ pub(super) fn promote_completed_prefills(
             continue;
         };
         let spontaneous_think = !p.enable_thinking && think_start_token == Some(first);
+        let slot = p.seq.slot_idx;
+        super::ttft_trace::mark(
+            slot,
+            super::ttft_trace::Mark::FirstSampled(!spontaneous_think && p.max_tokens > 0),
+        );
+        if !spontaneous_think {
+            super::ttft_trace::visible_at_prefill(slot);
+        }
         // Legacy echo+logprobs: prompt logprobs precede any token event.
         if p.seq.collect_prompt_logprobs.is_some()
             && let ResponseSink::Streaming(ref tx) = p.sink
@@ -153,7 +161,8 @@ pub(super) fn build_active_seq_from_prefill(
     );
     let mut seq = p.seq;
     // The min_tokens end-token ban, for every chunked prompt (one chunk or more).
-    spark_model::traits::EosBan::new(seq.prompt_len, p.min_tokens, &p.eos_tokens).arm(&mut seq);
+    spark_model::traits::EosBan::for_request(seq.prompt_len, p.min_tokens, &p.eos_tokens)
+        .arm(&mut seq);
     ActiveSeq {
         seq,
         session_hash: p.session_hash,
@@ -196,7 +205,7 @@ pub(super) fn build_active_seq_from_prefill(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: p.enable_thinking,
         thinking_budget: if !immediate_finish && spontaneous_think {
-            Some(p.spontaneous_think_budget)
+            crate::ir::server_thinking_budget(p.spontaneous_think_budget)
         } else {
             p.thinking_budget
         },

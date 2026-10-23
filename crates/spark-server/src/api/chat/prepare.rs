@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::ir::ChatRequest;
 
-use super::{msg_entry, template, thinking};
+use super::{msg_entry, template, thinking, vision_admit};
 
 // Opt-in per-request phase timing for the chat request path
 // (`ATLAS_CHAT_PHASE_TIMING=1`, strict `== "1"`).
@@ -78,8 +78,11 @@ pub(crate) fn prepare_chat_prompt(
             "ATLAS_NO_TOOL_INJECT=1: skipping the parser tool system prompt.              This is an experiment - the injection is load-bearing for the              hallucination category (~96 vs 30/64 without)."
         );
     }
+    // A verbatim-prompt model gets the template's tool block alone, as on
+    // the reference server.
     if tools_active
         && !skip_inject
+        && !state.chat.verbatim_prompt
         && let Some(ref parser) = state.tool_call_parser
     {
         let default_choice = crate::tool_parser::ToolChoice::Mode("auto".to_string());
@@ -111,7 +114,7 @@ pub(crate) fn prepare_chat_prompt(
         image_pixels,
         image_pad_counts,
         vision_placeholders,
-    } = msg_entry::build_msg_entries(
+    } = msg_entry::build_msg_entries_admitted(
         state.vision_config.as_ref(),
         state.vision_max_pixels,
         &state.remote_image_policy,
@@ -123,11 +126,18 @@ pub(crate) fn prepare_chat_prompt(
         tools_active,
         &state.chat,
         state.tokenizer.uses_deepseek_v4_encoding(),
+        // A request the engine cannot serve is refused while its media are
+        // read, with a 400, rather than failing at prefill start where
+        // clients retry it forever (`vision_admit`).
+        vision_admit::AdmitCtx {
+            limits: state.vision_limits.as_ref(),
+            budget: state.vision_budget.as_ref(),
+        },
     )?;
     // A call that keeps returning the same result gets a notice on its
     // latest result and one turn of deeper thinking, instead of having
     // `<tool_call>` masked (see `loop_detect::check_loops`).
-    let repeat_run = if tools_active {
+    let repeat_run = if tools_active && !state.chat.verbatim_prompt {
         crate::hint_injector::identical_tool_round_run(&req.messages)
     } else {
         0
@@ -173,10 +183,12 @@ pub(crate) fn prepare_chat_prompt(
             .min(gen_max as u32);
         thinking_budget = thinking_budget.map(|b| b.max(deeper));
     }
+    // A template that owns its effort vocabulary gets the client's effort
+    // whatever thinking resolved to, as vLLM passes it.
     let reasoning_effort = effective_reasoning_effort(
         req.reasoning_effort,
         state.default_reasoning_effort,
-        enable_thinking,
+        enable_thinking || state.behavior.verbatim_reasoning_effort,
     );
     let us_thinking = _t_phase.elapsed().as_micros() - us_msg_entry;
 
@@ -199,7 +211,6 @@ pub(crate) fn prepare_chat_prompt(
         // leaves the Jinja variable undefined (template default).
         req.preserve_thinking.or(state.behavior.preserve_thinking),
         tools_active,
-        req.response_format.is_some(),
     )?;
     if state.chat.phase_timing {
         let us_template = _t_phase.elapsed().as_micros() - us_msg_entry - us_thinking;
@@ -228,10 +239,10 @@ pub(crate) fn prepare_chat_prompt(
 /// `thinking_in_tools=false`, ...) must never carry an effort directive
 /// into the render (Qwen3.8 gates its effort block on `enable_thinking`;
 /// Mistral's validator raises on any effort other than `none` when the
-/// settings line is emitted). `None` with thinking on falls through to
-/// the cross-template `"medium"` fallback in `tokenizer/chat_render.rs`
-/// — the neutral tier, NOT the pre-2026-08 `"high"` that Qwen3.8
-/// escalated to its most expensive `xhigh` directive.
+/// settings line is emitted). `None` with thinking on leaves the
+/// template's own default (`tokenizer/chat_render.rs`); `server_default`
+/// already folds MODEL.toml `[behavior].default_reasoning_effort` below
+/// the CLI flag.
 fn effective_reasoning_effort(
     request: Option<crate::ir::ReasoningEffort>,
     server_default: Option<crate::ir::ReasoningEffort>,
@@ -262,6 +273,14 @@ fn inject_tool_system_prompt(messages: &mut Vec<crate::ir::Message>, tool_prompt
 }
 
 #[cfg(test)]
+#[path = "glm_prompt_parity_tests.rs"]
+mod glm_prompt_parity_tests;
+
+#[cfg(test)]
+#[path = "qwen4_exp_prompt_tests.rs"]
+mod qwen4_exp_prompt_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{effective_reasoning_effort, inject_tool_system_prompt};
     use crate::ir::{Message, ReasoningEffort, Role};
@@ -280,8 +299,8 @@ mod tests {
         assert_eq!(effective_reasoning_effort(low, max, true), low);
         // Server default fills a silent request.
         assert_eq!(effective_reasoning_effort(None, max, true), max);
-        // Fully unset: None → the "medium" chat_render fallback (the
-        // neutral tier), asserted byte-level in tokenizer/tests/qwen_dense.rs.
+        // Fully unset: None → the template's own default, asserted
+        // byte-level in tokenizer/tests/qwen_dense.rs.
         assert_eq!(effective_reasoning_effort(None, None, true), None);
         // Thinking off suppresses both sources.
         assert_eq!(effective_reasoning_effort(low, max, false), None);

@@ -86,17 +86,17 @@ int main(int argc, char** argv) {
     int failures = 0;
     for (const Shape& sh : shapes) {
         const unsigned G = sh.G, N = sh.N, K = sh.K, lda = G * K, ldc = G * N;
-        const size_t wel = (size_t)G * N * K, cel = (size_t)MMAX * ldc;
-        std::vector<unsigned short> hw(wel * copies), ha((size_t)MMAX * lda);
+        const size_t weight_elements = (size_t)G * N * K, cel = (size_t)MMAX * ldc;
+        std::vector<unsigned short> hw(weight_elements * copies), ha((size_t)MMAX * lda);
         for (auto& x : hw) { bf b = __float2bfloat16(nd(rng) * 0.03f); memcpy(&x, &b, 2); }
         for (auto& x : ha) { bf b = __float2bfloat16(nd(rng)); memcpy(&x, &b, 2); }
         bf *dw, *da, *dah, *dc[3]; unsigned char *dq, *ds;
-        CK(cudaMalloc(&dw, wel * copies * 2)); CK(cudaMalloc(&da, ha.size() * 2)); CK(cudaMalloc(&dah, MMAX * K * 2));
-        CK(cudaMalloc(&dq, wel * copies)); CK(cudaMalloc(&ds, wel * copies / MX_BLOCK));
+        CK(cudaMalloc(&dw, weight_elements * copies * 2)); CK(cudaMalloc(&da, ha.size() * 2)); CK(cudaMalloc(&dah, MMAX * K * 2));
+        CK(cudaMalloc(&dq, weight_elements * copies)); CK(cudaMalloc(&ds, weight_elements * copies / MX_BLOCK));
         for (auto& c : dc) CK(cudaMalloc(&c, cel * 2));
         CK(cudaMemcpy(dw, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(da, ha.data(), ha.size() * 2, cudaMemcpyHostToDevice));
-        const unsigned long long blocks = wel * copies / MX_BLOCK;
+        const unsigned long long blocks = weight_elements * copies / MX_BLOCK;
         mxfp8_quantize_bf16<<<(unsigned)((blocks + 255) / 256), 256>>>(dw, dq, ds, blocks);
         CK(cudaDeviceSynchronize());
         auto grouped = [&](int copy, unsigned M, bf* out, bool pdl = true) {
@@ -104,12 +104,12 @@ int main(int argc, char** argv) {
             cfg.gridDim = dim3((N + 15) / 16, 1, G); cfg.blockDim = dim3(MX_WARPS * MX_WARP); cfg.stream = st;
             cudaLaunchAttribute at; at.id = cudaLaunchAttributeProgrammaticStreamSerialization;
             at.val.programmaticStreamSerializationAllowed = 1; cfg.attrs = &at; cfg.numAttrs = pdl;
-            const unsigned char* q = dq + copy * wel;
-            const unsigned char* s = ds + copy * wel / MX_BLOCK;
+            const unsigned char* q = dq + copy * weight_elements;
+            const unsigned char* s = ds + copy * weight_elements / MX_BLOCK;
             if (G == 1) CK(cudaLaunchKernelEx(&cfg, kPlain[tier(M)], (const bf*)da, q, s, out, M, N, K, ldc));
             else CK(cudaLaunchKernelEx(&cfg, kGrouped[tier(M)], (const bf*)da, q, s, out, M, N, K, lda, ldc));
         };
-        auto cublas = [&](int copy, bf* out) { lt.run(da, dw + copy * wel, out, st); };
+        auto cublas = [&](int copy, bf* out) { lt.run(da, dw + copy * weight_elements, out, st); };
 
         // Bitwise: grouped == per-head plain launches on a compacted activation slice.
         std::vector<unsigned short> o[3] = {std::vector<unsigned short>(cel), std::vector<unsigned short>(cel),
@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
             for (unsigned h = 0; h < G; h++) {
                 CK(cudaMemcpy2DAsync(dah, K * 2, da + h * K, lda * 2, K * 2, M, cudaMemcpyDeviceToDevice, st));
                 kPlain[tier(M)]<<<(N + 15) / 16, MX_WARPS * MX_WARP, 0, st>>>(
-                    dah, dq + wel + (size_t)h * N * K, ds + (wel + (size_t)h * N * K) / MX_BLOCK, dc[1] + h * N, M, N, K, ldc);
+                    dah, dq + weight_elements + (size_t)h * N * K, ds + (weight_elements + (size_t)h * N * K) / MX_BLOCK, dc[1] + h * N, M, N, K, ldc);
             }
             CK(cudaStreamSynchronize(st));
             CK(cudaMemcpy(o[0].data(), dc[0], cel * 2, cudaMemcpyDeviceToHost));

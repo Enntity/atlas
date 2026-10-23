@@ -33,6 +33,7 @@
 
 pub mod driver;
 pub mod geometry;
+pub mod image_geometry;
 pub mod probes;
 pub mod provision;
 pub mod request;

@@ -66,7 +66,7 @@ pub(super) fn applies(m: u32, n: u32, weight_nk: bool) -> bool {
     requested() && weight_nk && m >= 2048 && n >= 2048 && super::version() >= 130000
 }
 
-fn attr(algo: *const c_void, which: u32) -> Option<i32> {
+pub(super) fn attr(algo: *const c_void, which: u32) -> Option<i32> {
     let mut v = 0i32;
     let mut written = 0usize;
     // SAFETY: `algo` points at a heuristic result's algo field (64 bytes,
@@ -83,33 +83,140 @@ fn attr(algo: *const c_void, which: u32) -> Option<i32> {
     (st == 0).then_some(v)
 }
 
+/// `id=.. tile=.. splitK=.. reduction=..` of a heuristic result's algorithm.
+pub(super) fn describe(algo: *const c_void) -> String {
+    let a = |w| attr(algo, w).map_or_else(|| "?".to_string(), |v| v.to_string());
+    format!(
+        "id={} tile={} splitK={} reduction={}",
+        a(CONFIG_ID),
+        a(CONFIG_TILE_ID),
+        a(CONFIG_SPLITK_NUM),
+        a(CONFIG_REDUCTION_SCHEME)
+    )
+}
+
+/// Whether a kernel with these `CUBLASLT_ALGO_CONFIG_SPLITK_NUM` and
+/// `_REDUCTION_SCHEME` values runs K in order in one pass: split-K 0 or 1
+/// (no split) and reduction 0 (none). Anything else, an unreadable value
+/// or a negative split-K included (the heuristic's MXFP8 split-K kernels
+/// report -2), is not.
+pub(super) fn unsplit(split_k: Option<i32>, reduction: Option<i32>) -> bool {
+    matches!(split_k, Some(0 | 1)) && reduction == Some(0)
+}
+
+/// [`unsplit`] of `algo`'s own attributes.
+pub(super) fn in_order(algo: *const c_void) -> bool {
+    unsplit(
+        attr(algo, CONFIG_SPLITK_NUM),
+        attr(algo, CONFIG_REDUCTION_SCHEME),
+    )
+}
+
 /// Algo 21 without split-K or a reduction: the in-order k-chain.
 fn kchain(algo: *const c_void) -> bool {
-    attr(algo, CONFIG_ID) == Some(ALGO_SM80)
-        && attr(algo, CONFIG_SPLITK_NUM).is_some_and(|s| s <= 1)
-        && attr(algo, CONFIG_REDUCTION_SCHEME) == Some(0)
+    attr(algo, CONFIG_ID) == Some(ALGO_SM80) && in_order(algo)
 }
 
-/// Heuristic results to ask for.
-pub(super) fn requested_count(pin: bool) -> i32 {
-    if pin { CANDIDATES as i32 } else { 1 }
+/// How `gemm_bf16_pick` chooses among the heuristic's results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Pick {
+    /// The first result (the default).
+    First,
+    /// The pin: a preferred-tile k-chain kernel when the first result is one.
+    Pin,
+    /// A k-chain kernel, preferring the fast tiles, or nothing -- to replace
+    /// a k-chain GEMM of another library ([`bf16_gemm_act_weight_t_kchain`]).
+    Force,
 }
 
-/// Byte offset in `results` of the algorithm to run: the pick when `pin`,
-/// else the heuristic's first result.
-pub(super) fn offset(pin: bool, results: &[u8], returned: i32) -> usize {
-    if pin {
-        pick(results, returned.max(0) as usize) * RESULT_BYTES
-    } else {
-        0
+impl Pick {
+    /// Heuristic results to ask for.
+    pub(super) fn requested(self) -> i32 {
+        match self {
+            Pick::First => 1,
+            Pick::Pin | Pick::Force => CANDIDATES as i32,
+        }
+    }
+
+    /// Byte offset in `results` of the algorithm to run; `None` (Force only)
+    /// when no k-chain kernel was offered.
+    pub(super) fn offset(self, results: &[u8], returned: i32) -> Option<usize> {
+        let found = (returned.max(0) as usize).min(results.len() / RESULT_BYTES);
+        let at = |i: usize| results[i * RESULT_BYTES..].as_ptr() as *const c_void;
+        let i = match self {
+            Pick::First => 0,
+            Pick::Pin => pick(results, found),
+            Pick::Force => FORCE_TILES.iter().find_map(|&tile| {
+                (0..found).find(|&i| kchain(at(i)) && attr(at(i), CONFIG_TILE_ID) == Some(tile))
+            })?,
+        };
+        Some(i * RESULT_BYTES)
     }
 }
 
-/// Index of the result to run among `found` heuristic results packed at
-/// `RESULT_BYTES` in `results`.
+/// Force's tile preference: 256x128, 128x256, 128x64, 64x256, 64x64.
+const FORCE_TILES: [i32; 5] = [24, 23, 18, 19, 15];
+
+/// `out[M,N] = act[M,K] @ weight[N,K]^T` (BF16) on a cuBLASLt k-chain kernel,
+/// under `ATLAS_LT_KCHAIN_PIN` -- byte-identical to any other in-order
+/// m16n8k16 k-chain over the same operands, such as the Atlas tile kernel
+/// `dense_gemm_bf16_pipelined`. `Ok(false)`: off, unavailable, or no k-chain
+/// kernel offered for the shape; nothing was launched.
+pub fn bf16_gemm_act_weight_t_kchain(
+    act: u64,
+    weight: u64,
+    out: u64,
+    m: u32,
+    n: u32,
+    k: u32,
+    stream: u64,
+) -> anyhow::Result<bool> {
+    if !requested() || super::version() < 130000 || !super::available() {
+        return Ok(false);
+    }
+    super::gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        super::CUBLAS_OP_T,
+        Pick::Force,
+        super::CUDA_R_16BF,
+        stream,
+    )
+}
+
+/// [`bf16_gemm_act_weight_t_kchain`] without the `ATLAS_LT_KCHAIN_PIN`
+/// switch, for the row-invariant qwen4_exp prefill
+/// (`ATLAS_QWEN4EXP_PREFILL_ROWINV`): every k-chain kernel gives the same
+/// bytes at any row count, so a wide projection may take the fastest one
+/// offered for each `m`. `Ok(false)`: none offered, nothing launched.
+pub fn bf16_gemm_act_weight_t_kchain_any(
+    act: u64,
+    weight: u64,
+    out: u64,
+    [m, n, k]: [u32; 3],
+    stream: u64,
+) -> anyhow::Result<bool> {
+    if super::version() < 130000 || !super::available() {
+        return Ok(false);
+    }
+    super::gemm_bf16::gemm_bf16_pick(
+        act,
+        weight,
+        out,
+        [m, n, k],
+        super::CUBLAS_OP_T,
+        Pick::Force,
+        super::CUDA_R_16BF,
+        stream,
+    )
+}
+
+/// The pin's index among `found` heuristic results packed at `RESULT_BYTES`
+/// in `results`.
 fn pick(results: &[u8], found: usize) -> usize {
     let at = |i: usize| results[i * RESULT_BYTES..].as_ptr() as *const c_void;
-    let found = found.min(results.len() / RESULT_BYTES);
     if found == 0 || !kchain(at(0)) {
         return 0;
     }
@@ -119,4 +226,27 @@ fn pick(results: &[u8], found: usize) -> usize {
             (0..found).find(|&i| kchain(at(i)) && attr(at(i), CONFIG_TILE_ID) == Some(tile))
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unsplit;
+
+    #[test]
+    fn only_split_k_zero_or_one_without_a_reduction_is_in_order() {
+        assert!(unsplit(Some(0), Some(0)));
+        assert!(unsplit(Some(1), Some(0)));
+        for (split_k, reduction) in [
+            (Some(-2), Some(0)),
+            (Some(-1), Some(0)),
+            (Some(-2), Some(2)),
+            (Some(2), Some(0)),
+            (Some(1), Some(1)),
+            (Some(1), None),
+            (None, Some(0)),
+            (Some(i32::MIN), Some(0)),
+        ] {
+            assert!(!unsplit(split_k, reduction), "{split_k:?} {reduction:?}");
+        }
+    }
 }

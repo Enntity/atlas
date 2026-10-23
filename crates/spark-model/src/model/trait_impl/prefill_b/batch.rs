@@ -404,6 +404,7 @@ impl TransformerModel {
                 // will hoist this out of the loop with `layer.prefill_batched`).
                 self.prefill_b_forward_layers(
                     seq,
+                    tokens,
                     &mut kv_cache,
                     chunk_start,
                     chunk_len,
@@ -456,6 +457,7 @@ impl TransformerModel {
                         proc_count,
                         0,
                         row_base + stream_idx,
+                        None,
                         stream,
                     )?
                 } else {

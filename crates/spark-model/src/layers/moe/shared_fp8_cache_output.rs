@@ -37,7 +37,7 @@ impl MoeLayer {
         );
         // Validate the ordinal before its diagnostic bit shift, including
         // ordinary and large-row calls that never enter the K5 oracle.
-        let (pn, pk, owner, capacity, cached, original) = match projection {
+        let (projection_n, projection_k, owner, capacity, cached, original) = match projection {
             0 => (
                 2048,
                 4096,
@@ -69,7 +69,7 @@ impl MoeLayer {
             "shared FP8 output row capacity exceeded"
         );
         anyhow::ensure!(
-            (n, k) == (pn, pk) && output == owner && cached == Some(weight),
+            (n, k) == (projection_n, projection_k) && output == owner && cached == Some(weight),
             "shared FP8 output geometry/owner/cached-weight binding"
         );
         let bf16_bytes = |width: u32| {

@@ -18,7 +18,7 @@ use super::block_mgmt::{
 };
 use super::ssm_pool::SsmStatePool;
 use super::ssm_snapshot::SsmSnapshotPool;
-use super::types::{PinnedMetaStaging, TransformerModel};
+use super::types::{EP_CMD_BUF_BYTES, EP_MIN_STRIDE, PinnedMetaStaging, TransformerModel};
 use crate::layer::{
     AttnMetadataDev, ForwardContext, GdnPrefillBuffers, LayerState, SsmLayerState, TransformerLayer,
 };
@@ -224,10 +224,41 @@ impl TransformerModel {
     /// most 2 NCCL ops per chunk-0 cache hit (negligible vs the prefill
     /// compute it unblocks).
     pub(super) fn ep_min_u32(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, false)
+    }
+
+    /// [`Self::ep_min_u32`] where rank 0 may arrive long after the others
+    /// (it encoded vision items they only receive: about 20 s per 2048^2
+    /// image). The others take rank 0's word as an idle receive, which the
+    /// slow-collective latch does not count, so a long encode does not mark
+    /// the communicator unhealthy. Same collectives, same order.
+    pub(super) fn ep_min_u32_head_late(&self, val: u32) -> Result<u32> {
+        self.ep_min_u32_with(val, true)
+    }
+
+    fn ep_min_u32_with(&self, val: u32, head_late: bool) -> Result<u32> {
         let Some(comm) = self.comm.as_ref() else {
             return Ok(val);
         };
         let stream = self.gpu.default_stream();
+        // One gather of every rank's value where the transport has one (the
+        // chain), instead of a broadcast, sync and copy back per rank: the
+        // same minimum, one round.
+        let world = comm.world_size();
+        if world * EP_MIN_STRIDE <= EP_CMD_BUF_BYTES && comm.supports_gather_async(4) {
+            let base = self.ep_cmd_buf;
+            self.gpu
+                .copy_h2d(&val.to_le_bytes(), base.offset(comm.rank() * EP_MIN_STRIDE))?;
+            if comm.gather_async(base.0, EP_MIN_STRIDE as i64, 4, stream)? {
+                self.gpu.synchronize(stream)?;
+                let mut buf = vec![0u8; world * EP_MIN_STRIDE];
+                self.gpu.copy_d2h(base, &mut buf)?;
+                return Ok((0..world)
+                    .map(|r| u32::from_le_bytes(buf[r * EP_MIN_STRIDE..][..4].try_into().unwrap()))
+                    .min()
+                    .unwrap_or(val));
+            }
+        }
         // Loop over the ranks of the ACTUAL communicator: under pure TP
         // (`--tp-size 2 --ep-size 1`) `ep_world_size` is 1 but the comm
         // spans `tp_world_size` ranks — looping only `0..1` would leave
@@ -243,7 +274,11 @@ impl TransformerModel {
                 comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
                 val
             } else {
-                comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                if head_late && root == 0 {
+                    comm.receive_idle_command_word(self.ep_cmd_buf.0)?;
+                } else {
+                    comm.broadcast(self.ep_cmd_buf.0, 4, root)?;
+                }
                 self.gpu.synchronize(stream)?;
                 let mut buf = [0u8; 4];
                 self.gpu.copy_d2h(self.ep_cmd_buf, &mut buf)?;
@@ -398,6 +433,7 @@ impl TransformerModel {
     /// - 0xFFFFFFF2/3/4: verify K=2/3/4 → K tokens, then accept/num_accepted
     /// - 0xFFFFFFF5/6/7, 0xFFFFFFE1, 0xFFFFFFEB/EC: GLM/vision extensions (`impl_a2_ep_worker`)
     /// - 0xFFFFFFE6: batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`)
+    /// - 0xFFFFFFE8: packed multi-prompt prefill (`glm_packed_prefill`)
     /// - 0xFFFFFFF8: cache this slot's sequence (`trait_impl::finish_leaf`)
     /// - 0xFFFFFFED: plant a prefix checkpoint → position (`prefill_b::pc_inflight`)
     /// - 0xFFFFFFFF: shutdown (seq_id is ignored; applies to the whole worker)
@@ -408,6 +444,14 @@ impl TransformerModel {
         if cmd == 0xFFFFFFFF {
             return Ok(false);
         }
+        // ATLAS_QWEN4EXP_GDN_COMMIT_FUSE: only the batched verify takes a
+        // pending GDN commit, and the draft-assist walk between two of them
+        // reads no GDN state; every other command lands them first.
+        if cmd != super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH
+            && cmd != super::draft_assist::EP_CMD_DRAFT_ASSIST
+        {
+            self.gdn_fuse_flush_all()?;
+        }
 
         // Batched-decode (`0xFFFFFFE0`): the preamble seq_id is sentinel-0;
         // the real per-token routing lives in the seq_ids[N] payload that
@@ -415,6 +459,9 @@ impl TransformerModel {
         // + tokens off the wire and dispatches the matched compute.
         if cmd == 0xFFFFFFE0 {
             return self.ep_worker_decode_batch(slots);
+        }
+        if cmd == super::impl_a2_ep_worker::EP_CMD_PREFILL_MULTI {
+            return self.ep_worker_prefill_multi(slots);
         }
         // Batched multi-sequence verify (`trait_impl/ep_verify_batch.rs`).
         if cmd == super::trait_impl::ep_verify_batch::EP_CMD_VERIFY_BATCH {

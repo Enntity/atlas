@@ -14,6 +14,7 @@
 use anyhow::Result;
 
 mod broadcast;
+pub mod chain_channel;
 #[cfg(test)]
 mod idle_command_tests;
 pub mod peer_lifeline;
@@ -30,11 +31,98 @@ pub mod nccl_backend;
 #[cfg(feature = "nccl")]
 pub use nccl_backend::NcclBackend;
 
+/// Whether `ATLAS_RDMA_ALLREDUCE=1`: collectives take the direct RDMA pair
+/// (two ranks) or chain (three or four in a line) instead of NCCL.
+pub fn rdma_requested() -> bool {
+    std::env::var("ATLAS_RDMA_ALLREDUCE").as_deref() == Ok("1")
+}
+
 /// Communication backend trait for distributed operations.
 ///
 /// All collective operations take raw device pointer + byte count.
 /// The pointer type is u64 (matching CUDA CUdeviceptr) to avoid
 /// coupling this crate to spark-runtime's DevicePtr.
+/// One plane of [`CommBackend::all_to_all_async`]: device addresses, and
+/// 16-byte multiples for `row_bytes`, `pitch` and the strides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AllToAllPlane {
+    /// This rank's part for rank `d` at `src + d * src_stride`.
+    pub src: u64,
+    pub src_stride: i64,
+    /// Rank `o`'s part lands at `dst + o * dst_stride`, rows `pitch` apart.
+    pub dst: u64,
+    pub dst_stride: i64,
+    pub rows: usize,
+    pub row_bytes: usize,
+    pub pitch: usize,
+}
+
+/// One piece of a fused reduce-scatter's producer walk (`RsFusedPiece` in
+/// `rdma_rs_fused.cuh`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RsFusedPiece {
+    /// The piece's first row in the reduce-scatter's input (device).
+    pub out: u64,
+    /// Where a raw piece is staged (pinned); 0 for a piece kept in `out`.
+    pub s: u64,
+    /// The op's piece index.
+    pub p: u32,
+    pub pad: u32,
+}
+
+/// Most pieces a fused reduce-scatter op has (`ONESHOT_RS_MAX_PIECES`).
+pub const RS_FUSED_MAX_PIECES: usize = 32;
+
+/// What a fused reduce-scatter's producer kernel takes by value
+/// (`RsFusedPlan` in `rdma_rs_fused.cuh`): the op's buffers, and its pieces
+/// in the order the producer must finish them.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RsFusedPlan {
+    pub ready: u64,
+    pub state: u64,
+    pub stage: u64,
+    pub poison: u64,
+    pub timeout_ns: u64,
+    pub code: u32,
+    pub npieces: u32,
+    pub piece_bytes: u32,
+    pub mode: u32,
+    pub pad: u64,
+    pub piece: [RsFusedPiece; RS_FUSED_MAX_PIECES],
+}
+
+impl RsFusedPlan {
+    /// The plan as 8-byte kernel-argument words.
+    pub fn words(&self) -> &[u64] {
+        const WORDS: usize = std::mem::size_of::<RsFusedPlan>() / 8;
+        const _: () = assert!(std::mem::size_of::<RsFusedPlan>() == 64 + 24 * RS_FUSED_MAX_PIECES);
+        // SAFETY: repr(C), 8-byte aligned, a whole number of u64 words, no
+        // padding bytes beyond the explicit `pad` fields.
+        unsafe { std::slice::from_raw_parts((self as *const Self).cast::<u64>(), WORDS) }
+    }
+}
+
+/// A fused reduce-scatter begun by [`CommBackend::rs_fused_begin`]: the
+/// producer's plan, then [`CommBackend::reduce_scatter_fused_async`]; the
+/// consumer waits per piece of its own segment
+/// ([`CommBackend::rs_fused_wait`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RsFused {
+    pub plan: RsFusedPlan,
+    /// u32 per piece of this rank's segment: `epoch` once its sum is final.
+    pub done: u64,
+    pub epoch: u32,
+    /// Bytes of a piece (`plan.piece_bytes`), and pieces of a segment.
+    pub piece_bytes: usize,
+    pub pieces: usize,
+    /// The op, as begun: segment `d` at `seg0 + d * stride`, `bytes` each.
+    pub seg0: u64,
+    pub stride: i64,
+    pub bytes: usize,
+}
+
 pub trait CommBackend: Send + Sync {
     /// All-reduce: sum across all ranks, result on all ranks.
     fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()>;
@@ -121,7 +209,8 @@ pub trait CommBackend: Send + Sync {
     /// peer's `bytes` in `dst`, added in place (BF16) when `add`, else copied.
     /// With equal halves this is a reduce-scatter (`add`) or an all-gather
     /// step. Both ranks must call it with the same `bytes`. Returns `false`
-    /// (nothing enqueued) when unavailable for this call.
+    /// (nothing enqueued) when unavailable for this call, and always with
+    /// other than two ranks.
     fn exchange_async(
         &self,
         _send: u64,
@@ -130,6 +219,120 @@ pub trait CommBackend: Send + Sync {
         _add: bool,
         _compute_stream: u64,
     ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Stream-ordered in-place all-gather over every rank: rank `r`'s `bytes`
+    /// at `base + r * stride` (`stride` may be negative; the parts must not
+    /// overlap) land at the same addresses on every rank, copied. Every rank
+    /// must call it with the same `bytes` and `stride`. Returns `false`
+    /// (nothing enqueued) when unavailable; [`Self::supports_gather_async`]
+    /// says beforehand, from the size and configuration alone. The RDMA chain
+    /// serves it.
+    fn gather_async(&self, _base: u64, _stride: i64, _bytes: usize, _stream: u64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Independent collective channels this communicator has: the RDMA
+    /// chain's one-shot channels (`ATLAS_RDMA_ONESHOT_CHANNELS`), selected
+    /// per thread with [`chain_channel::enter`]; 1 elsewhere.
+    fn collective_channels(&self) -> usize {
+        1
+    }
+
+    /// Whether [`Self::gather_async`] can serve parts of `bytes`.
+    fn supports_gather_async(&self, _bytes: usize) -> bool {
+        false
+    }
+
+    /// Stream-ordered broadcast of rank `root`'s `ptr[..bytes]` into every
+    /// rank's `ptr` (each rank's own address), copied. Every rank must call
+    /// it with the same `bytes` and `root`. Returns `false` (nothing
+    /// enqueued) when unavailable; it is available exactly when
+    /// [`Self::gather_async`] is (the RDMA chain serves both).
+    fn broadcast_async(
+        &self,
+        _ptr: u64,
+        _bytes: usize,
+        _root: usize,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Stream-ordered reduce-scatter over every rank of a four-rank chain:
+    /// segment `d` (`bytes` at `seg0 + d * stride`) of every rank's BF16
+    /// partial is summed, in the all-reduce's own order (so the words are
+    /// the all-reduce's), into rank `d`'s segment; the other segments are
+    /// left unspecified. Every rank must call it with the same `bytes` and
+    /// `stride`. Returns `false` (nothing enqueued) when unavailable;
+    /// [`Self::supports_reduce_scatter_async`] says beforehand.
+    fn reduce_scatter_async(
+        &self,
+        _seg0: u64,
+        _stride: i64,
+        _bytes: usize,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether [`Self::reduce_scatter_async`] can serve segments of `bytes`
+    /// (16-byte aligned).
+    fn supports_reduce_scatter_async(&self, _bytes: usize) -> bool {
+        false
+    }
+
+    /// [`Self::reduce_scatter_async`] with the pieces on the wire as E4M3
+    /// values and one f32 scale per 128 (about half the bytes): each hop
+    /// dequantizes, adds in f32 and requantizes only what it forwards, in
+    /// the same (x0 + x1) + (x2 + x3) pairing, and the owner rounds the f32
+    /// sum to BF16 once. Lossy, so opt-in, and needs `bytes` in whole 8 KiB.
+    /// Returns `false` (nothing enqueued) when unavailable.
+    fn reduce_scatter_fp8_async(
+        &self,
+        _seg0: u64,
+        _stride: i64,
+        _bytes: usize,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Begin a fused four-rank chain reduce-scatter of the same segments as
+    /// [`Self::reduce_scatter_async`] (`bytes` at `seg0 + d * stride`): the
+    /// plan a producer kernel takes, which writes every input row of the op
+    /// itself, raw pieces straight into the op's staging, and publishes each
+    /// piece as it finishes (`rdma_rs_fused.cuh`). Enqueues nothing; after
+    /// `Some` the caller must launch the producer (stream-ordered after every
+    /// earlier collective) and [`Self::reduce_scatter_fused_async`]. Same
+    /// sums as the reduce-scatter. `None` when unavailable (off, too large,
+    /// or right after another fused op): fall back to the plain one.
+    fn rs_fused_begin(&self, _seg0: u64, _stride: i64, _bytes: usize) -> Result<Option<RsFused>> {
+        Ok(None)
+    }
+
+    /// The chain kernel of a [`Self::rs_fused_begin`] op on `stream`; it may
+    /// run beside the producer (it waits for each piece the producer
+    /// publishes).
+    fn reduce_scatter_fused_async(&self, _fused: &RsFused, _stream: u64) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Make `stream` wait until piece `piece` of this rank's segment of
+    /// `fused` holds its final sum.
+    fn rs_fused_wait(&self, _fused: &RsFused, _piece: usize, _stream: u64) -> Result<()> {
+        anyhow::bail!("fused reduce-scatter unavailable")
+    }
+
+    /// Stream-ordered all-to-all over every rank of a four-rank chain: for
+    /// each plane, rank `r`'s part for rank `d` (`rows` rows of `row_bytes`,
+    /// contiguous at `src + d * src_stride`) lands on rank `d` as the `rows`
+    /// rows at `dst + r * dst_stride`, `pitch` bytes apart; a rank's own part
+    /// is copied the same way. Two planes carry, say, E4M3 rows and their
+    /// scale tiles in one op. Every rank must call it with the same shapes.
+    /// Returns `false` (nothing enqueued) when unavailable.
+    fn all_to_all_async(&self, _planes: &[AllToAllPlane], _stream: u64) -> Result<bool> {
         Ok(false)
     }
 
@@ -170,10 +373,16 @@ pub trait CommBackend: Send + Sync {
         0
     }
 
-    /// Provide the kernel handle for the capturable collectives
-    /// (`rdma_oneshot_bf16`); loaded by the model layer like
-    /// [`Self::set_add_kernel`].
+    /// Provide the kernel handle for the capturable collectives (module
+    /// `rdma_oneshot`, function [`Self::oneshot_kernel`]); loaded by the
+    /// model layer like [`Self::set_add_kernel`].
     fn set_oneshot_kernel(&self, _handle: u64) {}
+
+    /// The function [`Self::set_oneshot_kernel`] expects: `rdma_oneshot_bf16`
+    /// for two ranks, `rdma_chain_bf16` for a chain.
+    fn oneshot_kernel(&self) -> &'static str {
+        "rdma_oneshot_bf16"
+    }
 
     /// Whether [`Self::exchange_async`] can serve payloads up to `bytes`.
     fn supports_exchange_async(&self, _bytes: usize) -> bool {

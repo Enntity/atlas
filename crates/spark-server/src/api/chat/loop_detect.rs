@@ -9,9 +9,8 @@
 // into the downstream sampling-bias logic.
 
 use crate::ir::{Message, Role};
-
 pub(super) struct LoopDetectOut {
-    /// True when the verdict was Suppress OR spinning detection
+    /// True when the repeated-call verdict was Suppress
     /// fired. Caller flips the `<tool_call>` token bias to avoid
     /// re-emitting tool calls for one turn.
     pub(super) suppress_tool_call: bool,
@@ -135,6 +134,9 @@ pub(super) fn check_loops(
     // Spinning detection — independent signal: if the model has
     // produced ≥5 consecutive short, low-content responses,
     // something is structurally wrong even if no two are similar.
+    // #55: short prose turns are diagnostic only.
+    // Client-supplied history is not provenance and reply length does not
+    // establish that tool use is repeating or should be discouraged.
     let mut recent_short: usize = 0;
     for m in messages.iter().rev() {
         if m.role != Role::Assistant {
@@ -272,11 +274,10 @@ pub(super) fn check_loops(
     }
 
     if spinning {
-        tracing::warn!(
+        tracing::debug!(
             recent_short,
-            "Spinning detection fired — suppressing <tool_call>"
+            "Short prose history detected; tool availability unchanged"
         );
-        suppress_tool_call = !loop_suppress_disabled();
     }
 
     // An identical call answered by an identical result got a repeat

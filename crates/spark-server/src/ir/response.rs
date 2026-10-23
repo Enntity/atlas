@@ -44,6 +44,11 @@ pub struct Choice {
     /// Per-token logprobs (opt-in). Only the OpenAI surface encodes
     /// these today.
     pub logprobs: Option<ChoiceLogprobs>,
+    /// #55: the server-side guard that cut this response, when one did
+    /// (`ActiveSeq::guard_stop`, e.g. `inter_tool_prose_budget`).
+    /// Surfaced as a `guard_stop` extension field on the wire choice;
+    /// the standard finish_reason remains unchanged.
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Neutral logprob report: sampled token + alternatives.
@@ -74,7 +79,7 @@ pub struct Usage {
     /// Completion tokens spent inside the thinking block
     /// (OpenAI `completion_tokens_details.reasoning_tokens`).
     pub reasoning_tokens: usize,
-    /// Speculative-decode draft tokens the verify step ACCEPTED (MTP path)
+    /// Accepted speculative draft tokens retained in the completion (MTP path)
     /// (OpenAI `completion_tokens_details.accepted_prediction_tokens` — the
     /// field's meaning is "predicted tokens that matched generation", which
     /// Atlas's self-drafted MTP predictions are). 0 when speculation is off.

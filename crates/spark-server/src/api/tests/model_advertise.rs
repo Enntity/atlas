@@ -42,6 +42,7 @@ fn unknown_ceiling() -> serde_json::Value {
         created: 0,
         owned_by: "atlas-spark".to_string(),
         max_model_len: None,
+        atlas_image_processor: None,
     })
     .expect("ModelInfo serializes")
 }

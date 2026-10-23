@@ -23,7 +23,8 @@ impl TransformerModel {
             return Ok(());
         }
         let trace = std::env::var("ATLAS_DFLASH_CAPTURE_TRACE").as_deref() == Ok("1");
-        let result = self.dflash_capture_rows_inner(row0, rows, dst, dst_stride, stream);
+        let result =
+            self.dflash_capture_rows_inner(&self.buffers, row0, rows, dst, dst_stride, stream);
         if trace && result.is_ok() {
             // Debug only: synchronous readback of the first captured row.
             self.gpu.synchronize(stream)?;
@@ -40,8 +41,11 @@ impl TransformerModel {
         result
     }
 
-    fn dflash_capture_rows_inner(
+    /// [`Self::dflash_capture_rows`] from the rows of `arena` (the model's,
+    /// or a pipelined half-chunk's).
+    pub(in crate::model) fn dflash_capture_rows_inner(
         &self,
+        arena: &spark_runtime::buffers::BufferArena,
         row0: usize,
         rows: usize,
         dst: spark_runtime::gpu::DevicePtr,
@@ -50,6 +54,18 @@ impl TransformerModel {
     ) -> Result<()> {
         let h = self.config.hidden_size;
         let hc = self.config.hc_mult;
+        if let Some(src) = crate::layers::glm_sp::capture_source() {
+            // The chunk's rows, contracted and gathered already.
+            return self.gpu.copy_d2d_2d_async(
+                src.offset(row0 * h * 2),
+                h * 2,
+                dst,
+                dst_stride,
+                h * 2,
+                rows,
+                stream,
+            );
+        }
         if hc > 1 {
             static KERNEL: std::sync::OnceLock<spark_runtime::gpu::KernelHandle> =
                 std::sync::OnceLock::new();
@@ -75,7 +91,7 @@ impl TransformerModel {
             return spark_runtime::kernel_args::KernelLaunch::new(self.gpu.as_ref(), kernel)
                 .grid([rows as u32, 1, 1])
                 .block([256, 1, 1])
-                .arg_ptr(self.buffers.hc_streams().offset(
+                .arg_ptr(arena.hc_streams().offset(
                     row0 * hc * h * crate::layers::ops::hc_elem_bytes(&self.config.model_type),
                 ))
                 .arg_ptr(dst)
@@ -84,7 +100,7 @@ impl TransformerModel {
                 .arg_u32((dst_stride / 2) as u32)
                 .launch(stream);
         }
-        let src = self.buffers.hidden_states();
+        let src = arena.hidden_states();
         for t in 0..rows {
             self.gpu.copy_d2d_async(
                 src.offset((row0 + t) * h * 2),
@@ -120,6 +136,21 @@ impl TransformerModel {
         proc_count: usize,
         stream: u64,
     ) -> Result<()> {
+        self.try_dflash_prefill_capture_layer_at(seq, layer_idx, chunk_start, proc_count, 0, stream)
+    }
+
+    /// [`Self::try_dflash_prefill_capture_layer`] for a pass whose rows sit
+    /// at arena row `row_base` (a packed prefill's prompt,
+    /// `glm_packed_prefill`): the same capture plan, read `row_base` rows on.
+    pub(super) fn try_dflash_prefill_capture_layer_at(
+        &self,
+        seq: &mut crate::traits::SequenceState,
+        layer_idx: usize,
+        chunk_start: usize,
+        proc_count: usize,
+        row_base: usize,
+        stream: u64,
+    ) -> Result<()> {
         if self.dflash_capture_layers.is_empty() {
             return Ok(());
         }
@@ -150,18 +181,31 @@ impl TransformerModel {
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
         let acc_base = dstate.ctx_hidden_acc;
-        let max_ctx = dstate.max_ctx_len;
         let own_row = dstate.own_row;
-        // The accumulator holds the LAST `max_ctx` prompt positions (the
-        // drafter's context window), not the first: slot 0 is position
-        // `window_start`. Earlier rows of this chunk are dropped.
-        let end = chunk_start + proc_count;
-        let window_start = seq.tokens.len().max(end).saturating_sub(max_ctx);
-        let mut first = window_start.max(chunk_start);
         // A sequence-parallel chunk keeps only this rank's rows (rank 0: the
         // upper half, compacted at row 0) in the highway.
-        let sp_row0 = crate::layers::glm_sp::current().map_or(0, |sp| sp.row0);
-        first = first.max(chunk_start + sp_row0);
+        // Gathered over a chain (`glm_sp::capture_source`), every row is here.
+        let sp_row0 = crate::layers::glm_sp::current()
+            .filter(|_| crate::layers::glm_sp::capture_source().is_none())
+            .map_or(0, |sp| sp.row0);
+        // The accumulator holds the LAST `max_ctx_len` prompt positions (the
+        // drafter's context window), not the first: slot 0 is position
+        // `window_start`. Earlier rows of this chunk are dropped. Where the
+        // window is anchored is `ATLAS_DFLASH_WARM_CTX` (`warm_ctx`).
+        let pass = crate::layers::dflash_head::warm_ctx::Pass {
+            tokens_len: seq.tokens.len(),
+            prompt_len: seq.prompt_len,
+            start: chunk_start,
+            rows: proc_count,
+            sp_row0,
+            branch_at: seq.pc_branch_at,
+        };
+        let plan = crate::layers::dflash_head::warm_ctx::capture_plan(
+            dstate.warm_ctx,
+            dstate.max_ctx_len,
+            dstate.ctx_floor,
+            &pass,
+        );
         // Non-legacy `ATLAS_DFLASH_FIRST_APPEND`: keep this pass's last row —
         // after the final chunk, the last prompt position — in the sequence's
         // own spare row, whatever the window below keeps.
@@ -169,20 +213,21 @@ impl TransformerModel {
             && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, sp_row0)
         {
             self.dflash_capture_rows(
-                row,
+                row_base + row,
                 1,
                 own_row.offset(slot_idx * h * bf16),
                 n_capture * h * bf16,
                 stream,
             )?;
         }
-        if first >= end {
+        let Some(plan) = plan else {
             return Ok(());
-        }
+        };
+        dstate.note_capture(&plan);
         self.dflash_capture_rows(
-            first - chunk_start - sp_row0,
-            end - first,
-            acc_base.offset((first - window_start) * n_capture * h * bf16 + slot_idx * h * bf16),
+            row_base + plan.src_row(&pass),
+            plan.rows(),
+            acc_base.offset(plan.dst_slot() * n_capture * h * bf16 + slot_idx * h * bf16),
             n_capture * h * bf16,
             stream,
         )

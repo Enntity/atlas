@@ -68,6 +68,9 @@ pub struct Qwen3SsmLayer {
     /// Set by `quantize_dense_gdn_to_fp8` (`ATLAS_QWEN4EXP_FP8_GDN=1`); false
     /// everywhere else, where the dispatch is unchanged.
     fp8w_decode_only: bool,
+    /// The checkpoint's own MXFP8 QKVZ / out_proj (FP4-Local), read by every
+    /// decode arm, and by prefill under `ATLAS_QWEN4EXP_PREFILL_W8A8`.
+    gdn_mx: Option<init_mxfp8::GdnMxfp8>,
     // Transposed [K,N] copies of the block-scaled FP8 weights for the coalesced
     // `w8a16_gemm_t` prefill path — populated by `transpose_fp8_for_prefill`
     // for native-FP8 GDN checkpoints. The non-transposed `*_fp8w` copies stay
@@ -124,6 +127,8 @@ pub struct Qwen3SsmLayer {
     /// all verify rows. `KernelHandle(0)` on kernel sets that lack it →
     /// callers keep the per-token `dense_gemv` / tile-GEMM fallback.
     dense_gemv_batchm_k: KernelHandle,
+    /// Its 16/32-row twins under `ATLAS_QWEN4EXP_BATCH_FAST` (`exact_rows.rs`).
+    wide_rows: ops::Qwen4ExpWideRows,
     /// Per-row-FP8 GEMV siblings for `qkvz_fp8_dense`/`out_proj_fp8_dense`:
     /// M=1 `dense_gemv_fp8w` and the M<=8 batched `dense_gemv_fp8w_batchm`.
     /// `KernelHandle(0)` on kernel sets that lack them → BF16 decode path.
@@ -415,13 +420,16 @@ pub struct Qwen3SsmLayer {
 // Kernel-selection helpers moved to `kernel_select.rs` (≤500 LoC split).
 
 // ── Sub-files (split for ≤500 LoC) ────────────────────────────────────────
+mod ckpt_capture;
 mod debug;
-mod exact_rows;
+pub(crate) mod exact_rows;
 mod fla_dispatch;
+mod gdn_defer;
 pub mod gdn_flags;
 mod gdn_fused_rows;
 mod init;
 mod init_fp8;
+mod init_mxfp8;
 mod init_q2;
 mod kernel_select;
 mod lora;
@@ -445,10 +453,12 @@ mod trait_prefill_block;
 mod trait_prefill_gdn;
 mod trait_prefill_hc;
 mod trait_prefill_helper;
+mod trait_prefill_multi;
 mod trait_prefill_phase1;
 mod trait_prefill_phase3;
 mod trait_prefill_proj;
 mod trait_prefill_recur;
+mod w8a8;
 
 pub use gdn_flags::{
     GdnFlags, gdn_fused_norm_enabled, ssm_batched_recurrent_enabled, ssm_h_dtype_bits,

@@ -9,6 +9,7 @@
 
 #[cfg(test)]
 use super::COLLECTIVE_TIMEOUT_SECS;
+use super::pair_ops::oneshot_kernel_name;
 use super::{ALL_REDUCE_DTYPE_BYTES, NcclBackend};
 use crate::CommBackend;
 use crate::broadcast::{Classification, validate_idle_receiver};
@@ -20,7 +21,9 @@ use std::sync::atomic::Ordering;
 
 impl CommBackend for NcclBackend {
     fn all_reduce(&self, ptr: u64, bytes: usize) -> Result<()> {
-        if self.try_oneshot(ptr, ptr, bytes, true, self.legacy_stream)? {
+        if self.try_oneshot(ptr, ptr, bytes, true, self.legacy_stream)?
+            || self.try_chain_all_reduce(ptr, bytes, self.legacy_stream)?
+        {
             return Ok(());
         }
         if self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0 {
@@ -50,7 +53,9 @@ impl CommBackend for NcclBackend {
     }
 
     fn all_reduce_async(&self, ptr: u64, bytes: usize, compute_stream: u64) -> Result<()> {
-        if self.try_oneshot(ptr, ptr, bytes, true, compute_stream)? {
+        if self.try_oneshot(ptr, ptr, bytes, true, compute_stream)?
+            || self.try_chain_all_reduce(ptr, bytes, compute_stream)?
+        {
             return Ok(());
         }
         if self.world_size == 2 && self.add_kernel.load(Ordering::Relaxed) != 0 {
@@ -181,10 +186,74 @@ impl CommBackend for NcclBackend {
         add: bool,
         compute_stream: u64,
     ) -> Result<bool> {
+        if self.world_size != 2 {
+            return Ok(false);
+        }
         if self.try_oneshot(send, dst, bytes, add, compute_stream)? {
             return Ok(true);
         }
         self.try_rdma_exchange(send, dst, bytes, add, compute_stream)
+    }
+
+    fn gather_async(&self, base: u64, stride: i64, bytes: usize, stream: u64) -> Result<bool> {
+        self.try_chain_gather(base, stride, bytes, stream)
+    }
+
+    fn broadcast_async(&self, ptr: u64, bytes: usize, root: usize, stream: u64) -> Result<bool> {
+        self.try_chain_broadcast_parts(ptr, bytes, root, stream)
+    }
+
+    fn collective_channels(&self) -> usize {
+        self.oneshot_channels()
+    }
+
+    fn supports_gather_async(&self, bytes: usize) -> bool {
+        bytes.is_multiple_of(2) && self.chain_oneshot_max_bytes() > 0
+    }
+
+    fn reduce_scatter_async(
+        &self,
+        seg0: u64,
+        stride: i64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        self.try_chain_reduce_scatter(seg0, stride, bytes, false, stream)
+    }
+
+    fn reduce_scatter_fp8_async(
+        &self,
+        seg0: u64,
+        stride: i64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        self.try_chain_reduce_scatter(seg0, stride, bytes, true, stream)
+    }
+
+    fn rs_fused_begin(
+        &self,
+        seg0: u64,
+        stride: i64,
+        bytes: usize,
+    ) -> Result<Option<crate::RsFused>> {
+        self.try_chain_rs_fused_begin(seg0, stride, bytes)
+    }
+
+    fn reduce_scatter_fused_async(&self, fused: &crate::RsFused, stream: u64) -> Result<bool> {
+        self.try_chain_reduce_scatter_fused(fused, stream)
+    }
+
+    fn rs_fused_wait(&self, fused: &crate::RsFused, piece: usize, stream: u64) -> Result<()> {
+        self.try_chain_rs_fused_wait(fused, piece, stream)
+    }
+
+    fn all_to_all_async(&self, planes: &[crate::AllToAllPlane], stream: u64) -> Result<bool> {
+        self.try_chain_all_to_all(planes, stream)
+    }
+
+    fn supports_reduce_scatter_async(&self, bytes: usize) -> bool {
+        self.world_size == 4 && bytes > 0 && bytes.is_multiple_of(128) && self.chain_rs_ready()
     }
 
     fn all_reduce_capturable(&self, ptr: u64, bytes: usize, stream: u64) -> Result<bool> {
@@ -207,6 +276,10 @@ impl CommBackend for NcclBackend {
 
     fn set_oneshot_kernel(&self, handle: u64) {
         self.set_oneshot_kernel_handle(handle);
+    }
+
+    fn oneshot_kernel(&self) -> &'static str {
+        oneshot_kernel_name(self.world_size)
     }
 
     fn supports_exchange_async(&self, bytes: usize) -> bool {

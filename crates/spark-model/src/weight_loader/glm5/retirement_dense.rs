@@ -6,6 +6,8 @@ use crate::weight_map::DenseWeight;
 pub(in crate::weight_loader::glm5) struct LoadedDense<'a> {
     pub(in crate::weight_loader::glm5) dense: DenseWeight,
     store: &'a WeightStore,
+    /// The checkpoint tensor `dense` came from (while it may still alias it).
+    name: String,
     log: Option<&'a RetirementLog<'a>>,
     origin: Option<Origin>,
     bytes: usize,
@@ -66,6 +68,7 @@ impl<'a> LoadedDense<'a> {
         Ok(Self {
             dense,
             store,
+            name: name.into(),
             log,
             origin,
             bytes,
@@ -78,7 +81,11 @@ impl<'a> LoadedDense<'a> {
             (Some(log), None) => {
                 log.release_derived(self.store, self.dense.weight, self.bytes, gpu)
             }
-            (None, None) => gpu.free(self.dense.weight),
+            // A BF16 checkpoint hands back the store's own tensor: reclaim it
+            // (teardown then skips it) instead of freeing it under the store.
+            (None, None) => {
+                crate::weight_map::free_loader_source(self.store, gpu, &self.name, self.dense)
+            }
             (None, Some(_)) => unreachable!("origin requires construction log"),
         }
     }
@@ -94,6 +101,7 @@ impl<'a> LoadedDense<'a> {
         }
         let store = self.store;
         let log = self.log;
+        let name = self.name.clone();
         if let Some(log) = log {
             log.validate_derived(store, ptr, bytes, gpu)?;
         }
@@ -101,6 +109,7 @@ impl<'a> LoadedDense<'a> {
         Ok(Self {
             dense: DenseWeight { weight: ptr },
             store,
+            name,
             log,
             origin: None,
             bytes,

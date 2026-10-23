@@ -18,12 +18,16 @@
 //! The codebook is the tree's existing mul1 decoder
 //! (`weight_map::exl3::mul1_decode`, bit-exact with `decode_3inst<2>`).
 
+#[cfg(feature = "cuda")]
 use anyhow::Result;
+#[cfg(feature = "cuda")]
 use half::{bf16, f16};
 
+#[cfg(feature = "cuda")]
 use crate::weight_map::exl3::mul1_decode;
 
 /// `ROW_DIM` in `ngram_codec.py`.
+#[cfg(feature = "cuda")]
 pub const ROW_DIM: usize = 160;
 
 /// Packed EXL3 n-gram table metadata needed to turn a gathered I16 row into
@@ -39,6 +43,7 @@ pub struct NgramTrellis {
 }
 
 /// `words_per_row(K) = 1 + 10*K`. Inverse: K from a packed width such as 51.
+#[cfg(feature = "cuda")]
 pub fn k_from_packed_words(words: usize) -> Option<u32> {
     if words <= 1 {
         return None;
@@ -53,6 +58,7 @@ pub fn k_from_packed_words(words: usize) -> Option<u32> {
 
 /// The cache still stores packed I16 bytes. Refuse a scale-array or a stride
 /// that is not `packed_words * 2`.
+#[cfg(feature = "cuda")]
 pub fn check_packed_stride(stride: usize, spec: &NgramTrellis, scaled: bool) -> Result<()> {
     anyhow::ensure!(
         !scaled,
@@ -68,11 +74,13 @@ pub fn check_packed_stride(stride: usize, spec: &NgramTrellis, scaled: bool) -> 
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn stream_bit(words: &[u16], bit: usize) -> u16 {
     (words[bit / 16] >> (bit % 16)) & 1
 }
 
 /// One-row `unpack_rows`: 160 trellis states plus the fp16 row scale.
+#[cfg(feature = "cuda")]
 pub fn unpack_row(packed: &[u16], k: u32) -> Result<([u16; ROW_DIM], f16)> {
     let expect = 1 + ROW_DIM * k as usize / 16;
     anyhow::ensure!(
@@ -99,6 +107,7 @@ pub fn unpack_row(packed: &[u16], k: u32) -> Result<([u16; ROW_DIM], f16)> {
     Ok((states, scale))
 }
 
+#[cfg(feature = "cuda")]
 pub fn head_for_row(spec: &NgramTrellis, row: u64) -> Result<usize> {
     for (h, (&off, &vocab)) in spec
         .head_offsets
@@ -115,6 +124,7 @@ pub fn head_for_row(spec: &NgramTrellis, row: u64) -> Result<usize> {
 
 /// Concatenated BF16 embeddings, one `ROW_DIM` slice per id, in `ids` order.
 /// That is the `[T, heads * 160]` matrix the PLE GEMM reads from `emb`.
+#[cfg(feature = "cuda")]
 pub fn decode_rows_bf16(spec: &NgramTrellis, ids: &[u64], raw_rows: &[Vec<u8>]) -> Result<Vec<u8>> {
     anyhow::ensure!(
         ids.len() == raw_rows.len(),
@@ -156,7 +166,7 @@ pub fn decode_rows_bf16(spec: &NgramTrellis, ids: &[u64], raw_rows: &[Vec<u8>]) 
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 

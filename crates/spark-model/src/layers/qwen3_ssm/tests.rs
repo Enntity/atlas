@@ -123,6 +123,7 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
         gdn_commit_qkv: DevicePtr(0),
         gdn_commit_gb: DevicePtr(0),
         gdn_commit_pending: false,
+        gdn_fuse_n: DevicePtr::NULL,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,
@@ -625,3 +626,6 @@ fn gdn_defer_active_gates_on_lever_band_and_handles() {
         assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(1)));
     }
 }
+
+#[path = "init_mxfp8_tests.rs"]
+mod mxfp8;

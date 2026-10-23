@@ -110,6 +110,7 @@ struct Target {
     behavior_default_num_drafts: u32,
     behavior_disable_tool_steering: bool,
     behavior_template_owns_tool_definitions: bool,
+    behavior_verbatim_reasoning_effort: bool,
     behavior_disable_cwd_hint_injection: bool,
     behavior_use_sampling_presets_for_core: bool,
     behavior_use_sampling_preset_penalties_for_core: bool,
@@ -136,6 +137,10 @@ struct Target {
     behavior_rom_head: String,
     behavior_tool_retry: bool,
     behavior_preserve_thinking: Option<bool>,
+    behavior_verbatim_prompt: bool,
+    behavior_default_reasoning_effort: String,
+    behavior_eos_ends_thinking: bool,
+    behavior_tool_call_steering: bool,
     /// Which `(model_type, hidden_size)` pairs this kernel target supports.
     /// Parsed from `[[model_types]]` in MODEL.toml.
     model_type_matches: Vec<ModelTypeMatch>,
@@ -632,11 +637,21 @@ fn closure_attestation(
             continue;
         }
         let model_dir = target.model_kernel_dir.parent();
-        let configs = [
+        let mut configs: Vec<_> = [
             workspace_root
                 .join("kernels")
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
+            workspace_root
+                .join("kernels")
+                .join(&target.hw)
+                .join(&target.model)
+                .join("MODEL.toml"),
+            target
+                .common_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
             target
                 .base_kernel_dir
@@ -648,6 +663,8 @@ fn closure_attestation(
         .into_iter()
         .filter(|p| p.is_file())
         .collect();
+        configs.sort();
+        configs.dedup();
 
         let inputs = atlas_closure::ClosureInputs {
             sources,
@@ -1249,6 +1266,7 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_default_num_drafts: pb.default_num_drafts,
                 behavior_disable_tool_steering: pb.disable_tool_steering,
                 behavior_template_owns_tool_definitions: pb.template_owns_tool_definitions,
+                behavior_verbatim_reasoning_effort: pb.verbatim_reasoning_effort,
                 behavior_disable_cwd_hint_injection: pb.disable_cwd_hint_injection,
                 behavior_use_sampling_presets_for_core: pb.use_sampling_presets_for_core,
                 behavior_use_sampling_preset_penalties_for_core: pb
@@ -1276,6 +1294,10 @@ fn resolve_targets(workspace_root: &std::path::Path) -> Vec<Target> {
                 behavior_rom_head: pb.rom_head,
                 behavior_tool_retry: pb.tool_retry,
                 behavior_preserve_thinking: pb.preserve_thinking,
+                behavior_verbatim_prompt: pb.verbatim_prompt,
+                behavior_default_reasoning_effort: pb.default_reasoning_effort,
+                behavior_eos_ends_thinking: pb.eos_ends_thinking,
+                behavior_tool_call_steering: pb.tool_call_steering,
                 model_type_matches,
                 match_names,
                 dflash,

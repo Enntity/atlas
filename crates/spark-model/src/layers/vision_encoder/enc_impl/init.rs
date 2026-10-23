@@ -42,10 +42,7 @@ pub const CEILING_MAX_PATCHES: usize = 16384;
 /// decision alongside the value so the caller can say out loud when a
 /// checkpoint asked for more than it got — silently ignoring the checkpoint is
 /// the failure mode this whole change exists to remove.
-pub(crate) fn derive_max_patches(
-    max_pixels: Option<usize>,
-    patch_size: usize,
-) -> (usize, Option<usize>) {
+pub fn derive_max_patches(max_pixels: Option<usize>, patch_size: usize) -> (usize, Option<usize>) {
     let Some(area) = max_pixels.filter(|&a| a > 0) else {
         return (FALLBACK_MAX_PATCHES, None);
     };
@@ -76,6 +73,7 @@ impl VisionEncoder {
         intermediate_size: usize,
         patch_size: usize,
         max_pixels: Option<usize>,
+        max_chunk_tokens: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         let head_dim = hidden_size / num_heads;
@@ -120,7 +118,25 @@ impl VisionEncoder {
         let buf_wide = gpu.alloc(p_max * intermediate_size * 2)?;
         let buf_merge_in = gpu.alloc((p_max / 4) * merger_in_dim * 2)?;
         let buf_merge_fc1 = gpu.alloc((p_max / 4) * merger_in_dim * 2)?;
-        let buf_out = gpu.alloc(p_max * out_hidden_size * 2)?;
+        // One prefill chunk's items, not one encoder batch: a chunk encodes
+        // every item it touches, in passes of at most `p_max` patches.
+        let out_rows =
+            crate::vision_limits::window_rows(p_max, spatial_merge_size, max_chunk_tokens);
+        let buf_out = gpu.alloc(out_rows * out_hidden_size * 2)?;
+        let window_mib = (out_rows * out_hidden_size * 2) as f64 / (1024.0 * 1024.0);
+        if window_mib > 256.0 {
+            // Linear in the chunk: a large --max-prefill-tokens or
+            // ATLAS_MAX_BATCH_TOKENS buys this much more per rank.
+            tracing::warn!(
+                "Vision output window {out_rows} rows ({window_mib:.0} MiB per rank) for prefill \
+                 chunks of up to {max_chunk_tokens} tokens; a smaller chunk shrinks it"
+            );
+        } else {
+            tracing::info!(
+                "Vision output window {out_rows} rows ({window_mib:.0} MiB) for prefill chunks of \
+                 up to {max_chunk_tokens} tokens"
+            );
+        }
         let buf_pos_resampled = gpu.alloc(p_max * hidden_size * 2)?;
         let buf_rope_cos = gpu.alloc(p_max * head_dim * 2)?;
         let buf_rope_sin = gpu.alloc(p_max * head_dim * 2)?;
@@ -214,6 +230,7 @@ impl VisionEncoder {
             out_hidden_size,
             intermediate_size,
             p_max,
+            out_rows,
             num_grid_per_side,
             buf_f32,
             buf_h1,
@@ -246,6 +263,7 @@ impl VisionEncoder {
         let glm = GlmVisionEncoder::new(weights, config, gpu)?;
         let glm_buf_out = glm.buf_out;
         let glm_p_max = glm.p_max;
+        let glm_out_rows = glm.out_rows;
         Ok(Self {
             glm: Some(Box::new(glm)),
             patch_embed_w: DevicePtr::NULL,
@@ -283,6 +301,7 @@ impl VisionEncoder {
             out_hidden_size: config.out_hidden_size,
             intermediate_size: config.intermediate_size,
             p_max: glm_p_max,
+            out_rows: glm_out_rows,
             num_grid_per_side: 0,
             buf_f32: DevicePtr::NULL,
             buf_h1: DevicePtr::NULL,

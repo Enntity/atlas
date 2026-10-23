@@ -35,7 +35,7 @@ impl MoeLayer {
             && self.moe_decode_atomic_c4_silu_down_accum_k.0 != 0
             && self.moe_decode_atomic_c4_finalize_k.0 != 0
             && self.bf16_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_unfused_shared_expert()
             && self.fp8_gate_weight_ptrs.is_none()
             && !self.use_t_layout_for_decode()
             && self.pre_expert_norm.is_none()
@@ -67,7 +67,7 @@ impl MoeLayer {
         } else {
             ops::dense_gemm(
                 ctx.gpu,
-                self.dense_gemm,
+                self.router_gemm,
                 router_in,
                 &self.weights.gate,
                 gate_logits,

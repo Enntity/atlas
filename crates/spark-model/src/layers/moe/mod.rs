@@ -35,6 +35,19 @@ pub(crate) struct ExpertPtrTable {
     pub(crate) scale2_vals: DevicePtr,
 }
 
+impl ExpertPtrTable {
+    /// This table's weights with other per-expert `scale2_vals` (owned by
+    /// the caller; the pointer arrays stay this table's).
+    pub(crate) fn with_scale2(&self, scale2_vals: DevicePtr) -> Self {
+        Self {
+            allocation: None,
+            packed_ptrs: self.packed_ptrs,
+            scale_ptrs: self.scale_ptrs,
+            scale2_vals,
+        }
+    }
+}
+
 /// Device-resident top-k routing results that can be sliced across fused
 /// small-M expert waves without recomputing the router projection.
 #[derive(Clone, Copy)]
@@ -166,9 +179,21 @@ mod forward_prefill_finish;
 mod forward_prefill_fp8;
 mod forward_prefill_phase;
 mod forward_prefill_q38;
+pub(crate) use forward_prefill_q38::{q38_requested, sp_shared_requested, w2_requested};
+mod forward_prefill_q38_rs;
 mod forward_prefill_route;
+pub(crate) mod forward_prefill_route_sp;
 mod forward_prefill_routed;
+mod prefill_row_bound;
+pub(crate) use forward_prefill_routed::{grouped_cutlass_gate_up_enabled, prefill_fp8_down};
+pub(crate) use prefill_row_bound::take_offset_read_wait;
 mod forward_prefill_router;
+mod forward_prefill_tcp;
+pub(crate) use forward_prefill_tcp::tcp_requested;
+mod forward_prefill_w4a4;
+pub(crate) use forward_prefill_w4a4::skips_routed_transpose;
+mod w4a4_scales;
+pub(crate) use w4a4_scales::W4a4Scales;
 mod forward_rows;
 mod forward_token_major;
 mod gate_up_m16;
@@ -178,7 +203,10 @@ mod gate_up_repack_test_gpu;
 mod helpers_a;
 mod helpers_b;
 mod helpers_c;
+mod route_dump;
 mod shared_fp8_cache;
+mod shared_mxfp8;
+pub(crate) use shared_mxfp8::Mxfp8SharedExpert;
 mod shared_fp8_cache_load;
 mod shared_fp8_cache_output;
 #[cfg(test)]
@@ -191,23 +219,29 @@ pub use shared_fp8_cache::{validate_shared_fp8_cache_graphs, validate_shared_fp8
 pub(crate) use shared_fp8_origin::load_glm_shared_fp8_weight;
 mod init;
 mod init_optional;
+mod input_scales;
+pub(crate) use input_scales::{DecodeRows, InputScales, PromptRows};
 mod inplace_transpose;
 mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
 mod route_fuse;
 mod router_bn4;
+mod sp_quant_gather;
+pub(crate) use init_optional::down_e4m3_requested;
 pub(crate) use route_fuse::route_fuse_requested;
 mod router_prefill_bn32;
 mod shared_fp8_cache_bytes;
 mod shared_m16;
+pub(crate) mod shared_native;
 pub(crate) use m5_projections::validate_m5_projection_graphs;
 #[cfg(test)]
 mod mod_tests;
 mod prequant_fp4;
 mod prequant_fp4_c3;
 mod prequant_fp4_down;
-pub(crate) use prequant_fp4::with_owner_rows;
+pub(crate) use prequant_fp4::{glm_tp_ep, with_owner_rows};
+pub(crate) use route_fuse::DeadRows;
 mod ptr_table_build;
 mod qwen4exp_fast;
 mod union_stats;

@@ -34,7 +34,7 @@ use image::RgbImage;
 
 use crate::vision_preprocess::{
     MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
-    patch_coordinates, target_size_for,
+    patch_coordinates, qwen_fit,
 };
 
 /// Frames per second to sample at, when the caller has no better idea.
@@ -405,7 +405,6 @@ pub fn preprocess_video(
     // refinement: the groups are concatenated into one pad run whose token
     // count assumes a single grid.
     let first = &frames[keep[0]];
-    let grid_unit = (vcfg.patch_size * vcfg.spatial_merge_size) as u32;
     let (th, tw) = if vcfg.is_glm5_next {
         glm_target_size(
             vcfg,
@@ -416,7 +415,13 @@ pub fn preprocess_video(
             true,
         )?
     } else {
-        target_size_for(first.height(), first.width(), grid_unit, max_pixels)
+        qwen_fit(
+            vcfg,
+            first.height(),
+            first.width(),
+            max_pixels,
+            Some(keep.len()),
+        )?
     };
     let glm_min_pixels = 16usize
         * tp

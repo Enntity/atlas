@@ -281,3 +281,61 @@ fn per_target_flags_are_carried_per_target() {
         "recomputation must use each target's own flags"
     );
 }
+
+#[test]
+fn an_alias_behavior_edit_is_not_excused_by_unchanged_kernel_sources() {
+    let root = fixture("alias-behavior");
+    let dir = root.join("kernels/gb10/alias");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MODEL.toml"),
+        "[model]\nkernel_source = 'modelA'\n",
+    )
+    .unwrap();
+    let before = attest_all(&root);
+    std::fs::write(
+        dir.join("MODEL.toml"),
+        "[model]\nkernel_source = 'modelA'\n[behavior]\nthinking_default = true\n",
+    )
+    .unwrap();
+    let path = "kernels/gb10/alias/MODEL.toml".to_owned();
+    assert!(!excuses(&root, std::slice::from_ref(&path), &before));
+    assert_eq!(
+        changed_targets(&root, &[path], &before),
+        ["gb10/alias/nvfp4"]
+    );
+}
+
+#[test]
+fn a_common_kernel_mapping_edit_reopens_every_consumer() {
+    let root = fixture("common-config");
+    let path = "kernels/gb10/common/KERNEL.toml".to_owned();
+    std::fs::write(root.join(&path), "[modules]\nshared = 'old'\n").unwrap();
+    let before = attest_all(&root);
+    std::fs::write(root.join(&path), "[modules]\nshared = 'new'\n").unwrap();
+    assert!(!excuses(&root, std::slice::from_ref(&path), &before));
+    assert_eq!(
+        changed_targets(&root, &[path], &before),
+        ["gb10/modelA/nvfp4", "gb10/modelB/nvfp4"]
+    );
+}
+
+#[test]
+fn source_model_metadata_reopens_source_and_alias_targets() {
+    let root = fixture("alias-source-config");
+    let dir = root.join("kernels/gb10/alias");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MODEL.toml"),
+        "[model]\nkernel_source = 'modelA'\n",
+    )
+    .unwrap();
+    let before = attest_all(&root);
+    let path = "kernels/gb10/modelA/MODEL.toml".to_owned();
+    std::fs::write(root.join(&path), "[behavior]\nthinking_default = true\n").unwrap();
+    assert!(!excuses(&root, std::slice::from_ref(&path), &before));
+    assert_eq!(
+        changed_targets(&root, &[path], &before),
+        ["gb10/alias/nvfp4", "gb10/modelA/nvfp4"]
+    );
+}

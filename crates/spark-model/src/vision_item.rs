@@ -2,6 +2,8 @@
 
 //! The unit of vision input handed to the model.
 
+use std::sync::Arc;
+
 /// One vision item: a still image, or a video, ready for the encoder.
 ///
 /// `groups` holds the TEMPORAL GROUPS. A still image has exactly one; a video
@@ -18,7 +20,9 @@
 #[derive(Debug, Clone, PartialEq)]
 pub struct VisionItem {
     /// Per temporal group: `[grid_h * grid_w, C * temporal_patch_size * patch^2]`.
-    pub groups: Vec<Vec<f32>>,
+    /// Clones share this immutable pixel storage so serial `n > 1` choices do
+    /// not duplicate the image while each choice is in flight.
+    pub groups: Arc<Vec<Vec<f32>>>,
     /// Pre-merge patch grid, identical across this item's groups.
     pub grid_h: usize,
     pub grid_w: usize,
@@ -27,6 +31,9 @@ pub struct VisionItem {
     /// produce the same encoder rows, so their KV may be shared; the prompt's
     /// placeholder tokens alone cannot tell two images apart (issue #58).
     pub content_hash: u128,
+    /// The in-flight budget this item's pixels hold (`vision_budget`),
+    /// returned when the last copy drops. Not part of its identity.
+    pub held: crate::vision_budget::HeldRows,
 }
 
 impl VisionItem {
@@ -39,11 +46,22 @@ impl VisionItem {
     pub fn video(groups: Vec<Vec<f32>>, grid_h: usize, grid_w: usize) -> Self {
         let content_hash = content_hash(&groups, grid_h, grid_w);
         Self {
-            groups,
+            groups: Arc::new(groups),
             grid_h,
             grid_w,
             content_hash,
+            held: Default::default(),
         }
+    }
+
+    /// The item, holding `permit` until its last copy drops.
+    /// Several items of one request may share one permit.
+    pub fn holding(
+        mut self,
+        permit: std::sync::Arc<crate::vision_budget::VisionRowPermit>,
+    ) -> Self {
+        self.held = crate::vision_budget::HeldRows(Some(permit));
+        self
     }
 
     /// Temporal extent, in groups. 1 for a still.
@@ -81,6 +99,8 @@ fn content_hash(groups: &[Vec<f32>], grid_h: usize, grid_w: usize) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::VisionItem;
 
     #[test]
@@ -102,5 +122,12 @@ mod tests {
             a.content_hash, clip.content_hash,
             "grouping is part of the identity"
         );
+    }
+
+    #[test]
+    fn clones_share_pixel_storage() {
+        let item = VisionItem::image(vec![0.25; 8], 2, 4);
+        let clone = item.clone();
+        assert!(Arc::ptr_eq(&item.groups, &clone.groups));
     }
 }

@@ -103,6 +103,12 @@ pub fn prefill_request(
         // The model's EOS passes through the matcher even under `ignore_eos`.
         &[model_eos, eos_tokens].concat(),
         req_enable_thinking && think_end_token.is_some(),
+        first_token_thinking::native_opener(
+            sched.limits.glm_tool_boundary,
+            req_tools_present,
+            tool_call_start_token,
+        ),
+        tool_call_start_token,
         &mut sink,
     )?;
 
@@ -255,11 +261,13 @@ pub fn prefill_request(
         return Ok(None);
     }
 
+    let mut image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&mut seq, &image_pixels)?;
+        if has_images {
+            model.prepare_vision_embed(&mut seq, std::mem::take(&mut image_pixels))?;
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
@@ -267,7 +275,7 @@ pub fn prefill_request(
         model.ep_broadcast_vision_state_for_seq(
             &seq,
             seq.slot_idx as u32,
-            !image_pixels.is_empty(),
+            has_images,
             0,
             0,
             0,
@@ -295,7 +303,7 @@ pub fn prefill_request(
             top_k,
             top_p,
             min_p,
-            eos_tokens,
+            &crate::scheduler::min_tokens_ban::first_token_suppress(eos_tokens, req_min_tokens),
             grammar_state.as_mut(),
             &sched.levers.sampling(),
         )
@@ -472,7 +480,8 @@ pub fn prefill_request(
     }
 
     // The min_tokens end-token ban, as on the chunked paths.
-    spark_model::traits::EosBan::new(seq.prompt_len, req_min_tokens, eos_tokens).arm(&mut seq);
+    spark_model::traits::EosBan::for_request(seq.prompt_len, req_min_tokens, eos_tokens)
+        .arm(&mut seq);
     Ok(Some(ActiveSeq {
         seq,
         session_hash: req_session_hash,
@@ -507,7 +516,7 @@ pub fn prefill_request(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
-            Some(spontaneous_think_budget)
+            crate::ir::server_thinking_budget(spontaneous_think_budget)
         } else {
             req_thinking_budget
         },

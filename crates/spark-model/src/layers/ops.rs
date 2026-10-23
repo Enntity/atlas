@@ -27,8 +27,16 @@ mod dispatch_config;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/fp8b.rs"]
+mod fp8b;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
+#[path = "ops/mxfp8_act.rs"]
+mod mxfp8_act;
+#[path = "ops/mxfp8_w8a8.rs"]
+mod mxfp8_w8a8;
+#[path = "ops/rank_join.rs"]
+mod rank_join;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -98,6 +106,8 @@ mod glm_mla_fuse;
 mod glm_router_bn4;
 #[path = "ops/glm_sparse_canonical.rs"]
 mod glm_sparse_canonical;
+#[path = "ops/glm_sparse_native.rs"]
+mod glm_sparse_native;
 #[path = "ops/glm_sparse_prefill_tc.rs"]
 mod glm_sparse_prefill_tc;
 pub use glm_router_bn4::glm_router_bn4;
@@ -117,9 +127,16 @@ mod kda_indexed;
 // Raw-GEMM plumbing for the lowrank path, split for the 500-LoC cap.
 #[path = "ops/hyper_connection_lowrank_gemm.rs"]
 mod hyper_connection_lowrank_gemm;
+pub(crate) use hyper_connection_lowrank_gemm::hc_fast;
 #[path = "ops/hyper_connection_lowrank_prefill.rs"]
 mod hyper_connection_lowrank_prefill;
 pub(crate) use hyper_connection_lowrank_prefill::HC_PREFILL_SLAB;
+#[path = "ops/hyper_connection_lowrank_mma.rs"]
+mod hyper_connection_lowrank_mma;
+pub(crate) use hyper_connection_lowrank_mma::{hc_mma, hc_stage_fit};
+#[cfg(all(test, feature = "cuda"))]
+#[path = "ops/hyper_connection_lowrank_mma_tests.rs"]
+mod hyper_connection_lowrank_mma_tests;
 #[path = "ops/hyper_connection_lowrank_split.rs"]
 mod hyper_connection_lowrank_split;
 // GPU parity test, so it needs the cuda backend to compile at all. Gated on
@@ -206,18 +223,32 @@ mod quant_dispatch;
 pub mod qwen4exp;
 #[path = "ops/qwen4exp_decode_fuse.rs"]
 pub mod qwen4exp_decode_fuse;
+#[path = "ops/qwen4exp_gdn_defer.rs"]
+pub mod qwen4exp_gdn_defer;
 #[path = "ops/qwen4exp_gdn_rows.rs"]
 pub mod qwen4exp_gdn_rows;
 #[path = "ops/qwen4exp_moe.rs"]
 mod qwen4exp_moe;
 #[path = "ops/qwen4exp_moe_rows.rs"]
 mod qwen4exp_moe_rows;
+#[path = "ops/qwen4exp_moe_tc3.rs"]
+mod qwen4exp_moe_tc3;
 #[path = "ops/qwen4exp_prefill.rs"]
 pub mod qwen4exp_prefill;
 #[path = "ops/qwen4exp_prefill_hc.rs"]
 pub mod qwen4exp_prefill_hc;
 #[path = "ops/qwen4exp_prefill_seam.rs"]
 pub mod qwen4exp_prefill_seam;
+#[path = "ops/qwen4exp_rowinv.rs"]
+pub mod qwen4exp_rowinv;
+#[path = "ops/qwen4exp_w4_rows.rs"]
+mod qwen4exp_w4_rows;
+#[path = "ops/qwen4exp_w4_wide.rs"]
+mod qwen4exp_w4_wide;
+#[path = "ops/qwen4exp_w8a8.rs"]
+pub mod qwen4exp_w8a8;
+#[path = "ops/qwen4exp_wide_rows.rs"]
+mod qwen4exp_wide_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
 #[cfg(test)]
 #[path = "ops/grammar_bitmask_tests.rs"]
@@ -276,6 +307,7 @@ pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
+pub use fp8b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_dense_router::*;
@@ -286,7 +318,7 @@ pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
 pub use gemv_touch::{
-    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_pair_touch,
+    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, native_touch, w4a16_pair_touch,
     w4a16_tc_twin, w4a16_verify_touch,
 };
 pub use glm_hc_prefill::*;
@@ -295,6 +327,7 @@ pub use glm_indexer_dynamic::*;
 pub use glm_kv_shard::*;
 pub use glm_mla_fuse::*;
 pub use glm_sparse_canonical::*;
+pub use glm_sparse_native::*;
 pub use glm_sparse_prefill_tc::*;
 pub use hyper_connection::*;
 pub use hyper_connection_dispatch::*;
@@ -324,6 +357,8 @@ pub use moe_lora_grouped::*;
 pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
 pub use mxfp8::*;
+pub use mxfp8_act::*;
+pub use mxfp8_w8a8::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
 pub use ple::*;
@@ -342,6 +377,10 @@ pub use qsa_rows::*;
 pub use quant_dispatch::*;
 pub use qwen4exp_moe::*;
 pub use qwen4exp_moe_rows::*;
+pub use qwen4exp_w4_rows::*;
+pub use qwen4exp_w4_wide::*;
+pub use qwen4exp_wide_rows::*;
+pub use rank_join::{rank_join_bf16, rank_join_kernel};
 pub use sampling::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;

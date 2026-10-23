@@ -38,25 +38,31 @@ pub(super) fn render_template(
     reasoning_effort: Option<crate::ir::ReasoningEffort>,
     preserve_thinking: Option<bool>,
     tools_active: bool,
-    // `response_format` set: thinking off renders a closed think block
-    // (`RenderFlags::empty_think_off`), so no template-forced thinking.
-    structured_output: bool,
 ) -> Result<TemplateOut, Response> {
     // Use closed thinking when client doesn't explicitly enable it.
     let template_thinking = enable_thinking;
+    let reasoning_effort = reasoning_effort.map(if state.behavior.verbatim_reasoning_effort {
+        crate::ir::ReasoningEffort::wire_str
+    } else {
+        crate::ir::ReasoningEffort::as_str
+    });
 
     // Build JSON messages with structured tool_calls for Jinja.
-    let mut json_messages =
-        build_json_messages_for(messages, state.tokenizer.uses_deepseek_v4_encoding());
+    let mut json_messages = build_json_messages(messages);
     // When TSCG is enabled the parser's `system_prompt()` has already
     // placed the compact tool signatures into messages[0]; passing
     // `tools` to Jinja as well would re-render the full JSON schema and
     // defeat the compaction. Pass `None` so the template's `{% if tools
     // %}` branch falls through — the tool-call format instructions
-    // still come from `system_prompt()`.
-    let mut jinja_tools: Option<Vec<serde_json::Value>> = if tools_active
-        && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
-    {
+    // still come from `system_prompt()`. A verbatim-prompt model renders
+    // the request's tools whenever it has any, `tool_choice: "none"`
+    // included, as the reference server does.
+    let render_tools = if state.chat.verbatim_prompt {
+        !tools.is_empty()
+    } else {
+        tools_active && (state.tokenizer.uses_deepseek_v4_encoding() || !state.chat.prompt.tscg)
+    };
+    let mut jinja_tools: Option<Vec<serde_json::Value>> = if render_tools {
         Some(
             tools
                 .iter()
@@ -66,6 +72,22 @@ pub(super) fn render_template(
     } else {
         None
     };
+
+    // GLM-5 and Qwen4_exp register their tool-envelope XML as added tokens.
+    // Escape matching markup in incoming message prose before rendering so it
+    // remains text; structured call envelopes are still emitted by the
+    // template as native calls; literal argument values and schema descriptions
+    // remain text.
+    let escaped_tool_markup = state.tokenizer.escape_glm_tool_markup(
+        json_messages
+            .iter_mut()
+            .chain(jinja_tools.iter_mut().flatten()),
+    );
+    if escaped_tool_markup > 0 {
+        tracing::info!(
+            "{escaped_tool_markup} GLM/Qwen tool markers in message text encoded as text"
+        );
+    }
 
     // In a request with media only the template's own vision markers may
     // become placeholders: markers written in message text encode as text
@@ -95,9 +117,8 @@ pub(super) fn render_template(
                 jinja_tools.as_deref(),
                 template_thinking,
                 state.behavior.disable_tool_steering,
-                reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
+                reasoning_effort,
                 preserve_thinking,
-                structured_output,
             )
             .map(|t| t.len())
             .unwrap_or(0);
@@ -115,9 +136,8 @@ pub(super) fn render_template(
         jinja_tools.as_deref(),
         template_thinking,
         state.behavior.disable_tool_steering,
-        reasoning_effort.map(crate::ir::ReasoningEffort::as_str),
+        reasoning_effort,
         preserve_thinking,
-        structured_output,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -193,12 +213,12 @@ fn reconcile_prompt_thinking(
             (None, _) => false,
         };
         if has_unclosed_think && !enable_thinking {
+            let budget = crate::ir::server_thinking_budget(max_thinking_budget);
             tracing::info!(
                 "Template-forced thinking detected (unclosed \\<think\\> in prompt tail) — \
-                 overriding enable_thinking=true with budget={}",
-                max_thinking_budget,
+                 overriding enable_thinking=true with budget={budget:?}",
             );
-            (true, Some(max_thinking_budget))
+            (true, budget)
         } else {
             (enable_thinking, thinking_budget)
         }
@@ -217,18 +237,13 @@ mod thinking_tests;
 ///   * no media → `content` is a plain string,
 ///   * media    → `content` is `[<one marker per media item, in the
 ///     client's order>, {type:text}]` (text part omitted when empty),
-///   * `tool_calls` / `reasoning_content` attached when present.
+///   * `tool_calls` / `tool_call_id` / `reasoning_content` attached when
+///     present (vLLM passes `tool_call_id` to every template; GLM-5.3's orders
+///     parallel tool results by it).
 ///
 /// Roles arrive canonical (`developer` → `system` normalization happens
 /// at MsgEntry build time).
 pub(super) fn build_json_messages(messages: &[MsgEntry]) -> Vec<serde_json::Value> {
-    build_json_messages_for(messages, false)
-}
-
-fn build_json_messages_for(
-    messages: &[MsgEntry],
-    include_tool_call_ids: bool,
-) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|m| {
@@ -261,7 +276,7 @@ fn build_json_messages_for(
             if let Some(ref tcs) = m.tool_calls {
                 msg["tool_calls"] = serde_json::Value::Array(tcs.clone());
             }
-            if include_tool_call_ids && let Some(ref id) = m.tool_call_id {
+            if let Some(ref id) = m.tool_call_id {
                 msg["tool_call_id"] = serde_json::Value::String(id.clone());
             }
             // F1: forward historical reasoning trace to the Jinja
@@ -386,7 +401,7 @@ mod json_message_tests {
                 ],
                 "reasoning_content": "plan the verification"
             },
-            {"role": "tool", "content": "total 0"},
+            {"role": "tool", "content": "total 0", "tool_call_id": "c1"},
             {"role": "user", "content": "thanks"}
         ]);
         assert_eq!(

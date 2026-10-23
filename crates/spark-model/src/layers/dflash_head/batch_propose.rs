@@ -341,7 +341,11 @@ impl BlockDiffusionDraftHead {
                 }
             }
             if self.candidate_selector.is_some() {
-                self.run_batched_dflash2_tail(batch_size, last_tokens, ctx, stream)?;
+                // ATLAS_GLM_DRAFT_TP_TOPK: the split swapped candidate lists.
+                let lists = batch_split
+                    .filter(|(split, _)| split.plan().topk)
+                    .and_then(|(split, _)| split.topk.as_ref());
+                self.run_batched_dflash2_tail(batch_size, last_tokens, lists, ctx, stream)?;
             } else {
                 self.run_batched_markov(batch_size, ctx, stream)?;
             }

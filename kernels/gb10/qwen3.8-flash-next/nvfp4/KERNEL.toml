@@ -1,18 +1,9 @@
 # Qwen3.8-Flash-Next NVFP4 shadow.
 #
-# NO .cu overrides yet — every kernel is inherited from `common/`. That is a
-# supported shape (see `nllb-200-3.3b/bf16`, also override-free) and it is the
-# right starting point: the startup kernel audit is fail-closed, so if a
-# dispatch path needs something common/ does not provide, it says so by name
-# rather than serving wrong numbers.
-#
-# The module map below is copied from `qwen3.6-35b-a3b/nvfp4` because that is
-# the closest live architecture — GDN + MoE + NVFP4 + ViT, same vocab
-# (248320), rope_theta, head_dim, partial-rotary factor and GDN key geometry.
-# Its three tuned overrides (gated_delta_rule, moe_w4a16_grouped_gemm,
-# w4a16_gemm) are shaped for hidden 2048 / 256 experts; this model is hidden
-# 2560 / 512 experts, so they are a LATER tuning question, not a
-# copy-them-now one.
+# Inherits common kernels and supplies Qwen-shaped overrides in this directory.
+# The RNE weight quantizer is shared with GLM through a tracked symlink.
+# The module map keeps runtime lookup names stable; the startup audit refuses
+# missing requested entry points rather than silently serving another path.
 
 [build]
 extra_nvcc_flags = ["--fmad=false"]

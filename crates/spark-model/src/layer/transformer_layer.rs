@@ -7,7 +7,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
+use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, MultiPass};
 
 mod default_loops;
 
@@ -33,6 +33,17 @@ mod default_loops;
 /// is a pure host-side layout change). 48 GDN layers x 16 tables x 32
 /// entries x 8 B = 192 KB.
 pub const VERIFY_WY_TABLE_SEQS: usize = 32;
+
+/// The decode rows of a [`TransformerLayer::decode_rows_kv_only`] call:
+/// `n` rows of `hidden` / `residual` scratch, row `i` at KV row `seq_lens[i]`.
+#[derive(Clone, Copy)]
+pub struct KvRows<'a> {
+    pub hidden: DevicePtr,
+    pub residual: DevicePtr,
+    pub n: usize,
+    pub seq_lens: &'a [usize],
+    pub stream: u64,
+}
 /// Tables per GDN layer: h_state + Hi0..Hi14 (K=16 verify → 15
 /// intermediates). wy2..4 read only the first `k` slabs and wyN reads only
 /// slabs 0 (h) and 1 (Hi_0 base) — the extra slabs exist so the
@@ -78,6 +89,22 @@ pub trait TransformerLayer: Send + Sync {
         anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
     }
 
+    /// Packed multi-prompt prefill (`glm_packed`): `owners` tile arena rows
+    /// `[0, total)`, each a whole new prompt. Row-local work runs once over
+    /// every row; each prompt advances only its own state. Unsupported layers
+    /// refuse before any work.
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        _total: usize,
+        _owners: &mut [super::glm_packed::GlmPackedOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM packed prefill is unsupported for this layer")
+    }
+
     /// True when this layer's PREFILL attends only over the tokens it is
     /// handed, so a prefix-cache skip would hide the cached prefix from
     /// attention entirely. MLA layers on the paged path do; everything else
@@ -103,6 +130,26 @@ pub trait TransformerLayer: Send + Sync {
         _num_tokens: usize,
     ) -> bool {
         false
+    }
+
+    /// `ATLAS_QWEN4EXP_EXACT_DEFER`: whether this layer's exact verify at
+    /// `num_tokens` rows a sequence runs deferred
+    /// (`layers/ops/qwen4exp_gdn_defer.rs`). Host-side and pure like
+    /// [`Self::gdn_deferred_wyn`], for the same reason. Default: never.
+    fn gdn_exact_defer(
+        &self,
+        _gpu: &dyn spark_runtime::gpu::GpuBackend,
+        _levers: &crate::layers::ops::ModelLevers,
+        _config: &atlas_core::config::ModelConfig,
+        _num_tokens: usize,
+    ) -> bool {
+        false
+    }
+
+    /// The conv1d weight the exact deferred commit replays with. NULL on
+    /// non-GDN layers.
+    fn gdn_conv_weight(&self) -> spark_runtime::gpu::DevicePtr {
+        spark_runtime::gpu::DevicePtr::NULL
     }
 
     /// `gated_delta_rule_commit` handle for the deferred-commit accept path
@@ -220,14 +267,18 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
-    /// Finish the staged ingest of `row` at position `pos` into `state` (the
-    /// row's owner) after a staged run. Only layers that
-    /// [`Self::qsa_inert_capturable`] stage anything.
+    /// Finish the staged ingest of rows `row..row + count` at positions
+    /// `pos..pos + count` into `state` (the rows' owner) after a staged run;
+    /// `pitched`: as one pitched copy (`QsaIndexer::commit_staged_rows`).
+    /// Only layers that [`Self::qsa_inert_capturable`] stage anything.
+    #[allow(clippy::too_many_arguments)]
     fn qsa_commit_staged(
         &self,
         _state: &mut dyn LayerState,
         _row: usize,
         _pos: usize,
+        _count: usize,
+        _pitched: bool,
         _gpu: &dyn GpuBackend,
         _stream: u64,
     ) -> Result<()> {
@@ -422,6 +473,15 @@ pub trait TransformerLayer: Send + Sync {
     /// `kv_write_start`: number of tokens whose KV cache entries are already
     /// populated (prefix caching). Attention layers skip KV writes for
     /// positions `< kv_write_start`. SSM layers ignore this (recurrent).
+    /// One prefill pass over several sequences' rows (`ATLAS_QWEN4EXP_PREFILL_MULTI`):
+    /// `segs` lie back to back in `hidden` (`total` rows). The row-wise work
+    /// runs once over every row, the per-sequence work (recurrences, PLE,
+    /// attention) per segment, each row's bytes those of its own sequence's
+    /// single-sequence row-invariant prefill. Default: unsupported.
+    fn prefill_multi(&self, pass: &mut MultiPass<'_, '_>) -> Result<()> {
+        super::multi_seg::unsupported(pass)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,
@@ -843,6 +903,20 @@ pub trait TransformerLayer: Send + Sync {
             ctx,
             stream,
         )
+    }
+
+    /// Write the KV rows of `rows` (metadata in `ctx`) and nothing else: no
+    /// attention read, FFN or residual update. A one-layer drafter's KV row
+    /// depends on its own input row only, which is what the qwen4_exp MTP
+    /// absorb (`ATLAS_QWEN4EXP_MTP_ABSORB`) relies on. `Ok(false)` =
+    /// unsupported.
+    fn decode_rows_kv_only(
+        &self,
+        _rows: KvRows<'_>,
+        _kv_cache: &mut PagedKvCache,
+        _ctx: &ForwardContext,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Decode N sequences through this layer in a single batched call.

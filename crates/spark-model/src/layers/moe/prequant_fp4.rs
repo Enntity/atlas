@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod grouped;
+
 #[derive(Clone, Copy)]
 pub(super) struct CompactMoeWorklist {
     pub worklist: DevicePtr,
@@ -47,9 +49,17 @@ pub(super) fn glm_grouped_shape(config: &atlas_core::config::ModelConfig) -> boo
         && config.shared_expert_intermediate_size == 2048
         && config.num_experts == 288
         && config.num_experts_per_tok == 8
-        && config.tp_world_size == 2
-        && config.ep_world_size == 2
+        && glm_tp_ep(config)
         && config.scoring_func == "sigmoid"
+}
+
+/// Whether the ranks split GLM-5 as the TP2/EP2 pair or the TP4/EP4 chain
+/// do: one TP rank per EP rank. Each rank holds its 1/ep of the routed
+/// experts (or, under expert TP, of every expert's width), so every routed
+/// and shared lane serves the same rows on every rank and the one all-reduce
+/// sums the ranks' partials, at two ranks or four.
+pub(crate) fn glm_tp_ep(config: &atlas_core::config::ModelConfig) -> bool {
+    config.tp_world_size == config.ep_world_size && matches!(config.ep_world_size, 2 | 4)
 }
 
 /// Row tiles of the K128W kernels over `rows` sorted rows: the device prefix
@@ -104,7 +114,9 @@ impl MoeLayer {
     /// routed GEMV to the established prequantized native-FP4 grouped path.
     pub(super) fn glm_c3_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
         // ATLAS_GLM_CANONICAL_VERIFY: no K=3-only arm (router, shared, tiles).
+        // A packed prefill keeps the generic grouped path (`glm_packed_scope`).
         !crate::layers::canonical_verify::enabled()
+            && !crate::layers::glm_packed_scope::active()
             && std::env::var("ATLAS_GLM_C3_GROUPED_MOE").as_deref() == Ok("1")
             && c3_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && self.glm_grouped_resources(ctx)
@@ -112,7 +124,8 @@ impl MoeLayer {
     }
 
     pub(super) fn glm_c4_grouped(&self, ctx: &ForwardContext, rows: u32) -> bool {
-        crate::model::glm_c4::enabled(&ctx.config.model_type)
+        !crate::layers::glm_packed_scope::active()
+            && crate::model::glm_c4::enabled(&ctx.config.model_type)
             && super::forward_c4::c4_grouped_requested()
             && c4_grouped_shape(ctx.config, rows, ctx.levers.max_decode_seqs)
             && ctx.attn_metadata.is_some_and(|m| m.num_seqs == 4)
@@ -123,7 +136,7 @@ impl MoeLayer {
 
     pub(super) fn glm_grouped_resources(&self, ctx: &ForwardContext) -> bool {
         self.glm_native_moe_resources(ctx)
-            && self.nvfp4_prequant_moe
+            && self.prequant_moe()
             && self.nvfp4_fused_silu_quant
             && self.moe_w4a4_prequant_t_k64.0 != 0
             && self.moe_w4a4_prequant_t_k64_compact.0 != 0
@@ -140,7 +153,7 @@ impl MoeLayer {
             && self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_mixed_bf16_shared_expert()
+            && !self.has_unfused_shared_expert()
             && self.experts_scale_kind == crate::weight_map::WeightQuantFormat::Nvfp4
             && !self.nvfp4_mmq_layout
             && self.use_btile_or_t_prefill()
@@ -187,18 +200,57 @@ impl MoeLayer {
         // `prerouted`: `glm_moe_router_quant` wrote them (route_fuse.rs).
         let a_packed = ctx.buffers.expert_down_out();
         let a_scale = a_packed.offset(n as usize * h as usize / 2);
+        // ATLAS_GLM_FP4L_DECODE_A16's stream twins read the BF16 rows and the
+        // plain tables (`input_scales.rs`).
+        let a16 = self.a16_stream();
+        if a16 {
+            let grid = wide.filter(|g| g.gate_up_silu.grid.0 != 0);
+            anyhow::ensure!(
+                grid.is_some() && inter.is_multiple_of(128) && h.is_multiple_of(128),
+                "ATLAS_GLM_FP4L_DECODE_A16: {n} rows left the W4A16 stream twins' grid"
+            );
+            let grid = grid.expect("checked above");
+            if ctx.gpu.op_cache().first_shape("moe:decode_a16", n, 0, 0) {
+                tracing::info!(
+                    "ATLAS_GLM_FP4L_DECODE_A16 engaged: rows={n} on the W4A16 stream twins"
+                );
+            }
+            ops::moe_w4a4_grouped_gemm_prequant_gate_up_silu_k128w(
+                ctx.gpu,
+                grid.gate_up_silu,
+                expert_input,
+                DevicePtr::NULL,
+                [gate.packed_ptrs, gate.scale_ptrs, gate.scale2_vals],
+                [up.packed_ptrs, up.scale_ptrs, up.scale2_vals],
+                // The BF16 SiLU·mul rows over the up output's.
+                [expert_up_out, DevicePtr::NULL, DevicePtr::NULL],
+                expert_offsets,
+                sorted_token_ids,
+                num_experts,
+                inter,
+                h,
+                grid.prefix,
+                grid.schedule,
+                stream,
+            )?;
+            return Ok(true);
+        }
         if !prerouted {
-            ops::quantize_bf16_to_nvfp4(
+            ops::quantize_bf16_to_nvfp4_scaled(
                 ctx.gpu,
                 self.quantize_nvfp4_k,
                 expert_input,
                 a_packed,
                 a_scale,
+                self.a1_scale2(),
                 n,
                 h,
                 stream,
             )?;
         }
+        // ATLAS_GLM_FP4L_INPUT_SCALES: the tables folding the gate/up input's
+        // scale back (`input_scales.rs`); these themselves without it.
+        let (gate, up) = (self.a4_table(gate)?, self.a4_table(up)?);
         let grouped_kernel = if self.nvfp4_vecscale && self.moe_w4a4_prequant_t_k64_vecscale.0 != 0
         {
             self.moe_w4a4_prequant_t_k64_vecscale
@@ -282,8 +334,11 @@ impl MoeLayer {
                 a_scale,
                 [gate.packed_ptrs, gate.scale_ptrs, gate.scale2_vals],
                 [up.packed_ptrs, up.scale_ptrs, up.scale2_vals],
-                expert_up_out,
-                expert_up_out.offset(grid.rows as usize * inter as usize / 2),
+                [
+                    expert_up_out,
+                    expert_up_out.offset(grid.rows as usize * inter as usize / 2),
+                    self.a2_gscale(),
+                ],
                 expert_offsets,
                 sorted_token_ids,
                 num_experts,
@@ -391,75 +446,6 @@ impl MoeLayer {
             gate_up_silu: self.moe_w4a4_prequant_gate_up_silu,
             down: self.moe_w4a4_prequant_t_k128w,
         }))
-    }
-
-    /// One prequant grouped projection `[rows, k] x [k, n]`: the K128W kernel
-    /// over `wide` when it fits, else the K128 kernel (256 threads) when
-    /// enabled and K128/N128-aligned, else `fallback` (128 threads) over the
-    /// dense `(n/128, max_m_tiles, experts)` grid. All three agree bit for bit.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn prequant_grouped(
-        &self,
-        fallback: KernelHandle,
-        [a_packed, a_scale]: [DevicePtr; 2],
-        weight: &ExpertPtrTable,
-        output: DevicePtr,
-        expert_offsets: DevicePtr,
-        sorted_token_ids: DevicePtr,
-        num_experts: u32,
-        [n, k]: [u32; 2],
-        max_m_tiles: u32,
-        wide: Option<MtileGrid>,
-        ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<()> {
-        if let Some(grid) = wide
-            && n % 256 == 0
-            && k % 128 == 0
-        {
-            return ops::moe_w4a4_grouped_gemm_prequant_k128w(
-                ctx.gpu,
-                grid.down,
-                a_packed,
-                a_scale,
-                weight.packed_ptrs,
-                weight.scale_ptrs,
-                weight.scale2_vals,
-                output,
-                expert_offsets,
-                sorted_token_ids,
-                num_experts,
-                n,
-                k,
-                grid.prefix,
-                grid.schedule,
-                stream,
-            );
-        }
-        let (kernel, threads) =
-            if self.moe_w4a4_prequant_t_k128.0 != 0 && n % 128 == 0 && k % 128 == 0 {
-                (self.moe_w4a4_prequant_t_k128, 256)
-            } else {
-                (fallback, 128)
-            };
-        ops::moe_w4a4_grouped_gemm_prequant_n128(
-            ctx.gpu,
-            kernel,
-            a_packed,
-            a_scale,
-            weight.packed_ptrs,
-            weight.scale_ptrs,
-            weight.scale2_vals,
-            output,
-            expert_offsets,
-            sorted_token_ids,
-            num_experts,
-            n,
-            k,
-            max_m_tiles,
-            threads,
-            stream,
-        )
     }
 }
 

@@ -11,24 +11,24 @@ use anyhow::{Result, bail};
 use atlas_core::config::ModelConfig;
 use spark_comm::CommBackend;
 use spark_runtime::buffers::BufferArena;
-use spark_runtime::gpu::mock::MockGpuBackend;
+use spark_runtime::gpu::{GpuBackend, mock::MockGpuBackend};
 
 use super::*;
 
 /// One rank's outgoing payloads, in order.
 #[derive(Default)]
-struct Wire {
+pub(crate) struct Wire {
     queues: Mutex<[VecDeque<Vec<u8>>; 2]>,
     cv: Condvar,
 }
 
-struct LoopPair<'a> {
-    gpu: &'a MockGpuBackend,
-    rank: usize,
-    wire: Arc<Wire>,
+pub(crate) struct LoopPair<'a> {
+    pub(crate) gpu: &'a MockGpuBackend,
+    pub(crate) rank: usize,
+    pub(crate) wire: Arc<Wire>,
 }
 
-fn bf16(x: f32) -> u16 {
+pub(crate) fn bf16(x: f32) -> u16 {
     let b = x.to_bits();
     ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) as u16
 }
@@ -38,7 +38,7 @@ fn f32_of(x: u16) -> f32 {
 }
 
 /// `dst + src` per BF16 element, as `__hadd` rounds it.
-fn add_into(dst: &mut [u8], src: &[u8]) {
+pub(crate) fn add_into(dst: &mut [u8], src: &[u8]) {
     for (d, s) in dst.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
         let a = f32_of(u16::from_le_bytes([d[0], d[1]]));
         let b = f32_of(u16::from_le_bytes([s[0], s[1]]));
@@ -103,9 +103,35 @@ impl CommBackend for LoopPair<'_> {
     }
 }
 
-fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardContext) -> R) -> R {
+pub(crate) fn with_ctx<R>(
+    gpu: &MockGpuBackend,
+    comm: &LoopPair,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
+    with_comm_ctx(gpu, comm, f)
+}
+
+/// [`with_ctx`] over any communicator.
+pub(crate) fn with_comm_ctx<R>(
+    gpu: &MockGpuBackend,
+    comm: &dyn CommBackend,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
+    with_model_ctx(gpu, comm, None, f)
+}
+
+/// [`with_comm_ctx`] with an explicit model type for model-specific GPU tests.
+pub(crate) fn with_model_ctx<R>(
+    gpu: &dyn GpuBackend,
+    comm: &dyn CommBackend,
+    model_type: Option<&str>,
+    f: impl FnOnce(&ForwardContext) -> R,
+) -> R {
     let mut config = ModelConfig::qwen3_next_80b_nvfp4();
     config.tp_world_size = 2;
+    if let Some(model_type) = model_type {
+        config.model_type = model_type.to_owned();
+    }
     let buffers = BufferArena::new(&config, 1, 256, 16, 1, gpu).unwrap();
     let dispatch = crate::layers::ops::GemmDispatch::defaults();
     let derived = crate::layers::ops::DerivedWeights::new();
@@ -122,7 +148,7 @@ fn with_ctx<R>(gpu: &MockGpuBackend, comm: &LoopPair, f: impl FnOnce(&ForwardCon
         config: &config,
         attn_metadata: None,
         profile: false,
-        comm: Some(comm as &dyn spark_comm::CommBackend),
+        comm: Some(comm),
         graph_capture: false,
         gdn_exact_replay: false,
         token_ids: None,

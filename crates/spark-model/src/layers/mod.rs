@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
+pub mod aux_d2h;
 pub mod canonical_verify;
 pub mod deepseek_v4_mtp;
 pub mod dense_ffn;
@@ -7,8 +8,14 @@ pub mod dflash_head;
 pub mod ep_dispatch;
 pub mod fp8_calibration;
 mod glm5_kda;
+pub mod glm5_mtp;
+pub(crate) mod glm5_mtp_cursor;
 pub mod glm_kv_shard;
+pub mod glm_native;
+pub mod glm_packed_scope;
 pub mod glm_sp;
+pub mod glm_sp_moe_seam;
+pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
 pub mod moe;
 mod moe_grouped_decode;
@@ -21,11 +28,14 @@ pub mod nemotron_moe;
 pub mod ngram_embed;
 pub mod ops;
 pub mod ple;
+pub(crate) mod prefill_profile;
 pub mod qsa;
 pub mod qwen3_attention;
 pub mod qwen3_ssm;
+pub mod qwen4exp_ckpt;
 pub mod qwen4exp_draft_head;
 pub mod qwen4exp_mtp;
+pub mod qwen4exp_sp_pipe;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 
@@ -72,8 +82,10 @@ pub use dflash_head::{
 };
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
 pub(crate) use glm5_kda::{
-    kda_batched_ffn_enabled, kda_multi_seq_enabled, verify_fused_tp_hc_enabled,
+    kda_batched_ffn_enabled, kda_multi_seq_enabled, kda_side_proj_lt_enabled,
+    verify_fused_tp_hc_enabled,
 };
+pub use glm5_mtp::{Glm5MtpHead, Glm5MtpProposerState};
 pub use moe::MoeLayer;
 pub use moe_grouped_decode::{
     moe_grouped_decode_decide, moe_grouped_decode_enabled, moe_grouped_decode_for,
@@ -289,6 +301,7 @@ pub enum FfnComponent {
 
 mod ffn_c4;
 mod ffn_glm;
+pub(crate) use ffn_glm::ffn_glm_gather_group;
 
 impl FfnComponent {
     pub fn is_none(&self) -> bool {

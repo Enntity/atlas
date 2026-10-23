@@ -40,8 +40,11 @@ fn checked_output(
     owner: DevicePtr,
     capacity: usize,
 ) -> Result<usize> {
-    let (pn, pk, _) = projection.geometry();
-    anyhow::ensure!((n, k) == (pn, pk), "GLM shared M16 projection geometry");
+    let (projection_n, projection_k, _) = projection.geometry();
+    anyhow::ensure!(
+        (n, k) == (projection_n, projection_k),
+        "GLM shared M16 projection geometry"
+    );
     let bytes = 5 * n as usize * 2;
     anyhow::ensure!(
         output == owner && capacity >= bytes,

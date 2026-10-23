@@ -168,11 +168,12 @@ pub(in crate::layers::qwen3_attention) fn glm_chunk_pieces(
 }
 
 /// An `fp8_g128` owner's latents dequantized to BF16 in the arena scratch,
-/// addressed through an identity block table.
+/// addressed through an identity block table of `blocks` entries.
 #[derive(Clone, Copy)]
 pub(super) struct Bf16LatentView {
     pub(super) latents: DevicePtr,
     pub(super) identity_table: DevicePtr,
+    pub(super) blocks: usize,
 }
 
 impl Qwen3AttentionLayer {
@@ -210,6 +211,7 @@ impl Qwen3AttentionLayer {
         let latent_row = nq * kv_lora * 2;
         let sizes = ctx.buffers.sizes();
         if !on
+            || crate::layers::glm_packed_scope::active()
             || owners.len() < if solo { 1 } else { 2 }
             || rows > 64
             || sizes.ssm_qkvz < 2 * rows * key_row
@@ -231,7 +233,7 @@ impl Qwen3AttentionLayer {
         let index = if any_owner_selects(owners, c.index_topk) {
             let query = q_absorbed.offset(rows * latent_row);
             let weights = ctx.buffers.ssm_gates();
-            self.glm_index_project_query(q_latent, normed, n, query, weights, ctx, stream)?;
+            self.glm_index_project_query(q_latent, Some(normed), n, query, weights, ctx, stream)?;
             Some((query, weights))
         } else {
             None
@@ -298,6 +300,7 @@ impl Qwen3AttentionLayer {
         Ok(Some(Bf16LatentView {
             latents,
             identity_table,
+            blocks: capacity / 16,
         }))
     }
 }

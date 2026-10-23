@@ -4,6 +4,8 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
+use crate::weight_map::DenseWeight;
+
 pub fn kda_pack_qkv(
     gpu: &dyn GpuBackend,
     kernel: KernelHandle,
@@ -21,6 +23,63 @@ pub fn kda_pack_qkv(
         .arg_u32(tokens)
         .arg_u32(dim)
         .launch(stream)
+}
+
+/// The KDA prefill convolution of `m` rows into `output` (`[m, 3p]`) from
+/// packed `[m, 3p]` q|k|v rows or, `planar`, the three `[m, p]` planes the
+/// projection wrote (`ATLAS_GLM_KDA_CONV_PLANES`, no `kda_pack_qkv` copy):
+/// one [`super::conv1d_update_prefill`] per plane over that plane's channels,
+/// state rows and weights. Every (channel, token) output and every channel's
+/// state is the same arithmetic either way, so the bytes are identical.
+/// `planar_out`: `output` takes the three `[m, p]` planes instead
+/// (`ATLAS_GLM_KDA_FLASH_PLANES`, the FlashKDA bridge's operands), the same
+/// values at other addresses.
+#[allow(clippy::too_many_arguments)]
+pub fn kda_conv_prefill(
+    gpu: &dyn GpuBackend,
+    [kernel, tp_kernel]: [KernelHandle; 2],
+    conv_state: DevicePtr,
+    (input, planar): (DevicePtr, bool),
+    weight: &DenseWeight,
+    (output, planar_out): (DevicePtr, bool),
+    [m, p, d_conv]: [u32; 3],
+    stream: u64,
+) -> Result<()> {
+    let planes = if planar || planar_out { 3 } else { 1 };
+    let channels = 3 * p / planes;
+    // Where channel group `plane`'s rows start, and their stride, in a
+    // packed `[m, 3p]` or a planar `3 x [m, p]` operand.
+    let at = |base: DevicePtr, planar: bool, plane: u32| {
+        if planar {
+            (base.offset(plane as usize * m as usize * p as usize * 2), p)
+        } else {
+            (base.offset((plane * channels) as usize * 2), 3 * p)
+        }
+    };
+    for plane in 0..planes {
+        let ch0 = (plane * channels) as usize;
+        let (src, in_stride) = at(input, planar, plane);
+        let (dst, out_stride) = at(output, planar_out, plane);
+        super::conv1d_update_prefill(
+            gpu,
+            kernel,
+            tp_kernel,
+            conv_state.offset(ch0 * d_conv as usize * 4),
+            src,
+            &DenseWeight {
+                weight: weight.weight.offset(ch0 * d_conv as usize * 2),
+            },
+            DevicePtr::NULL,
+            dst,
+            channels,
+            d_conv,
+            m,
+            in_stride,
+            out_stride,
+            stream,
+        )?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -322,3 +381,7 @@ pub fn kda_sigmoid_gated_norm(
         .arg_f32(eps)
         .launch(stream)
 }
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "kda_conv_planes_test_gpu.rs"]
+mod conv_planes_gpu_tests;

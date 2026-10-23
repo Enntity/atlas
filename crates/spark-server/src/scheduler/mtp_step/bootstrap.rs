@@ -144,6 +144,58 @@ pub(super) fn bootstrap_one(
         // reached for the Lightning product (handled above).
     }
 
+    // Native GLM MTP starts from the first token already sampled by
+    // prefill. Its prompt primer owns rows through the last prompt pair;
+    // stage the prompt-final hidden and propose at position P so the first
+    // generated token fills the missing `(token, hidden_{P-1})` pair.
+    // Running the ordinary standalone decode here would consume an extra
+    // target row and leave that pair absent from the private MTP cache.
+    if model.native_mtp_bootstrap_enabled() {
+        let effective_num_drafts =
+            crate::scheduler::spec_step::effective_drafts_under_grammar(a, ladder_nd);
+        if let Err(e) = model.save_native_mtp_prompt_hidden(&a.seq) {
+            tracing::error!("native MTP bootstrap hidden staging failed: {e:#}");
+            mark_engine_error(
+                a,
+                format!("native MTP bootstrap hidden staging failed: {e:#}"),
+            );
+            return false;
+        }
+        let _mtp_grammar_mask = mtp_grammar_mask_for(a);
+        match model.run_mtp_propose_multi(
+            a.last_token,
+            a.seq.seq_len,
+            effective_num_drafts,
+            &mut a.seq,
+            0,
+            _mtp_grammar_mask.as_deref(),
+        ) {
+            Ok(drafts) if !drafts.is_empty() => {
+                tracing::debug!(
+                    "native MTP bootstrap: tok={} position={} drafts={drafts:?}",
+                    a.last_token,
+                    a.seq.seq_len,
+                );
+                a.set_proposed_drafts(drafts);
+            }
+            Ok(_) => {
+                mark_engine_error(a, "native MTP bootstrap returned no drafts");
+            }
+            Err(e) => {
+                tracing::error!("native MTP bootstrap propose failed: {e:#}");
+                mark_engine_error(a, format!("native MTP bootstrap propose failed: {e:#}"));
+            }
+        }
+        if a.finished {
+            return false;
+        }
+        if let Err(e) = model.start_checkpoint_async(&mut a.seq) {
+            tracing::error!("native MTP bootstrap checkpoint failed: {e:#}");
+            mark_engine_error(a, format!("native MTP bootstrap checkpoint failed: {e:#}"));
+        }
+        return false;
+    }
+
     // Non-DFlash path (or DFlash-propose fallback): EP broadcast + standalone decode.
     // EP: broadcast token to worker before decode (worker runs decode in lockstep).
     if let Err(e) = model.ep_broadcast_cmd_for_seq(a.seq.slot_idx as u32, a.last_token) {
@@ -163,21 +215,15 @@ pub(super) fn bootstrap_one(
     // the GPU argmax only where the pipeline provably keeps it, otherwise the
     // full pipeline — inside `<think>` and right after it included, where the
     // raw argmax used to be taken unmasked.
-    let tok = match crate::scheduler::fast_greedy::pick_row(model, logits, a, verify_ctx, None) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("bootstrap sample error: {e:#}");
-            mark_engine_error(a, format!("bootstrap sampling failed: {e:#}"));
-            return false;
-        }
-    };
-
-    // Extract logprobs from bootstrap decode logits (single position).
-    let lp = if let Some(k) = a.top_logprobs {
-        extract_single_logprobs(model, logits, tok, k)
-    } else {
-        None
-    };
+    let (tok, lp) =
+        match crate::scheduler::fast_greedy::pick_row_scored(model, logits, a, verify_ctx, None) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("bootstrap sample error: {e:#}");
+                mark_engine_error(a, format!("bootstrap sampling failed: {e:#}"));
+                return false;
+            }
+        };
 
     emit_token(a, tok, lp, sched);
     if a.finished {

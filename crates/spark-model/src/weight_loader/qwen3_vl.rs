@@ -289,6 +289,9 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
             vcfg.intermediate_size,
             vcfg.patch_size,
             vcfg.max_pixels,
+            // The longest prefill chunk sizes the output window
+            // (`vision_limits::window_rows`); every arena region uses it too.
+            config.max_batch_tokens,
             gpu,
         )?;
         tracing::info!(

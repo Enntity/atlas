@@ -39,6 +39,10 @@ pub struct SchedLevers {
     /// `ATLAS_PREFILL_SRPT=1`: a new multi-chunk prefill joins the queue by
     /// tokens left (shortest first) instead of by arrival.
     pub prefill_srpt: bool,
+    /// `ATLAS_PREFILL_QUEUE_FIRST_CHUNK=1` (multi-rank worlds): a new prompt
+    /// admitted behind a prefill in flight waits in the queue for its first
+    /// chunk instead of running it at admission (`phase_start_prefills::queue_first`).
+    pub prefill_queue_first_chunk: bool,
 
     // ── DFlash speculation ──
     pub dflash_masked_verify: bool,
@@ -67,8 +71,6 @@ pub struct SchedLevers {
     // ── Watchdogs ──
     /// Disable every generation watchdog.
     pub disable_watchdogs: bool,
-    /// Suppress EOS while inside a thinking block.
-    pub eos_suppressed_by_thinking: bool,
     /// Forced-token fast path. Ships ON; `ATLAS_DISABLE_FORCED_TOKEN=1` opts out.
     pub forced_token_fastpath: bool,
 
@@ -81,6 +83,10 @@ pub struct SchedLevers {
     /// Per-request deep MTP draft ceiling (`ATLAS_MTP_DYNAMIC_DEPTH=1`,
     /// `mtp_deep_depth`).
     pub mtp_dynamic_depth: bool,
+    /// `ATLAS_QWEN_COPY_DRAFTS=1`: prompt/reply copies in place of the MTP
+    /// head's propose where every verify row is serial decode's
+    /// (`copy_drafts::mtp`).
+    pub qwen_copy_drafts: bool,
     pub adadec_diagnostic: bool,
 
     /// Loop watchdog. **Runtime-mutable** — the TUI ops REPL toggles it while
@@ -154,6 +160,7 @@ impl SchedLevers {
             mtp_minp: on_unless("ATLAS_NO_MTP_MINP"),
             mtp_verify_sample: on_unless("ATLAS_NO_MTP_VERIFY_SAMPLE"),
             prefill_srpt: opt_in("ATLAS_PREFILL_SRPT"),
+            prefill_queue_first_chunk: opt_in("ATLAS_PREFILL_QUEUE_FIRST_CHUNK"),
 
             dflash_masked_verify: opt_in("ATLAS_DFLASH_MASKED_VERIFY"),
             dflash_seam_serial: opt_in("ATLAS_DFLASH_SEAM_SERIAL"),
@@ -175,7 +182,6 @@ impl SchedLevers {
             disable_watchdogs: crate::scheduler::helpers::parse_disable_watchdogs(
                 std::env::var("ATLAS_DISABLE_WATCHDOGS").ok().as_deref(),
             ),
-            eos_suppressed_by_thinking: opt_in("ATLAS_EOS_SUPPRESS_THINKING"),
             forced_token_fastpath: crate::scheduler::helpers::parse_forced_token_fastpath(
                 std::env::var("ATLAS_DISABLE_FORCED_TOKEN").ok().as_deref(),
             ),
@@ -188,6 +194,7 @@ impl SchedLevers {
             mtp_gate_force: mtp_gate_force(),
             mtp_single_depth_adapt: opt_in("ATLAS_MTP_SINGLE_DEPTH_ADAPT"),
             mtp_dynamic_depth: spark_model::speculative::deep_depth::enabled(),
+            qwen_copy_drafts: opt_in("ATLAS_QWEN_COPY_DRAFTS"),
             adadec_diagnostic: present("ATLAS_ADADEC_DIAGNOSTIC"),
 
             loop_watchdog: AtomicBool::new(false),
@@ -205,6 +212,7 @@ impl SchedLevers {
             mtp_minp: true,
             mtp_verify_sample: true,
             prefill_srpt: false,
+            prefill_queue_first_chunk: false,
             dflash_masked_verify: false,
             dflash_seam_serial: false,
             dflash_adaptive: false,
@@ -217,13 +225,13 @@ impl SchedLevers {
             dflash_resume_guard: 0,
             shadow_topk: 0,
             disable_watchdogs: false,
-            eos_suppressed_by_thinking: false,
             forced_token_fastpath: true,
             decode_timing: false,
             mtp_timing: false,
             mtp_gate_force: false,
             mtp_single_depth_adapt: false,
             mtp_dynamic_depth: false,
+            qwen_copy_drafts: false,
             adadec_diagnostic: false,
             loop_watchdog: AtomicBool::new(false),
         }
@@ -296,6 +304,8 @@ mod tests {
             !d.decode_timing && !d.mtp_timing && !d.mtp_single_depth_adapt && !d.adadec_diagnostic
         );
         assert!(!d.mtp_dynamic_depth);
+        assert!(!d.prefill_srpt && !d.prefill_queue_first_chunk);
+        assert!(!d.qwen_copy_drafts);
     }
 
     #[test]

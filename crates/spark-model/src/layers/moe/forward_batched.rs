@@ -16,7 +16,7 @@ impl MoeLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        if ctx.config.expert_tp {
+        if self.grouped_only(ctx) {
             return self.forward_prefill(input, num_tokens, ctx, stream);
         }
         // LongCat zero-experts ARE wired here (softmax+bias arm below); the
@@ -454,8 +454,8 @@ impl MoeLayer {
                 stream,
             )?;
 
-            if self.has_mixed_bf16_shared_expert() {
-                self.run_bf16_shared_expert(
+            if self.has_unfused_shared_expert() {
+                self.run_unfused_shared_expert(
                     input_t,
                     1,
                     h,

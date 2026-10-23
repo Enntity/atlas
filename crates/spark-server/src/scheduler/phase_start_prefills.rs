@@ -6,11 +6,14 @@
 
 use spark_model::traits::Model;
 
+use super::beam_prefill::pack_beam_chunks;
 use super::*;
 use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
 mod initial_budget;
+mod packed;
+mod queue_first;
 mod queue_order;
 
 #[allow(clippy::too_many_arguments)]
@@ -250,11 +253,43 @@ pub(super) fn start_new_requests(
         }
     }
 
+    // Packed multi-prompt prefill (`packed`, ATLAS_GLM_PACKED_PREFILL=1):
+    // which of this tick's prompts join it. Off, `packed_prefill_capacity`
+    // is (0, 0) and nothing below changes.
+    let pack_caps = model.packed_prefill_capacity();
+    let packable: Vec<bool> = new_reqs
+        .iter()
+        .zip(&pc_plants)
+        .map(|(req, plant)| {
+            chunked && pack_caps.1 > 0 && packed::eligible(model, req, plant.is_some(), pack_caps.0)
+        })
+        .collect();
+    let mut packed_ps: Vec<PrefillInProgress> = Vec::new();
+    // ATLAS_QWEN4EXP_PREFILL_MULTI: defer the short prompts of a burst (two
+    // or more this tick, or some already waiting) to one multi-sequence pass.
+    let multi_eligible = |req: &InferenceRequest| {
+        chunked
+            && !req.has_image_pixels()
+            && req.num_beams() <= 1
+            && super::prefill_multi::eligible(
+                model,
+                req.prompt_len(),
+                req.prompt_len() <= max_prefill_tokens,
+                req.prompt_logprobs().is_some(),
+                req.adapter_slot(),
+            )
+    };
+    let multi_burst = new_reqs.iter().filter(|r| multi_eligible(r)).count() >= 2
+        || super::prefill_multi::pending(model, prefilling);
+
     for (req_idx, (req, pc_plant)) in new_reqs.into_iter().zip(pc_plants).enumerate() {
         let precomputed_beam_hyp = beam_hyps[req_idx].take();
         if chunked {
-            let defer =
-                want_codispatch || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
+            let pack = packable[req_idx];
+            let defer = pack
+                || want_codispatch
+                || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels())
+                || (multi_burst && multi_eligible(&req));
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -276,6 +311,20 @@ pub(super) fn start_new_requests(
                 active.is_empty() && prefilling.is_empty(),
                 glm_c4_sparse,
             );
+            // ATLAS_PREFILL_QUEUE_FIRST_CHUNK: behind a prefill in flight, a
+            // prompt longer than one chunk waits for its turn (`queue_first`);
+            // `start_chunked_prefill`'s first chunk is the whole prompt
+            // exactly when it fits `budget` (the granule rounding only cuts a
+            // chunk short of the prompt's end).
+            let first_chunk = queue_first::first_chunk(
+                defer,
+                sched.levers.prefill_queue_first_chunk,
+                model.is_ep(),
+                !prefilling.is_empty(),
+                req.has_image_pixels(),
+                req.num_beams() > 1,
+                req.prompt_len() <= budget,
+            );
             match start_chunked_prefill(
                 sched,
                 think_end_token,
@@ -290,7 +339,8 @@ pub(super) fn start_new_requests(
                 prefill_event,
                 grammar_engine,
                 spontaneous_think_budget,
-                defer,
+                first_chunk,
+                pack,
                 vision_slice,
                 precomputed_beam_hyp,
                 pc_plant,
@@ -303,6 +353,7 @@ pub(super) fn start_new_requests(
                     );
                     active.push(a);
                 }
+                Ok(StartPrefillResult::InProgress(p)) if pack => packed_ps.push(p),
                 Ok(StartPrefillResult::InProgress(p)) => {
                     tracing::info!(
                         "Prefill chunk 0/{}: {}/{} tokens",
@@ -319,6 +370,12 @@ pub(super) fn start_new_requests(
                         .collect();
                     let left = p.prompt_tokens.len() - p.chunk_offset;
                     let at = queue_order::position(&queued, left, sched.levers.prefill_srpt);
+                    if p.queued_first_chunk.is_some() {
+                        tracing::info!(
+                            "Prefill queued for its first chunk at {at} of {} in flight",
+                            queued.len(),
+                        );
+                    }
                     prefilling.insert(at, p);
                 }
                 Ok(StartPrefillResult::Finished) => {} // EOS on first token
@@ -356,34 +413,16 @@ pub(super) fn start_new_requests(
             }
         }
     }
-}
-
-/// Group beam requests by adapter — the model's single global LoRA gate forces
-/// one adapter per fused batch — then pack each group into chunks whose summed
-/// beam count does not exceed `cap`. `items` is `(req_idx, adapter_slot,
-/// num_beams)`; returns chunks of `req_idx` (adapter order is deterministic).
-fn pack_beam_chunks(items: &[(usize, i32, usize)], cap: usize) -> Vec<Vec<usize>> {
-    let mut groups: std::collections::BTreeMap<i32, Vec<(usize, usize)>> =
-        std::collections::BTreeMap::new();
-    for &(idx, adapter, nb) in items {
-        groups.entry(adapter).or_default().push((idx, nb));
-    }
-    let mut chunks: Vec<Vec<usize>> = Vec::new();
-    for reqs in groups.into_values() {
-        let (mut chunk, mut beams) = (Vec::new(), 0usize);
-        for (idx, nb) in reqs {
-            if !chunk.is_empty() && beams + nb > cap {
-                chunks.push(std::mem::take(&mut chunk));
-                beams = 0;
-            }
-            chunk.push(idx);
-            beams += nb;
-        }
-        if !chunk.is_empty() {
-            chunks.push(chunk);
-        }
-    }
-    chunks
+    packed::run(
+        model,
+        sched,
+        packed_ps,
+        think_end_token,
+        think_start_token,
+        tool_call_start_token,
+        tool_call_end_token,
+        active,
+    );
 }
 
 /// SSM-pool-full preemption: free oldest active sequence and surface a
@@ -402,51 +441,5 @@ fn handle_prefill_start_error(model: &dyn Model, e: &anyhow::Error, active: &mut
         send_error(model, &mut victim, "Preempted: server resource pressure");
     } else {
         tracing::error!("Prefill start error: {err_msg}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::pack_beam_chunks;
-
-    #[test]
-    fn groups_by_adapter_then_packs_by_cap() {
-        // Two adapters (-1, 7), five beams each request. cap=15 ⇒ ≤3 per chunk.
-        let items = [
-            (0, -1, 5),
-            (1, 7, 5),
-            (2, -1, 5),
-            (3, 7, 5),
-            (4, -1, 5),
-            (5, 7, 5),
-            (6, -1, 5),
-            (7, 7, 5),
-        ];
-        let chunks = pack_beam_chunks(&items, 15);
-        // adapter -1: idx 0,2,4,6 → [0,2,4] + [6]; adapter 7: 1,3,5,7 → [1,3,5] + [7].
-        assert_eq!(chunks, vec![vec![0, 2, 4], vec![6], vec![1, 3, 5], vec![7]]);
-        // No chunk exceeds the cap.
-        for c in &chunks {
-            let beams: usize = c.iter().map(|&i| items[i].2).sum();
-            assert!(beams <= 15, "chunk {c:?} exceeds cap");
-        }
-    }
-
-    #[test]
-    fn single_adapter_all_fit_one_chunk() {
-        let items = [(0, -1, 5), (1, -1, 5), (2, -1, 5)];
-        assert_eq!(pack_beam_chunks(&items, 320), vec![vec![0, 1, 2]]);
-    }
-
-    #[test]
-    fn heterogeneous_beam_counts_respect_cap() {
-        // 8+8+4 with cap 16 ⇒ [8,8] then [4] (adding the 4 would hit 20>16).
-        let items = [(0, -1, 8), (1, -1, 8), (2, -1, 4)];
-        assert_eq!(pack_beam_chunks(&items, 16), vec![vec![0, 1], vec![2]]);
-    }
-
-    #[test]
-    fn empty_items_no_chunks() {
-        assert!(pack_beam_chunks(&[], 320).is_empty());
     }
 }

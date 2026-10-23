@@ -422,6 +422,15 @@ pub struct DflashProposerState {
     /// `max_ctx_len`, holding this sequence's latest own capture (its last
     /// prefilled position, then each single-sequence decode).
     pub own_row: Option<DevicePtr>,
+    /// `ATLAS_DFLASH_WARM_CTX`, frozen from the head at allocation.
+    pub warm_ctx: WarmCtx,
+    /// Lowest prompt position the prefill window may start at: the first
+    /// position this prefill computes or restored (`warm_ctx`); 0 = none.
+    pub ctx_floor: usize,
+    /// The accumulator rows this prefill wrote or restored (`warm_ctx`).
+    pub(crate) ctx_run: Option<warm_ctx::CtxRun>,
+    /// The store windows this prefill wrote and restored from (`warm_ctx`).
+    pub(crate) ctx_store: warm_ctx_store::StoreRefs,
 }
 
 impl DflashProposerState {
@@ -706,6 +715,13 @@ pub struct BlockDiffusionDraftHead {
     /// One extra-lane stream may serve several seqs (n > lanes); the lane
     /// itself never moves for a seq.
     pub next_lane: std::sync::atomic::AtomicUsize,
+    /// Finished sequences' ctx accumulators, `(bytes, ptr)`, kept for the
+    /// next `alloc_state` (re-zeroed there) instead of freed: the
+    /// accumulator's cuMemAlloc was 3.2 ms of every request's TTFT on GB10
+    /// (rank-0 nsys 2026-10-18). At most `acc_pool_cap` (0: none, freed as
+    /// before).
+    pub acc_pool: Mutex<Vec<(usize, DevicePtr)>>,
+    pub acc_pool_cap: usize,
     /// Entry-ordering event: recorded on the default stream at the top of
     /// the multi-lane `propose_batch`; every extra lane waits on it so
     /// drafter-ctx precompute / `after_verify` writes enqueued on the
@@ -778,6 +794,17 @@ pub use lifecycle::{
 };
 mod first_append;
 pub use first_append::FirstAppend;
+pub mod warm_ctx;
+pub use warm_ctx::WarmCtx;
+mod warm_ctx_seq;
+pub(crate) mod warm_ctx_store;
+pub use warm_ctx_store::{WarmCtxStore, store_bytes as warm_ctx_store_bytes};
+#[cfg(test)]
+mod warm_ctx_gpu_tests;
+#[cfg(test)]
+mod warm_ctx_store_tests;
+#[cfg(test)]
+mod warm_ctx_tests;
 pub(crate) use first_append::{keep_own_capture, note_own_capture, own_capture_row};
 #[cfg(test)]
 mod first_append_own_tests;
@@ -1129,7 +1156,16 @@ impl DraftProposer for BlockDiffusionDraftHead {
         let max_ctx_len = self.ctx_window_len();
         let own = self.startup.diagnostics.first_append != FirstAppend::Legacy;
         let total = (max_ctx_len + own as usize) * ctx_slot_bytes;
-        let ctx_hidden_acc = gpu.alloc(total)?;
+        let pooled = {
+            let mut pool = self.acc_pool.lock();
+            pool.iter()
+                .position(|&(bytes, _)| bytes == total)
+                .map(|i| pool.swap_remove(i).1)
+        };
+        let ctx_hidden_acc = match pooled {
+            Some(ptr) => ptr,
+            None => gpu.alloc(total)?,
+        };
         // Initialize to zero so stale data doesn't leak between sequences.
         // Transactional: a failed memset frees the accumulator instead of
         // leaking it for the server's lifetime; a failed FREE during that
@@ -1172,6 +1208,10 @@ impl DraftProposer for BlockDiffusionDraftHead {
             own_capture: false,
             own_row_at: None,
             own_row: own.then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
+            warm_ctx: self.startup.diagnostics.warm_ctx,
+            ctx_floor: 0,
+            ctx_run: None,
+            ctx_store: Default::default(),
             // Propose lane: fixed for the seq lifetime (batch positions
             // reorder; captured graphs bake lane scratch pointers). Round-
             // robin keeps concurrent seqs spread across the lane streams.
@@ -1240,7 +1280,7 @@ impl DraftProposer for BlockDiffusionDraftHead {
         &self,
         comm: &dyn spark_comm::CommBackend,
         seqs: &[rank_split::CtxSeq<'_>],
-    ) -> u32 {
+    ) -> u64 {
         self.split_ctx_rows(comm, seqs)
     }
 
@@ -1395,6 +1435,17 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // is logged and the pointer RETAINED so a cleanup retry can release
         // it (a silently cleared pointer would leak unrecoverably).
         if dstate.ctx_hidden_acc.0 != 0 {
+            let bytes = (dstate.max_ctx_len + usize::from(dstate.own_row.is_some()))
+                * dstate.ctx_slot_bytes;
+            let mut pool = self.acc_pool.lock();
+            if pool.len() < self.acc_pool_cap {
+                // Kept for the next sequence (`acc_pool`).
+                pool.push((bytes, dstate.ctx_hidden_acc));
+                dstate.ctx_hidden_acc = DevicePtr(0);
+                dstate.own_row = None;
+            }
+        }
+        if dstate.ctx_hidden_acc.0 != 0 {
             if let Err(error) = gpu.free(dstate.ctx_hidden_acc) {
                 tracing::error!(
                     "DSpark free_state: freeing ctx accumulator {:#x} failed ({error}); \
@@ -1436,6 +1487,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         (dstate.first_append_at, dstate.own_row_at) = (None, None);
         dstate.own_capture = false;
         dstate.end_floor = 0;
+        (dstate.ctx_floor, dstate.ctx_run) = (0, None);
+        dstate.ctx_store = Default::default();
         Ok(())
     }
 }

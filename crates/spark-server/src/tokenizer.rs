@@ -64,7 +64,9 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
-mod jinja_helpers;
+mod ids_only;
+pub(crate) mod jinja_helpers;
+mod large_encode;
 mod message_preprocess;
 
 pub(crate) use message_preprocess::{
@@ -79,8 +81,17 @@ enum ChatEncoding {
 
 pub struct ChatTokenizer {
     tokenizer: Tokenizer,
+    /// Shared by every caller of this tokenizer; limits only large CPU encodes.
+    large_encode_gate: Option<std::sync::Arc<large_encode::Gate>>,
+    /// Explicitly skip unused token spellings and offsets during serving encode.
+    ids_only: bool,
     eos_token_id: u32,
     supports_thinking: bool,
+    /// GLM-5 and Qwen4_exp register their tool-envelope XML as added tokens.
+    /// Incoming prose needs the tokenizer-side sentinel escape; other model
+    /// families must retain their existing prompt bytes. The historical field
+    /// name remains because the mechanism originated in the GLM path.
+    pub(crate) glm_tool_markup_as_text: bool,
     chat_encoding: ChatEncoding,
     /// Compiled Jinja chat template (from tokenizer_config.json).
     #[allow(dead_code)]

@@ -61,6 +61,7 @@ pub(super) fn finalize_done<'a>(
         reason: crate::ir::FinishReason::from(fr),
         usage,
         token_ids: state.take_ids_if(return_token_ids),
+        guard_stop: state.guard_stop,
     });
 
     (deltas, fr)

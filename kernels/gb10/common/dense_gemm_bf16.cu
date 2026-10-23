@@ -201,10 +201,14 @@ extern "C" __global__ void dense_gemm_f32in_f32out(
 #define RG_BK 64
 #define RG_NCOL 4
 
-extern "C" __global__ void dense_gemm_bf16_router(
+__device__ __forceinline__ void rg_store(__nv_bfloat16* c, float v) { *c = __float2bfloat16(v); }
+__device__ __forceinline__ void rg_store(float* c, float v) { *c = v; }
+
+template <typename OutT>
+__device__ __forceinline__ void dense_gemm_bf16_router_body(
     const __nv_bfloat16* __restrict__ A,  // [M, K] row-major
     const __nv_bfloat16* __restrict__ B,  // [N, K] row-major (read transposed)
-    __nv_bfloat16* __restrict__ C,         // [M, N] row-major
+    OutT* __restrict__ C,                  // [M, N] row-major
     unsigned int M,
     unsigned int N,
     unsigned int K
@@ -278,8 +282,25 @@ extern "C" __global__ void dense_gemm_bf16_router(
     if (row < M) {
         #pragma unroll
         for (int j = 0; j < RG_NCOL; j++)
-            if (col + j < N) C[(size_t)row * N + col + j] = __float2bfloat16(acc[j]);
+            if (col + j < N) rg_store(C + (size_t)row * N + col + j, acc[j]);
     }
+}
+
+extern "C" __global__ void dense_gemm_bf16_router(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    dense_gemm_bf16_router_body(A, B, C, M, N, K);
+}
+
+// FP32-output twin (routers that keep FP32 logits, GLM-5's
+// `moe_router_dtype: float32`): the same chains, unrounded, so each output is
+// dense_gemm_bf16_f32out's.
+extern "C" __global__ void dense_gemm_bf16_router_f32out(
+    const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
+    float* __restrict__ C, unsigned int M, unsigned int N, unsigned int K
+) {
+    dense_gemm_bf16_router_body(A, B, C, M, N, K);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -612,6 +633,31 @@ extern "C" __global__ void dense_gemm_bf16_pipelined(
 ) {
     dense_gemm_bf16_pipelined_tile(A, B, C, M, N, K, blockIdx.y * DM_M_TILE,
         blockIdx.x * DM_N_TILE);
+}
+
+/// `dense_gemm_bf16_pipelined` with the output tiles visited in groups of 8
+/// M-tiles (ATLAS_QWEN4EXP_PREFILL_GEMM_RASTER, the qwen4_exp PLE key
+/// projection). The default walks every N-tile of an M-row before the next
+/// M-row, so a weight wider than L2 (PLE key_proj: [10240, 2560], 52 MB) is
+/// streamed from DRAM once per M-tile; here the CTAs in flight share 8 M-tiles'
+/// A and a few N-tiles' B in L2. Only WHICH tile a CTA computes changes: every
+/// tile is `dense_gemm_bf16_pipelined_tile`, so every output byte is the
+/// default's. Same grid, block and shared memory as the default.
+extern "C" __global__ void dense_gemm_bf16_pipelined_g8(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned int M,
+    unsigned int N,
+    unsigned int K
+) {
+    const unsigned int gn = gridDim.x, gm = gridDim.y, G = 8;
+    const unsigned int id = blockIdx.y * gn + blockIdx.x;
+    const unsigned int per_group = G * gn, first_m = id / per_group * G;
+    const unsigned int rows = (gm - first_m) < G ? (gm - first_m) : G;
+    const unsigned int in = id % per_group;
+    dense_gemm_bf16_pipelined_tile(A, B, C, M, N, K, (first_m + in % rows) * DM_M_TILE,
+        in / rows * DM_N_TILE);
 }
 
 // Fused SiLU(gate) * up activation — vectorized 2-wide BF16 loads/stores.
