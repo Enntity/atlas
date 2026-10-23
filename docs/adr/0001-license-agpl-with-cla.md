@@ -1,6 +1,9 @@
 # ADR-0001: License — AGPL-3.0 with a CLA
 
-**Status:** Accepted
+> Historical upstream decision. Enntity/atlas retains AGPL-3.0-only licensing
+> but does not require a CLA. See [CONTRIBUTING.md](../../CONTRIBUTING.md#license).
+
+**Status:** Historical upstream decision; CLA requirement superseded for Enntity/atlas
 **Date:** 2026-04-17
 
 ## Context

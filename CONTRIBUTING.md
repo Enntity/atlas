@@ -244,9 +244,8 @@ prose. Each state names its exit condition and the command that proves it.
 | 3 | `edit` | — | change is complete and committed | — |
 | 4 | `checks` | `cargo fmt --all -- --check`<br/>`cargo clippy --workspace --tests`<br/>`cargo test --workspace`<br/>`cargo doc --workspace --no-deps` | all four exit 0 | → 3 |
 | 5 | `gates` | `./target/release/spark benchmark run <id> --pull-request-gate --yes` | every required gate PASSes at the **current tip** | → 3 |
-| 6 | `cla` | reply to the CLA bot | signed | blocked |
-| 7 | `review` | — | a human approves | → 3 |
-| 8 | `merge` | maintainer squashes | — | — |
+| 6 | `review` | — | a human approves | → 3 |
+| 7 | `merge` | maintainer squashes | — | — |
 
 Invariants an agent must not violate:
 
@@ -297,6 +296,13 @@ AI-generated, and we are tracking the exceptions on purpose.
 
 You will not be penalised for writing code by hand. You will be asked why.
 
-## License & CLA
+## License
 
-By contributing, you agree that your contributions will be governed by our [Contributor License Agreement (CLA)](CLA.md). Your work will be distributed in the Community Edition under the [AGPLv3 License](LICENSE) and you grant us the right to commercially re-license it for the Enterprise Edition.
+Contributions to Enntity/atlas are accepted under the repository's
+[AGPL-3.0-only license](LICENSE). This fork does not require a separate
+Contributor License Agreement or a grant of commercial relicensing rights.
+Keep existing copyright notices and third-party license terms intact.
+
+Open pull requests against Enntity/atlas. Contributing to another repository,
+including Atlas-Inf/atlas, is a separate action governed by that repository's
+contribution policy.

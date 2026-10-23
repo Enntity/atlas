@@ -1,13 +1,12 @@
-# references/pr-and-ci.md — sync-pr automation, CI-green preflight, CLA/CI cleanup
+# references/pr-and-ci.md — sync-pr automation, CI-green preflight, fork contribution policy
 
 ## Remotes (know which is which)
-```
-origin      https://github.com/Atlas-Inf/atlas.git   # the fork we ship (maintainer pushes here)
-monumental  https://github.com/MonumentalSystems/atlas.git       # upstream
-```
-Sync direction: **upstream `monumental/main` → fork `origin/main`.** Never the
-reverse without intent. `sparkrun` recipes and `azeezish/atlas-gb10:latest` are built from
-`origin`.
+
+Enntity/atlas is this fork. Verify `origin` points to
+`https://github.com/Enntity/atlas.git` before pushing or opening a PR.
+Atlas-Inf/atlas is an upstream source, not a publication target for this fork's
+work. The sync procedure below is inherited upstream guidance; do not run it
+against Enntity branches without a separately requested engine sync.
 
 ## `/atlas-release sync-pr` — the loop
 1. **Detect:** `git fetch monumental && git log --oneline origin/main..monumental/main`.
@@ -22,7 +21,7 @@ reverse without intent. `sparkrun` recipes and `azeezish/atlas-gb10:latest` are 
    `MODEL.toml`/`factory.rs`/docker stanza to be *deployable*, open **that**
    enablement PR on `origin`. Otherwise there is no PR — a plain engine sync just
    feeds the next image cut.
-5. **Preflight (below) must be green before submit.** AI-attributed, CLA-clean.
+5. **Preflight (below) must be green before submit.** AI-attributed. Enntity/atlas requires no CLA.
 
 **No-takeover rule:** sync-pr opens *additive* enablement PRs or pushes a trivial
 fix to an existing branch. It never opens a parallel reimplementation of someone's
@@ -66,50 +65,12 @@ changes) · `Docs` · `Site`.
 `/atlas-release verify` (the serve matrix) proves the image serves. Keep the two
 gates distinct in your head and in PR descriptions.
 
-## CLA cleanup — "the CLA check isn't ideal, clean this up"
+## Enntity fork contribution policy
 
-### What it does today (`cla.yml`)
-`contributor-assistant/github-action@v2.6.1` posts a comment on any PR whose
-author is neither an existing signer (`signatures/version1/cla.json` on the
-`cla-signatures` branch) nor in the `allowlist`, and sets a **failing status
-check that blocks merge** until they reply with the exact phrase
-`I have read the CLA Document and I hereby sign the CLA`. A custom "Prepare Dynamic
-Signature Match" pre-step scrapes PR comment history via `gh api` to re-inject the
-signature on `synchronize`/push so re-pushes don't wipe it.
-
-### Why it's friction for an AI-first repo
-- The repo philosophy is "**all PRs are AI-generated**" — yet the CLA gates every
-  PR whose author isn't allowlisted, adding a manual comment ceremony to
-  automation the maintainer owns.
-- The `allowlist` originally covered only **bots** (`dependabot[bot]`,
-  `renovate[bot]`, `google-labs-jules[bot]`, `claude[bot]`, plus bare
-  `google-labs-jules`/`claude`). The maintainer's own human accounts (`AzeezIsh`,
-  `tbraun96`) were **not** on it — so their AI PRs depended on the mutable
-  signature-state file rather than a stable rule.
-- The dynamic-signature bolt-on is a maintenance smell: it papers over the
-  ceremony not persisting across re-pushes, depends on comment order (`.[-1]`) and
-  heredoc delimiters, and `cla.json` was hand-seeded with synthetic timestamps.
-
-### The cleanup
-1. **✅ Applied — allowlist the maintainer-controlled identities.** This pass added
-   `AzeezIsh,tbraun96` to `cla.yml`'s `allowlist` so their (AI-generated) PRs never
-   touch the CLA path. Rationale: the maintainers already own the copyright and have
-   signed — the gate adds nothing on their own PRs, and the allowlist is a stable
-   rule where the `cla.json` state is a mutable file on a side branch. (Left in the
-   working tree for maintainer review before commit — `cla.yml` is a
-   `pull_request_target` security surface, so it does not auto-push.)
-2. **Optional — make the CLA informational, not required.** Keep the bot's comment
-   but drop the CLA status from the required-checks set, so it never *blocks* an AI
-   PR — external human contributors still get asked, and the record is still written.
-3. **Optional — retire the dynamic-signature bolt-on.** Now that maintainer
-   identities are allowlisted they no longer hit that gated path; it remains only to
-   survive re-pushes for external first-time human contributors. Keep it (with the
-   note added to `cla.yml`) or remove it if (2) lands.
-
-Whichever path: keep external first-time human contributors covered (the CLA is a
-real legal instrument — `CLA.md` grants the Enterprise-Edition re-license right,
-and the signing ceremony is the only recorded consent). The goal is to stop
-gating the maintainer's own automation, not to remove the CLA.
+Enntity/atlas does not require a CLA. Do not request signatures, add contributors
+to an inherited CLA allowlist, or edit historical signature records. See
+[CONTRIBUTING.md](../../../../CONTRIBUTING.md#license). Keep pull requests in
+Enntity/atlas unless the user explicitly requests a separate upstream contribution.
 
 ## CI convergence — the drift to reconcile
 The maintainer flagged "our PRs and CI are all over the place." The concrete,

@@ -69,7 +69,9 @@ The test matrix has caught many issues that would have looked like "model halluc
 
 ## The CLA
 
-By contributing, you agree to the [Contributor License Agreement](https://github.com/Atlas-Inf/atlas/blob/main/CLA.md). Your work goes out under AGPL-3.0 in the Community Edition, and you grant Atlas Inference the right to relicense for the Enterprise Edition.
+Enntity/atlas accepts contributions under AGPL-3.0-only and does not require a
+separate CLA or commercial relicensing grant. See the fork’s
+[contribution policy](https://github.com/Enntity/atlas/blob/spark-shared/CONTRIBUTING.md#license).
 
 The `CLA Assistant` bot automatically comments on every PR. You must explicitly acknowledge and sign before merge.
 
