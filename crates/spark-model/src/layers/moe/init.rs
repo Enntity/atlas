@@ -87,13 +87,13 @@ impl MoeLayer {
             ),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
             dense_gemm_router_m5: super::super::try_kernel_gated(
-                router_f32,
+                router_f32 && config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_m5",
             ),
             dense_gemm_router_rows: super::super::try_kernel_gated(
-                router_f32,
+                router_f32 && config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_rows",
@@ -141,7 +141,8 @@ impl MoeLayer {
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
-            w4a16_batch5_dual_k: super::super::try_kernel(
+            w4a16_batch5_dual_k: super::super::try_kernel_gated(
+                config.model_type == "glm5_next",
                 gpu,
                 "w4a16_gemv",
                 "w4a16_gemv_batch5_dual",

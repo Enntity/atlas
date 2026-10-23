@@ -20,6 +20,10 @@ pub(super) fn unpermute_ep_kernel(
     gpu: &dyn GpuBackend,
     config: &atlas_core::config::ModelConfig,
 ) -> Result<KernelHandle> {
+    // The sparse reduce is a GLM-only module; other models use dense EP reduce.
+    if config.model_type != "glm5_next" {
+        return Ok(KernelHandle(0));
+    }
     let max_top_k = config
         .num_experts_per_toks
         .iter()
@@ -276,3 +280,23 @@ mod tests {
 #[cfg(test)]
 #[path = "ep_prefill_test_gpu.rs"]
 mod gpu_tests;
+
+#[cfg(test)]
+mod lookup_tests {
+    #[test]
+    fn unrelated_targets_do_not_resolve_glm_ep_reduce() {
+        use spark_runtime::gpu::mock::MockGpuBackend;
+        for model in [
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_6_moe",
+            "qwen4_exp",
+            "glm5_next",
+        ] {
+            let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = model.into();
+            let kernel = super::unpermute_ep_kernel(&MockGpuBackend::new(), &config).unwrap();
+            assert_eq!(kernel.0 != 0, model == "glm5_next", "{model}");
+        }
+    }
+}

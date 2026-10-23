@@ -43,7 +43,12 @@ fn bf16_layer(
 
 #[test]
 fn multi_seq_qkv_reads_each_twin_once_for_every_row() {
-    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    // Keep the compact synthetic geometry, but select the model that ships
+    // checkpoint-native MXFP8 attention twins.
+    let config = ModelConfig {
+        model_type: "qwen4_exp".into(),
+        ..ModelConfig::qwen3_next_80b_nvfp4()
+    };
     let gpu = MockGpuBackend::new();
     let (mut layer, twins) = bf16_layer(&gpu, &config);
     layer.install_dense_mxfp8(twins).unwrap();
@@ -65,7 +70,12 @@ fn multi_seq_qkv_reads_each_twin_once_for_every_row() {
 
 #[test]
 fn o_rows_take_the_twin_and_a_wrong_shape_is_an_error() {
-    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    // Keep the compact synthetic geometry, but select the model that ships
+    // checkpoint-native MXFP8 attention twins.
+    let config = ModelConfig {
+        model_type: "qwen4_exp".into(),
+        ..ModelConfig::qwen3_next_80b_nvfp4()
+    };
     let gpu = MockGpuBackend::new();
     let (mut layer, twins) = bf16_layer(&gpu, &config);
     let (h, q_dim) = (
@@ -90,7 +100,12 @@ fn o_rows_take_the_twin_and_a_wrong_shape_is_an_error() {
 
 #[test]
 fn twins_are_found_by_slot_once_the_bf16_copies_are_null() {
-    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    // Keep the compact synthetic geometry, but select the model that ships
+    // checkpoint-native MXFP8 attention twins.
+    let config = ModelConfig {
+        model_type: "qwen4_exp".into(),
+        ..ModelConfig::qwen3_next_80b_nvfp4()
+    };
     let gpu = MockGpuBackend::new();
     let (mut layer, twins) = bf16_layer(&gpu, &config);
     layer.install_dense_mxfp8(twins).unwrap();
@@ -127,7 +142,12 @@ fn twins_are_found_by_slot_once_the_bf16_copies_are_null() {
 
 #[test]
 fn a_build_with_a_quantized_decode_copy_refuses_twins() {
-    let config = ModelConfig::qwen3_next_80b_nvfp4();
+    // Keep the compact synthetic geometry, but select the model that ships
+    // checkpoint-native MXFP8 attention twins.
+    let config = ModelConfig {
+        model_type: "qwen4_exp".into(),
+        ..ModelConfig::qwen3_next_80b_nvfp4()
+    };
     let gpu = MockGpuBackend::new();
     let (_, twins) = bf16_layer(&gpu, &config);
     // NVFP4 Q/K/V as built by the default arm.

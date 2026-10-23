@@ -198,3 +198,46 @@ mod dense_mx;
 
 #[path = "kv_bf16_tests.rs"]
 mod kv_bf16;
+
+#[test]
+fn unrelated_targets_do_not_resolve_glm_or_mxfp8_attention_kernels() {
+    for model in ["qwen3_next", "qwen3_5", "qwen3_5_moe"] {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = model.into();
+        let layer = attn_layer(&MockGpuBackend::new(), &config);
+        assert_eq!(layer.dense_gemv_batch5_k.0, 0, "{model}: GLM batch5");
+        assert!(layer.mxfp8_gemv_k.iter().all(|k| k.0 == 0), "{model}");
+        assert!(
+            layer.mxfp8_gemv_grouped_k.iter().all(|k| k.0 == 0),
+            "{model}"
+        );
+        assert_eq!(layer.mxfp8_quantize_k.0, 0, "{model}");
+    }
+}
+
+#[test]
+fn native_mxfp8_targets_keep_attention_projection_kernels() {
+    for model in ["glm5_next", "qwen4_exp"] {
+        let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+        config.model_type = model.into();
+        if model == "glm5_next" {
+            config.kv_lora_rank = 512;
+            config.qk_rope_head_dim = 0;
+        }
+        let layer = attn_layer(&MockGpuBackend::new(), &config);
+        assert!(layer.mxfp8_gemv_k.iter().all(|k| k.0 != 0), "{model}");
+        assert!(
+            layer
+                .mxfp8_gemv_grouped_k
+                .iter()
+                .all(|k| (k.0 != 0) == (model == "glm5_next")),
+            "{model}"
+        );
+        assert_eq!(
+            layer.mxfp8_quantize_k.0 != 0,
+            model == "glm5_next",
+            "{model}"
+        );
+        assert_eq!(layer.dense_gemv_batch5_k.0 != 0, model == "glm5_next");
+    }
+}

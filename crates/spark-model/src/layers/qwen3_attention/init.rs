@@ -126,6 +126,9 @@ impl Qwen3AttentionLayer {
         } = GlmIndexSelection::from_config(config, &probes)?;
         // Short gate flags so each GLM/hyper-connection lookup stays one line.
         let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
+        // Only these targets ship native MXFP8 projection kernels.
+        let glm_target = config.model_type == "glm5_next";
+        let native_mxfp8 = glm_target || config.model_type == "qwen4_exp";
         let layer = Self {
             input_norm,
             attn,
@@ -292,7 +295,8 @@ impl Qwen3AttentionLayer {
             dense_gemv_batchm_k: gpu
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),
-            dense_gemv_batch5_k: super::super::try_kernel(
+            dense_gemv_batch5_k: super::super::try_kernel_gated(
+                config.model_type == "glm5_next",
                 gpu,
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5",
@@ -594,10 +598,10 @@ impl Qwen3AttentionLayer {
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
-                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
+                .map(|name| gate(native_mxfp8, gpu, "mxfp8_gemv", name)),
             mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
-                .map(|name| super::super::try_kernel(gpu, "mxfp8_gemv", name)),
-            mxfp8_quantize_k: super::super::try_kernel(gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
+                .map(|name| gate(glm_target, gpu, "mxfp8_gemv", name)),
+            mxfp8_quantize_k: gate(glm_target, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
