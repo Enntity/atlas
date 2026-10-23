@@ -311,7 +311,15 @@ fn redirect_preserves_identity_and_resolves_source_inputs() {
     };
     assert!(walk(&root).contains(&alias));
     assert_eq!(sources(&root, &alias), sources(&root, &source));
-    assert_eq!(configs(&root, &alias), configs(&root, &source));
+    let mut expected = configs(&root, &source);
+    expected.push(
+        root.join("kernels/gb10")
+            .join(&alias.model)
+            .join("MODEL.toml"),
+    );
+    expected.sort();
+    expected.dedup();
+    assert_eq!(configs(&root, &alias), expected);
     assert!(affected(&root, &["kernels/gb10/modelA/nvfp4/shared.cu".into()]).contains(&alias));
 }
 
@@ -376,7 +384,15 @@ fn real_qwen38_alias_matches_qwen36_kernel_inputs() {
     };
     assert!(walk(&root).contains(&alias));
     assert_eq!(sources(&root, &alias), sources(&root, &source));
-    assert_eq!(configs(&root, &alias), configs(&root, &source));
+    let mut expected = configs(&root, &source);
+    expected.push(
+        root.join("kernels/gb10")
+            .join(&alias.model)
+            .join("MODEL.toml"),
+    );
+    expected.sort();
+    expected.dedup();
+    assert_eq!(configs(&root, &alias), expected);
 }
 
 #[test]

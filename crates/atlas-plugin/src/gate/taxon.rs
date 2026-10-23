@@ -165,9 +165,9 @@ pub fn sources(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
 
 /// Config files that steer a target's compile without being sources.
 ///
-/// Match the native build attestation: hardware, source-model metadata, and
-/// quant configs, including a composed base. Redirects retain their target
-/// identity while hashing the source model used by the build.
+/// Match the native build attestation: hardware, target and source-model
+/// metadata, common kernel config, and quant configs including a composed base.
+/// Alias behavior and shared module mappings are compile inputs too.
 pub fn configs(root: &Path, target: &Target) -> Vec<PathBuf> {
     let hw_dir = root.join("kernels").join(&target.hardware);
     let Some(model_dir) = paths::model_dir(&hw_dir, &target.model) else {
@@ -176,11 +176,19 @@ pub fn configs(root: &Path, target: &Target) -> Vec<PathBuf> {
     let Some(overlays) = paths::overlays(&model_dir, &target.quant) else {
         return Vec::new();
     };
-    [hw_dir.join("HARDWARE.toml"), model_dir.join("MODEL.toml")]
-        .into_iter()
-        .chain(overlays.into_iter().map(|dir| dir.join("KERNEL.toml")))
-        .filter(|p| p.is_file())
-        .collect()
+    let mut configs: Vec<_> = [
+        hw_dir.join("HARDWARE.toml"),
+        hw_dir.join(&target.model).join("MODEL.toml"),
+        model_dir.join("MODEL.toml"),
+        hw_dir.join("common/KERNEL.toml"),
+    ]
+    .into_iter()
+    .chain(overlays.into_iter().map(|dir| dir.join("KERNEL.toml")))
+    .filter(|p| p.is_file())
+    .collect();
+    configs.sort();
+    configs.dedup();
+    configs
 }
 
 /// The hardware node a repo-relative path sits under, if any.

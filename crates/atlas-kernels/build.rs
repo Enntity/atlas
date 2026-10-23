@@ -637,11 +637,21 @@ fn closure_attestation(
             continue;
         }
         let model_dir = target.model_kernel_dir.parent();
-        let configs = [
+        let mut configs: Vec<_> = [
             workspace_root
                 .join("kernels")
                 .join(&target.hw)
                 .join("HARDWARE.toml"),
+            workspace_root
+                .join("kernels")
+                .join(&target.hw)
+                .join(&target.model)
+                .join("MODEL.toml"),
+            target
+                .common_kernel_dir
+                .as_ref()
+                .map(|d| d.join("KERNEL.toml"))
+                .unwrap_or_default(),
             model_dir.map(|d| d.join("MODEL.toml")).unwrap_or_default(),
             target
                 .base_kernel_dir
@@ -653,6 +663,8 @@ fn closure_attestation(
         .into_iter()
         .filter(|p| p.is_file())
         .collect();
+        configs.sort();
+        configs.dedup();
 
         let inputs = atlas_closure::ClosureInputs {
             sources,
