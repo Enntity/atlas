@@ -7,6 +7,7 @@ use super::*;
 /// Kernels a target may not ship; each is `KernelHandle(0)` when absent or
 /// gated off, and the dispatch sites check the handle before launching.
 pub(super) struct OptionalKernels {
+    pub(super) w4a16_batch5_dual_k: KernelHandle,
     pub(super) moe_grouped_gemm_t_k64_m32: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64: KernelHandle,
     pub(super) moe_w4a4_prequant_t_k64_vecscale: KernelHandle,
@@ -93,6 +94,12 @@ impl OptionalKernels {
             std::env::var("ATLAS_GLM_MOE_PREFILL_PERSIST").as_deref() == Ok("1"),
         );
         Self {
+            w4a16_batch5_dual_k: super::super::try_kernel_gated(
+                glm,
+                gpu,
+                "w4a16_gemv",
+                "w4a16_gemv_batch5_dual",
+            ),
             moe_grouped_gemm_t_k64_m32: super::super::try_kernel_gated(
                 glm,
                 gpu,

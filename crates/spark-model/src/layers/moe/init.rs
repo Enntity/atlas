@@ -141,12 +141,7 @@ impl MoeLayer {
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
             w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
-            w4a16_batch5_dual_k: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
-                gpu,
-                "w4a16_gemv",
-                "w4a16_gemv_batch5_dual",
-            ),
+            w4a16_batch5_dual_k: optional.w4a16_batch5_dual_k,
             moe_expert_gate_up_shared_token_major: gpu
                 .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
             moe_expert_silu_down_shared_token_major: gpu
