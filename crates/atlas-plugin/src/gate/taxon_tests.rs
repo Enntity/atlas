@@ -277,3 +277,155 @@ fn spans_are_reported_per_node_level() {
         "two models under one hardware — the case a split check can honestly fail"
     );
 }
+
+fn alias_fixture(name: &str) -> (PathBuf, Target) {
+    let root = fixture(name);
+    let dir = root.join("kernels/gb10/alias");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MODEL.toml"),
+        "[model]\nkernel_source = 'modelA'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("kernels/gb10/modelA/nvfp4/KERNEL.toml"),
+        "[build]\n",
+    )
+    .unwrap();
+    (
+        root,
+        Target {
+            hardware: "gb10".into(),
+            model: "alias".into(),
+            quant: "nvfp4".into(),
+        },
+    )
+}
+
+#[test]
+fn redirect_preserves_identity_and_resolves_source_inputs() {
+    let (root, alias) = alias_fixture("redirect");
+    let source = Target {
+        model: "modelA".into(),
+        ..alias.clone()
+    };
+    assert!(walk(&root).contains(&alias));
+    assert_eq!(sources(&root, &alias), sources(&root, &source));
+    assert_eq!(configs(&root, &alias), configs(&root, &source));
+    assert!(affected(&root, &["kernels/gb10/modelA/nvfp4/shared.cu".into()]).contains(&alias));
+}
+
+#[test]
+fn composed_quant_includes_base_sources_and_config() {
+    let (root, mut target) = alias_fixture("composed");
+    target.quant = "exl3".into();
+    let overlay = root.join("kernels/gb10/modelA/exl3");
+    std::fs::create_dir_all(&overlay).unwrap();
+    std::fs::write(
+        overlay.join("KERNEL.toml"),
+        "[build]\nbase_quant = 'nvfp4'\n",
+    )
+    .unwrap();
+    std::fs::write(overlay.join("extra.cu"), "__global__ void e() {}\n").unwrap();
+    let sources = sources(&root, &target).unwrap();
+    assert!(
+        sources
+            .iter()
+            .any(|p| p.ends_with("modelA/nvfp4/shared.cu"))
+    );
+    assert!(sources.iter().any(|p| p.ends_with("modelA/exl3/extra.cu")));
+    let configs = configs(&root, &target);
+    assert!(
+        configs
+            .iter()
+            .any(|p| p.ends_with("modelA/nvfp4/KERNEL.toml"))
+    );
+    assert!(
+        configs
+            .iter()
+            .any(|p| p.ends_with("modelA/exl3/KERNEL.toml"))
+    );
+}
+
+#[test]
+fn invalid_redirects_fail_closed_even_with_common_sources() {
+    let (root, target) = alias_fixture("invalid-redirect");
+    let path = root.join("kernels/gb10/alias/MODEL.toml");
+    for content in [
+        "[model]\nkernel_source = 'missing'",
+        "[model]\nkernel_source = 'alias'",
+        "[model]\nkernel_source = 7",
+        "not valid toml",
+    ] {
+        std::fs::write(&path, content).unwrap();
+        assert!(sources(&root, &target).is_none(), "{content}");
+    }
+}
+
+#[test]
+fn real_qwen38_alias_matches_qwen36_kernel_inputs() {
+    let root = repo_root();
+    let alias = Target {
+        hardware: "gb10".into(),
+        model: "qwen3.8-27b".into(),
+        quant: "nvfp4".into(),
+    };
+    let source = Target {
+        model: "qwen3.6-27b".into(),
+        ..alias.clone()
+    };
+    assert!(walk(&root).contains(&alias));
+    assert_eq!(sources(&root, &alias), sources(&root, &source));
+    assert_eq!(configs(&root, &alias), configs(&root, &source));
+}
+
+#[test]
+fn invalid_quant_composition_fails_closed() {
+    let (root, mut target) = alias_fixture("invalid-base");
+    target.quant = "exl3".into();
+    let overlay = root.join("kernels/gb10/modelA/exl3");
+    std::fs::create_dir_all(&overlay).unwrap();
+    for base in ["missing", "exl3"] {
+        std::fs::write(
+            overlay.join("KERNEL.toml"),
+            format!("[build]\nbase_quant = '{base}'\n"),
+        )
+        .unwrap();
+        assert!(sources(&root, &target).is_none());
+    }
+    std::fs::write(
+        overlay.join("KERNEL.toml"),
+        "[build]\nbase_quant = 'nvfp4'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        overlay.join("shared.cu"),
+        "__global__ void forbidden_shadow() {}\n",
+    )
+    .unwrap();
+    assert!(
+        sources(&root, &target).is_none(),
+        "base quant shadows are rejected by the compiler"
+    );
+}
+
+#[test]
+fn an_unenumerable_redirect_cannot_silently_disappear_from_the_gate() {
+    let (root, target) = alias_fixture("invalid-walk");
+    std::fs::write(
+        root.join("kernels/gb10/alias/MODEL.toml"),
+        "[model]\nkernel_source = 'missing'\n",
+    )
+    .unwrap();
+    assert!(sources(&root, &target).is_none());
+    // Like the native build, enumeration must stop on invalid metadata.
+    // Skipping this alias (which has no local quant dir) would excuse it.
+    assert!(std::panic::catch_unwind(|| walk(&root)).is_err());
+    assert!(
+        std::panic::catch_unwind(|| affected(
+            &root,
+            &["kernels/gb10/modelA/nvfp4/shared.cu".into()]
+        ))
+        .is_err()
+    );
+}

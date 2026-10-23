@@ -43,11 +43,16 @@ fn a_common_kernel_change_reopens_every_target_on_that_hardware() {
 }
 
 #[test]
-fn a_model_specific_change_reopens_only_that_model() {
+fn a_model_specific_change_reopens_that_model_and_its_kernel_alias() {
     let root = repo_root();
     let v = &views(&root, &[pr(2, &[FLAGSHIP])])[0];
-    assert_eq!(v.targets.len(), 1);
-    assert_eq!(v.targets.iter().next().unwrap().model, "qwen3.6-27b");
+    assert_eq!(
+        v.targets
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["gb10/qwen3.6-27b/nvfp4", "gb10/qwen3.8-27b/nvfp4"]
+    );
 }
 
 /// ★ A diff that reaches outside `kernels/` re-opens everything, and must be
@@ -88,8 +93,9 @@ fn two_prs_touching_one_target_collide() {
     let root = repo_root();
     let v = views(&root, &[pr(1, &[FLAGSHIP]), pr(2, &[FLAGSHIP])]);
     let c = collisions(&v);
-    assert_eq!(c.len(), 1);
+    assert_eq!(c.len(), 2);
     assert_eq!(c["gb10/qwen3.6-27b/nvfp4"], vec![1, 2]);
+    assert_eq!(c["gb10/qwen3.8-27b/nvfp4"], vec![1, 2]);
 }
 
 #[test]
