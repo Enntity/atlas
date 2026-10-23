@@ -10,7 +10,7 @@ atlas/
 ├── QUICKSTART.md                 per-model Docker recipes
 ├── CONTRIBUTING.md, AGENTS.md    contributor workflow
 ├── SECURITY.md                   disclosure
-├── CLA.md                        contributor license agreement
+├── CLA.md                        fork contribution licensing policy
 ├── LICENSE                       AGPL-3.0-only
 ├── Cargo.toml                    workspace root (12 members)
 ├── Cargo.lock
