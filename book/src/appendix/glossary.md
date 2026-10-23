@@ -7,7 +7,7 @@ Short definitions for the acronyms and names that recur in this book and the Atl
 | **AGPL-3.0** | GNU Affero General Public License, v3. Atlas's community-edition license. Copyleft; network use counts as distribution. |
 | **axum** | Rust async web framework (built on tokio + tower). Atlas's HTTP layer. |
 | **BF16** | Brain Floating-Point 16. 1 sign + 8 exponent + 7 mantissa. Standard precision for Atlas activations and residual streams. |
-| **CLA** | Contributor License Agreement. Required before Atlas PR merge; see `CLA.md`. |
+| **CLA** | Contributor License Agreement. Not required by Enntity/atlas; see `CLA.md`. |
 | **CommBackend** | Atlas's trait for collective ops (all-reduce, broadcast, send/recv). NCCL-backed in production; no-op in single-GPU. |
 | **ComputeTarget** | Atlas's build-time trait for vendor-specific compilers (`nvcc`, `xcrun metal`, `hipcc`, `icpx`). |
 | **conv1d** | 1D convolution, typically causal with small kernel width (3–4). Used in Mamba-style SSMs. |

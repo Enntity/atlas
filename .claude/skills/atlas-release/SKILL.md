@@ -141,8 +141,8 @@ that must be green before `publish`. `references/verify-matrix.md` is its spec.
 The upstream→fork automation. Watch `monumental/main` (upstream) for merges →
 fast-forward `origin` → build → verify → **if** the merge enables a
 new model (new `kernels/gb10/<model>/MODEL.toml` or loader), open the enablement
-PR. AI-attributed, CLA-clean, CI-green **before** submit. Full runbook incl. the
-remotes, the CLA allowlist cleanup, and the CI-green preflight: `references/pr-and-ci.md`.
+PR. AI-attributed and CI-green **before** submit. Enntity/atlas requires no CLA;
+keep PRs in Enntity/atlas. Full runbook including remotes and CI preflight: `references/pr-and-ci.md`.
 
 ---
 
