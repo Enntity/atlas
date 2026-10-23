@@ -135,13 +135,13 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            // Moved, not copied, into choice 0: the scheduler holds the only
-            // copy of the pixels (and their in-flight permits), and drops it
-            // when that choice's prefill ends, not when every choice is done.
-            image_pixels: if choice_idx == 0 {
+            // VisionItem clones share the pixel storage and in-flight permit.
+            // Keep the images present for every serial choice; move the final
+            // vector so n=1 and the last choice avoid an extra Vec clone.
+            image_pixels: if choice_idx + 1 == n {
                 std::mem::take(&mut image_pixels)
             } else {
-                Vec::new()
+                image_pixels.clone()
             },
             max_tokens,
             min_tokens: req.min_tokens,
@@ -599,3 +599,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "get_weather");
     }
 }
+
+#[cfg(test)]
+#[path = "chat_blocking_vision_tests.rs"]
+mod vision_fanout_tests;
