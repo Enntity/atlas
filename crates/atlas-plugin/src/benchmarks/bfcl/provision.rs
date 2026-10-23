@@ -27,6 +27,7 @@ pub const PLUGIN_ID: &str = "bfcl";
 
 const REQUIREMENTS: &str = include_str!("../../../assets/bfcl/requirements.txt");
 const PROVISION_PY: &str = include_str!("../../../assets/bfcl/provision.py");
+const PREFLIGHT_PY: &str = include_str!("../../../assets/bfcl/preflight.py");
 const SCORE_PY: &str = include_str!("../../../assets/bfcl/score.py");
 
 /// Minimum interpreter. bfcl-eval and the scorer both use `match` and modern
@@ -62,6 +63,7 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
     write_asset(&dir, "requirements.txt", REQUIREMENTS)?;
     write_asset(&dir, "provision.py", PROVISION_PY)?;
     write_asset(&dir, "score.py", SCORE_PY)?;
+    write_asset(&dir, "preflight.py", PREFLIGHT_PY)?;
 
     let dataset = dir.join("dataset.jsonl");
     let scorer = dir.join("score.py");
@@ -73,17 +75,19 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
         &dir,
         ".provisioned",
         format!(
-            "v1 py>={}.{} req={} prov={} score={}",
+            "v2 py>={}.{} req={} prov={} score={} preflight={}",
             MIN_PYTHON.0,
             MIN_PYTHON.1,
             REQUIREMENTS.len(),
             PROVISION_PY.len(),
-            SCORE_PY.len()
+            SCORE_PY.len(),
+            PREFLIGHT_PY.len()
         ),
     );
 
     if stamp.is_current() && dataset.is_file() && interpreter.is_file() {
         handle.info("BFCL artifacts already provisioned");
+        scorer_preflight(&interpreter, &dir, handle).await?;
         let totals = read_totals(&dir)?;
         return Ok(Artifacts {
             dir,
@@ -103,6 +107,8 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
 
     handle.status("BFCL: downloading bfcl-eval (needs network)");
     python::pip_install(&interpreter, &dir.join("requirements.txt")).await?;
+
+    scorer_preflight(&interpreter, &dir, handle).await?;
 
     handle.status("BFCL: materializing the single-turn dataset");
     let out = python::run(
@@ -144,6 +150,22 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
         scorer,
         subset_totals: summary.subsets,
     })
+}
+
+async fn scorer_preflight(interpreter: &Path, dir: &Path, handle: &PluginHandle) -> Result<()> {
+    handle.status("BFCL: verifying scorer dependencies and argument checks");
+    let script = dir.join("preflight.py");
+    let out = python::run(
+        interpreter,
+        &[script
+            .to_str()
+            .context("preflight path is not valid UTF-8")?],
+        Some(dir),
+    )
+    .await
+    .context("BFCL scorer preflight failed before inference")?;
+    handle.info(out.stdout.trim());
+    Ok(())
 }
 
 fn read_totals(dir: &Path) -> Result<std::collections::BTreeMap<String, usize>> {
