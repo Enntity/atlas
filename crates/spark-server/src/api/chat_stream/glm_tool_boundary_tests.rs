@@ -22,6 +22,8 @@ const LITERAL_CONTENT: [&str; 4] = [
     "```xml\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>\n```\nEND",
 ];
 
+#[path = "glm_literal_xml_tests.rs"]
+mod glm_literal_xml_tests;
 #[path = "qwen_literal_xml_tests.rs"]
 mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
@@ -72,6 +74,7 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "`<tool_call><function=get_weather><parameter=not_a_parameter>BAD</parameter></function></tool_call>` END.",
         "<tool_call><function=not_registered><parameter=value>42</parameter></function></tool_call> END.",
         "<tool_call><function=not_registered><parameter=value>42",
+        "get_weather<arg_key>not_a_parameter</arg_key><arg_value>BAD</arg_value></tool_call> END.",
     ];
     let vocab = words
         .iter()
