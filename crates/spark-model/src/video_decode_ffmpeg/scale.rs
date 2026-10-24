@@ -9,7 +9,7 @@ pub(super) fn decoded_scale_filter(max_pixels: usize) -> String {
     // First bound the height, then derive the width from that integer height.
     // This makes the area bound explicit even for extreme aspect ratios and
     // avoids relying on FFmpeg's rounding of two independent square roots.
-    let height = format!("min(ih,max(1,floor(sqrt({area}*ih/iw))))");
+    let height = format!("min(ih,min({area},max(1,floor(sqrt({area}*ih/iw)))))");
     let width = format!("min(iw,max(1,floor({area}/({height}))))");
     format!("scale='{width}':'{height}':force_original_aspect_ratio=decrease")
 }
