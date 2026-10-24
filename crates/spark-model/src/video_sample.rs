@@ -25,13 +25,9 @@
 
 use anyhow::{Result, ensure};
 
-/// Refuse to build a `select` filter with more clauses than this.
-///
-/// The bound exists because the clauses are handed to ffmpeg as ONE argv
-/// element: a container that declares an absurd duration must fail with a
-/// message about the container rather than build a megabyte-long argument.
-/// Well above the 768 the checkpoint's `video_processor` declares.
-pub const MAX_SAMPLE_PLAN: usize = 4_096;
+/// Bound the host-side timestamp vector and downstream frame work. The
+/// FFmpeg timestamp filter itself is constant-size even for hour-long clips.
+pub const MAX_SAMPLE_PLAN: usize = 16_384;
 
 /// What to decode, and when each returned frame sits in the source clip.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,18 +64,23 @@ impl SamplePlan {
     /// `t` reaches that position. This keeps CFR and VFR inputs on their own
     /// timeline; the decoder can then report the selected frame's real PTS.
     pub fn select_time_filter(&self) -> String {
-        // A flat sum avoids a deeply nested expression when the policy allows
-        // hundreds of samples. Each term is 0 or 1; exactly one term can be
-        // live for a given selected_n, and after the final target all terms
-        // are zero.
-        let expression = self
-            .times
-            .iter()
-            .enumerate()
-            .map(|(index, time)| format!("eq(selected_n\\,{index})*gte(t\\,{time:.6})"))
-            .collect::<Vec<_>>()
-            .join("+");
-        format!("select='{expression}'")
+        // Plans are uniformly spaced. Express the next target from selected_n
+        // in constant space: thousands of clauses exceed Linux's argv bound
+        // and require quadratic work across an hour of source frames.
+        if self.times.len() <= 1 {
+            return "select='eq(selected_n,0)'".into();
+        }
+        let start = f64::from(self.times[0]);
+        let end = f64::from(self.times[self.times.len() - 1]);
+        // Source times are f32: at an hour their rounding can put the final
+        // target beyond the last actual PTS. Compute the repeated step in f64
+        // and inset by two f32 rounding units (under 1 ms at an hour).
+        let rounding = f64::from(f32::EPSILON) * end.abs().max(1.0) * 2.0;
+        let step = (end - start - rounding).max(0.0) / (self.times.len() - 1) as f64;
+        format!(
+            "select='lt(selected_n\\,{})*gte(t\\,{start:.12}+selected_n*{step:.12})'",
+            self.times.len()
+        )
     }
 }
 

@@ -923,7 +923,7 @@ pub struct ServeArgs {
 
     /// Vision tokens (merged patches, one prompt placeholder each) one request
     /// may carry across all its images and videos. A request over it, one of
-    /// more than 1024 items (the rank protocol's limit, applied on every world
+    /// more than 8192 items (the rank protocol's limit, applied on every world
     /// size), or one whose prefill chunks could not encode their images (see
     /// `spark_model::vision_limits`), is refused at admission with a 400
     /// naming the counts, instead of failing in prefill where clients retry.
@@ -1037,6 +1037,12 @@ pub struct ServeArgs {
     /// the Qwen-VL families (`max_frames`, just over six minutes).
     #[arg(long)]
     pub video_max_frames: Option<usize>,
+
+    /// Qwen video pixel volume across all sampled frames, overriding the
+    /// checkpoint's video processor bound. 469762048 is the reference
+    /// hour-video recipe (224K merged tokens). Does not change still images.
+    #[arg(long)]
+    pub video_max_pixels: Option<usize>,
 
     /// Wall-clock budget for decoding one video. Bounds a decoder that hangs
     /// on a malformed container; the child is killed when it expires.

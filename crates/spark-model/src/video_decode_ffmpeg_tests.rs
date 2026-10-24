@@ -8,7 +8,7 @@
 
 use super::*;
 
-fn have_ffmpeg() -> bool {
+pub(super) fn have_ffmpeg() -> bool {
     matches!(probe(&enabled()), Availability::Ready(_))
 }
 
@@ -20,7 +20,7 @@ fn enabled() -> FfmpegPolicy {
 }
 
 /// Encode a short clip and hand back the container bytes.
-fn make_mp4(seconds: u32, fps: u32, size: &str, codec: &str) -> Option<Vec<u8>> {
+pub(super) fn make_mp4(seconds: u32, fps: u32, size: &str, codec: &str) -> Option<Vec<u8>> {
     // Unique per CALL, not per parameter set. Keying the directory on
     // (pid, seconds, fps, codec) collided between tests that differ only in
     // frame size, and since each call ends by removing its directory, one

@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use crate::ir::message::{ContentPart, ImageData, ImageSource, Message, Role};
-use spark_model::vision_preprocess::fixtures::{header_only_png, png, qwen_config};
+use crate::ir::{
+    MediaKind,
+    message::{ContentPart, ImageData, ImageSource, Message, Role, VideoSource},
+};
+use crate::tokenizer::QwenVisionKind;
+use spark_model::vision_preprocess::fixtures::{header_only_png, png, qwen_config, short_gif};
 
 fn limits(request_rows: usize) -> VisionRowLimits {
     VisionRowLimits::resolve(
@@ -26,6 +30,12 @@ fn admit<'a>(l: &'a VisionRowLimits, b: Option<&'a Arc<VisionRowBudget>>) -> Adm
         limits: Some(l),
         budget: b,
     }
+}
+
+fn video(uri: String) -> ContentPart {
+    ContentPart::Video(VideoSource {
+        data: ImageData::Base64(uri),
+    })
 }
 
 #[tokio::test]
@@ -67,6 +77,81 @@ fn the_worst_chunk_is_checked_once_every_item_is_sized() {
         a.note(rows).unwrap();
     }
     assert_eq!(a.admit().err().unwrap().status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn a_video_reservation_is_reconciled_into_the_shared_request_permit() {
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(1_000);
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 1, true).unwrap();
+
+    // The decoder needs a conservative 800-row reservation, but the actual
+    // clip produces only 250 rows. The same permit is shrunk before it is
+    // attached to the item; no drop/reacquire window exists.
+    a.reserve_video(800).unwrap();
+    assert_eq!(budget.in_use(), 800);
+    a.note(250).unwrap();
+    let admitted = a.admit().unwrap();
+    assert_eq!(budget.in_use(), 250);
+    let item = admitted.attach(VisionItem::image(vec![0.0; 4], 2, 2));
+    drop(admitted);
+    assert_eq!(budget.in_use(), 250);
+    drop(item);
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[test]
+fn sequential_short_videos_release_their_unused_ceiling_before_the_next_decode() {
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(1_000);
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 2, true).unwrap();
+
+    a.reserve_video(800).unwrap();
+    a.reconcile_video(50).unwrap();
+    assert_eq!(budget.in_use(), 50);
+    a.note(50).unwrap();
+
+    // A second short clip can reserve the same ceiling because the first
+    // clip's unused 750 rows were returned before this decode began.
+    a.reserve_video(800).unwrap();
+    assert_eq!(budget.in_use(), 850);
+    a.reconcile_video(100).unwrap();
+    assert_eq!(budget.in_use(), 100);
+    a.note(50).unwrap();
+    let admitted = a.admit().unwrap();
+    assert_eq!(budget.in_use(), 100);
+    drop(admitted);
+    assert_eq!(budget.in_use(), 0);
+}
+
+#[test]
+fn a_video_reservation_refuses_before_decode_when_budget_is_spent() {
+    let l = limits(usize::MAX);
+    let budget = VisionRowBudget::new(600);
+    let held = budget.try_acquire(300).unwrap();
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 1, true).unwrap();
+    assert_eq!(
+        a.reserve_video(400).unwrap_err().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        budget.in_use(),
+        300,
+        "the failed reservation allocated nothing"
+    );
+    drop(held);
+}
+
+#[test]
+fn a_video_reservation_above_the_request_bound_is_a_bad_request_before_decode() {
+    let l = limits(600);
+    let budget = VisionRowBudget::new(1_000);
+    let mut a = Admission::begin(admit(&l, Some(&budget)), 1, true).unwrap();
+    assert_eq!(
+        a.reserve_video(601).unwrap_err().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(budget.in_use(), 0);
 }
 
 #[tokio::test]
@@ -121,7 +206,8 @@ fn a_request_that_can_never_fit_is_a_400_even_when_the_budget_is_spent() {
 
 #[tokio::test]
 async fn the_item_count_is_checked_before_any_url_is_fetched() {
-    // 1025 image URLs: refused for their count, before any is resolved
+    // One more than the protocol's image-item limit: refused for their count,
+    // before any URL is resolved
     // (here fetching is off, which would have answered "not fetched").
     let l = limits(usize::MAX);
     let parts: Vec<ContentPart> = (0..=MAX_VISION_ITEMS)
@@ -186,6 +272,85 @@ fn build_parts(
         false,
         ctx,
     )
+}
+
+#[tokio::test]
+async fn legacy_qwen_short_gif_is_admitted_from_actual_rows() {
+    // The legacy profile has no checkpoint video-pixel bound, so admission
+    // must not reject this small clip using the opaque-video worst-case
+    // ceiling.  The 64-row request limit is below that ceiling by orders of
+    // magnitude, but above the clip's actual two temporal groups (8 rows).
+    let out = match build_parts(vec![video(short_gif())], admit(&limits(64), None)) {
+        Ok(out) => out,
+        Err(resp) => panic!("short legacy GIF should be admitted: {}", body(resp).await),
+    };
+
+    assert_eq!(out.image_pixels.len(), 2, "one VisionItem per Qwen group");
+    assert!(out.image_pixels.iter().all(|item| item.t_len() == 1));
+    assert_eq!(out.image_pad_counts, vec![8]);
+    assert_eq!(out.qwen_vision_placeholders.len(), 1);
+    let placeholder = &out.qwen_vision_placeholders[0];
+    assert_eq!(placeholder.kind, QwenVisionKind::Video);
+    assert_eq!(placeholder.pad_count, 8);
+    assert_eq!(placeholder.per_frame_pad_count, 4);
+    assert_eq!(placeholder.timestamps, vec![0.25, 1.25]);
+}
+
+#[tokio::test]
+async fn mixed_image_video_image_keeps_temporal_groups_aligned() {
+    let out = match build_parts(
+        vec![
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(png(64, 64)),
+            }),
+            video(short_gif()),
+            ContentPart::Image(ImageSource {
+                data: ImageData::Base64(png(64, 64)),
+            }),
+        ],
+        admit(&limits(64), None),
+    ) {
+        Ok(out) => out,
+        Err(resp) => panic!("mixed media should be admitted: {}", body(resp).await),
+    };
+
+    // The video occupies two encoder items after temporal splitting, while
+    // its one prompt marker remains between the two still-image markers.
+    assert_eq!(out.image_pixels.len(), 4);
+    assert_eq!(
+        out.image_pixels
+            .iter()
+            .map(|item| item.t_len())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 1]
+    );
+    assert_eq!(out.image_pad_counts, vec![4, 8, 4]);
+    assert_eq!(
+        out.messages[0].media,
+        vec![MediaKind::Image, MediaKind::Video, MediaKind::Image]
+    );
+    assert_eq!(
+        out.qwen_vision_placeholders
+            .iter()
+            .map(|placeholder| placeholder.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            QwenVisionKind::Image,
+            QwenVisionKind::Video,
+            QwenVisionKind::Image
+        ]
+    );
+    assert_eq!(
+        out.qwen_vision_placeholders
+            .iter()
+            .map(|placeholder| placeholder.pad_count)
+            .collect::<Vec<_>>(),
+        vec![4, 8, 4]
+    );
+    assert_ne!(
+        out.image_pixels[1].content_hash, out.image_pixels[2].content_hash,
+        "distinct GIF frames must remain distinct after splitting"
+    );
 }
 
 #[tokio::test]

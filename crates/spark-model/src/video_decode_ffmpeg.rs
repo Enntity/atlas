@@ -25,10 +25,9 @@
 //!
 //! - **No shell.** Arguments are passed as argv. Nothing is interpolated into
 //!   a command string, so no input can become a flag or a second command.
-//! - **No temp file.** The container goes in over stdin, so there is no path
-//!   to traverse, collide on, or leave behind.
-//! - **`-nostdin`, and stdin is the pipe** — ffmpeg cannot reach for a
-//!   terminal or block waiting on one.
+//! - **Private seekable input.** A uniquely created, owner-only temporary file
+//!   supports tail-index containers and is removed when decoding ends.
+//! - **`-nostdin`** prevents ffmpeg from waiting on a terminal.
 //! - **Frame count** capped with `-frames:v`, so a long clip cannot decode
 //!   forever — but the cap is applied to a plan that SPANS the clip
 //!   ([`crate::video_sample`]) rather than to a fixed-rate walk that would
@@ -43,14 +42,12 @@
 //!   the cap is passed.
 //! - **Wall clock** capped by a watchdog that kills the child; a decoder that
 //!   hangs must not hold a request thread indefinitely.
-//! - **Protocol whitelist** is moot because the input is a pipe, but
-//!   `-f image2pipe` output and a `pipe:0` input mean ffmpeg is never asked
-//!   to open a URL — the SSRF path that `remote_image` guards for stills
-//!   simply does not exist here.
+//! - **Seekable input** uses a private temporary file so tail-index MP4s work.
+//!   Protocol and format whitelists refuse network URLs and playlist demuxers.
 
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbImage;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -64,6 +61,9 @@ mod timestamps;
 pub use frames::{decode_frame_indices, probe_frames};
 use probe::probe_duration;
 use scale::decoded_scale_filter;
+mod input;
+mod png_stream;
+use png_stream::decoded_frame_budget;
 use timestamps::parse_showinfo_timestamps;
 
 /// Operator policy for subprocess decoding.
@@ -88,6 +88,9 @@ pub struct FfmpegPolicy {
     /// scaled to fit BEFORE it is read back as RGB, which is what bounds the
     /// returned frame collection at `max_frames × max_decoded_pixels`.
     pub max_decoded_pixels: usize,
+    /// Optional aggregate RGB pixel bound, applied before frames leave FFmpeg.
+    /// Long-video profiles use the same total pixel budget as preprocessing.
+    pub max_total_decoded_pixels: Option<usize>,
 }
 
 /// Default decoded-frame area cap: 640×640.
@@ -111,6 +114,7 @@ impl Default for FfmpegPolicy {
             timeout_secs: 120,
             fps: 2.0,
             max_decoded_pixels: DEFAULT_MAX_DECODED_PIXELS,
+            max_total_decoded_pixels: None,
         }
     }
 }
@@ -254,10 +258,7 @@ pub fn decode_with_plan(
         .filter(|&count| count > 0 && count <= crate::video_sample::MAX_SAMPLE_PLAN as u64)
         .filter(|&count| want >= count as usize)
     {
-        (
-            crate::video_sample::select_frames(0..count as usize),
-            count as usize,
-        )
+        ("select=1".to_string(), count as usize)
     } else {
         let mut plan = sample_plan(want, timing.duration_secs)?;
         // A container's duration usually names the end of its presentation
@@ -306,31 +307,17 @@ fn run_ffmpeg(
     let filter = format!(
         "{},showinfo,{}",
         selection,
-        decoded_scale_filter(policy.max_decoded_pixels),
+        decoded_scale_filter(decoded_frame_budget(policy, output_frames)?),
     );
-    let (out, stderr) = spawn_ffmpeg(
+    let (frames, stderr) = spawn_ffmpeg(
         bytes,
         &filter,
         output_frames,
         &["-fps_mode", "passthrough", "-vcodec", "png"],
         policy,
         "info",
-        |stdout| {
-            // Read with a hard cap. `take` bounds it without trusting the child.
-            let mut out = Vec::new();
-            stdout
-                .take(policy.max_output_bytes as u64 + 1)
-                .read_to_end(&mut out)
-                .context("reading decoded frames")?;
-            ensure!(
-                out.len() <= policy.max_output_bytes,
-                "decoded output exceeded the {}-byte cap",
-                policy.max_output_bytes
-            );
-            Ok(out)
-        },
+        |stdout| png_stream::read_frames(stdout, output_frames, policy),
     )?;
-    let frames = split_png_stream(&out)?;
     ensure!(
         !frames.is_empty(),
         "the container decoded to zero frames (is there a video stream?)"
@@ -361,14 +348,26 @@ fn spawn_ffmpeg<T>(
     log_level: &str,
     read: impl FnOnce(&mut std::process::ChildStdout) -> Result<T>,
 ) -> Result<(T, String)> {
+    let input_file = input::SeekableInput::new(bytes)?;
     let mut child = Command::new(&policy.binary)
         // Never touch a terminal: without `-nostdin` ffmpeg can block on a
         // prompt when it thinks stdin is interactive.
-        .args(["-v", log_level, "-nostdin", "-i", "pipe:0", "-vf", filter])
+        .args([
+            "-v",
+            log_level,
+            "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
+            "-i",
+        ])
+        .arg(input_file.path())
+        .args(["-vf", filter])
         .args(["-frames:v", &frames.to_string()])
         .args(output)
         .args(["-f", "image2pipe", "pipe:1"])
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -380,7 +379,6 @@ fn spawn_ffmpeg<T>(
             )
         })?;
 
-    let mut stdin = child.stdin.take().context("no stdin pipe")?;
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     let mut stderr = child.stderr.take().context("no stderr pipe")?;
 
@@ -394,17 +392,6 @@ fn spawn_ffmpeg<T>(
             .take(8 * 1024 * 1024)
             .read_to_end(&mut bytes);
         String::from_utf8_lossy(&bytes).into_owned()
-    });
-
-    // Feed the container on a thread. It MUST be concurrent with reading:
-    // ffmpeg writes output while still consuming input, so a write-then-read
-    // sequence deadlocks as soon as the output pipe buffer fills.
-    let input = bytes.to_vec();
-    let writer = std::thread::spawn(move || {
-        // A broken pipe here is normal — ffmpeg stops reading once it has the
-        // frames it was asked for — so the error is deliberately dropped.
-        let _ = stdin.write_all(&input);
-        drop(stdin);
     });
 
     let child = Arc::new(Mutex::new(child));
@@ -442,7 +429,6 @@ fn spawn_ffmpeg<T>(
     let err_text = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("ffmpeg stderr reader panicked"))?;
-    let _ = writer.join();
 
     let status = {
         let mut g = child
@@ -471,6 +457,7 @@ fn spawn_ffmpeg<T>(
 /// payload can legitimately contain the IEND byte pattern, whereas the
 /// 8-byte signature only appears at a file start in a well-formed stream
 /// produced by `image2pipe`.
+#[cfg(test)]
 fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
     let mut starts = Vec::new();
     let mut i = 0usize;
@@ -495,3 +482,7 @@ fn split_png_stream(buf: &[u8]) -> Result<Vec<RgbImage>> {
 #[cfg(test)]
 #[path = "video_decode_ffmpeg_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "video_decode_ffmpeg_hour_tests.rs"]
+mod hour_tests;

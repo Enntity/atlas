@@ -39,19 +39,24 @@ fn probe_command(policy: &FfmpegPolicy) -> Command {
 /// otherwise its instantaneous rate — used only to plan coverage, and NOT as a
 /// substitute for a duration that could not be read.
 pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<ClipTiming> {
-    let mut child = probe_command(policy)
+    let input_file = input::SeekableInput::new(bytes)?;
+    let child = probe_command(policy)
         .args([
             "-v",
             "error",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
             "-select_streams",
             "v:0",
             "-show_entries",
             "format=duration:stream=avg_frame_rate,r_frame_rate,nb_frames",
             "-of",
             "default=nw=1",
-            "pipe:0",
         ])
-        .stdin(Stdio::piped())
+        .arg(input_file.path())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -64,50 +69,7 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
             )
         })?;
 
-    // Same reason ffmpeg's input is fed on a thread: the child writes its
-    // report while still draining stdin, so a write-then-read sequence can
-    // deadlock on a large container.
-    let mut stdin = child.stdin.take().context("no ffprobe stdin pipe")?;
-    let input = bytes.to_vec();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        drop(stdin);
-    });
-
-    let mut out = Vec::new();
-    let read_res = child
-        .stdout
-        .take()
-        .context("no ffprobe stdout pipe")?
-        .read_to_end(&mut out);
-
-    // Bound the wait the same way the decoder is bounded: a probe that hangs
-    // must not hold a request thread. The watchdog kills the child, which
-    // closes its stdout and releases the reader above.
-    let mut err_text = String::new();
-    let status = {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(policy.timeout_secs.max(1));
-        loop {
-            match child.try_wait().context("waiting for ffprobe")? {
-                Some(s) => break s,
-                None if std::time::Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!(
-                        "probing the clip's duration exceeded {}s and was stopped",
-                        policy.timeout_secs
-                    );
-                }
-                None => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        }
-    };
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut err_text);
-    }
-    let _ = writer.join();
-    read_res.context("reading the ffprobe report")?;
+    let (out, err_text, status) = read_probe(child, policy.timeout_secs)?;
 
     let text = String::from_utf8_lossy(&out);
     let field = |name: &str| -> Option<String> {
@@ -148,6 +110,65 @@ pub(super) fn probe_duration(bytes: &[u8], policy: &FfmpegPolicy) -> Result<Clip
         native_fps,
         frame_count,
     })
+}
+
+/// Read a probe process under the same bounded watchdog as production FFprobe.
+pub(super) fn read_probe(
+    mut child: std::process::Child,
+    timeout_secs: u64,
+) -> Result<(Vec<u8>, String, std::process::ExitStatus)> {
+    let mut stdout = child.stdout.take().context("no ffprobe stdout pipe")?;
+    let mut stderr = child.stderr.take().context("no ffprobe stderr pipe")?;
+    let child = Arc::new(Mutex::new(child));
+    // Start the watchdog BEFORE reading stdout: read_to_end itself blocks
+    // on a hung probe. A timeout installed after that read cannot bound it.
+    let watchdog = {
+        let child = Arc::clone(&child);
+        let secs = timeout_secs.max(1);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let mut guard = child.lock().expect("probe lock");
+                match guard.try_wait() {
+                    Ok(Some(_)) | Err(_) => return false,
+                    Ok(None) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = guard.kill();
+                    return true;
+                }
+            }
+        })
+    };
+    let errors = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.by_ref().take(64 * 1024).read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let mut out = Vec::new();
+    let read_res = stdout.by_ref().take(64 * 1024 + 1).read_to_end(&mut out);
+    if read_res.is_err() || out.len() > 64 * 1024 {
+        let _ = child.lock().expect("probe lock").kill();
+    }
+    let err_text = errors.join().unwrap_or_default();
+    let status = child
+        .lock()
+        .expect("probe lock")
+        .wait()
+        .context("waiting for ffprobe")?;
+    ensure!(
+        !watchdog.join().unwrap_or(true),
+        "probing the clip's duration exceeded {}s and was stopped",
+        timeout_secs
+    );
+    read_res.context("reading the ffprobe report")?;
+    ensure!(
+        out.len() <= 64 * 1024,
+        "ffprobe report exceeded the 64 KiB bound"
+    );
+
+    Ok((out, err_text, status))
 }
 
 /// Parse ffprobe's `num/den` frame-rate form. Returns `None` for `0/0` and
