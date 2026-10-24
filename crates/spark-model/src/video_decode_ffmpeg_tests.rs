@@ -197,6 +197,48 @@ fn the_frame_cap_is_honoured() {
 }
 
 #[test]
+fn decoded_frames_are_area_bounded_without_enlarging_or_distorting_them() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: no ffmpeg");
+        return;
+    }
+    const MAX_AREA: usize = 640 * 640;
+    let cases = [
+        ("1920x1080", 16.0 / 9.0, None),
+        ("3840x2160", 16.0 / 9.0, None),
+        ("2048x256", 8.0, None),
+        ("320x240", 4.0 / 3.0, Some((320, 240))),
+    ];
+    let policy = FfmpegPolicy {
+        max_decoded_pixels: MAX_AREA,
+        ..enabled()
+    };
+    for (size, expected_aspect, expected_dimensions) in cases {
+        let mp4 = make_mp4(1, 1, size, "libx264").expect("encode");
+        let frames = decode_frames(&mp4, 1.0, &policy).expect("decode");
+        assert_eq!(frames.len(), 1, "{size}");
+        let (width, height) = frames[0].dimensions();
+        let area = width as usize * height as usize;
+        assert!(
+            area <= MAX_AREA,
+            "{size} became {width}x{height} ({area} pixels), over {MAX_AREA}"
+        );
+        let aspect = width as f32 / height as f32;
+        assert!(
+            (aspect - expected_aspect).abs() < 0.02,
+            "{size} changed aspect ratio from {expected_aspect:.4} to {aspect:.4}"
+        );
+        if let Some(expected) = expected_dimensions {
+            assert_eq!(
+                (width, height),
+                expected,
+                "small frames must stay native-sized"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_capped_clip_selects_actual_frames_at_the_tail() {
     if !have_ffmpeg() {
         eprintln!("skipping: no ffmpeg");

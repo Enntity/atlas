@@ -59,9 +59,11 @@ use crate::video_sample::{sample_plan, wanted_frames};
 
 mod frames;
 mod probe;
+mod scale;
 mod timestamps;
 pub use frames::{decode_frame_indices, probe_frames};
 use probe::probe_duration;
+use scale::decoded_scale_filter;
 use timestamps::parse_showinfo_timestamps;
 
 /// Operator policy for subprocess decoding.
@@ -302,9 +304,9 @@ fn run_ffmpeg(
     // `select` first, `scale` after: at most `output_frames` frames are ever
     // scaled, and the scale is what caps the RGB the returned Vec holds.
     let filter = format!(
-        "{},showinfo,scale='min({px},iw)':'min({px},ih)':force_original_aspect_ratio=decrease",
+        "{},showinfo,{}",
         selection,
-        px = policy.max_decoded_pixels.max(1),
+        decoded_scale_filter(policy.max_decoded_pixels),
     );
     let (out, stderr) = spawn_ffmpeg(
         bytes,
