@@ -64,18 +64,16 @@ fn thousands_of_samples_cover_an_hour_without_an_argv_sized_filter() {
 #[cfg(unix)]
 #[test]
 fn probe_timeout_covers_a_blocked_stdout_read() {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::temp_dir().join(format!("atlas-hung-probe-{}", std::process::id()));
-    std::fs::write(&path, "#!/bin/sh\nexec sleep 30\n").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let p = FfmpegPolicy {
-        probe_binary: path.to_string_lossy().into_owned(),
-        timeout_secs: 1,
-        ..Default::default()
-    };
+    // Use an installed executable: executing a just-written script can race
+    // with parallel fork/exec tests on overlayfs and yield ETXTBSY instead.
+    let child = Command::new("sleep")
+        .arg("30")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let start = std::time::Instant::now();
-    let err = probe::probe_duration(b"invalid", &p).unwrap_err();
-    let _ = std::fs::remove_file(path);
+    let err = probe::read_probe(child, 1).unwrap_err();
     assert!(err.to_string().contains("exceeded 1s"), "{err:#}");
     assert!(start.elapsed().as_secs() < 5);
 }
