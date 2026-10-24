@@ -884,7 +884,8 @@ pub fn build_model(
         tail_slots,
         latent_shard: glm_cache_plan.and_then(|p| p.shard()),
         auxiliary_block_bytes: native_block_bytes,
-    };
+    }
+    .with_per_token_aux(aux_bytes_per_token)?;
     let (blocks, kv_placement) = if hss_cache_blocks_per_seq.is_none() {
         kv_carveout::extend(gpu.as_ref(), kv_shape, num_kv_blocks)
     } else {

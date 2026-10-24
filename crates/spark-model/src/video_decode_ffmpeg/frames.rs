@@ -47,13 +47,22 @@ pub fn decode_frame_indices(
     // `passthrough`: one output frame per selected input frame, never a
     // duplicate to fill a constant-rate timeline.
     let output = ["-fps_mode", "passthrough", "-vcodec", "ppm"];
-    spawn_ffmpeg(bytes, &filter, indices.len(), &output, policy, |stdout| {
-        read_ppm_frames(
-            &mut std::io::BufReader::new(stdout),
-            indices.len(),
-            on_frame,
-        )
-    })
+    let (count, _) = spawn_ffmpeg(
+        bytes,
+        &filter,
+        indices.len(),
+        &output,
+        policy,
+        "error",
+        |stdout| {
+            read_ppm_frames(
+                &mut std::io::BufReader::new(stdout),
+                indices.len(),
+                on_frame,
+            )
+        },
+    )?;
+    Ok(count)
 }
 
 /// Read concatenated binary PPM (`P6`, maxval 255) frames, at most `limit`,

@@ -114,6 +114,15 @@ fn the_select_filter_names_every_planned_frame() {
     );
 }
 
+#[test]
+fn the_timestamp_filter_advances_once_per_planned_source_time() {
+    let p = sample_plan(3, 10.0).expect("plan");
+    assert_eq!(
+        p.select_time_filter(),
+        "select='eq(selected_n\\,0)*gte(t\\,0.000000)+eq(selected_n\\,1)*gte(t\\,4.995000)+eq(selected_n\\,2)*gte(t\\,9.990000)'"
+    );
+}
+
 /// A container declaring an absurd rate must be refused by the planner rather
 /// than build a filter with millions of clauses.
 #[test]

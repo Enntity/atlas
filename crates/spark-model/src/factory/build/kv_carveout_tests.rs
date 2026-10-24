@@ -195,3 +195,32 @@ fn native_pool_growth_is_charged_even_when_target_latents_use_carveout() {
     let over = KvPlacement::plan(&joint.buffers(n + 1), GB10);
     assert!(joint.system_bytes(n + 1, &over) > system);
 }
+
+#[test]
+fn qwen_carveout_growth_reserves_indexer_state_for_every_added_token() {
+    let mut cfg = config(12, KvCacheDtype::Bf16);
+    cfg.head_dim = 256;
+    let bare = KvShape {
+        config: &cfg,
+        v_aliases_k: false,
+        index: None,
+        tail_slots: None,
+        latent_shard: None,
+        auxiliary_block_bytes: 0,
+    };
+    let shape = bare.with_per_token_aux(768).unwrap();
+    let budgeted = 208_676;
+    let (n, placement) = plan(shape, budgeted, GB10);
+    assert!(n > budgeted);
+    let actual = |blocks, placement: &KvPlacement| {
+        bare.system_bytes(blocks, placement) + blocks * cfg.block_size * 768
+    };
+    let budget = actual(budgeted, &KvPlacement::default());
+    assert!(actual(n, &placement) <= budget);
+    assert!(carveout_footprint(shape, n, &placement) <= GB10);
+    let over = KvPlacement::plan(&shape.buffers(n + 1), GB10);
+    assert!(actual(n + 1, &over) > budget);
+    let (old_n, old_placement) = plan(bare, budgeted, GB10);
+    assert!(actual(old_n, &old_placement) > budget);
+    assert!(bare.with_per_token_aux(usize::MAX).is_err());
+}

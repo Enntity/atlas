@@ -55,12 +55,16 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use crate::video_sample::{grid_step, sample_plan, wanted_frames};
+use crate::video_sample::{sample_plan, wanted_frames};
 
 mod frames;
 mod probe;
+mod scale;
+mod timestamps;
 pub use frames::{decode_frame_indices, probe_frames};
 use probe::probe_duration;
+use scale::decoded_scale_filter;
+use timestamps::parse_showinfo_timestamps;
 
 /// Operator policy for subprocess decoding.
 #[derive(Debug, Clone)]
@@ -242,24 +246,47 @@ pub fn decode_with_plan(
     // The plan converts the frame COUNT into evenly spaced positions across
     // the probed duration — this, and not the frame count, is what makes the
     // samples cover the whole clip instead of stopping `cap / fps` seconds in.
-    let plan = sample_plan(want, timing.duration_secs)?;
-    // The grid runs at the SOURCE rate, subdivided so the selector's indices
-    // land on a dense-enough grid to name the plan's positions. The coverage
-    // bound the operator's `fps` represents is enforced by how MANY samples
-    // the plan asks for, not by ffmpeg dropping the rest — which is exactly
-    // the distinction the old `fps=` filter could not make.
-    let native = crate::video_sample::finite_positive(timing.native_fps as f32).unwrap_or(fps);
-    let step = grid_step(native, fps, fps);
-    // `fps=A/B` samples one frame every `B/A` seconds, so the frame the
-    // selector names for index K is the grid frame at time `K × B/A`.
-    let grid = format!("fps={native}/{step}");
-    let frames = run_ffmpeg(bytes, &plan, &grid, policy)?;
-
-    // The frame-bearing timestamps come from the plan, clipped to the frames
-    // that were actually produced: a container whose last frame lands earlier
-    // than its declared duration must not be reported with timestamps for
-    // frames the model never received.
-    let times = plan.times.iter().copied().take(frames.len()).collect();
+    // When the cap can hold every declared source frame, select by index so a
+    // short CFR or VFR clip is not warped by an evenly spaced time plan. The
+    // showinfo timestamps still come from the frames ffmpeg actually emits.
+    let (selection, output_frames) = if let Some(count) = timing
+        .frame_count
+        .filter(|&count| count > 0 && count <= crate::video_sample::MAX_SAMPLE_PLAN as u64)
+        .filter(|&count| want >= count as usize)
+    {
+        (
+            crate::video_sample::select_frames(0..count as usize),
+            count as usize,
+        )
+    } else {
+        let mut plan = sample_plan(want, timing.duration_secs)?;
+        // A container's duration usually names the end of its presentation
+        // timeline, while its last frame starts one frame interval earlier.
+        // Rescale the targets to end inside that final interval so the
+        // timestamp selector can actually reach it. The returned time is
+        // still the decoded frame's PTS, captured from ffmpeg below.
+        if plan.len() > 1 {
+            let final_step = timing
+                .frame_count
+                .filter(|&count| count > 1)
+                .map(|count| timing.duration_secs / (count - 1) as f32)
+                .or_else(|| {
+                    crate::video_sample::finite_positive(timing.native_fps as f32)
+                        .map(|rate| 1.0 / rate)
+                })
+                .unwrap_or(1.0 / fps);
+            let old_end = *plan.times.last().expect("a non-empty plan");
+            let new_end = old_end.min((timing.duration_secs - final_step).max(0.0));
+            if new_end < old_end && old_end > 0.0 {
+                for time in &mut plan.times {
+                    *time = *time * new_end / old_end;
+                }
+            }
+        }
+        let output_frames = plan.len();
+        (plan.select_time_filter(), output_frames)
+    };
+    let (frames, times) = run_ffmpeg(bytes, &selection, output_frames, policy)?;
     Ok((frames, times))
 }
 
@@ -270,23 +297,24 @@ pub fn decode_with_plan(
 /// RGB) is readable on its own.
 fn run_ffmpeg(
     bytes: &[u8],
-    plan: &crate::video_sample::SamplePlan,
-    grid: &str,
+    selection: &str,
+    output_frames: usize,
     policy: &FfmpegPolicy,
-) -> Result<Vec<RgbImage>> {
-    // `select` first, `scale` after: at most `plan.len()` frames are ever
+) -> Result<(Vec<RgbImage>, Vec<f32>)> {
+    // `select` first, `scale` after: at most `output_frames` frames are ever
     // scaled, and the scale is what caps the RGB the returned Vec holds.
     let filter = format!(
-        "{grid},{},scale='min({px},iw)':'min({px},ih)':force_original_aspect_ratio=decrease",
-        plan.select_filter(),
-        px = policy.max_decoded_pixels.max(1),
+        "{},showinfo,{}",
+        selection,
+        decoded_scale_filter(policy.max_decoded_pixels),
     );
-    let out = spawn_ffmpeg(
+    let (out, stderr) = spawn_ffmpeg(
         bytes,
         &filter,
-        plan.len(),
-        &["-vcodec", "png"],
+        output_frames,
+        &["-fps_mode", "passthrough", "-vcodec", "png"],
         policy,
+        "info",
         |stdout| {
             // Read with a hard cap. `take` bounds it without trusting the child.
             let mut out = Vec::new();
@@ -307,7 +335,14 @@ fn run_ffmpeg(
         !frames.is_empty(),
         "the container decoded to zero frames (is there a video stream?)"
     );
-    Ok(frames)
+    let times = parse_showinfo_timestamps(&stderr)?;
+    ensure!(
+        times.len() == frames.len(),
+        "ffmpeg reported {} selected frame timestamps for {} decoded frames",
+        times.len(),
+        frames.len()
+    );
+    Ok((frames, times))
 }
 
 /// Run ffmpeg over `bytes` with `filter`, at most `frames` frames out in the
@@ -323,12 +358,13 @@ fn spawn_ffmpeg<T>(
     frames: usize,
     output: &[&str],
     policy: &FfmpegPolicy,
+    log_level: &str,
     read: impl FnOnce(&mut std::process::ChildStdout) -> Result<T>,
-) -> Result<T> {
+) -> Result<(T, String)> {
     let mut child = Command::new(&policy.binary)
         // Never touch a terminal: without `-nostdin` ffmpeg can block on a
         // prompt when it thinks stdin is interactive.
-        .args(["-v", "error", "-nostdin", "-i", "pipe:0", "-vf", filter])
+        .args(["-v", log_level, "-nostdin", "-i", "pipe:0", "-vf", filter])
         .args(["-frames:v", &frames.to_string()])
         .args(output)
         .args(["-f", "image2pipe", "pipe:1"])
@@ -347,6 +383,18 @@ fn spawn_ffmpeg<T>(
     let mut stdin = child.stdin.take().context("no stdin pipe")?;
     let mut stdout = child.stdout.take().context("no stdout pipe")?;
     let mut stderr = child.stderr.take().context("no stderr pipe")?;
+
+    // `showinfo` emits one stderr line per selected frame. Read it alongside
+    // stdout or a large (but still bounded) plan can fill the stderr pipe
+    // while the main reader waits for image bytes.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr
+            .by_ref()
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
 
     // Feed the container on a thread. It MUST be concurrent with reading:
     // ffmpeg writes output while still consuming input, so a write-then-read
@@ -391,8 +439,9 @@ fn spawn_ffmpeg<T>(
         let _ = g.kill();
     }
 
-    let mut err_text = String::new();
-    let _ = stderr.read_to_string(&mut err_text);
+    let err_text = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("ffmpeg stderr reader panicked"))?;
     let _ = writer.join();
 
     let status = {
@@ -413,7 +462,7 @@ fn spawn_ffmpeg<T>(
         let why = err_text.lines().next_back().unwrap_or("no detail").trim();
         bail!("decoder failed: {why}");
     }
-    Ok(out)
+    Ok((out, err_text))
 }
 
 /// Split a concatenated PNG stream into images.

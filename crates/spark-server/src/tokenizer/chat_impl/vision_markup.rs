@@ -27,7 +27,8 @@ use anyhow::Result;
 use super::super::ChatTokenizer;
 
 /// The vision markers the server's own placeholder expansion handles: Qwen's
-/// (`expand_vision_pads`) and GLM-5's (`expand_glm5_vision_placeholders`).
+/// (`expand_qwen_vision_placeholders`) and GLM-5's
+/// (`expand_glm5_vision_placeholders`).
 /// A tokenizer lacking one leaves it out ([`ChatTokenizer::vision_markup`]).
 const VISION_MARKUP: &[&str] = &[
     "<|vision_start|>",

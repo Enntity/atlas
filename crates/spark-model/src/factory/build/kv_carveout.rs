@@ -32,11 +32,21 @@ pub(super) struct KvShape<'a> {
     pub(super) tail_slots: Option<TailSlotPlan>,
     /// The latent shard the pool is built with (`glm::new_kv_cache`).
     pub(super) latent_shard: Option<LatentShardSpec>,
-    /// Native proposer bytes per logical block; always remain in system memory.
+    /// Proposer and per-token auxiliary bytes per block; remain in system memory.
     pub(super) auxiliary_block_bytes: usize,
 }
 
 impl KvShape<'_> {
+    /// QSA's pooled index keys grow with the logical pool too, even when
+    /// some K/V buffers are placed in the display heap.
+    pub(super) fn with_per_token_aux(mut self, bytes: usize) -> anyhow::Result<Self> {
+        self.auxiliary_block_bytes = bytes
+            .checked_mul(self.config.block_size)
+            .and_then(|n| n.checked_add(self.auxiliary_block_bytes))
+            .ok_or_else(|| anyhow::anyhow!("KV auxiliary block budget overflow"))?;
+        Ok(self)
+    }
+
     fn buffers(self, blocks: usize) -> Vec<(KvBuffer, usize)> {
         let k_slots = self
             .latent_shard

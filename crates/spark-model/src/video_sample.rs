@@ -59,6 +59,28 @@ impl SamplePlan {
     pub fn select_filter(&self) -> String {
         select_frames(0..self.times.len())
     }
+
+    /// The ffmpeg `select` filter that advances through this plan by source
+    /// timestamp rather than by a synthetic frame index.
+    ///
+    /// `selected_n` is the number of frames already accepted by the filter.
+    /// For each plan position we accept the first source frame whose actual
+    /// `t` reaches that position. This keeps CFR and VFR inputs on their own
+    /// timeline; the decoder can then report the selected frame's real PTS.
+    pub fn select_time_filter(&self) -> String {
+        // A flat sum avoids a deeply nested expression when the policy allows
+        // hundreds of samples. Each term is 0 or 1; exactly one term can be
+        // live for a given selected_n, and after the final target all terms
+        // are zero.
+        let expression = self
+            .times
+            .iter()
+            .enumerate()
+            .map(|(index, time)| format!("eq(selected_n\\,{index})*gte(t\\,{time:.6})"))
+            .collect::<Vec<_>>()
+            .join("+");
+        format!("select='{expression}'")
+    }
 }
 
 /// The ffmpeg `select` filter that keeps exactly the input frames numbered
