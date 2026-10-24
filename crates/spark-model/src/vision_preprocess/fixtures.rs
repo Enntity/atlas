@@ -119,3 +119,26 @@ pub fn glm_config() -> VisionConfig {
         ..qwen_config()
     }
 }
+
+/// Four distinct 64x64 GIF frames, each held for half a second.
+pub fn short_gif() -> String {
+    use image::codecs::gif::GifEncoder;
+    use image::{Delay, Frame, Rgba, RgbaImage};
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(&mut bytes);
+        for i in 0..4u8 {
+            let color = 20 + 37 * i;
+            let frame = RgbaImage::from_pixel(64, 64, Rgba([color, 40, 255 - color, 255]));
+            encoder
+                .encode_frame(Frame::from_parts(
+                    frame,
+                    0,
+                    0,
+                    Delay::from_numer_denom_ms(500, 1),
+                ))
+                .expect("encode GIF fixture");
+        }
+    }
+    data_uri("image/gif", &bytes)
+}
