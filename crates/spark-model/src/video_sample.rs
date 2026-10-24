@@ -70,10 +70,15 @@ impl SamplePlan {
         if self.times.len() <= 1 {
             return "select='eq(selected_n,0)'".into();
         }
-        let start = self.times[0];
-        let step = (self.times[self.times.len() - 1] - start) / (self.times.len() - 1) as f32;
+        let start = f64::from(self.times[0]);
+        let end = f64::from(self.times[self.times.len() - 1]);
+        // Source times are f32: at an hour their rounding can put the final
+        // target beyond the last actual PTS. Compute the repeated step in f64
+        // and inset by two f32 rounding units (under 1 ms at an hour).
+        let rounding = f64::from(f32::EPSILON) * end.abs().max(1.0) * 2.0;
+        let step = (end - start - rounding).max(0.0) / (self.times.len() - 1) as f64;
         format!(
-            "select='lt(selected_n\\,{})*gte(t\\,{start:.9}+selected_n*{step:.9})'",
+            "select='lt(selected_n\\,{})*gte(t\\,{start:.12}+selected_n*{step:.12})'",
             self.times.len()
         )
     }
