@@ -71,6 +71,53 @@ impl VisionRowPermit {
     pub fn rows(&self) -> usize {
         self.rows
     }
+
+    /// Return unused rows to the budget before this permit is shared.
+    ///
+    /// A video has no cheap header equivalent to a still image, so the API
+    /// may reserve a conservative upper bound before decoding it. Once the
+    /// actual groups are known, shrink that reservation before wrapping the
+    /// permit in an `Arc` and attaching it to the request's items.
+    pub fn shrink_to(&mut self, rows: usize) {
+        assert!(
+            rows <= self.rows,
+            "a vision permit cannot grow via shrink_to"
+        );
+        let refund = self.rows - rows;
+        if refund != 0 {
+            self.rows = rows;
+            self.budget.used.fetch_sub(refund, Ordering::AcqRel);
+        }
+    }
+
+    /// Grow a pre-decode reservation to the actual request total.
+    ///
+    /// This keeps the same permit in place, so the API never has to drop a
+    /// temporary reservation and race another request before it acquires the
+    /// final amount.
+    pub fn try_grow(&mut self, rows: usize) -> bool {
+        if rows == 0 {
+            return true;
+        }
+        let mut used = self.budget.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = used.checked_add(rows).filter(|&n| n <= self.budget.limit) else {
+                return false;
+            };
+            match self.budget.used.compare_exchange_weak(
+                used,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.rows += rows;
+                    return true;
+                }
+                Err(now) => used = now,
+            }
+        }
+    }
 }
 
 impl Drop for VisionRowPermit {
@@ -132,5 +179,21 @@ mod tests {
         });
         assert_eq!(held.len(), 1000 / 7);
         assert_eq!(b.in_use(), 7 * held.len());
+    }
+
+    #[test]
+    fn a_conservative_reservation_can_be_shrunk_or_grown_in_place() {
+        let b = VisionRowBudget::new(100);
+        let mut p = b.try_acquire(80).unwrap();
+        assert_eq!(b.in_use(), 80);
+        p.shrink_to(50);
+        assert_eq!(p.rows(), 50);
+        assert_eq!(b.in_use(), 50);
+        assert!(p.try_grow(25));
+        assert_eq!(p.rows(), 75);
+        assert_eq!(b.in_use(), 75);
+        assert!(!p.try_grow(30));
+        assert_eq!(p.rows(), 75);
+        assert_eq!(b.in_use(), 75);
     }
 }

@@ -183,6 +183,24 @@ pub(crate) fn load_model(
             })
         });
     }
+    if let Some(pixels) = args.video_max_pixels {
+        anyhow::ensure!(pixels > 0, "--video-max-pixels must be positive");
+        let vision = config
+            .vision
+            .as_mut()
+            .context("--video-max-pixels requires a vision model")?;
+        anyhow::ensure!(
+            !vision.is_glm5_next,
+            "--video-max-pixels is a Qwen video option"
+        );
+        let bounds = vision
+            .video_pixels
+            .as_mut()
+            .context("checkpoint lacks video pixel bounds")?;
+        bounds.max_pixels = pixels;
+        bounds.min_pixels = bounds.min_pixels.min(pixels);
+        tracing::info!("Qwen video pixel volume override: {pixels}");
+    }
     match vision_max_pixels {
         Some(px) => tracing::info!(
             "Vision pixel budget: {} px ({})",
@@ -250,6 +268,12 @@ pub(crate) fn load_model(
         binary: args.video_ffmpeg_path.clone(),
         max_frames: video_max_frames,
         timeout_secs: args.video_decode_timeout_s,
+        max_total_decoded_pixels: args.video_max_pixels,
+        max_output_bytes: args.video_max_pixels.map_or(512 * 1024 * 1024, |pixels| {
+            pixels
+                .saturating_mul(4)
+                .saturating_add(video_max_frames.saturating_mul(1024))
+        }),
         ..Default::default()
     };
     match spark_model::video_decode_ffmpeg::probe(&video_ffmpeg) {
