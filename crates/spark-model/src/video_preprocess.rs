@@ -9,11 +9,11 @@
 //! `C × temporal_patch_size × patch²`, so a patch spans `tp` consecutive
 //! frames. A still image fills that axis by replicating itself `tp` times.
 //!
-//! A video of `n` sampled frames becomes `grid_t = n / tp` temporal groups,
-//! each a full `grid_h × grid_w` patch plane. The native encoder runs each
-//! group as its own attention sequence, then packs the resulting merger rows
-//! into one contiguous video pad run. Keeping the grouping in the item is
-//! still necessary for token insertion and MRoPE: T advances once per group.
+//! A video of `n` sampled frames becomes `grid_t = ceil(n / tp)` temporal
+//! groups for Qwen (the final frame is repeated into an odd group), or whole
+//! groups for GLM. Each group is a full `grid_h × grid_w` patch plane. The
+//! native encoder runs each group as its own attention sequence, and Qwen's
+//! prompt expansion gives every group its own timestamped pad range.
 //!
 //! # Container support
 //!
@@ -56,9 +56,8 @@ pub struct PreprocessedVideo {
     pub grid_t: usize,
     pub grid_h: usize,
     pub grid_w: usize,
-    /// One timestamp per temporal group, in source-video seconds. GLM's
-    /// prompt expansion places this text after each per-frame image marker;
-    /// retaining it here keeps the prompt and encoder group order coupled.
+    /// One timestamp per temporal group, in source-video seconds. The prompt
+    /// expanders for Qwen and GLM retain this metadata in encoder order.
     pub timestamps: Vec<f32>,
 }
 
@@ -160,8 +159,9 @@ pub fn sample_indices(
 /// samples through [`crate::video_sample`] and only rounds to groups here.
 fn _legacy_sampling_reference() {}
 
-/// The only re-sampling left after the decoder has done the coverage work:
-/// drop any trailing partial temporal group.
+/// GLM's re-sampling step after the decoder has done the coverage work: drop
+/// any trailing partial temporal group. Qwen's processor pads that remainder
+/// in `preprocess_video` instead.
 ///
 /// The decoder ([`crate::video_sample`]) already chose which source frames to
 /// return, at the operator's rate and spanning the clip. A partial group
@@ -383,27 +383,27 @@ pub fn preprocess_video(
 
     // The decoder has already sampled the clip: its frames ARE the plan, at
     // the operator's rate and spanning the whole clip. Re-sampling here would
-    // be a second, lossy pass over positions the decoder chose deliberately
-    // (and, for a GIF, would need a rate the container may not declare).
-    // The one thing still owed is the group shape: a partial temporal group
-    // has no representation, so the count is rounded down to whole groups.
-    let keep = group_indices(frames.len(), tp);
+    // be a second, lossy pass over positions the decoder chose deliberately.
+    // Qwen's patchify duplicates the final frame when a clip has an odd count;
+    // GLM keeps its historical whole-group rule and drops a remainder.
+    let keep = if vcfg.is_glm5_next {
+        group_indices(frames.len(), tp)
+    } else {
+        (0..frames.len()).collect()
+    };
     ensure!(!keep.is_empty(), "frame sampling selected no frames");
-
-    // A clip shorter than one temporal group cannot be encoded as video.
-    // Saying so beats silently padding it into a still, which would report a
-    // plausible token count for something the model never saw as motion.
-    ensure!(
-        keep.len() >= tp,
-        "video has {} usable frame(s) but temporal_patch_size is {tp}; a clip must carry at \
-         least one full temporal group",
-        keep.len()
-    );
+    if vcfg.is_glm5_next {
+        ensure!(
+            keep.len() >= tp,
+            "video has {} usable frame(s) but temporal_patch_size is {tp}; a clip must carry at \
+             least one full temporal group",
+            keep.len()
+        );
+    }
 
     // Geometry is decided ONCE, from the first kept frame, and applied to all
     // of them. Per-frame sizing would be a correctness bug rather than a
-    // refinement: the groups are concatenated into one pad run whose token
-    // count assumes a single grid.
+    // refinement: every temporal group and its pad range must share a grid.
     let first = &frames[keep[0]];
     let (th, tw) = if vcfg.is_glm5_next {
         glm_target_size(
@@ -433,7 +433,11 @@ pub fn preprocess_video(
     let ps = vcfg.patch_size;
     let grid_h = (th as usize) / ps;
     let grid_w = (tw as usize) / ps;
-    let grid_t = keep.len() / tp;
+    let grid_t = if vcfg.is_glm5_next {
+        keep.len() / tp
+    } else {
+        keep.len().div_ceil(tp)
+    };
     let patch_dim = 3 * tp * ps * ps;
     let plane = grid_h * grid_w;
 
@@ -444,7 +448,8 @@ pub fn preprocess_video(
         // the work `patch²` times.
         let resized: Vec<RgbImage> = (0..tp)
             .map(|k| {
-                let f = &frames[keep[g * tp + k]];
+                let frame_index = (g * tp + k).min(keep.len() - 1);
+                let f = &frames[keep[frame_index]];
                 if vcfg.is_glm5_next {
                     glm_resize_or_pad(f, th, tw, glm_allow_upscale)
                 } else {
@@ -489,13 +494,19 @@ pub fn preprocess_video(
         grid_t,
         grid_h,
         grid_w,
-        // The pinned GLM processor's non-Glm4v path formats full-second
-        // timestamps (`"{:.1f} seconds"`) and takes one timestamp per
-        // temporal pair. The decoder's per-frame source times are the SSOT
-        // for where each group sits — an assumed constant rate would drift
-        // from the positions actually sampled.
+        // Qwen's processor averages the source times at the two ends of each
+        // temporal merge. GLM keeps its historical per-group floor, because
+        // its own prompt updater formats that metadata differently.
         timestamps: (0..grid_t)
-            .map(|g| frame_times[keep[g * tp]].floor())
+            .map(|g| {
+                let first = frame_times[keep[g * tp]];
+                if vcfg.is_glm5_next {
+                    first.floor()
+                } else {
+                    let last = frame_times[keep[(g * tp + tp - 1).min(keep.len() - 1)]];
+                    (first + last) / 2.0
+                }
+            })
             .collect(),
     })
 }
