@@ -43,14 +43,12 @@
 //!   the cap is passed.
 //! - **Wall clock** capped by a watchdog that kills the child; a decoder that
 //!   hangs must not hold a request thread indefinitely.
-//! - **Protocol whitelist** is moot because the input is a pipe, but
-//!   `-f image2pipe` output and a `pipe:0` input mean ffmpeg is never asked
-//!   to open a URL — the SSRF path that `remote_image` guards for stills
-//!   simply does not exist here.
+//! - **Seekable input** uses a private temporary file so tail-index MP4s work.
+//!   Protocol and format whitelists refuse network URLs and playlist demuxers.
 
 use anyhow::{Context, Result, bail, ensure};
 use image::RgbImage;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -355,7 +353,16 @@ fn spawn_ffmpeg<T>(
     let mut child = Command::new(&policy.binary)
         // Never touch a terminal: without `-nostdin` ffmpeg can block on a
         // prompt when it thinks stdin is interactive.
-        .args(["-v", log_level, "-nostdin", "-i"])
+        .args([
+            "-v",
+            log_level,
+            "-nostdin",
+            "-protocol_whitelist",
+            "file,pipe",
+            "-format_whitelist",
+            "mov,matroska,webm,avi,mpegts,mpeg,ogg,flv",
+            "-i",
+        ])
         .arg(input_file.path())
         .args(["-vf", filter])
         .args(["-frames:v", &frames.to_string()])
