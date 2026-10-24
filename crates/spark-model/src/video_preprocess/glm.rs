@@ -10,7 +10,9 @@ use anyhow::{Result, ensure};
 use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
-use super::{PreprocessedVideo, gif_frames, gif_timeline, patchify_group};
+use super::PreprocessedVideo;
+use super::gif_access::{gif_frames, gif_timeline};
+use super::patchify::patchify_group;
 use crate::video_decode_ffmpeg::{FfmpegPolicy, decode_frame_indices, probe_frames};
 use crate::video_sample::{finite_positive, glm_sample_frame_indices};
 use crate::vision_preprocess::{
@@ -69,6 +71,17 @@ pub(super) fn preprocess_glm_video(
     let canvas = |(h, w): (u32, u32), frames: usize| -> Result<(u32, u32, bool)> {
         let (th, tw) = glm_target_size(vcfg, h, w, frames, max_pixels, true)?;
         let min_pixels = glm_pixel_budget(vcfg, max_pixels, true).0;
+        if let Some(budget) = ffmpeg.max_total_decoded_pixels {
+            let volume = frames
+                .div_ceil(tp)
+                .saturating_mul(tp)
+                .saturating_mul(th as usize)
+                .saturating_mul(tw as usize);
+            ensure!(
+                volume <= budget,
+                "video grid needs {volume} pixels, above the {budget}-pixel volume bound"
+            );
+        }
         Ok((th, tw, frames * h as usize * (w as usize) < min_pixels))
     };
     let wanted = indices.len();
@@ -101,7 +114,7 @@ pub(super) fn preprocess_glm_video(
         );
         indices.truncate(got);
     }
-    while frames.len() % tp != 0 {
+    while !frames.len().is_multiple_of(tp) {
         frames.push(frames[frames.len() - 1].clone());
         indices.push(indices[indices.len() - 1]);
     }

@@ -12,7 +12,7 @@ use image::{DynamicImage, ImageDecoder, ImageReader, Limits, Rgb, RgbImage};
 
 mod glm_sizing;
 mod qwen_sizing;
-use glm_sizing::glm_pixel_budget;
+pub(crate) use glm_sizing::glm_pixel_budget;
 pub(crate) use glm_sizing::{
     glm_max_item_tokens, glm_max_sequence_patches, glm_resize_or_pad, glm_target_size,
 };

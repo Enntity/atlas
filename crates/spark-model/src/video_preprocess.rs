@@ -10,8 +10,8 @@
 //! frames. A still image fills that axis by replicating itself `tp` times.
 //!
 //! A video of `n` sampled frames becomes `grid_t = ceil(n / tp)` temporal
-//! groups for Qwen (the final frame is repeated into an odd group), or whole
-//! groups for GLM. Each group is a full `grid_h × grid_w` patch plane. The
+//! groups; each model repeats its last sampled frame into an odd group.
+//! Each group is a full `grid_h × grid_w` patch plane. The
 //! native encoder runs each group as its own attention sequence, and Qwen's
 //! prompt expansion gives every group its own timestamped pad range.
 //!
@@ -33,8 +33,7 @@ use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
 use crate::vision_preprocess::{
-    MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
-    patch_coordinates, qwen_fit,
+    decode_data_uri_bytes, normalize_channel, patch_coordinates, qwen_fit,
 };
 
 /// Frames per second to sample at, when the caller has no better idea.
@@ -152,16 +151,8 @@ pub fn sample_indices(
     out
 }
 
-/// GLM's processor uses an `fps_interval` timestamp walk followed by a
-/// linspace repair when the greedy walk misses its requested frame count.
-///
-/// Kept for the grouping contract's arithmetic above; the decode path now
-/// samples through [`crate::video_sample`] and only rounds to groups here.
-fn _legacy_sampling_reference() {}
-
-/// GLM's re-sampling step after the decoder has done the coverage work: drop
-/// any trailing partial temporal group. Qwen's processor pads that remainder
-/// in `preprocess_video` instead.
+/// Legacy grouping helper: drop a trailing partial temporal group.
+/// The model-specific preprocessors pad their final sampled group instead.
 ///
 /// The decoder ([`crate::video_sample`]) already chose which source frames to
 /// return, at the operator's rate and spanning the clip. A partial group
@@ -234,7 +225,11 @@ fn sniff_container(bytes: &[u8], mime: &str) -> String {
 }
 
 mod gif;
+mod gif_access;
+mod glm;
+mod patchify;
 use gif::decode_gif;
+use patchify::patchify_group;
 
 /// Full pipeline: a base64 `data:` URI holding an animated container becomes
 /// temporal groups of patches.
@@ -249,66 +244,27 @@ pub fn preprocess_video(
         vcfg.patch_size > 0 && vcfg.spatial_merge_size > 0 && vcfg.temporal_patch_size > 0,
         "vision_config geometry is invalid (patch/merge/temporal size is 0)"
     );
+    if vcfg.is_glm5_next {
+        return glm::preprocess_glm_video(data_uri, vcfg, max_pixels, target_fps, ffmpeg);
+    }
     let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
     let tp = vcfg.temporal_patch_size;
+    ensure!(!frames.is_empty(), "frame sampling selected no frames");
 
-    // The decoder has already sampled the clip: its frames ARE the plan, at
-    // the operator's rate and spanning the whole clip. Re-sampling here would
-    // be a second, lossy pass over positions the decoder chose deliberately.
-    // Qwen's patchify duplicates the final frame when a clip has an odd count;
-    // GLM keeps its historical whole-group rule and drops a remainder.
-    let keep = if vcfg.is_glm5_next {
-        group_indices(frames.len(), tp)
-    } else {
-        (0..frames.len()).collect()
-    };
-    ensure!(!keep.is_empty(), "frame sampling selected no frames");
-    if vcfg.is_glm5_next {
-        ensure!(
-            keep.len() >= tp,
-            "video has {} usable frame(s) but temporal_patch_size is {tp}; a clip must carry at \
-             least one full temporal group",
-            keep.len()
-        );
-    }
-
-    // Geometry is decided ONCE, from the first kept frame, and applied to all
-    // of them. Per-frame sizing would be a correctness bug rather than a
-    // refinement: every temporal group and its pad range must share a grid.
-    let first = &frames[keep[0]];
-    let (th, tw) = if vcfg.is_glm5_next {
-        glm_target_size(
-            vcfg,
-            first.height(),
-            first.width(),
-            keep.len(),
-            max_pixels,
-            true,
-        )?
-    } else {
-        qwen_fit(
-            vcfg,
-            first.height(),
-            first.width(),
-            max_pixels,
-            Some(keep.len()),
-        )?
-    };
-    let glm_min_pixels = 16usize
-        * tp
-        * (vcfg.patch_size * vcfg.spatial_merge_size)
-            .saturating_mul(vcfg.patch_size * vcfg.spatial_merge_size);
-    let glm_allow_upscale = vcfg.is_glm5_next
-        && keep.len() * first.height() as usize * (first.width() as usize) < glm_min_pixels;
-
+    // Qwen keeps the coverage decoder's source frames and repeats the last
+    // frame to complete an odd temporal group. GLM uses its reference sampler.
+    let first = &frames[0];
+    let (th, tw) = qwen_fit(
+        vcfg,
+        first.height(),
+        first.width(),
+        max_pixels,
+        Some(frames.len()),
+    )?;
     let ps = vcfg.patch_size;
-    let grid_h = (th as usize) / ps;
-    let grid_w = (tw as usize) / ps;
-    let grid_t = if vcfg.is_glm5_next {
-        keep.len() / tp
-    } else {
-        keep.len().div_ceil(tp)
-    };
+    let grid_h = th as usize / ps;
+    let grid_w = tw as usize / ps;
+    let grid_t = frames.len().div_ceil(tp);
     if let Some(budget) = ffmpeg.max_total_decoded_pixels {
         let volume = grid_t
             .saturating_mul(tp)
@@ -320,74 +276,28 @@ pub fn preprocess_video(
              reduce frames or use a less extreme aspect ratio"
         );
     }
-    let patch_dim = 3 * tp * ps * ps;
-    let plane = grid_h * grid_w;
-
-    let mut groups = Vec::with_capacity(grid_t);
-    for g in 0..grid_t {
-        // Resize this group's `tp` frames once each, up front: the patch loop
-        // reads every pixel of every frame, so resizing inside it would redo
-        // the work `patch²` times.
-        let resized: Vec<RgbImage> = (0..tp)
-            .map(|k| {
-                let frame_index = (g * tp + k).min(keep.len() - 1);
-                let f = &frames[keep[frame_index]];
-                if vcfg.is_glm5_next {
-                    glm_resize_or_pad(f, th, tw, glm_allow_upscale)
-                } else {
-                    image::imageops::resize(f, tw, th, image::imageops::FilterType::CatmullRom)
-                }
-            })
-            .collect();
-
-        let mut pixels = vec![0.0f32; plane * patch_dim];
-        for (patch_idx, (ph, pw)) in patch_coordinates(vcfg, grid_h, grid_w)
-            .into_iter()
-            .enumerate()
-        {
-            for c in 0..3usize {
-                for (t, frame) in resized.iter().enumerate() {
-                    for py in 0..ps {
-                        for px in 0..ps {
-                            let raw = frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                [c] as f32
-                                / 255.0;
-                            let off = c * (tp * ps * ps) + t * (ps * ps) + py * ps + px;
-                            pixels[patch_idx * patch_dim + off] = if vcfg.is_glm5_next {
-                                normalize_channel(
-                                    vcfg,
-                                    c,
-                                    frame.get_pixel((pw * ps + px) as u32, (ph * ps + py) as u32)
-                                        [c],
-                                )
-                            } else {
-                                (raw - MEAN[c]) / STD[c]
-                            };
-                        }
-                    }
-                }
-            }
-        }
-        groups.push(pixels);
-    }
-
+    let groups = (0..grid_t)
+        .map(|g| {
+            let resized: Vec<RgbImage> = (0..tp)
+                .map(|k| {
+                    let frame = &frames[(g * tp + k).min(frames.len() - 1)];
+                    image::imageops::resize(frame, tw, th, image::imageops::FilterType::CatmullRom)
+                })
+                .collect();
+            patchify_group(vcfg, &resized, grid_h, grid_w)
+        })
+        .collect();
     Ok(PreprocessedVideo {
         groups,
         grid_t,
         grid_h,
         grid_w,
-        // Qwen's processor averages the source times at the two ends of each
-        // temporal merge. GLM keeps its historical per-group floor, because
-        // its own prompt updater formats that metadata differently.
+        // Qwen uses the average source time of each group's end frames.
         timestamps: (0..grid_t)
             .map(|g| {
-                let first = frame_times[keep[g * tp]];
-                if vcfg.is_glm5_next {
-                    first.floor()
-                } else {
-                    let last = frame_times[keep[(g * tp + tp - 1).min(keep.len() - 1)]];
-                    (first + last) / 2.0
-                }
+                let first = frame_times[g * tp];
+                let last = frame_times[(g * tp + tp - 1).min(frames.len() - 1)];
+                (first + last) / 2.0
             })
             .collect(),
     })
