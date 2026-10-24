@@ -339,7 +339,16 @@ fn decode_gif(
 
     // Decode once, keeping only the frames the plan selected, in plan order.
     let wanted_indices: Vec<usize> = plan.times.iter().map(|&t| index_for(t)).collect();
-    let keep: std::collections::BTreeSet<usize> = wanted_indices.iter().copied().collect();
+    // A plan target can land inside a long single-frame delay. Do not retain
+    // an extra full RGB clone for each repeated target; the source frame is
+    // already the actual information available at that time.
+    let mut selected_indices = Vec::with_capacity(wanted_indices.len());
+    for index in wanted_indices {
+        if selected_indices.last().copied() != Some(index) {
+            selected_indices.push(index);
+        }
+    }
+    let keep: std::collections::BTreeSet<usize> = selected_indices.iter().copied().collect();
     let mut chosen: Vec<Option<RgbImage>> = vec![None; count];
     for (i, frame) in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
         .context("not a decodable GIF")?
@@ -353,12 +362,12 @@ fn decode_gif(
         chosen[i] = Some(image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8());
     }
 
-    let mut frames = Vec::with_capacity(wanted_indices.len());
-    let mut times = Vec::with_capacity(wanted_indices.len());
-    for (t, &i) in plan.times.iter().zip(&wanted_indices) {
+    let mut frames = Vec::with_capacity(selected_indices.len());
+    let mut times = Vec::with_capacity(selected_indices.len());
+    for i in selected_indices {
         if let Some(img) = chosen[i].take() {
             frames.push(img);
-            times.push(*t);
+            times.push((cumulative[i] / 1000.0) as f32);
         }
     }
     ensure!(!frames.is_empty(), "the GIF sampled to zero frames");
