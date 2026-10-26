@@ -79,6 +79,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "get_weather<arg_key>not_a_parameter</arg_key><arg_value>BAD</arg_value></tool_call> END.",
         "get_weather<arg_key>city</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
         "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
+        "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>",
+        "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
     ];
     let vocab = words
         .iter()
@@ -219,7 +221,16 @@ fn stream_for_app(
     tools: bool,
     tokens: Vec<u32>,
 ) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
-    let defs = if tools { request().tools } else { vec![] };
+    stream_for_request(state, tools, tokens, request())
+}
+
+fn stream_for_request(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+    request: ir::ChatRequest,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    let defs = if tools { request.tools } else { vec![] };
     let ctx = StreamCtx {
         _active_guard: crate::metrics::ActiveRequestGuard::new(),
         state: state.clone(),

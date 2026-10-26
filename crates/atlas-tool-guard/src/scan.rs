@@ -49,9 +49,17 @@ pub(crate) fn is_metadata(host: &str) -> bool {
 }
 
 pub(crate) fn urls(s: &str) -> impl Iterator<Item = Url> + '_ {
-    let network_command = s
-        .split(|c: char| c.is_whitespace() || matches!(c, '|' | ';' | '&'))
-        .any(|w| matches!(w, "curl" | "wget" | "scp" | "rsync"));
+    let words = shlex::split(s);
+    let network_command = words.as_ref().is_some_and(|words| {
+        words.iter().any(|word| {
+            word.split(['|', ';', '&']).any(|part| {
+                matches!(
+                    part.rsplit('/').next(),
+                    Some("curl" | "wget" | "scp" | "rsync")
+                )
+            })
+        })
+    });
     s.split(|c: char| {
         c.is_whitespace()
             || matches!(
@@ -69,7 +77,9 @@ pub(crate) fn urls(s: &str) -> impl Iterator<Item = Url> + '_ {
                 &word[start..]
             })
             .unwrap_or(word);
-        if word.contains("://") {
+        if word.starts_with("//") {
+            Url::parse(&format!("http:{word}")).ok()
+        } else if word.contains("://") {
             Url::parse(word).ok()
         } else if word.starts_with("169.254.")
             || word.starts_with("100.100.100.200")
@@ -79,16 +89,17 @@ pub(crate) fn urls(s: &str) -> impl Iterator<Item = Url> + '_ {
         } else if network_command && !word.starts_with(['-', '/', '~', '$', '@']) {
             // curl accepts scheme-less hosts; scp/rsync accept user@host:path.
             // This is lexical recognition, not shell evaluation.
-            if let Some((host, path)) = word.split_once(':')
+            if word.starts_with('[') {
+                Url::parse(&format!("http://{word}")).ok()
+            } else if let Some((host, path)) = word.split_once(':')
                 && !host.contains('/')
                 && !path.is_empty()
+                && !path.chars().next().is_some_and(|c| c.is_ascii_digit())
             {
                 Url::parse(&format!("ssh://{host}/")).ok()
-            } else if word
-                .split('/')
-                .next()
-                .is_some_and(|h| h.contains('.') && !h.starts_with('.'))
-            {
+            } else if word.split('/').next().is_some_and(|h| {
+                (h.contains('.') || h.chars().all(|c| c.is_ascii_digit())) && !h.starts_with('.')
+            }) {
                 Url::parse(&format!("http://{word}")).ok()
             } else {
                 None
@@ -161,31 +172,39 @@ pub(crate) fn sensitive_source(s: &str) -> bool {
 }
 
 pub(crate) fn is_transfer(s: &str) -> bool {
-    [
-        "--data",
-        "--json",
-        "--upload-file",
-        " -t ",
-        " -d ",
-        "--post-data",
-        "--post-file",
+    shlex::split(s).is_some_and(|words| {
+        words.iter().any(|w| {
+            matches!(w.rsplit('/').next(), Some("scp" | "rsync"))
+                || [
+                    "--data",
+                    "--json",
+                    "--upload-file",
+                    "--post-data",
+                    "--post-file",
+                    "--header",
+                    "--form",
+                    "-T",
+                    "-F",
+                    "-d",
+                    "-H",
+                ]
+                .iter()
+                .any(|flag| w.starts_with(flag))
+        })
+    }) || [
         "requests.post",
         "requests.put",
         "httpx.post",
         "httpx.put",
         "upload_file(",
         "put_object(",
-        "scp ",
-        "rsync ",
-        " -h",
-        "--header",
     ]
     .iter()
     .any(|p| s.contains(p))
 }
 
 pub(crate) fn sensitive_url(u: &Url) -> bool {
-    let data = format!("{}{}", u.path(), u.query().unwrap_or(""));
+    let data = format!("{}{}", u.path(), u.query().unwrap_or("")).to_ascii_lowercase();
     sensitive_source(&data) || private_key(&data) || token_literal(&data)
 }
 
@@ -241,7 +260,7 @@ fn auth_header_value(s: &str) -> bool {
     s.split_once(':').is_some_and(|(name, _)| auth_header(name))
 }
 pub(crate) fn sensitive_command(s: &str) -> bool {
-    if !s.contains("curl ") || !(s.contains(" -h") || s.contains("--header")) {
+    if !s.contains("-h") && !s.contains("--header") {
         return sensitive_source(s) || token_literal(s);
     }
     let Some(words) = shlex::split(s) else {

@@ -3,6 +3,29 @@
 use super::*;
 use crate::api::chat_stream::{handle_done::handle_done, tool_handlers::*};
 
+fn request() -> ir::ChatRequest {
+    let wire: crate::openai::ChatCompletionRequest = serde_json::from_value(json!({
+        "model":"fixture", "messages":[{"role":"user","content":"weather"}],
+        "tools":[{"type":"function","function":{"name":"get_weather",
+            "parameters":{"type":"object","properties":{"city":{"type":"string"}},
+                "required":["city"]}}},
+            {"type":"function","function":{"name":"get_url",
+            "parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+            {"type":"function","function":{"name":"write_document",
+            "parameters":{"type":"object","properties":{"content":{"type":"string"}},"required":["content"]}}}], "max_tokens":192
+    }))
+    .unwrap();
+    wire.into()
+}
+
+fn stream_for_app(
+    state: Arc<AppState>,
+    tools: bool,
+    tokens: Vec<u32>,
+) -> (StreamCtx, StreamState, Vec<ir::StreamDelta>) {
+    super::stream_for_request(state, tools, tokens, request())
+}
+
 fn setup(glm: bool) -> (StreamCtx, StreamState) {
     let a = app_for_model(
         if glm { "glm5_next" } else { "qwen4_exp" },
@@ -59,14 +82,12 @@ fn dispatch(s: &mut StreamState, c: &StreamCtx, text: &str) -> Vec<ir::StreamDel
     }
     out
 }
-fn xml(glm: bool, city: &str) -> String {
+fn xml(glm: bool, url: &str) -> String {
     if glm {
-        format!(
-            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>{city}</arg_value></tool_call>"
-        )
+        format!("<tool_call>get_url<arg_key>url</arg_key><arg_value>{url}</arg_value></tool_call>")
     } else {
         format!(
-            "<tool_call><function=get_weather><parameter=city>{city}</parameter></function></tool_call>"
+            "<tool_call><function=get_url><parameter=url>{url}</parameter></function></tool_call>"
         )
     }
 }
@@ -106,7 +127,7 @@ fn tool_guard_allowed_calls_release_only_at_completion() {
             .collect();
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&args).unwrap(),
-            json!({"city":"Oslo"})
+            json!({"url":"Oslo"})
         );
         assert!(!s.cancel_flag.load(Ordering::Acquire));
     }
@@ -183,7 +204,7 @@ fn tool_guard_rejects_fragmented_json_and_cancels_remaining_calls() {
     let (c, mut s) = setup(false);
     let mut out = vec![];
     handle_tool_call_start(&mut s, &c, "a".into(), "get_weather".into(), 0, &mut out);
-    for fragment in ["{\"city\":\"http://169.", "254.169.254/\"}"] {
+    for fragment in ["{\"url\":\"http://169.", "254.169.254/\"}"] {
         handle_tool_call_args_fragment(&mut s, &c, fragment.into(), 0, &mut out);
         assert!(out.is_empty());
     }
@@ -207,9 +228,9 @@ fn tool_guard_real_token_path_blocks_without_releasing_call_ids() {
             },
         );
         let body = if glm {
-            "get_weather<arg_key>city</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>"
+            "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>"
         } else {
-            "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>"
+            "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>"
         };
         let token = a.tokenizer.inner().token_to_id(body).unwrap();
         let (c, mut s, mut out) = stream_for_app(a, true, vec![END, TOOL, token]);
@@ -251,4 +272,22 @@ fn tool_guard_does_not_release_calls_stopped_by_loop_limits() {
     }
     assert!(s.buffered_tool_chunks.is_empty());
     assert_ne!(s.guard_stop, Some(atlas_tool_guard::GUARD_STOP));
+}
+
+#[test]
+fn tool_guard_document_examples_remain_callable_in_both_formats() {
+    for glm in [false, true] {
+        let (c, mut s) = setup(glm);
+        let text = xml(glm, "http://169.254.169.254/")
+            .replace("get_url", "write_document")
+            .replace(">url<", ">content<")
+            .replace("parameter=url", "parameter=content");
+        let out = dispatch(&mut s, &c, &text);
+        assert!(
+            out.iter()
+                .any(|d| matches!(d, ir::StreamDelta::ToolCallStart { .. })),
+            "{out:?}"
+        );
+        assert!(!s.cancel_flag.load(Ordering::Acquire));
+    }
 }
