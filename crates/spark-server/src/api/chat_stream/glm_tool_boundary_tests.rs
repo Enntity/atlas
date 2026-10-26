@@ -28,6 +28,8 @@ mod glm_literal_xml_tests;
 mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
 mod reasoning_done_tests;
+#[path = "tool_security_tests.rs"]
+mod tool_security_tests;
 
 fn app(glm: bool) -> Arc<AppState> {
     app_for_model(
@@ -75,6 +77,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "<tool_call><function=not_registered><parameter=value>42</parameter></function></tool_call> END.",
         "<tool_call><function=not_registered><parameter=value>42",
         "get_weather<arg_key>not_a_parameter</arg_key><arg_value>BAD</arg_value></tool_call> END.",
+        "get_weather<arg_key>city</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
+        "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
     ];
     let vocab = words
         .iter()

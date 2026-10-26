@@ -169,6 +169,19 @@ pub(super) fn handle_content(
         // Drain the detector outputs into a local Vec so we can drop
         // the &mut borrow on `state.detector` before the helpers below
         // (which take other &mut state fields) run.
+        if ctx.state.tool_guard.enabled
+            && state.detector.as_ref().is_some_and(|d| {
+                d.pending_tool_bytes() > 0
+                    && d.pending_tool_bytes().saturating_add(delta.len())
+                        > ctx.state.tool_guard.max_bytes
+            })
+        {
+            crate::api::chat_stream::tool_security::reject(
+                state,
+                atlas_tool_guard::BlockReason::ArgumentsTooLarge,
+            );
+            return deltas;
+        }
         let outputs = {
             let det = state.detector.as_mut().expect("detector is Some");
             det.process(&delta)
@@ -204,8 +217,12 @@ pub(super) fn handle_content(
                     handle_tool_call_args_fragment(state, ctx, fragment, idx, &mut deltas);
                 }
                 tool_parser::DetectorOutput::ToolCallEnd { idx } => {
-                    handle_tool_call_end(state, ctx, idx);
+                    handle_tool_call_end(state, ctx, idx, &mut deltas);
                 }
+            }
+            if state.guard_stop == Some(atlas_tool_guard::GUARD_STOP) {
+                deltas.clear();
+                return deltas;
             }
         }
     } else {

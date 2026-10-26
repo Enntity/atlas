@@ -33,6 +33,7 @@ pub fn resolve_adapter_slot(adapter_names: &[String], adapter: Option<&str>) -> 
 
 /// Shared application state accessible from all HTTP handlers.
 pub struct AppState {
+    pub tool_guard: atlas_tool_guard::Policy,
     pub tokenizer: ChatTokenizer,
     pub model_name: String,
     /// Startup LoRA adapter name (`--lora-adapter NAME=…`). `None` = no
