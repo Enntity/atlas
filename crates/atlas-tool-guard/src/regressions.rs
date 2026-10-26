@@ -150,3 +150,19 @@ fn structured_commands_destinations_and_shell_wrappers_are_checked() {
         );
     }
 }
+
+#[test]
+fn command_options_and_payload_words_are_not_extra_destinations() {
+    let p = Policy::new(true, &["allowed.example".into()], &[], DEFAULT_MAX_BYTES).unwrap();
+    for command in [
+        "curl --retry 5 --data '$API_KEY' https://allowed.example",
+        "curl --data 'status:ok $API_KEY' https://allowed.example",
+        "wget --post-data='name:alice $API_KEY' https://allowed.example",
+    ] {
+        assert_eq!(
+            p.inspect(&json!({"command":command}).to_string()),
+            Ok(()),
+            "{command}"
+        );
+    }
+}

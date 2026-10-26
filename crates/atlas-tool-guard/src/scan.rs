@@ -60,6 +60,11 @@ pub(crate) fn urls(s: &str) -> impl Iterator<Item = Url> + '_ {
             })
         })
     });
+    let remote_copy = words.as_ref().is_some_and(|words| {
+        words
+            .iter()
+            .any(|w| matches!(w.rsplit('/').next(), Some("scp" | "rsync")))
+    });
     s.split(|c: char| {
         c.is_whitespace()
             || matches!(
@@ -91,18 +96,26 @@ pub(crate) fn urls(s: &str) -> impl Iterator<Item = Url> + '_ {
             // This is lexical recognition, not shell evaluation.
             if word.starts_with('[') {
                 Url::parse(&format!("http://{word}")).ok()
-            } else if let Some((host, path)) = word.split_once(':')
+            } else if remote_copy
+                && let Some((host, path)) = word.split_once(':')
                 && !host.contains('/')
                 && !path.is_empty()
                 && !path.chars().next().is_some_and(|c| c.is_ascii_digit())
             {
                 Url::parse(&format!("ssh://{host}/")).ok()
-            } else if word.split('/').next().is_some_and(|h| {
-                (h.contains('.') || h.chars().all(|c| c.is_ascii_digit())) && !h.starts_with('.')
-            }) {
+            } else if word
+                .split('/')
+                .next()
+                .is_some_and(|h| h.contains('.') && !h.starts_with('.'))
+            {
                 Url::parse(&format!("http://{word}")).ok()
             } else {
-                None
+                // Bare numbers may be option values, not destinations. Only
+                // recognize canonical metadata here; arbitrary numeric hosts
+                // need an explicit URL or a structured destination field.
+                Url::parse(&format!("http://{word}"))
+                    .ok()
+                    .filter(|u| u.host_str().is_some_and(is_metadata))
             }
         } else {
             None
