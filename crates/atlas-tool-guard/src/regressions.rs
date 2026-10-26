@@ -166,3 +166,12 @@ fn command_options_and_payload_words_are_not_extra_destinations() {
         );
     }
 }
+
+#[test]
+fn non_http_destinations_use_case_insensitive_host_policy() {
+    assert_eq!(
+        Policy::default()
+            .inspect(&json!({"url":"ssh://SANMAOHE.OSS-CN-BEIJING.ALIYUNCS.COM/path"}).to_string()),
+        Err(BlockReason::BlockedHost)
+    );
+}

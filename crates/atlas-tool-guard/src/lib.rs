@@ -102,7 +102,8 @@ impl Policy {
         let Some(host) = url.host_str() else {
             return Ok(false);
         };
-        let host = host.trim_end_matches('.');
+        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+        let host = normalized.as_str();
         if scan::is_metadata(host) {
             return Err(BlockReason::MetadataAccess);
         }
