@@ -100,7 +100,6 @@ pub(crate) fn urls(s: &str) -> impl Iterator<Item = Url> + '_ {
                 && let Some((host, path)) = word.split_once(':')
                 && !host.contains('/')
                 && !path.is_empty()
-                && !path.chars().next().is_some_and(|c| c.is_ascii_digit())
             {
                 Url::parse(&format!("ssh://{host}/")).ok()
             } else if word
