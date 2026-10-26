@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/atlas-tool-guard",
     "crates/atlas-core",
     "crates/atlas-kernels",
     "crates/atlas-plugin",

@@ -35,6 +35,7 @@ name = "spark"
 path = "src/main.rs"
 
 [dependencies]
+atlas-tool-guard = { path = "../atlas-tool-guard" }
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 # `default-features = false` on path-deps so the metal feature actually

@@ -21,6 +21,7 @@ pub(crate) mod build_behavior;
 pub(crate) fn app_state(tokenizer: crate::tokenizer::ChatTokenizer) -> AppState {
     let (request_tx, _) = tokio::sync::mpsc::channel(1);
     AppState {
+        tool_guard: Default::default(),
         tokenizer,
         model_name: "fixture".into(),
         adapter_name: None,

@@ -238,7 +238,9 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         choice.matched_stop = matched_stop;
         choice.finish_reason =
             stop_match_corrected(choice.finish_reason, choice.matched_stop.is_some());
-        choice.logprobs = build_logprobs(&state, &response);
+        if choice.guard_stop != Some(atlas_tool_guard::GUARD_STOP) {
+            choice.logprobs = build_logprobs(&state, &response);
+        }
         all_choices.push(choice);
     }
 

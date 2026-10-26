@@ -84,6 +84,15 @@ pub enum DetectorOutput {
 }
 
 impl StreamingToolDetector {
+    /// Unreleased raw tool syntax, for the API's bounded tool-call guard.
+    pub fn pending_tool_bytes(&self) -> usize {
+        if self.inside_tag || self.inside_dsml || self.current_tc_name.is_some() {
+            self.buffer.len()
+        } else {
+            0
+        }
+    }
+
     pub(super) fn push_content(&mut self, outputs: &mut Vec<DetectorOutput>, text: String) {
         if text.is_empty() {
             return;

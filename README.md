@@ -228,3 +228,9 @@ curl http://localhost:8888/v1/chat/completions \
 - **Enterprise Edition**: Commercial licensing for proprietary applications, SaaS hosting without AGPLv3 copyleft obligations, dedicated support, and custom hardware/kernel porting. Contact `azeez@atlasinference.dev`.
 
 <sub><b>Continuity notice.</b> Atlas is continuing. This repository, the <a href="https://github.com/Atlas-Inf">Atlas-Inf</a> GitHub organization, and <a href="https://atlasinference.dev">atlasinference.dev</a> are the replacement official Atlas channels. The existing website and GitHub repository remain disputed Atlas assets that have not been relinquished.</sub>
+
+## Tool-call protection
+
+Atlas blocks suspicious data-exfiltration tool calls by default with a bounded,
+CPU-only guard shared by Qwen and GLM. Tool calls are checked before release;
+normal text streams unchanged. See [configuration, coverage and limits](docs/TOOL_CALL_GUARD.md).
