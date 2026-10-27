@@ -456,7 +456,9 @@ fn the_fp4_local_config_parses_to_the_same_architecture() {
     let count = |algo: &str, enc: &str| {
         q.quantized_layers
             .values()
-            .filter(|s| s.quant_algo == algo && s.weight_scale_encoding == enc)
+            .filter(|s| {
+                s.quant_algo == algo && s.weight_scale_encoding.as_deref().unwrap_or_default() == enc
+            })
             .count()
     };
     // 36 GDN x 5 + 12 attention x 5 (q/k/v/o + indexer) + 48 shared x 3 + 27 ViT x 2.
@@ -466,7 +468,7 @@ fn the_fp4_local_config_parses_to_the_same_architecture() {
     assert_eq!(count("NVFP4", "csf"), 48);
     assert_eq!(count("NVFP4", ""), 1); // the PLE n-gram table
     for (path, spec) in &q.quantized_layers {
-        if spec.weight_scale_encoding == "csf" {
+        if spec.weight_scale_encoding.as_deref() == Some("csf") {
             assert!(
                 path.starts_with("model.language_model.layers.") && path.ends_with(".mlp.experts"),
                 "csf on {path}"
