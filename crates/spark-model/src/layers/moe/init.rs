@@ -87,6 +87,7 @@ impl MoeLayer {
             pre_expert_norm_k: rms_norm_k,
             dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
             dense_gemv_batchm: super::init_optional::router_gemv_batchm(gpu, config),
+            row_invariant_bf16_router: false,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
             // Untransposed router GEMM. On native HIP this resolves to the
@@ -500,5 +501,12 @@ impl MoeLayer {
             layer.validate_independent_handles()?;
         }
         Ok(layer)
+    }
+
+    /// Opt in to row-invariant BF16 routing for decode/verify (`types.rs`).
+    /// Called only by the qwen4_exp FP4-Local builder, which ships mlp.gate
+    /// as BF16; other models keep the scalar `dense_gemm` router arm.
+    pub fn set_row_invariant_bf16_router(&mut self) {
+        self.row_invariant_bf16_router = true;
     }
 }
