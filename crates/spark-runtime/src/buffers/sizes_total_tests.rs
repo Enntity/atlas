@@ -104,3 +104,22 @@ fn buffer_total_matches_actual_mock_allocations_with_grouped_o_and_adapters() {
     );
     assert_actual_arena_total(&config, 5);
 }
+
+#[test]
+fn qwen_extended_context_reserves_the_full_selection_slab() {
+    let mut config = ModelConfig::qwen3_next_80b_nvfp4();
+    config.index_n_heads = 4;
+    config.index_head_dim = 128;
+    config.index_compress_ratio = 4;
+    config.index_topk = 2048;
+    for (context, expected) in [(524_288, 1_084_751_872), (1_000_000, 2_059_010_048)] {
+        let sizes = BufferSizes::from_config(&config, 16384, context, 16, 4);
+        assert_eq!(sizes.qsa_select_scratch, expected);
+        // Preflight uses total_bytes() to subtract this from the KV budget.
+        // Disabling the indexer leaves only its 256-byte placeholder.
+        let mut without_indexer = config.clone();
+        without_indexer.index_topk = 0;
+        let small = BufferSizes::from_config(&without_indexer, 16384, context, 16, 4);
+        assert_eq!(sizes.total_bytes() - small.total_bytes(), expected - 256);
+    }
+}
