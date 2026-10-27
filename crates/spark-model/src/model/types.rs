@@ -454,7 +454,7 @@ pub struct TransformerModel {
     /// Row masks of a strict structured-output verify (`glm_verify_masks`).
     pub(super) verify_row_masks: super::glm_verify_masks::VerifyRowMasks,
     /// Optional vision encoder for VL models (Qwen3-VL).
-    pub(super) vision_encoder: Option<crate::layers::VisionEncoder>,
+    pub(super) vision_encoder: Option<crate::layers::VisionTower>,
     /// Page-locked host staging for batched metadata H2D transfers.
     /// Allocated once at init via cuMemAllocHost, freed in Drop.
     ///

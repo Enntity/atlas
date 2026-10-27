@@ -76,6 +76,7 @@ pub fn is_ngram_table(name: &str) -> bool {
 ///
 /// Never uploaded: the loader defers both halves and the model build decodes
 /// them into a plain E4M3 `weight_scale` (see `atlas_core::modelopt_codec`).
+#[allow(dead_code)]
 pub fn is_csf_stream(name: &str) -> bool {
     name.ends_with(".nvfp4_csf_fixed") || name.ends_with(".nvfp4_csf_exceptions")
 }

@@ -295,7 +295,6 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // shards, and nothing said which arm spent it. Summed here and logged
         // once, so the answer is read rather than guessed.
         let (mut moe_bytes, mut arm_bytes, mut hc_bytes) = (0u64, 0u64, 0u64);
-        let mut mx8_scratch = None;
         let free_now = |g: &dyn GpuBackend| g.free_memory().unwrap_or(0) as u64;
 
         for i in 0..config.num_hidden_layers {
@@ -356,17 +355,6 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                         input_norm, post_attn_norm, ffn,
                     )
                     .with_context(|| format!("qwen4_exp: GDN layer {i}"))?
-                }
-                LayerType::FullAttention if attn_mx8::present(store, &lp) => {
-                    let kv_dtype = layer_kv_dtypes.get(attn_idx).copied();
-                    let scratch = mx8_common::scratch_for(&mut mx8_scratch, config, gpu)?;
-                    let l = attn_mx8::build(
-                        i, store, &lp, gpu, config, kv_dtype.unwrap_or(KvCacheDtype::Bf16),
-                        attn_idx, (input_norm, post_attn_norm, ffn), scratch,
-                    )
-                    .with_context(|| format!("qwen4_exp: full-attention layer {i} (MXFP8)"))?;
-                    attn_idx += 1;
-                    l
                 }
                 LayerType::FullAttention => {
                     let kv_dtype = layer_kv_dtypes

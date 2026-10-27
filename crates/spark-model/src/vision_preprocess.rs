@@ -44,6 +44,35 @@ pub(crate) const GLM_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 /// 1920×1080 as ~900 (1280×720). Detail-bearing inputs — documents, charts,
 /// dense screenshots — paid for that directly, and nothing logged it.
 const FALLBACK_MAX_DIM: u32 = 1280;
+const ABS_MAX_DIM: u32 = 4096;
+
+pub(crate) fn target_size_for(
+    orig_h: u32,
+    orig_w: u32,
+    grid_unit: u32,
+    max_pixels: Option<usize>,
+) -> (u32, u32) {
+    target_size_with_max_pixels(orig_h, orig_w, grid_unit, max_pixels)
+}
+
+fn target_size_with_max_pixels(
+    orig_h: u32,
+    orig_w: u32,
+    grid_unit: u32,
+    max_pixels: Option<usize>,
+) -> (u32, u32) {
+    let long_side = orig_h.max(orig_w) as f32;
+    let area = (orig_h as f32) * (orig_w as f32);
+    let bound_scale = match max_pixels.filter(|&pixels| pixels > 0) {
+        Some(pixels) => ((pixels as f32) / area).sqrt(),
+        None => (FALLBACK_MAX_DIM as f32) / long_side,
+    };
+    let abs_scale = (ABS_MAX_DIM as f32) / long_side;
+    let scale = bound_scale.min(abs_scale).min(1.0);
+    let target_h = ((orig_h as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    let target_w = ((orig_w as f32 * scale / grid_unit as f32).round() as u32).max(1) * grid_unit;
+    (target_h, target_w)
+}
 
 /// Decoder limit: reject a header declaring more than this on either side
 /// before a single pixel is allocated. Everything is resized down to the
@@ -125,7 +154,7 @@ fn limited_reader(bytes: &[u8], fmt: image::ImageFormat) -> ImageReader<std::io:
 /// Decode a base64 data URI or raw base64 string into a `DynamicImage` (the
 /// probe and the decode do this in two steps outside tests).
 #[cfg(test)]
-fn decode_image(data_uri: &str) -> Result<DynamicImage> {
+pub(crate) fn decode_image(data_uri: &str) -> Result<DynamicImage> {
     let (_mime, bytes) = decode_data_uri_bytes(data_uri)?;
     let fmt = sniff_format(&bytes)?;
     decode_bytes(&bytes, fmt)
@@ -384,9 +413,6 @@ pub use probe::{ProbedImage, decode_gated, probe_image};
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod fixtures;
 
-#[cfg(test)]
-#[path = "vision_preprocess_format_tests.rs"]
-mod format_tests;
 #[cfg(test)]
 #[path = "vision_preprocess_format_tests.rs"]
 mod format_tests;

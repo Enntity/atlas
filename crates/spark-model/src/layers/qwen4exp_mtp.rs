@@ -165,27 +165,6 @@ pub struct Qwen4ExpMtpHead {
 #[path = "qwen4exp_mtp_new.rs"]
 mod qwen4exp_mtp_new;
 
-/// The drafter's KV geometry: `slot` placeholder layer slots, then the one
-/// layer it writes. The placeholders exist only so the body's
-/// `attn_idx = slot` lands on a real pool; they are never read or written,
-/// so they get the smallest geometry the allocator accepts (one 1-wide head,
-/// 32 B per block) instead of a full layer each. Full layers there cost
-/// 12/13 of the pool: 6.5 GB at --max-seq-len 262144 where 0.5 GB is used.
-fn drafter_kv_config(slot: usize, num_kv_heads: usize, head_dim: usize) -> KvCacheConfig {
-    let mut layer_dims = vec![(1, 1); slot];
-    layer_dims.push((num_kv_heads, head_dim));
-    KvCacheConfig {
-        block_size: 16,
-        num_kv_heads,
-        head_dim,
-        num_layers: slot + 1,
-        dtype: KvCacheDtype::Bf16,
-        layer_dtypes: vec![],
-        layer_dims,
-        cache_blocks_per_seq: None,
-    }
-}
-
 #[path = "qwen4exp_mtp_forward.rs"]
 mod qwen4exp_mtp_forward;
 

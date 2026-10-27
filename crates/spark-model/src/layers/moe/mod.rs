@@ -95,38 +95,6 @@ impl Bf16SharedExpert {
     }
 }
 
-/// A shared expert kept outside the fused routed-expert kernels and run as
-/// its own gate/up → silu_mul → down chain over the same scratch contract.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SeparateSharedExpert {
-    /// Checkpoint-native BF16 (Laguna).
-    Bf16(Bf16SharedExpert),
-    /// FP4-Local's checkpoint-native MXFP8: E4M3 weights + E8M0 scales,
-    /// projected by `mxfp8_proj.cu` — no BF16 expansion, no NVFP4 requant.
-    Mxfp8 {
-        gate_proj: Mxfp8Proj,
-        up_proj: Mxfp8Proj,
-        down_proj: Mxfp8Proj,
-        /// Gate‖up row-concatenated `[2*inter, h]` twin plus its
-        /// `[32, 2*inter]` BF16 landing buffer: one `mxfp8_proj` launch then
-        /// `fused_silu_mul` per row-band ≤ 32 (the batchm arm's span).
-        gate_up: Option<Mxfp8GateUp>,
-        kernels: ops::Mxfp8ProjKernels,
-        scratch: ops::Mxfp8Scratch,
-    },
-}
-
-/// The fused small-row arm of a [`SeparateSharedExpert::Mxfp8`].
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Mxfp8GateUp {
-    /// `[2*inter, h]` — gate rows then up rows.
-    pub proj: Mxfp8Proj,
-    /// `[32, 2*inter]` BF16 — one batchm-chunk's gate|up activations.
-    pub gate_up_out: DevicePtr,
-    /// `fused_silu_mul` (`dense_gemm_bf16.cu`); `0` resolves to the unfused path.
-    pub silu_mul: KernelHandle,
-}
-
 /// Unified expert pointer table for any quantization format.
 ///
 /// Replaces the separate `ExpertPtrTable` (NVFP4) and `Fp8ExpertPtrTable` (FP8)
@@ -276,13 +244,9 @@ pub(crate) use prequant_fp4::{glm_tp_ep, with_owner_rows};
 pub(crate) use route_fuse::DeadRows;
 mod ptr_table_build;
 mod qwen4exp_fast;
-mod union_stats;
+pub(crate) mod union_stats;
 pub(crate) use ptr_table_build::*;
 
-/// Exact `max_m_tiles` for the grouped GEMM grid: the largest per-expert row
-/// count (adjacent diffs of the sorted `expert_offsets` prefix-sum), tiled by
-/// 64 and clamped to `worst_case` for safety. `offsets_le` is the D2H copy of
-/// the `(num_experts + 1)` u32 LE prefix-sum buffer.
 pub(crate) fn exact_m_tiles(offsets_le: &[u8], worst_case: u32) -> u32 {
     let mut prev = 0u32;
     let mut max_rows = 0u32;
@@ -299,29 +263,24 @@ mod exact_m_tiles_tests {
     use super::exact_m_tiles;
 
     fn offsets(counts: &[u32]) -> Vec<u8> {
-        let mut o = vec![0u8; 4];
-        let mut acc = 0u32;
-        for &c in counts {
-            acc += c;
-            o.extend_from_slice(&acc.to_le_bytes());
+        let mut bytes = vec![0u8; 4];
+        let mut total = 0u32;
+        for &count in counts {
+            total += count;
+            bytes.extend_from_slice(&total.to_le_bytes());
         }
-        o
+        bytes
     }
 
     #[test]
-    fn tiles_cases() {
-        // all empty experts -> max diff 0 -> 1 tile
+    fn exact_tiles_match_prefix_sum_maximum() {
         assert_eq!(exact_m_tiles(&offsets(&[0, 0, 0]), 100), 1);
-        // one hot expert takes all 512*22 routed rows
         assert_eq!(
-            exact_m_tiles(&offsets(&[0, 512 * 22, 0]), 99999),
+            exact_m_tiles(&offsets(&[512 * 22, 0]), 99_999),
             (512 * 22) / 64
         );
-        // balanced: 2816 rows spread evenly over 8 experts
-        assert_eq!(exact_m_tiles(&offsets(&[352; 8]), 2816 / 64 + 1), 6);
-        // clamp to worst_case when the real max exceeds it
-        assert_eq!(exact_m_tiles(&offsets(&[0, 9000, 0]), 10), 10);
-        // empty slice -> 1
+        assert_eq!(exact_m_tiles(&offsets(&[352; 8]), 44), 6);
+        assert_eq!(exact_m_tiles(&offsets(&[9_000, 0]), 10), 10);
         assert_eq!(exact_m_tiles(&[], 5), 1);
     }
 }

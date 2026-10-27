@@ -2,6 +2,8 @@
 
 //! TransformerLayer::decode_multi_seq — batched-projection SSM mixer.
 
+use super::super::*;
+
 /// Tensor-core mixer projections for wide decode batches. **ON by default at
 /// n>=9**; `ATLAS_SSM_TC_PROJ=&lt;n&gt;` moves the threshold, `=0` disables.
 ///

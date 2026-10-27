@@ -279,7 +279,7 @@ fn load_moe_ffn(
 fn load_dense_ffn(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
-    model_type: &str,
+    _model_type: &str,
     lp: &str,
     intermediate_size: usize,
     h: usize,
@@ -330,7 +330,7 @@ fn load_dense_ffn(
         up_proj_t: Some(up_q.transpose_for_gemm(gpu, intermediate_size, h)?),
         down_proj_t: Some(down_q.transpose_for_gemm(gpu, h, intermediate_size)?),
     };
-    let mut dffn = DenseFfnLayer::new(dense_weights, gpu, model_type)?;
+    let mut dffn = DenseFfnLayer::new(dense_weights, gpu)?;
     // ATLAS_FFN_MMQ: eager Q4_K materialize + free `_t` at load (before KV sizing).
     dffn.finalize_q4k_load(gpu, h as u32, intermediate_size as u32, stream)?;
     Ok(FfnComponent::Dense(dffn))

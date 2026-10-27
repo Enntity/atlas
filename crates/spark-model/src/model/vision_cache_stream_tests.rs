@@ -26,7 +26,7 @@ fn staged() -> (Fixture, Vec<u32>) {
         f.model.gpu.as_ref(),
     )
     .unwrap();
-    f.model.vision_encoder = Some(tower);
+    f.model.vision_encoder = Some(crate::layers::VisionTower::Qwen(Box::new(tower)));
     let item = test_tower::image(16);
     f.seq.vision.grids = vec![(1, 8, 8)];
     f.seq.vision.hashes = vec![item.content_hash];
@@ -205,7 +205,7 @@ fn a_worker_waits_for_the_heads_encode_as_an_idle_receive() {
         w.model.gpu.as_ref(),
     )
     .unwrap();
-    w.model.vision_encoder = Some(tower);
+    w.model.vision_encoder = Some(crate::layers::VisionTower::Qwen(Box::new(tower)));
     w.seq.vision.grids = vec![(1, 8, 8)];
     w.seq.vision.hashes = vec![1];
     w.seq.vision.deferred = true;
@@ -273,7 +273,7 @@ fn a_head_without_pixels_fails_instead_of_splicing_stale_rows() {
             f.model.gpu.as_ref(),
         )
         .unwrap();
-        f.model.vision_encoder = Some(tower);
+        f.model.vision_encoder = Some(crate::layers::VisionTower::Qwen(Box::new(tower)));
         let (_, tokens) = staged();
         f.seq.vision.grids = vec![(1, 8, 8)];
         f.seq.vision.hashes = vec![1];

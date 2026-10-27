@@ -167,7 +167,7 @@ impl MoeLayer {
             moe_sorted_gate_up: gpu.kernel("moe_sorted", "moe_sorted_gate_up")?,
             moe_sorted_silu_down: gpu.kernel("moe_sorted", "moe_sorted_silu_down")?,
             moe_grouped_gemm: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable")?,
-            moe_grouped_gemm_t,
+            moe_grouped_gemm_t: gpu.kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t")?,
             moe_grouped_gemm_t_k64: gpu
                 .kernel("moe_w4a16", "moe_w4a16_grouped_gemm_ptrtable_t_k64")?,
             moe_grouped_gemm_t_k64_m32: optional.moe_grouped_gemm_t_k64_m32,
@@ -446,8 +446,7 @@ impl MoeLayer {
             bf16_shared_expert: None,
             mxfp8_shared_expert: None,
             fp8_shared_expert: None,
-            moe_down_t_k64_fp4: super::super::try_kernel_gated(
-                super::init_optional::gateup_fp4_series(&config.model_type),
+            moe_down_t_k64_fp4: super::super::try_kernel(
                 gpu,
                 "moe_w4a16",
                 "moe_w4a16_down_t_k64_fp4",

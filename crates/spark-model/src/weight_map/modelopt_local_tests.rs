@@ -17,8 +17,8 @@ fn spec(algo: &str, group: usize) -> QuantLayerSpec {
     QuantLayerSpec {
         quant_algo: algo.into(),
         group_size: group,
-        weight_scale_encoding: None,
         weight_block_size: vec![],
+        weight_scale_encoding: String::new(),
     }
 }
 
@@ -30,7 +30,7 @@ fn fp4_local_config() -> ModelConfig {
     let mut map = std::collections::BTreeMap::new();
     map.insert("model.language_model.layers.0.mlp.experts".into(), {
         let mut s = spec("NVFP4", 16);
-        s.weight_scale_encoding = Some("csf".into());
+        s.weight_scale_encoding = "csf".into();
         s
     });
     map.insert(SHARED.into(), spec("MXFP8", 32));
@@ -437,7 +437,7 @@ fn unknown_csf_encoding_is_refused() {
         .quantized_layers
         .get_mut(module)
         .unwrap()
-        .weight_scale_encoding = Some("csf_32x2_v1".into());
+        .weight_scale_encoding = "csf_32x2_v1".into();
     let err = materialize(&mut store, &cfg, &gpu).unwrap_err().to_string();
     assert!(
         err.contains("csf_32x2_v1"),

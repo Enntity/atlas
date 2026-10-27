@@ -75,7 +75,7 @@ impl PagedKvCache {
                 Ok(p) => p,
                 Err(e) => {
                     release(&layers);
-                    return Err(error);
+                    return Err(e);
                 }
             };
             let (v_pool, v_block_bytes, v_pool_bytes) = if v_aliases_k {

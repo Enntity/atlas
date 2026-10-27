@@ -27,9 +27,13 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
-#[path = "impl_a3/lmhead_arms.rs"]
-mod lmhead_arms;
-use lmhead_arms::*;
+/// Presence kill switch for the wide (9..=VERIFY_ROW_CAP row) batched LM head arm:
+/// `ATLAS_NO_LMHEAD_BATCHED_WIDE` restores the M64-tile `w4a16_gemm` fallback.
+/// Presence, not value — `=0` is NOT "off" (see `atlas_env_presence_check_trap`).
+fn lmhead_batched_wide_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ATLAS_NO_LMHEAD_BATCHED_WIDE").is_err())
+}
 
 /// Exact five-row BF16 vocabulary projection for GLM's K=5 verifier. The
 /// existing batched GEMV streams each BF16 weight row once and reuses it for
@@ -257,7 +261,6 @@ impl TransformerModel {
                     v as usize,
                     stream,
                 )?;
-                c0 += m;
             }
         } else if self.lm_head_dp4a_batch4(hidden, num_tokens, logits, h, v, stream)? {
             // Handled by the W4A8 DP4A arm (see `trait_impl/lm_head_dp4a.rs`).

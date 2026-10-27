@@ -18,6 +18,7 @@ pub(crate) const HEADS: usize = 2;
 pub(crate) fn config() -> VisionConfig {
     VisionConfig {
         is_glm5_next: true,
+        is_qwen3vl_video: false,
         in_channels: 3,
         depth: 2,
         hidden_size: 64 * HEADS,
@@ -41,6 +42,7 @@ pub(crate) fn config() -> VisionConfig {
         token_budgets: Default::default(),
         min_pixels: None,
         video_pixels: None,
+        omni: None,
     }
 }
 

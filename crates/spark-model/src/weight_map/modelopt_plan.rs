@@ -96,7 +96,8 @@ impl ModeloptQuantPlan {
                 ModuleFormat {
                     algo,
                     group_size,
-                    scale_encoding: spec.weight_scale_encoding.clone(),
+                    scale_encoding: (!spec.weight_scale_encoding.is_empty())
+                        .then(|| spec.weight_scale_encoding.clone()),
                 },
             );
         }

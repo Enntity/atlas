@@ -212,6 +212,9 @@ fn glm5_vision_native_encoder_oracle_dump() -> Result<()> {
         .load_vision_encoder(&store, &config, gpu)
         .context("construct native GLM vision encoder")?
         .context("native GLM vision loader returned no encoder")?;
+    let crate::layers::VisionTower::Qwen(encoder) = encoder else {
+        anyhow::bail!("GLM vision loader returned a non-Qwen tower")
+    };
     let stream = gpu.default_stream();
 
     // `odd_196x140` leaves the last 64-query attention tile partial;

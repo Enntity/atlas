@@ -49,7 +49,6 @@ impl Qwen3SsmLayer {
             out_proj_fp8w_t: None,
             qkvz_fp8w_rowwise: None,
             out_proj_fp8w_rowwise: None,
-            mx8: None,
             qkvz_q2: None,
             q2_0_gemv_k: super::super::try_kernel(gpu, "q2_0_gemv_vec", "q2_0_gemv_vec"),
             dequant_q2_0_gn_k: super::super::try_kernel(
@@ -209,7 +208,7 @@ impl Qwen3SsmLayer {
             w4a16_gemm_t_k: crate::layers::tgemm_kernel(gpu),
             w4a16_gemm_t_k64_k: crate::layers::k64_kernel(gpu)?,
             w4a16_gemm_t_k64_n64_k: crate::layers::k64_n64_kernel(gpu),
-            w4a16_gemm_t_m128_k: crate::layers::ops::w4a16_m128_kernel_required(gpu)?,
+            w4a16_gemm_t_m128_k: gpu.kernel("w4a16", "w4a16_gemm_t_m128")?,
             // 8-warp pipelined M128 (try_kernel: 0 when absent → falls back to m128/n128).
             w4a16_gemm_t_m128_v2_k: super::super::w4a16_v2_kernel(gpu),
             w4a16_gemv_batch2_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch2")?,
@@ -523,10 +522,7 @@ impl Qwen3SsmLayer {
                 "w8a16_gemv_batch16",
             ),
             // NVFP4 batched decode GEMV (all entries live in the w4a16_gemv module).
-            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
-                gpu,
-                config.model_type == "glm5_next",
-            ),
+            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
             // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other

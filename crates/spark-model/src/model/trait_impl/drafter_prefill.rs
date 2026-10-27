@@ -334,6 +334,5 @@ impl TransformerModel {
                 format!("MTP drafter prompt rows failed (drafting without them): {e:#}")
             });
         }
-        Ok(())
     }
 }

@@ -29,7 +29,7 @@ use spark_runtime::kernel_args::KernelLaunch;
 use spark_runtime::weights::WeightStore;
 
 use crate::layers::qwen3_attention::{HcHeadWeights, HcLowRank, HcSiteWeights};
-use crate::weight_map::{dense, dense_keep_f32};
+use crate::weight_map::dense;
 
 /// Flips every `input_mix_weight_up` from the checkpoint's `[hc*H, rank]` to
 /// the `[rank, hc*H]` the collapse kernels read.

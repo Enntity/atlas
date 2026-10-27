@@ -138,34 +138,6 @@ pub fn embed_from_argmax(
         .arg_u32(hidden_size)
         .launch(stream)
 }
-/// NVFP4 n-gram gather: slots index a `[slots, dim/2]` packed-E2M1 arena and
-/// a `[slots, dim/group]` E4M3 block-scale arena. Kernel:
-/// `embed_from_argmax.cu::batched_embed_nvfp4`.
-pub fn batched_embed_nvfp4(
-    gpu: &dyn GpuBackend,
-    kernel: KernelHandle,
-    slots_dev: DevicePtr,
-    packed: DevicePtr,
-    scales: DevicePtr,
-    global: f32,
-    output: DevicePtr,
-    num_tokens: u32,
-    dim: u32,
-    group: u32,
-    stream: u64,
-) -> Result<()> {
-    KernelLaunch::new(gpu, kernel)
-        .grid([num_tokens, 1, 1])
-        .block([256, 1, 1])
-        .arg_ptr(slots_dev)
-        .arg_ptr(packed)
-        .arg_ptr(scales)
-        .arg_f32(global)
-        .arg_ptr(output)
-        .arg_u32(dim)
-        .arg_u32(group)
-        .launch(stream)
-}
 
 /// Batched embedding: gather N rows from embedding table in one launch.
 ///
@@ -292,6 +264,8 @@ pub const DFLASH2_SELECTOR_MAX_RANK: usize = 256;
 /// Mirrors `DF2_SEL_MAX_SPLITS` / `DF2_SEL_THREADS` in the same kernel.
 pub const DFLASH2_SELECTOR_MAX_SPLITS: usize = 16;
 pub const DFLASH2_SELECTOR_THREADS: u32 = 512;
+pub const DFLASH2_SELECTOR_SYMBOL: &str = "dflash2_candidate_selector";
+pub const DFLASH2_SELECTOR_BANS_END_TOKENS: bool = true;
 
 /// Vocab slices per row of the fused selector: about one block per SM on
 /// GB10 over the `gamma` rows (six at gamma 8, the fastest on GLM-5.3's

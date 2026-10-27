@@ -27,7 +27,7 @@
 use anyhow::{Context, Result};
 use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::weights::{WeightDtype, WeightStore};
+use spark_runtime::weights::WeightStore;
 
 use crate::layers::moe::Mxfp8SharedExpert;
 use crate::layers::{FfnComponent, MoeLayer};
@@ -44,8 +44,6 @@ pub(super) fn build_moe(
     let absmax_k = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
     let quantize_k = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
     let stream = gpu.default_stream();
-    let inter = config.shared_expert_intermediate_size;
-    let native_shared = mxfp8_shared(store, lp, inter, h)?;
 
     let weights = load_moe_qwen35(
         store,

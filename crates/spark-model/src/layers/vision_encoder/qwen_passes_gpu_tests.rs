@@ -60,8 +60,11 @@ fn tower() -> Tower {
         .load_vision_encoder(&store, &config, gpu.as_ref())
         .unwrap()
         .expect("vision tower");
+    let crate::layers::VisionTower::Qwen(ve) = ve else {
+        panic!("Qwen4Exp loader returned a non-Qwen tower");
+    };
     Tower {
-        ve,
+        ve: *ve,
         _store: store,
         gpu,
     }

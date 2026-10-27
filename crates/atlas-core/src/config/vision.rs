@@ -9,6 +9,9 @@ pub struct VisionConfig {
     /// True only for the native GLM-5.3 vision tower.  Its RMSNorm/SwiGLU/
     /// convolutional merger is not interchangeable with the Qwen ViT path.
     pub is_glm5_next: bool,
+    /// True only when the checkpoint's video processor is HF's Qwen3VL.
+    /// Resolved at serve time from the checkpoint's preprocessor metadata.
+    pub is_qwen3vl_video: bool,
     /// Input channel count for the visual patch embed (GLM uses 3).
     pub in_channels: usize,
     /// Number of ViT transformer blocks (depth=27).
@@ -85,6 +88,8 @@ pub struct VisionConfig {
     /// over a clip's sampled frames (`video_preprocessor_config.json`).
     /// `None` sizes each frame like a still.
     pub video_pixels: Option<PixelBounds>,
+    /// Nemotron-H Omni RADIO tower parameters; absent for other vision paths.
+    pub omni: Option<OmniVisionConfig>,
 }
 
 /// `(min, max)` vision tokens per still and per video, as GLM-5.3's nested
@@ -114,6 +119,26 @@ impl Default for VisionTokenBudgets {
 pub struct PixelBounds {
     pub min_pixels: usize,
     pub max_pixels: usize,
+}
+
+/// RADIO-tower parameters for `nemotron_h_omni`, copied from its processor
+/// config rather than inferred from model dimensions.
+#[derive(Debug, Clone, Default)]
+pub struct OmniVisionConfig {
+    pub norm_mean: [f32; 3],
+    pub norm_std: [f32; 3],
+    pub max_num_patches: usize,
+    pub min_num_patches: usize,
+    pub downsample_ratio: f64,
+    pub image_token_id: u32,
+    pub image_start_token_id: u32,
+    pub image_end_token_id: u32,
+    pub force_image_size: usize,
+    pub prefix_tokens: usize,
+    pub num_summary_tokens: usize,
+    pub pos_grid_side: usize,
+    pub projector_norm_eps: f64,
+    pub layer_norm_eps: f64,
 }
 
 impl VisionConfig {

@@ -406,7 +406,7 @@ impl TransformerModel {
                 .comm
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("deferred vision payload without communicator"))?;
-            comm.broadcast(ve.buf_out.0, rows * ve.out_hidden_size * 2, 0)?;
+            comm.broadcast(ve.out_row().0, rows * ve.out_hidden_size() * 2, 0)?;
         }
         Ok(rows)
     }

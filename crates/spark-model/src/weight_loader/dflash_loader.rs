@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use spark_runtime::gpu::GpuBackend;
 use spark_runtime::weights::WeightStore;
 
-use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
+use crate::weight_map::{DenseWeight, dense_auto};
 
 #[path = "dflash_config.rs"]
 mod config;
@@ -66,9 +66,6 @@ pub struct DflashWeights {
     pub markov_rank: usize,
     pub embed_tokens: Option<DenseWeight>,
     pub candidate_selector: Option<DflashCandidateSelectorWeights>,
-    /// Own NVFP4 lm_head (LiLiCorr-style drafters, `has_own_lm_head: true`).
-    /// `None` on generic DFlash — the head shares the target's.
-    pub lm_head: Option<QuantizedWeight>,
 }
 
 /// Per-drafter-layer raw weights (BF16).
@@ -294,33 +291,6 @@ pub fn load_dflash_weights(
         None
     };
 
-    let lm_head = if own_lm_head_present(drafter_store, prefix, drafter_config.has_own_lm_head)? {
-        tracing::info!("DFlash drafter: own NVFP4 lm_head ({prefix}lm_head.weight)");
-        Some(
-            crate::weight_map::quantized(drafter_store, &format!("{prefix}lm_head"), gpu)
-                .context("DFlash drafter: load own lm_head")?,
-        )
-    } else {
-        None
-    };
-
-    // NVIDIA LiLiCorr drafters also ship a `lilicorr.*` candidate re-ranker.
-    // Its forward code is unavailable, so name the skipped tensors: drafts
-    // run on the drafter's own argmax and acceptance will be below NVIDIA's
-    // reference.
-    let lilicorr_prefix = format!("{prefix}lilicorr.");
-    let lilicorr_count = drafter_store
-        .names()
-        .filter(|n| n.starts_with(lilicorr_prefix.as_str()))
-        .count();
-    if lilicorr_count > 0 {
-        tracing::warn!(
-            "DFlash drafter ships {lilicorr_count} lilicorr.* tensors: the LiLiCorr \
-             candidate re-ranker is not implemented — drafts use the drafter's own \
-             argmax, so acceptance will be below NVIDIA's reference"
-        );
-    }
-
     if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
         && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
         && fc_meta.shape.len() == 2
@@ -361,7 +331,6 @@ pub fn load_dflash_weights(
         markov_rank,
         embed_tokens,
         candidate_selector,
-        lm_head,
     }))
 }
 

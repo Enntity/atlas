@@ -186,11 +186,11 @@ impl MoeLayer {
         let output = ctx.buffers.moe_output();
 
         if use_bf16_batch2
-            && let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
+            && let (Some(gp), Some(up), Some(dp), Some(shared)) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.separate_shared_expert,
+                self.bf16_shared_expert,
             )
         {
             // BF16 batch2 path (FP8-dequant-on-load experts, MTP K=2 verify).

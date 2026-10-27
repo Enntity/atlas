@@ -183,6 +183,24 @@ impl TransformerModel {
                             &mut full_h,
                             &mut full_w,
                         );
+                    } else if self
+                        .config
+                        .vision
+                        .as_ref()
+                        .is_some_and(|v| v.is_qwen3vl_video)
+                    {
+                        mrope_pos::build_qwen3vl(
+                            tokens,
+                            &grids,
+                            grid_base,
+                            grid_hi,
+                            0,
+                            pad_id,
+                            video_pad_id,
+                            &mut full_t,
+                            &mut full_h,
+                            &mut full_w,
+                        );
                     } else {
                         mrope_pos::build(
                             &tokens[..end],

@@ -135,23 +135,6 @@ impl TransformerModel {
         let normed = self.buffers.norm_output();
         self.final_norm_rows(last_hidden, normed, 1, stream)?;
 
-        // ATLAS_LAYER_H_PREFILL: post-final-norm sum (pairs with the
-        // per-layer ATLAS_LAYER_HP lines).
-        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
-            self.gpu.synchronize(stream)?;
-            let mut hb = vec![0u8; h * 2];
-            if self.gpu.copy_d2h(normed, &mut hb).is_ok() {
-                let mut s_ = 0f64;
-                for c in hb.chunks_exact(2) {
-                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
-                    if v.is_finite() {
-                        s_ += v.abs();
-                    }
-                }
-                tracing::warn!("ATLAS_LAYER_HP FINAL last_sabs={s_:.6} all_sabs={s_:.6}");
-            }
-        }
-
         // Diagnostic: post-norm hidden state
         if std::env::var("ATLAS_DIAG_GEMMA4").is_ok_and(|v| v == "1" || v == "true") {
             self.gpu.synchronize(stream)?;
@@ -186,7 +169,6 @@ impl TransformerModel {
         //   (1) re-restore the pristine SSM state@N from the snapshot, and
         //   (2) overwrite `normed` with the snapshot's stashed last-token
         //       post-norm hidden so `lm_head` emits the correct first token.
-        //   (3) re-apply its aux state (`exact_direct.rs`).
         // The redundant 1-token forward is otherwise harmless (its KV write
         // duplicates already-cached values).
         if let Some(snap_id) = seq.marconi_exact_snap {
@@ -197,7 +179,6 @@ impl TransformerModel {
                 self.gpu.as_ref(),
                 stream,
             )?;
-            self.exact_hit_reapply_aux(seq, snap_id, stream)?;
             if self.ssm_snapshots.has_hidden(snap_id) {
                 self.ssm_snapshots
                     .restore_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;

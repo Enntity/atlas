@@ -170,11 +170,11 @@ impl MoeLayer {
             }
 
             let shared_out = ctx.buffers.attn_output();
-            if let (Some(gp), Some(up), Some(dp), Some(SeparateSharedExpert::Bf16(shared))) = (
+            if let (Some(gp), Some(up), Some(dp), Some(shared)) = (
                 self.bf16_gate_weight_ptrs,
                 self.bf16_up_weight_ptrs,
                 self.bf16_down_weight_ptrs,
-                self.separate_shared_expert,
+                self.bf16_shared_expert,
             ) {
                 // BF16 path (FP8-dequant-on-load): same fused kernels as decode.
                 ops::moe_expert_gate_up_shared_bf16(
@@ -464,27 +464,17 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
-                    true,
                     stream,
                 )?;
             }
 
-            // EP fix (same contract as `forward_row_local`): the shared expert
-            // is computed identically on all ranks, so it must stay out of the
-            // pre-reduce blend or the all-reduce sums it once per rank.
-            let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-            let shared_for_blend = if is_ep && !shared_out.is_null() {
-                self.ep_blend_zero_row(ctx, stream)?
-            } else {
-                shared_out
-            };
             ops::moe_weighted_sum_blend(
                 ctx.gpu,
                 self.moe_weighted_sum_blend,
                 output_t,
                 expert_down_out,
                 weights_dev,
-                shared_for_blend,
+                shared_out,
                 input_t,
                 self.weights.shared_expert_gate.weight,
                 h,
@@ -493,9 +483,16 @@ impl MoeLayer {
                 stream,
             )?;
 
-            // EP all-reduce per-token partial output, then the shared expert
-            // added ONCE (`forward_ep_reduce` does both).
-            self.forward_ep_reduce(output_t, shared_out, input_t, 1, None, ctx, stream)?;
+            // EP all-reduce per-token partial output
+            if let Some(comm) = ctx.comm
+                && ctx.config.ep_world_size > 1
+            {
+                if ctx.graph_capture {
+                    comm.all_reduce(output_t.0, h as usize * 2)?;
+                } else {
+                    comm.all_reduce_async(output_t.0, h as usize * 2, stream)?;
+                }
+            }
         }
 
         Ok(())

@@ -103,6 +103,55 @@ pub(crate) fn build(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_qwen3vl(
+    chunk_tokens: &[u32],
+    grids: &[(usize, usize, usize)],
+    grid_base: usize,
+    grid_hi: usize,
+    start_pos: u32,
+    image_pad: u32,
+    video_pad: u32,
+    t_out: &mut Vec<u32>,
+    h_out: &mut Vec<u32>,
+    w_out: &mut Vec<u32>,
+) {
+    let is_pad = |tok: u32| tok == image_pad || tok == video_pad;
+    let mut pos = start_pos;
+    let mut item = grid_base;
+    let mut group = 0usize;
+    let mut i = 0usize;
+    while i < chunk_tokens.len() {
+        if is_pad(chunk_tokens[i]) && item < grid_hi {
+            let (t_len, gh, gw) = grids[item];
+            let plane = (gh * gw).max(1);
+            let contiguous = i + plane <= chunk_tokens.len()
+                && chunk_tokens[i..i + plane].iter().copied().all(is_pad);
+            if group < t_len.max(1) && contiguous {
+                let base = pos;
+                for k in 0..plane {
+                    t_out.push(base);
+                    h_out.push(base + (k / gw.max(1)) as u32);
+                    w_out.push(base + (k % gw.max(1)) as u32);
+                }
+                pos += gh.max(gw).max(1) as u32;
+                group += 1;
+                if group >= t_len.max(1) {
+                    item += 1;
+                    group = 0;
+                }
+                i += plane;
+                continue;
+            }
+        }
+        t_out.push(pos);
+        h_out.push(pos);
+        w_out.push(pos);
+        pos += 1;
+        i += 1;
+    }
+}
+
 /// GLM-5 position walk for the checkpoint's expanded prompt form. Images use
 /// one image marker triple. Videos use
 /// `video_start, (image_start, image_pad*, image_end, timestamp*)*, video_end`;

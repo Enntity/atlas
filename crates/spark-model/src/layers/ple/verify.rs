@@ -203,31 +203,8 @@ impl PleLayer {
                 DevicePtr(va)
             }
             #[cfg(feature = "cuda")]
-            NgramTable::ResidentNvfp4 {
-                rows,
-                row_base,
-                rows_total,
-                ..
-            } => {
-                // Fully resident packed table: the "slot" IS `row - row_base`
-                // (row_base 0 today), uploaded as u32 like the `Bf16` arm.
-                let bytes: Vec<u8> = ids
-                    .iter()
-                    .map(|r| {
-                        let (base, total) = (*row_base, *rows_total);
-                        anyhow::ensure!(
-                            *r >= base && *r < base + total,
-                            "PLE resident: row id {r} outside [{base}, {})",
-                            base + total
-                        );
-                        Ok((*r - base) as u32)
-                    })
-                    .collect::<Result<Vec<u32>>>()?
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect();
-                gpu.copy_h2d_async(&bytes, self.slots_dev, stream)?;
-                *rows
+            NgramTable::ResidentNvfp4 { .. } => {
+                anyhow::bail!("PLE: resident NVFP4 table is not supported by this gather path")
             }
             NgramTable::Bf16(w) => {
                 // Fully resident table (small fixtures / tests): the "slot" IS
@@ -255,10 +232,10 @@ impl PleLayer {
         gpu: &dyn GpuBackend,
         stream: u64,
     ) -> Result<()> {
-        // Trellis and NVFP4 rows are not embeddings. `gather_host` already
-        // wrote the decoded BF16 matrix into `emb`; launching `batched_embed`
-        // would overwrite it with packed bytes interpreted as BF16.
-        if !self.host_decoded() {
+        // Trellis rows are not embeddings. `gather_host` already wrote the
+        // decoded BF16 matrix into `emb`; launching `batched_embed` would
+        // overwrite it with packed I16 interpreted as BF16.
+        if self.trellis.is_none() {
             self.gather_embed_dispatch(table_va, num_tokens, heads, gpu, stream)?;
         }
         // The pins taken by this gather must outlive THIS kernel: record an event

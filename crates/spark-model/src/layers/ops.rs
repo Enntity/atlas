@@ -287,6 +287,8 @@ mod ssm_mamba_snap;
 mod ssm_preproc;
 #[path = "ops/ssm_ssd.rs"]
 mod ssm_ssd;
+#[path = "ops/strix_f16.rs"]
+mod strix_f16;
 #[path = "ops/strix_s64.rs"]
 mod strix_s64;
 pub mod token_overlay;

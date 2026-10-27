@@ -123,10 +123,7 @@ impl NgramRowCache {
         // slot handed out above is pinned, and `victim` skips pinned slots), so
         // the arena writes are disjoint, and `read_exact_at` is positional so a
         // shared `&File` has no cursor to race on.
-        let ft = std::time::Instant::now();
-        let r = self.fetch_many(&faults);
-        self.fault_us += ft.elapsed().as_micros() as u64;
-        if let Err(e) = r {
+        if let Err(e) = self.fetch_many(&faults) {
             // A partially-written slot must not stay claimed as resident: a
             // wrong n-gram row reads as fluent output with wrong logits, which
             // is the failure mode this cache exists to avoid. Drop the WHOLE

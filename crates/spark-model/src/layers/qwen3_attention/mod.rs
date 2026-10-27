@@ -46,7 +46,6 @@ mod prefill_weights;
 mod prefill_weights_rowinv;
 mod trait_impl;
 mod types;
-mod types_layer;
 mod types_weights;
 
 #[cfg(feature = "cuda")]
@@ -71,34 +70,6 @@ pub use types_weights::{
     CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
     MlaWeights,
 };
-pub(crate) use hc_prefill::{
-    HcNorm, HcSeam, hc_post_pre_prefill_fused, hc_pre_prefill_mix, hc_prefill_fuse2_enabled,
-};
-pub(crate) use hc_prefill_block::hc_seam_overlapped;
-pub(crate) use prefill::{attn_w4a4_requested, index_split_words, write_floor_legacy};
-pub(crate) use trait_impl::{
-    grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
-};
-pub(crate) use types::HeadGateActivation;
-pub use types_layer::Qwen3AttentionLayer;
-pub use types_weights::{
-    CompressorWeights, GlmIndexerWeights, HcHeadWeights, HcLowRank, HcSiteWeights, HcWeights,
-    MlaWeights,
-};
-
-/// `ATLAS_GLM_MLA_MULTI_SEQ=1`: GLM MLA layers decode a batch of sequences
-/// together. Both ranks must run the same value (`model::startup_parity`): a
-/// rank without it runs the per-sequence path, or refuses a C4 batch its peer
-/// has already started.
-pub(crate) fn glm_mla_multi_seq_enabled() -> bool {
-    std::env::var("ATLAS_GLM_MLA_MULTI_SEQ").ok().as_deref() == Some("1")
-}
-
-/// Opt-in eager semantic indexing for independent GLM C2/C3 decode rows.
-/// The model and server share this gate so admission and graph policy agree.
-pub fn glm_multi_seq_sparse_enabled(model_type: &str) -> bool {
-    model_type == "glm5_next" && std::env::var("ATLAS_GLM_MULTI_SEQ_SPARSE").as_deref() == Ok("1")
-}
 
 /// `ATLAS_GLM_MLA_MULTI_SEQ=1`: GLM MLA layers decode a batch of sequences
 /// together. Both ranks must run the same value (`model::startup_parity`): a
@@ -220,8 +191,3 @@ mod split_ref_seqs_tests {
         assert_ne!(split_ref_seqs(1, 4), split_ref_seqs(1, 16));
     }
 }
-
-#[cfg(test)]
-mod fp8_gemv_parity_gpu_tests;
-#[cfg(test)]
-mod init_glm_probe_tests;

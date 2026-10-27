@@ -52,10 +52,7 @@ mod upload_paged;
 mod warm;
 
 impl TransformerModel {
-    /// The chunk, optionally carrying DFlash verify owners after its rows
-    /// (`glm_fused_chunk`).
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::model) fn prefill_chunk_dispatch_with(
+    pub(super) fn prefill_chunk_dispatch(
         &self,
         tokens: &[u32],
         seq: &mut SequenceState,
@@ -63,7 +60,6 @@ impl TransformerModel {
         chunk_len: usize,
         is_last_chunk: bool,
         stream: u64,
-        mut passengers: Option<&mut super::super::glm_fused_chunk::Passengers<'_, '_>>,
     ) -> Result<DevicePtr> {
         self.prefill_chunk_dispatch_with(
             tokens,

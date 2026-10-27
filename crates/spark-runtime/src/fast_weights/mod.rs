@@ -32,7 +32,6 @@ mod shard;
 pub use deferred_slice::{SliceAxis, decode_deferred_csf_scale, with_deferred_slice};
 
 use header::resolve_shards;
-use shard::load_shard_fast;
 
 /// Run `f` over `len` bytes at `start` within a deferred tensor, read with
 /// `O_DIRECT` when the filesystem allows it (so the bytes never sit in the
@@ -301,7 +300,6 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
-                self.pack_slab,
                 &mut weights,
                 &mut deferred,
                 &mut offload_logged,
@@ -351,7 +349,6 @@ impl WeightLoader for FastSafetensorsLoader {
                 self.try_direct_io,
                 self.direct_io_tensor_cap,
                 self.prefetch_shards,
-                self.pack_slab,
                 &mut weights,
                 &mut deferred,
                 &mut extra_offload,

@@ -119,7 +119,7 @@ pub fn pixel_shuffle_v2_permutation(a: usize, b: usize, c: usize) -> Vec<u32> {
 use anyhow::Result;
 use atlas_core::config::VisionConfig;
 
-use super::vision_preprocess::decode_image;
+use super::vision_preprocess::decode_data_uri_bytes;
 
 /// Omni (`nemotron_h_omni`) image preprocessing, the port of
 /// `image_processing_nemotron_h_omni.py`:
@@ -144,7 +144,8 @@ pub fn preprocess_image_omni(
     max_num_patches: usize,
     min_num_patches: usize,
 ) -> Result<(Vec<f32>, usize, usize)> {
-    let img = decode_image(data_uri)?.to_rgb8();
+    let (_, bytes) = decode_data_uri_bytes(data_uri)?;
+    let img = image::load_from_memory(&bytes)?.to_rgb8();
     let (ow, oh) = (img.width() as usize, img.height() as usize);
     // Python: the per-image token budget is clamped to [min_num_patches,
     // max_num_patches] before `_compute_target_patches` sees it.

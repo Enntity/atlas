@@ -3,7 +3,14 @@
 //! Qwen3 attention struct definitions: `MlaWeights` (latent attention
 //! 2-step decode) and `Qwen3AttentionLayer` (full attention layer).
 
-pub(crate) use super::types_weights::HeadGateActivation;
+use spark_runtime::gpu::{DevicePtr, KernelHandle};
+use spark_runtime::kv_cache::KvCacheDtype;
+
+use crate::layers::FfnComponent;
+use crate::layers::fp8_calibration::Fp8KvCalibration;
+use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
+use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
+
 pub use super::types_weights::{HcWeights, MlaWeights};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

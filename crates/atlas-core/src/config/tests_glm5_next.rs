@@ -168,6 +168,7 @@ fn fp4_local_declares_csf32_routed_expert_scales() {
         quant_algo: algo.into(),
         group_size: 16,
         weight_scale_encoding: "csf_32x2_v1".into(),
+        weight_block_size: vec![],
     };
     // Routed experts of layers 3..=44 ship csf_32x2_v1 scales; the MTP
     // layer's (45) are plain W4A16_NVFP4.

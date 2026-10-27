@@ -437,9 +437,6 @@ impl TransformerModel {
             if let Some(rows) = serial_check {
                 self.batch_fast_compare(rows, self.decode_logits_ptr())?;
             }
-            if let Some(rows) = serial_check {
-                self.batch_fast_compare(rows, self.decode_logits_ptr())?;
-            }
             return Ok(self.decode_logits_ptr());
         }
         {
@@ -696,9 +693,6 @@ impl TransformerModel {
                 self.buffers.norm_output().offset(i * h * 2),
                 stream,
             )?;
-        }
-        if let Some(rows) = serial_check {
-            self.batch_fast_compare(rows, self.decode_logits_ptr())?;
         }
         if let Some(rows) = serial_check {
             self.batch_fast_compare(rows, self.decode_logits_ptr())?;

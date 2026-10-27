@@ -100,9 +100,9 @@ fn load_dense_ffn(
     store: &WeightStore,
     gpu: &dyn GpuBackend,
     lp: &str,
-    config: &ModelConfig,
+    _config: &ModelConfig,
 ) -> Result<FfnComponent> {
-    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu, &config.model_type)?;
+    let mut layer = DenseFfnLayer::new(null_dense_ffn_weights(), gpu)?;
     layer.set_bf16_weights(
         dense_auto(store, &format!("{lp}.mlp.gate_proj.weight"), gpu)?,
         dense_auto(store, &format!("{lp}.mlp.up_proj.weight"), gpu)?,

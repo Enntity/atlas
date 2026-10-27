@@ -352,37 +352,6 @@ impl NgramRowCache {
     pub fn stats(&self) -> (u64, u64, u64) {
         (self.hits, self.misses, self.evictions)
     }
-
-    /// Resident slots (map size) and total slots — the "n/N" of the log line.
-    pub fn occupancy(&self) -> (usize, usize) {
-        (self.map.len(), self.slots)
-    }
-
-    /// The periodic observability line: at most once per 30 s while the
-    /// cache is being resolved against. Callers: `resolve`/`prefetch`.
-    pub(crate) fn maybe_log_stats(&mut self) {
-        let dt = self.last_stats_log.elapsed();
-        if dt < std::time::Duration::from_secs(30) {
-            return;
-        }
-        self.last_stats_log = std::time::Instant::now();
-        let total = self.hits + self.misses;
-        let rate = if total > 0 {
-            self.hits as f64 * 100.0 / total as f64
-        } else {
-            0.0
-        };
-        tracing::info!(
-            "NgramRowCache: {}/{} slots resident, {} hits / {} misses ({:.1}% hit),              {} evictions, fault wall {:.1}s cumulative",
-            self.map.len(),
-            self.slots,
-            self.hits,
-            self.misses,
-            rate,
-            self.evictions,
-            self.fault_us as f64 / 1e6
-        );
-    }
 }
 
 #[cfg(feature = "cuda")]
@@ -435,11 +404,10 @@ impl Drop for NgramRowCache {
     fn drop(&mut self) {
         if self.hits + self.misses > 0 {
             tracing::info!(
-                "NgramRowCache closed: {} hits / {} misses, {} evictions, fault wall {:.1}s",
+                "NgramRowCache closed: {} hits / {} misses, {} evictions",
                 self.hits,
                 self.misses,
-                self.evictions,
-                self.fault_us as f64 / 1e6
+                self.evictions
             );
         }
     }

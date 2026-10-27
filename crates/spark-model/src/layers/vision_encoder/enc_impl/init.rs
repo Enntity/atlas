@@ -42,10 +42,7 @@ pub const CEILING_MAX_PATCHES: usize = 16384;
 /// decision alongside the value so the caller can say out loud when a
 /// checkpoint asked for more than it got — silently ignoring the checkpoint is
 /// the failure mode this whole change exists to remove.
-pub(crate) fn derive_max_patches(
-    max_pixels: Option<usize>,
-    patch_size: usize,
-) -> (usize, Option<usize>) {
+pub fn derive_max_patches(max_pixels: Option<usize>, patch_size: usize) -> (usize, Option<usize>) {
     let Some(area) = max_pixels.filter(|&a| a > 0) else {
         return (FALLBACK_MAX_PATCHES, None);
     };
@@ -166,32 +163,6 @@ impl VisionEncoder {
         let buf_scores = gpu.alloc(attn_max * attn_max * 4)?; // [seq, seq] f32
         let buf_probs = gpu.alloc(attn_max * attn_max * 2)?; // [seq, seq] bf16
         let buf_o_stage = gpu.alloc(p_max * head_dim * 2)?; // [seq, D] bf16
-        // Weight-dequant scratch: the largest quantized projection's BF16
-        // expansion (~10 MB for fc1 [4304,1152]). Owned by the encoder; never
-        // aliased with LM scratch.
-        let all_weights = || {
-            blocks
-                .iter()
-                .flat_map(|b| [b.qkv_w, b.proj_w, b.fc1_w, b.fc2_w])
-                .chain(
-                    deepstack
-                        .iter()
-                        .flat_map(|m| [m.fc1_w, m.fc2_w])
-                        .chain([merger.fc1_w, merger.fc2_w]),
-                )
-        };
-        // Lookup the dequant kernels ONLY when a loaded projection is that
-        // dtype: a BF16-only vision tree never registers them, so the boot
-        // audit has nothing to miss (the FP4-Local regression that failed
-        // every non-flash-next vision model).
-        let has_nvfp4_w = all_weights().any(|w| matches!(w, VitWeight::Nvfp4 { .. }));
-        let has_mxfp8_w = all_weights().any(|w| matches!(w, VitWeight::Mxfp8(_)));
-        let max_w_bytes = all_weights().map(|w| w.bf16_bytes()).max().unwrap_or(0);
-        let buf_vit_dq = if max_w_bytes > 0 {
-            gpu.alloc(max_w_bytes)?
-        } else {
-            DevicePtr::NULL
-        };
 
         // Download pos_embed weight to host as f32 so we can bilinear-
         // interpolate it per image (HF: `fast_pos_embed_interpolate`).
@@ -252,22 +223,6 @@ impl VisionEncoder {
             k_merge: gpu.kernel("vision_encoder", "vision_spatial_merge")?,
             k_f32_bf16: gpu.kernel("vision_encoder", "vision_f32_to_bf16")?,
             k_copy: gpu.kernel("vision_encoder", "vision_bf16_copy")?,
-            // Dequants for checkpoint-native quantized ViT projections:
-            // resolved ONLY when a loaded weight is that dtype (hard error
-            // if the kernel is missing then — the weight cannot decode
-            // without it). BF16-only trees never even issue the lookup.
-            k_nvfp4_dq: if has_nvfp4_w {
-                gpu.kernel("dequant_nvfp4_bf16", "dequant_nvfp4_to_bf16")
-                    .context("NVFP4 vision weight needs dequant_nvfp4_to_bf16")?
-            } else {
-                KernelHandle(0)
-            },
-            k_mx8_dq: if has_mxfp8_w {
-                gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")
-                    .context("MXFP8 vision weight needs mxfp8_proj_dequant")?
-            } else {
-                KernelHandle(0)
-            },
             hidden_size,
             num_heads,
             head_dim,
@@ -293,7 +248,6 @@ impl VisionEncoder {
             buf_scores,
             buf_probs,
             buf_o_stage,
-            buf_vit_dq,
             pos_embed_host_f32,
             rope_inv_freq,
         })

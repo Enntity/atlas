@@ -34,7 +34,7 @@ impl MoeLayer {
         };
 
         // ── Shared expert (BF16 dense GEMM) ──
-        let has_shared = shared_inter > 0 && self.separate_shared_expert.is_some();
+        let has_shared = shared_inter > 0 && self.bf16_shared_expert.is_some();
         if has_shared {
             self.run_unfused_shared_expert(
                 input,
@@ -45,7 +45,6 @@ impl MoeLayer {
                 ctx.buffers.ssm_qkvz(),
                 ctx.buffers.attn_output(),
                 ctx,
-                false,
                 stream,
             )?;
         }

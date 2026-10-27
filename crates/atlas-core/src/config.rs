@@ -747,6 +747,9 @@ pub struct QuantizationConfig {
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
+    /// Per-layer block-quant tile when a mixed-precision map overrides the
+    /// checkpoint-wide block size.
+    pub weight_block_size: Vec<usize>,
     /// How the block scales are STORED, when not plainly: `"csf"` means each
     /// `weight_scale` ships as a compressed `nvfp4_csf_fixed` +
     /// `nvfp4_csf_exceptions` pair (nvidia Qwen FP4-Local's routed experts);
@@ -820,7 +823,7 @@ pub(crate) use parsers::{
     parse_laguna, parse_longcat_ngram, parse_minimax_m2, parse_qwen4_exp, parse_step3p7,
     parse_vision_config,
 };
-pub use vision::{PixelBounds, VisionConfig, VisionTokenBudgets};
+pub use vision::{OmniVisionConfig, PixelBounds, VisionConfig, VisionTokenBudgets};
 
 pub(crate) fn finalize_config(config: &mut ModelConfig, raw: &serde_json::Value) -> Result<()> {
     if config.quantization_config.is_none() {

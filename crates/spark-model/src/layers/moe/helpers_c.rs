@@ -35,7 +35,7 @@ impl MoeLayer {
 
         // A checkpoint-native BF16 shared expert is the authoritative copy.
         // Do not manufacture an FP8 prefill variant with different numerics.
-        if self.separate_shared_expert.is_none()
+        if self.bf16_shared_expert.is_none()
             && !self.weights.shared_expert.gate_proj.is_null()
             && shared_inter > 0
         {
@@ -109,7 +109,7 @@ impl MoeLayer {
         self.bf16_up_weight_ptrs = Some(build_bf16_ptr_table(up_experts, gpu)?);
         self.bf16_down_weight_ptrs = Some(build_bf16_ptr_table(down_experts, gpu)?);
         if shared_gate.is_null() && shared_up.is_null() && shared_down.is_null() {
-            self.separate_shared_expert = None;
+            self.bf16_shared_expert = None;
         } else {
             self.set_bf16_shared_expert(
                 DenseWeight {

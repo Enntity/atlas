@@ -105,7 +105,6 @@ impl MoeLayer {
                 ctx.buffers.ssm_qkvz(),
                 ctx.buffers.attn_output(),
                 ctx,
-                false,
                 stream,
             )?;
         if !bf16_shared && has_shared && force_w8a8_sh {

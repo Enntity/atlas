@@ -101,6 +101,89 @@ impl NgramRowCache {
         Ok(())
     }
 
+    /// Install segmented per-row block scales. This path is opt-in at its
+    /// caller; the ordinary PLE cache keeps the existing per-row scale source.
+    pub fn attach_segmented_block_scales(
+        &mut self,
+        shards: &[(std::path::PathBuf, u64)],
+        scale_stride: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.scales.is_none(),
+            "NgramRowCache: a scale source is already installed"
+        );
+        anyhow::ensure!(
+            !shards.is_empty() && scale_stride > 0 && scale_stride <= BLOCK,
+            "NgramRowCache: bad segmented scale geometry (shards={}, stride={scale_stride})",
+            shards.len()
+        );
+        let seg = self
+            .segments
+            .as_ref()
+            .context("NgramRowCache: segmented scales need a segmented table")?;
+        anyhow::ensure!(
+            shards.len() == seg.bases.len(),
+            "NgramRowCache: {} scale shards for {} weight shards",
+            shards.len(),
+            seg.bases.len()
+        );
+        let rows_per = seg.rows_per;
+        let (paths, shard_file) = plan_shard_files(shards);
+        let mut files = Vec::with_capacity(paths.len());
+        for path in &paths {
+            files.push(open_direct(path)?);
+        }
+        let sbytes = self.slots * scale_stride;
+        let sblocks = sbytes.div_ceil(BLOCK);
+        let resident = if std::env::var("ATLAS_PLE_SCALES_RESIDENT")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            let shard_bytes = rows_per as usize * scale_stride;
+            let mut arena = vec![0u8; shards.len() * shard_bytes];
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for (dst, (path, base)) in arena.chunks_mut(shard_bytes).zip(shards) {
+                    let path = path.clone();
+                    let base = *base;
+                    handles.push(scope.spawn(move || -> Result<()> {
+                        use std::os::unix::fs::FileExt;
+                        std::fs::File::open(&path)
+                            .with_context(|| format!("scale shard {path:?}"))?
+                            .read_exact_at(dst, base)
+                            .with_context(|| format!("scale shard {path:?} short at {base}"))
+                    }));
+                }
+                for handle in handles {
+                    handle.join().expect("scale loader panic")?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+            Some(std::sync::Arc::new(arena))
+        } else {
+            None
+        };
+        self.scales = Some(ScaleCache {
+            arena: ExpertArena::new(1, sblocks as u32, BLOCK)
+                .context("NgramRowCache: block-scale arena")?,
+            stride: scale_stride,
+            src: ScaleSrc::Segmented(Segments {
+                bases: shards.iter().map(|(_, offset)| *offset).collect(),
+                rows_per,
+                files,
+                shard_file,
+            }),
+            resident,
+        });
+        Ok(())
+    }
+
+    pub fn block_scale_dev_va(&self) -> Result<Option<u64>> {
+        match &self.scales {
+            Some(scales) => Ok(Some(scales.arena.slot_dev_va(0, 0)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Mark the rows as packed NVFP4 (E2M1 codes, then their E4M3 block
     /// scales, in the row itself) and record the tensor's global f32 scale,
     /// which the NVFP4 gather multiplies in after the block scale.

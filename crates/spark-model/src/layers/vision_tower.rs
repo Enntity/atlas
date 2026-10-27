@@ -18,6 +18,10 @@ pub enum VisionTower {
 }
 
 impl VisionTower {
+    pub fn is_glm(&self) -> bool {
+        matches!(self, VisionTower::Qwen(v) if v.glm.is_some())
+    }
+
     /// Packed merged-token output rows (`[total_merged, out_hidden]` BF16).
     pub fn out_row(&self) -> DevicePtr {
         match self {
@@ -47,7 +51,7 @@ impl VisionTower {
             VisionTower::Radio(r) => {
                 let mut images = Vec::new();
                 for item in items {
-                    for group in &item.groups {
+                    for group in item.groups.iter() {
                         images.push((group.as_slice(), item.grid_h, item.grid_w));
                     }
                 }

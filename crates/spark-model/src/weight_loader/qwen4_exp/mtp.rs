@@ -189,9 +189,6 @@ fn build_mtp_moe(
                 });
             }
         }
-        MtpExpertLayout::PerExpertNvfp4 => {
-            experts = nvfp4::experts(store, &mlp, config, gpu, absmax_k, quantize_k, stream)?;
-        }
         // nvidia pack: per-expert FP8_PB_WO (weight + weight_scale_inv, g=128
         // blocks) instead of RadixArk's fused BF16 pair. Dequant to BF16 then
         // requant to NVFP4 so the body gets the same MoeLayer either way.
@@ -267,16 +264,25 @@ fn build_mtp_moe(
     }
 
     // The shared expert ships per-tensor BF16 like a main layer's, so it takes
-    // the ordinary named path rather than the stacked slicer. It is also
-    // installed BF16-native on the layer below — the fused kernels then take a
-    // NULL shared expert and the BF16 chain applies it separately, sparing the
-    // one expert every drafted token sees the 4-bit requant.
+    // the ordinary named path rather than the stacked slicer.
     let se = format!("{mlp}.shared_expert");
-    let se_gate = dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?;
-    let se_up = dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?;
-    let se_down = dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?;
-    // NULL in the fused kernels: the BF16 chain installed below applies it.
-    let shared_expert = ExpertWeight::null();
+    let shared_expert = ExpertWeight {
+        gate_proj: q(
+            &dense_auto(store, &format!("{se}.gate_proj.weight"), gpu)?,
+            inter,
+            h,
+        )?,
+        up_proj: q(
+            &dense_auto(store, &format!("{se}.up_proj.weight"), gpu)?,
+            inter,
+            h,
+        )?,
+        down_proj: q(
+            &dense_auto(store, &format!("{se}.down_proj.weight"), gpu)?,
+            h,
+            inter,
+        )?,
+    };
 
     let gate = dense_auto(store, &format!("{mlp}.gate.weight"), gpu)?;
     let weights = MoeWeights {
@@ -456,15 +462,10 @@ pub fn load_qwen4exp_mtp_module(
          (gated attn, dense — no QSA indexer + mHC + {}-expert MoE from {layout:?} experts), \
          shared embed/lm_head, own head mixer. Construction cost {:.2} GB.",
         config.num_experts,
-        mtp_expert_layout(store, &format!("{MTP_LAYER_PREFIX}.mlp")),
         spent as f64 / 1e9,
     );
     Ok(Some(module))
 }
-
-/// Per-expert NVFP4 MTP experts (FP4-Local).
-#[path = "mtp_nvfp4.rs"]
-mod nvfp4;
 
 #[cfg(test)]
 mod tests {

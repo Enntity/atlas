@@ -98,7 +98,8 @@ impl ModelWeightLoader for Glm5WeightLoader {
         store: &WeightStore,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
-    ) -> Result<Option<crate::layers::VisionEncoder>> {
+    ) -> Result<Option<crate::layers::VisionTower>> {
         vision::load(store, config, gpu)
+            .map(|encoder| encoder.map(|v| crate::layers::VisionTower::Qwen(Box::new(v))))
     }
 }

@@ -85,6 +85,7 @@ pub fn jpeg_with_orientation(w: u32, h: u32, orientation: u16) -> String {
 pub fn qwen_config() -> VisionConfig {
     VisionConfig {
         is_glm5_next: false,
+        is_qwen3vl_video: false,
         in_channels: 3,
         depth: 27,
         hidden_size: 1152,
@@ -108,6 +109,7 @@ pub fn qwen_config() -> VisionConfig {
         token_budgets: Default::default(),
         min_pixels: None,
         video_pixels: None,
+        omni: None,
     }
 }
 

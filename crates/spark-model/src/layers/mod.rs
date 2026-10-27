@@ -39,9 +39,6 @@ pub mod qwen4exp_sp_pipe;
 pub mod vision_encoder;
 pub mod w4a16_gemv_tiers;
 
-pub(crate) mod kernel_pick;
-pub use kernel_pick::*;
-
 pub(crate) use deepseek_v4_mtp::argmax_grammar_masked;
 pub use deepseek_v4_mtp::{DeepseekV4MtpHead, DeepseekV4MtpProposerState};
 pub use dense_ffn::{DenseFfnLayer, DenseFfnWeights, FfnActivation};
@@ -67,10 +64,29 @@ pub use qwen3_ssm::Qwen3SsmLayer;
 pub use qwen4exp_mtp::{Qwen4ExpMtpHead, Qwen4ExpMtpProposerState};
 pub(crate) use vision_encoder::{GlmVisionBlockWeights, GlmVisionMergerWeights, GlmVisionWeights};
 pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
+pub mod vision_tower;
+pub use vision_tower::VisionTower;
 
 use crate::layer::ForwardContext;
 use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
+
+pub(crate) fn w4a16_k64_min_k() -> u32 {
+    static MIN_K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN_K.get_or_init(|| {
+        if let Some(n) = std::env::var("ATLAS_W4A16_K64_MIN_K")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            return n;
+        }
+        if std::env::var("ATLAS_NO_W4A16_K64").ok().as_deref() == Some("1") {
+            8192
+        } else {
+            6144
+        }
+    })
+}
 
 /// Try to load an optional kernel, logging at debug level if it's not found.
 /// Returns `KernelHandle(0)` (null) on failure — callers must check before use.
@@ -499,5 +515,5 @@ impl FfnComponent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) mod glm_gpu_test_backend;

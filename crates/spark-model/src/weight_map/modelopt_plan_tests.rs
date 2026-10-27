@@ -10,8 +10,8 @@ fn spec(algo: &str) -> QuantLayerSpec {
     QuantLayerSpec {
         quant_algo: algo.into(),
         group_size: 0,
-        weight_scale_encoding: None,
         weight_block_size: vec![],
+        weight_scale_encoding: String::new(),
     }
 }
 
@@ -42,7 +42,7 @@ fn parses_the_flash_next_map() {
     mx.group_size = 32;
     let mut nv4 = spec("NVFP4");
     nv4.group_size = 16;
-    nv4.weight_scale_encoding = Some("csf".into());
+    nv4.weight_scale_encoding = "csf".into();
     let mut w4 = spec("W4A16_NVFP4");
     w4.group_size = 16;
     let mut plain = spec("NVFP4");
@@ -89,7 +89,7 @@ fn parses_the_csf_32x2_fixture_map() {
     let mut pb = spec("FP8_PB_WO");
     pb.weight_block_size = vec![128, 128];
     let mut csf2 = spec("NVFP4");
-    csf2.weight_scale_encoding = Some("csf_32x2_v1".into());
+    csf2.weight_scale_encoding = "csf_32x2_v1".into();
     let mut mx_plain = spec("MXFP8");
     mx_plain.group_size = 32;
     let cfg = cfg_with(&[

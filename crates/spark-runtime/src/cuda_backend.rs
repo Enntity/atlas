@@ -163,6 +163,9 @@ pub struct AtlasCudaBackend {
     /// `own_footprint` reports growth over the same span as the free-memory
     /// baseline (context and kernel modules are already in both).
     own_baseline: crate::own_footprint::Sample,
+    /// Registered slab extents for optional shard packing. The current fast
+    /// loader leaves packing disabled, so this stays empty on its default path.
+    slab_regions: parking_lot::Mutex<Vec<(u64, u64)>>,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -200,6 +203,7 @@ impl AtlasCudaBackend {
         Ok(Self {
             live_allocs: parking_lot::Mutex::default(),
             own_baseline: Self::own_sample(),
+            slab_regions: parking_lot::Mutex::new(Vec::new()),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -217,6 +221,17 @@ impl AtlasCudaBackend {
     /// Drop `ptr` from the ledger, returning the bytes it was recorded with.
     pub(crate) fn forget_alloc(&self, ptr: crate::gpu::DevicePtr) -> Option<usize> {
         self.live_allocs.lock().forget(ptr.0)
+    }
+
+    pub(crate) fn is_slab_interior(&self, ptr: u64) -> bool {
+        self.slab_regions
+            .lock()
+            .iter()
+            .any(|&(base, len)| ptr > base && ptr < base + len)
+    }
+
+    pub(crate) fn drop_slab_region(&self, base: u64) {
+        drop_slab_region(&mut self.slab_regions.lock(), base);
     }
 
     fn own_sample() -> crate::own_footprint::Sample {
@@ -251,6 +266,7 @@ impl AtlasCudaBackend {
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
         let outstanding = self.live_allocs.lock().drain();
+        self.slab_regions.lock().clear();
         let count = outstanding.len();
         for raw in outstanding {
             // Bypass `free`: the ledger is already drained, and a failure here
@@ -330,13 +346,21 @@ pub fn cuda_free_memory_bytes() -> Option<usize> {
 
     // On unified memory, also check MemAvailable from /proc/meminfo.
     // This includes reclaimable buff/cache that CUDA doesn't account for.
-    free = unified_free(
-        free,
-        total,
-        system_meminfo_bytes("MemTotal:"),
-        system_available_memory_bytes(),
-    );
+    if let Some(mem_available) = system_available_memory_bytes() {
+        free = free.max(mem_available);
+    }
     Some(free)
+}
+
+fn system_available_memory_bytes() -> Option<usize> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in contents.lines() {
+        if line.starts_with("MemAvailable:") {
+            let kb: usize = line.split_whitespace().nth(1)?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 /// Start a background OOM watchdog that polls GPU memory every `interval`.

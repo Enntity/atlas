@@ -340,7 +340,6 @@ impl BlockDiffusionDraftHead {
                     }
                 }
             }
-            self.mask_batched_draft_logits(n, grammar_bitmasks, ctx, stream)?;
             if self.candidate_selector.is_some() {
                 // ATLAS_GLM_DRAFT_TP_TOPK: the split swapped candidate lists.
                 let lists = batch_split

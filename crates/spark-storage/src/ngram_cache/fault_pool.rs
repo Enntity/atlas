@@ -27,8 +27,27 @@ use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow};
 
-use super::fault::{ArenaPtrs, Fault, RowSource, fetch_row};
-use super::{AlignedBlock, NgramRowCache, Segments};
+use super::fault::{ArenaPtrs, Fault, RowSource, ScaleSource, fetch_row};
+use super::{AlignedBlock, NgramRowCache, ScaleSrc, Segments};
+
+enum OwnedScaleSource {
+    Flat(File),
+    Segmented(Segments, Option<Arc<Vec<u8>>>),
+}
+
+fn clone_segments(segments: &Segments) -> Result<Segments> {
+    Ok(Segments {
+        bases: segments.bases.clone(),
+        rows_per: segments.rows_per,
+        files: segments
+            .files
+            .iter()
+            .map(File::try_clone)
+            .collect::<std::io::Result<_>>()
+            .context("NgramRowCache fault pool: dup shard files")?,
+        shard_file: segments.shard_file.clone(),
+    })
+}
 
 /// The cache's immutable row geometry, owned (cloned descriptors) so 'static
 /// workers can rebuild a `RowSource` from it.
@@ -37,7 +56,8 @@ struct OwnedSource {
     base_offset: u64,
     segments: Option<Segments>,
     row_stride: usize,
-    scale_file: Option<File>,
+    scale_src: Option<OwnedScaleSource>,
+    scale_stride: usize,
 }
 
 impl OwnedSource {
@@ -47,7 +67,14 @@ impl OwnedSource {
             base_offset: self.base_offset,
             segments: self.segments.as_ref(),
             row_stride: self.row_stride,
-            scale_file: self.scale_file.as_ref(),
+            scale_src: self.scale_src.as_ref().map(|source| match source {
+                OwnedScaleSource::Flat(file) => ScaleSource::Flat { file },
+                OwnedScaleSource::Segmented(segments, resident) => ScaleSource::Segmented {
+                    seg: segments,
+                    resident: resident.as_deref().map(Vec::as_slice),
+                },
+            }),
+            scale_stride: self.scale_stride,
         }
     }
 }
@@ -158,24 +185,24 @@ impl FaultPool {
     fn new(cache: &NgramRowCache, workers: usize) -> Result<Self> {
         let segments = match &cache.segments {
             None => None,
-            Some(s) => Some(Segments {
-                bases: s.bases.clone(),
-                rows_per: s.rows_per,
-                files: s
-                    .files
-                    .iter()
-                    .map(File::try_clone)
-                    .collect::<std::io::Result<_>>()
-                    .context("NgramRowCache fault pool: dup shard files")?,
-                shard_file: s.shard_file.clone(),
-            }),
+            Some(s) => Some(clone_segments(s)?),
         };
-        let scale_file = match cache.scales.as_ref().and_then(|sc| sc.file.as_ref()) {
-            Some(f) => Some(
-                f.try_clone()
-                    .context("NgramRowCache fault pool: dup scales")?,
-            ),
-            None => None,
+        let (scale_src, scale_stride) = match &cache.scales {
+            None => (None, 0),
+            Some(scales) => {
+                let source = match &scales.src {
+                    ScaleSrc::Constant => None,
+                    ScaleSrc::PerRowFile(file) => Some(OwnedScaleSource::Flat(
+                        file.try_clone()
+                            .context("NgramRowCache fault pool: dup scales")?,
+                    )),
+                    ScaleSrc::Segmented(segments) => Some(OwnedScaleSource::Segmented(
+                        clone_segments(segments)?,
+                        scales.resident.clone(),
+                    )),
+                };
+                (source, scales.stride)
+            }
         };
         let src = OwnedSource {
             file: cache
@@ -185,7 +212,8 @@ impl FaultPool {
             base_offset: cache.base_offset,
             segments,
             row_stride: cache.row_stride,
-            scale_file,
+            scale_src,
+            scale_stride,
         };
         Self::start(src, fetch_row, workers, spawn_worker)
     }

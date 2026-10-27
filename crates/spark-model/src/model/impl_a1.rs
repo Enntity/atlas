@@ -111,10 +111,7 @@ impl TransformerModel {
         // Narrow batched-GEMV family (M=4..8) for the K=3..8 verify lm_head
         // (try_kernel per tier: 0-handle on targets that predate a tier;
         // dispatch widens, then falls back to the GEMM).
-        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
-            gpu.as_ref(),
-            config.model_type == "glm5_next",
-        );
+        let w4a16_batchm = crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu.as_ref());
         // M<=16 batched GEMV for the wide BATCHED-DECODE lm_head. The SSM mixer
         // already carries this handle (qwen3_ssm/mod.rs); the model level did
         // not, so the decode head had no arm above 8 and fell to the M64-tile
@@ -148,12 +145,6 @@ impl TransformerModel {
             "dense_gemv_fp8w_batch2",
             "dense_gemv_fp8w_batch2",
         );
-        // BF16 dual-GEMV (batch=2) for the K=2 verify lm_head on a BF16 LM
-        // head. HIP only: the strix-hip kernel is bit-identical to two
-        // `dense_gemv_bf16` calls (same 32-lane walk per row, same shuffle
-        // reduction), while the NVIDIA builds use 64 lanes per row plus a
-        // shared-memory reduction, which reorders the sum. Elsewhere the
-        // handle stays 0 and the two-GEMV fallback runs unchanged.
         let dense_gemv_bf16_batch2_kernel = if cfg!(atlas_hip) {
             crate::layers::try_kernel(
                 gpu.as_ref(),
@@ -506,11 +497,6 @@ impl TransformerModel {
                 Err(e) => {
                     tracing::warn!("bf16_add_inplace kernel not found (send/recv disabled): {e}")
                 }
-            }
-            // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1); a
-            // backend without them ignores the handle.
-            if let Ok(k) = gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16") {
-                comm.set_oneshot_kernel(k.0);
             }
         }
         // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1) over the

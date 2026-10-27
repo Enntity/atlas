@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
-use spark_runtime::weights::WeightDtype;
-
 /// Smoke-test the DFlash drafter `config.json` parser against the live
 /// `z-lab/Qwen3.6-35B-A3B-DFlash` checkpoint downloaded into the user's
 /// HF cache. Skipped when the cache directory isn't populated — keeps

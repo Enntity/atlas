@@ -13,7 +13,7 @@ use crate::weight_map::{
 };
 
 impl BlockDiffusionDraftHead {
-    pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend, nvfp4_tc: bool) -> Result<()> {
+    pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         if std::env::var("ATLAS_NO_DFLASH_DRAFTER_NVFP4").is_ok() {
             return Ok(());
         }

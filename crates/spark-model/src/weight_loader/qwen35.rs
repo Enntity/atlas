@@ -216,18 +216,18 @@ impl ModelWeightLoader for Qwen35WeightLoader {
                 norm1_w: vision_tensor_dense_auto(store, &format!("{bp}.norm1.weight"), gpu)?
                     .weight,
                 norm1_b: vision_tensor_dense_auto(store, &format!("{bp}.norm1.bias"), gpu)?.weight,
-                qkv_w: vision_weight(store, &format!("{bp}.attn.qkv"), gpu)?,
+                qkv_w: vision_dense_auto(store, &format!("{bp}.attn.qkv"), gpu)?.weight,
                 qkv_b: vision_tensor_dense_auto(store, &format!("{bp}.attn.qkv.bias"), gpu)?.weight,
-                proj_w: vision_weight(store, &format!("{bp}.attn.proj"), gpu)?,
+                proj_w: vision_dense_auto(store, &format!("{bp}.attn.proj"), gpu)?.weight,
                 proj_b: vision_tensor_dense_auto(store, &format!("{bp}.attn.proj.bias"), gpu)?
                     .weight,
                 norm2_w: vision_tensor_dense_auto(store, &format!("{bp}.norm2.weight"), gpu)?
                     .weight,
                 norm2_b: vision_tensor_dense_auto(store, &format!("{bp}.norm2.bias"), gpu)?.weight,
-                fc1_w: vision_weight(store, &format!("{bp}.mlp.linear_fc1"), gpu)?,
+                fc1_w: vision_dense_auto(store, &format!("{bp}.mlp.linear_fc1"), gpu)?.weight,
                 fc1_b: vision_tensor_dense_auto(store, &format!("{bp}.mlp.linear_fc1.bias"), gpu)?
                     .weight,
-                fc2_w: vision_weight(store, &format!("{bp}.mlp.linear_fc2"), gpu)?,
+                fc2_w: vision_dense_auto(store, &format!("{bp}.mlp.linear_fc2"), gpu)?.weight,
                 fc2_b: vision_tensor_dense_auto(store, &format!("{bp}.mlp.linear_fc2.bias"), gpu)?
                     .weight,
             });
@@ -239,10 +239,10 @@ impl ModelWeightLoader for Qwen35WeightLoader {
             deepstack.push(crate::layers::MergerLayer {
                 norm_w: vision_tensor_dense_auto(store, &format!("{mp}.norm.weight"), gpu)?.weight,
                 norm_b: vision_tensor_dense_auto(store, &format!("{mp}.norm.bias"), gpu)?.weight,
-                fc1_w: vision_weight(store, &format!("{mp}.linear_fc1"), gpu)?,
+                fc1_w: vision_dense_auto(store, &format!("{mp}.linear_fc1"), gpu)?.weight,
                 fc1_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc1.bias"), gpu)?
                     .weight,
-                fc2_w: vision_weight(store, &format!("{mp}.linear_fc2"), gpu)?,
+                fc2_w: vision_dense_auto(store, &format!("{mp}.linear_fc2"), gpu)?.weight,
                 fc2_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc2.bias"), gpu)?
                     .weight,
             });
@@ -252,9 +252,9 @@ impl ModelWeightLoader for Qwen35WeightLoader {
         let merger = crate::layers::MergerLayer {
             norm_w: vision_tensor_dense_auto(store, &format!("{mp}.norm.weight"), gpu)?.weight,
             norm_b: vision_tensor_dense_auto(store, &format!("{mp}.norm.bias"), gpu)?.weight,
-            fc1_w: vision_weight(store, &format!("{mp}.linear_fc1"), gpu)?,
+            fc1_w: vision_dense_auto(store, &format!("{mp}.linear_fc1"), gpu)?.weight,
             fc1_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc1.bias"), gpu)?.weight,
-            fc2_w: vision_weight(store, &format!("{mp}.linear_fc2"), gpu)?,
+            fc2_w: vision_dense_auto(store, &format!("{mp}.linear_fc2"), gpu)?.weight,
             fc2_b: vision_tensor_dense_auto(store, &format!("{mp}.linear_fc2.bias"), gpu)?.weight,
         };
 

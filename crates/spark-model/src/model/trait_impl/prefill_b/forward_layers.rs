@@ -14,8 +14,6 @@ use super::super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::traits::SequenceState;
 
-mod profile_tail;
-
 impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,
@@ -233,9 +231,6 @@ impl TransformerModel {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        // ATLAS_LAYER_H_PREFILL: per-layer hidden sums for the last row of the
-        // chunk and over all rows, after each layer, eager path only.
-        let probe_hp = std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1");
         let t_loop = host_timing.then(std::time::Instant::now);
         let mut t_in_prefill = std::time::Duration::ZERO;
         let mut t_dflash = std::time::Duration::ZERO;
@@ -405,26 +400,6 @@ impl TransformerModel {
             }
             if let Some(t) = t_df {
                 t_dflash += t.elapsed();
-            }
-            if probe_hp {
-                self.gpu.synchronize(stream).ok();
-                let hs = self.config.hidden_size;
-                let mut hb = vec![0u8; proc_count * hs * 2];
-                if self.gpu.copy_d2h(hidden, &mut hb).is_ok() {
-                    let mut all = 0f64;
-                    let mut last = 0f64;
-                    for (e, c) in hb.chunks_exact(2).enumerate() {
-                        let v =
-                            f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64;
-                        if v.is_finite() {
-                            all += v.abs();
-                            if e / hs == proc_count - 1 {
-                                last += v.abs();
-                            }
-                        }
-                    }
-                    tracing::warn!("ATLAS_LAYER_HP L{i} last_sabs={last:.6} all_sabs={all:.6}");
-                }
             }
             if let Some(lt0) = lt0 {
                 self.gpu.synchronize(stream)?;
@@ -611,24 +586,28 @@ impl TransformerModel {
                 e.0 += us;
                 e.1 += 1;
             }
+            let per_type: Vec<String> = by_type
+                .iter()
+                .map(|(k, (us, n))| {
+                    format!(
+                        "{}x{}={:.0}ms(avg {:.1})",
+                        n,
+                        k,
+                        *us as f64 / 1000.0,
+                        *us as f64 / 1000.0 / *n as f64
+                    )
+                })
+                .collect();
+            tracing::info!(
+                "Prefill chunk {} tok (proc {}, {}): {:.1}ms total, by_type: {}, top5: {}",
+                chunk_len,
+                proc_count,
+                path_label,
+                total_us as f64 / 1000.0,
+                per_type.join(", "),
+                top5.join(", "),
+            );
         }
-        if let Some(p) = qsp.filter(|p| p.check) {
-            self.qwen4exp_sp_check(p, effective_seq_len_start, None, false, stream);
-        }
-        crate::det_trace::set_layer(self.layers.len());
-        det.tap("final", hidden, (0, proc_count), h * 2);
-        self.prefill_b_forward_layers_profile_tail(
-            seq,
-            effective_seq_len_start,
-            proc_count,
-            chunk_len,
-            use_decode_path,
-            t_loop,
-            t_in_prefill,
-            t_dflash,
-            &layer_times,
-            prefill_t0,
-            stream,
-        )
+        Ok(())
     }
 }

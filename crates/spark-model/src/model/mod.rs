@@ -118,6 +118,11 @@ pub mod nllb;
 
 pub use types::TransformerModel;
 
+#[cfg(test)]
+#[allow(clippy::duplicate_mod)]
+#[path = "impl_a2/idle_command_fixture.rs"]
+mod test_fixture;
+
 /// `ATLAS_EP_PROTOCOL=v2`: the head sends a slot id ahead of every worker
 /// command (`impl_a2`). Every rank must run the same value
 /// ([`startup_parity`]): the worker would read the slot id as the command.

@@ -74,20 +74,20 @@ impl TransformerModel {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("vision encode without an encoder"))?;
         let (gpu, stream) = (self.gpu.as_ref(), self.gpu.default_stream());
-        let row = ve.out_hidden_size * 2;
+        let row = ve.out_hidden_size() * 2;
         let count = |i: usize| {
             let (t, h, w) = seq.vision.grids[i];
             t * h * w
         };
         gpu.synchronize(stream)?;
         let mut window = vec![0u8; items.iter().map(|&i| count(i)).sum::<usize>() * row];
-        gpu.copy_d2h(ve.buf_out, &mut window)?;
+        gpu.copy_d2h(ve.out_row(), &mut window)?;
         let (mut at, mut differ) = (0usize, 0usize);
         for &i in items {
             ve.forward_items(&[&seq.vision.items[i]], gpu, stream)?;
             gpu.synchronize(stream)?;
             let mut alone = vec![0u8; count(i) * row];
-            gpu.copy_d2h(ve.buf_out, &mut alone)?;
+            gpu.copy_d2h(ve.out_row(), &mut alone)?;
             let got = &window[at * row..(at + count(i)) * row];
             if got != alone.as_slice() {
                 let bytes = got.iter().zip(&alone).filter(|(a, b)| a != b).count();
@@ -98,7 +98,7 @@ impl TransformerModel {
             }
             at += count(i);
         }
-        gpu.copy_h2d(&window, ve.buf_out)?;
+        gpu.copy_h2d(&window, ve.out_row())?;
         tracing::info!(
             "vision row check: {} items of the window, {differ} differ from their alone encodes",
             items.len()

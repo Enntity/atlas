@@ -32,10 +32,10 @@ use anyhow::{Context, Result, ensure};
 use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
-mod types;
 mod gif_access;
 mod glm;
 mod patchify;
+mod types;
 
 pub use types::{group_indices, sample_indices};
 

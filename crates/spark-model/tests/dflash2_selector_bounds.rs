@@ -125,10 +125,10 @@ fn kernel_signature_has_sixteen_params_with_device_anchor() {
             _ => {}
         }
     }
-    src[open + 1..close.expect("closing paren")]
+    let params = src[open + 1..close.expect("closing paren")]
         .split(',')
         .map(str::trim)
-        .collect();
+        .collect::<Vec<_>>();
     assert_eq!(
         params.len(),
         16,

@@ -32,7 +32,6 @@ mod draft_conf;
 mod paged_attn_modules;
 pub mod product_policy;
 pub mod selector;
-mod selector_platform;
 mod startup_diagnostics;
 pub use conv::Dflash2Conv;
 pub use product_policy::{
@@ -780,7 +779,6 @@ mod batch_execution;
 mod batch_execution_tests;
 mod batch_fallback;
 mod batch_forward;
-mod batch_grammar;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod batch_plan;
@@ -1494,6 +1492,3 @@ impl DraftProposer for BlockDiffusionDraftHead {
         Ok(())
     }
 }
-
-#[cfg(test)]
-pub(crate) mod prefill_test_support;

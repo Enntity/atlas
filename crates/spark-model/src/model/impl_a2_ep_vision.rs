@@ -31,7 +31,7 @@ impl TransformerModel {
     pub(crate) fn vision_row_bounds(&self) -> VisionRowBounds {
         let ve = self.vision_encoder.as_ref();
         let window = ve.map_or(0, |ve| ve.output_rows());
-        let glm = ve.is_some_and(|ve| ve.glm.is_some());
+        let glm = ve.is_some_and(crate::layers::VisionTower::is_glm);
         VisionRowBounds {
             window,
             request: if glm && self.multi_rank_protocol_active() {
@@ -95,7 +95,8 @@ impl TransformerModel {
             let payload = if seq.vision.deferred {
                 0
             } else {
-                let payload = payload_bytes(&state, ve.out_hidden_size, self.vision_row_bounds())?;
+                let payload =
+                    payload_bytes(&state, ve.out_hidden_size(), self.vision_row_bounds())?;
                 anyhow::ensure!(
                     payload > 0,
                     "vision request produced an empty encoder payload"
@@ -154,7 +155,7 @@ impl TransformerModel {
                 .vision_encoder
                 .as_ref()
                 .expect("vision payload without encoder");
-            comm.broadcast(ve.buf_out.0, payload, 0)?;
+            comm.broadcast(ve.out_row().0, payload, 0)?;
         }
         Ok(())
     }
@@ -178,7 +179,7 @@ impl TransformerModel {
         let payload = if state.deferred {
             0
         } else if let Some(ve) = &self.vision_encoder {
-            payload_bytes(&state, ve.out_hidden_size, self.vision_row_bounds())?
+            payload_bytes(&state, ve.out_hidden_size(), self.vision_row_bounds())?
         } else {
             anyhow::ensure!(
                 state.rows == 0,
@@ -194,7 +195,7 @@ impl TransformerModel {
             self.comm
                 .as_ref()
                 .expect("validated vision payload without communicator")
-                .broadcast(ve.buf_out.0, payload, 0)?;
+                .broadcast(ve.out_row().0, payload, 0)?;
         }
         seq.vision.grids = grids;
         seq.vision.hashes = hashes;

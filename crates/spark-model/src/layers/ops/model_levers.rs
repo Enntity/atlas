@@ -56,6 +56,11 @@ pub struct ModelLevers {
     /// CUDA-graph capture is unaffected. Same outputs, same committed
     /// state bit-for-bit — replay shares `gated_delta_rule_wyn_impl`.
     pub gdn_deferred_commit: bool,
+    /// Use exact persistent K-row Mamba-2 verification when its kernel is
+    /// available. Opt-in via `ATLAS_MAMBA_VERIFY_EXACT`.
+    pub mamba_verify_exact: bool,
+    /// Use fused K-row Mamba-2 verification unless explicitly disabled.
+    pub mamba_verify_fused: bool,
 
     // ── FFN / MoE ──
     /// Lossless single-warp decode GEMV (`w4a16_gemv_sw`, `w4a16_gemv_dual_sw`).
@@ -217,6 +222,8 @@ impl ModelLevers {
             gdn_wy17: opt_out("ATLAS_GDN_WY17"),
             gdn_wyn: opt_out("ATLAS_GDN_WYN"),
             gdn_deferred_commit: opt_out("ATLAS_GDN_DEFERRED_COMMIT"),
+            mamba_verify_fused: std::env::var_os("ATLAS_NO_MAMBA_VERIFY_FUSED").is_none(),
+            mamba_verify_exact: opt_in("ATLAS_MAMBA_VERIFY_EXACT"),
             ffn_small_m: opt_out("ATLAS_FFN_SMALLM"),
             gemv_sw: super::gemv_sw::gemv_sw_from(
                 std::env::var("ATLAS_NO_GEMV_SW").ok().as_deref(),

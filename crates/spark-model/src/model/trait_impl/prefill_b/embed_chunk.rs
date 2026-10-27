@@ -5,7 +5,7 @@
 
 #![allow(unused_imports, dead_code, clippy::too_many_arguments)]
 
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
 
 use super::super::super::types::TransformerModel;
 use crate::layers::ops;
@@ -114,71 +114,6 @@ pub(in crate::model) fn vision_splice_plan(
         pad_idx += 1;
     }
     Ok(plan)
-}
-
-/// `ATLAS_QWEN4EXP_PREFILL_HOST_IDS=1`: the prefill forward hands its layers
-/// the host copy of the token ids it uploaded (`ForwardContext::
-/// host_token_ids`). PLE otherwise reads them back from the device with a
-/// blocking copy in the middle of the pass, which drains the stream and
-/// leaves the GPU idle while the host then hashes the n-grams (5.5 ms at 16K
-/// on the pair, nsys `sqpf-p3s7-r0`). The ids are the same bytes: the copy
-/// mirrors the last upload into the stable `token_ids` buffer.
-pub(in crate::model) fn host_ids_requested() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("ATLAS_QWEN4EXP_PREFILL_HOST_IDS").as_deref(),
-            Ok("1") | Ok("true")
-        )
-    })
-}
-
-thread_local! {
-    /// The ids last uploaded into the stable `token_ids` buffer.
-    static STAGED_IDS: std::cell::RefCell<Option<Vec<u32>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// The host copy of the ids in `token_ids`, taken by the forward that reads
-/// them (`None`: switch off, or no prefill upload since the last take).
-pub(super) fn take_staged_ids() -> Option<Vec<u32>> {
-    STAGED_IDS.with(|s| s.borrow_mut().take())
-}
-
-/// Return the packed vision-row range covered by one prompt chunk. The
-/// encoder output follows the complete prompt's pad-token order, so a chunk
-/// starting in the middle of a media run must begin after every earlier image
-/// or video pad token. `row_base` is the request slice in co-dispatch output;
-/// `pending` is the complete packed output row count.
-fn vision_pad_row_range(
-    tokens: &[u32],
-    chunk_start: usize,
-    chunk_len: usize,
-    image_pad: u32,
-    video_pad: u32,
-    row_base: usize,
-    pending: usize,
-) -> Result<(usize, usize)> {
-    let chunk_tokens = &tokens[chunk_start..chunk_start + chunk_len];
-    let is_pad = |tok: &&u32| **tok == image_pad || **tok == video_pad;
-    let prior_pad_count = tokens[..chunk_start].iter().filter(is_pad).count();
-    let chunk_pad_count = chunk_tokens.iter().filter(is_pad).count();
-    let start = row_base
-        .checked_add(prior_pad_count)
-        .ok_or_else(|| anyhow::anyhow!("vision pad overlay row offset overflow"))?;
-    let end = start
-        .checked_add(chunk_pad_count)
-        .ok_or_else(|| anyhow::anyhow!("vision pad overlay row count overflow"))?;
-    if end > pending {
-        bail!(
-            "vision pad overlay exceeds packed encoder output: base={}, prior={}, chunk={}, pending={}",
-            row_base,
-            prior_pad_count,
-            chunk_pad_count,
-            pending
-        );
-    }
-    Ok((start, end))
 }
 
 impl TransformerModel {
@@ -420,10 +355,10 @@ impl TransformerModel {
             pending,
         )?;
         for (i, physical) in plan {
-            let src = ve.buf_out.offset(physical * ve.out_hidden_size * 2);
+            let src = ve.out_row().offset(physical * ve.out_hidden_size() * 2);
             let dst = hidden_dst.offset(i * h * elem_bytes);
             self.gpu
-                .copy_d2d_async(src, dst, ve.out_hidden_size * 2, stream)?;
+                .copy_d2d_async(src, dst, ve.out_hidden_size() * 2, stream)?;
         }
         Ok(())
     }
