@@ -18,6 +18,7 @@ fn mxfp8_exact_rows_chunks_and_never_dequants() {
         w: crate::weight_map::Mxfp8Weight {
             data: DevicePtr(0x10000),
             scales: DevicePtr(0x11000),
+            tiled: false,
         },
         n: 640,
         k: 2560,
@@ -120,6 +121,7 @@ fn mxfp8_shared_expert_exact_chunks_the_fused_chain() {
         w: crate::weight_map::Mxfp8Weight {
             data: DevicePtr(ptr),
             scales: DevicePtr(ptr + 0x1000),
+            tiled: false,
         },
         n: n as u32,
         k: k as u32,

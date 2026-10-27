@@ -72,6 +72,7 @@ mod gpu {
                 w: Mxfp8Weight {
                     data: wd,
                     scales: sd,
+                    tiled: false,
                 },
                 n,
                 k,
@@ -171,6 +172,7 @@ mod gpu {
                 w: Mxfp8Weight {
                     data: wd,
                     scales: sdd,
+                    tiled: false,
                 },
                 n,
                 k,

@@ -103,6 +103,7 @@ pub(super) fn build(
     let qkvz = Mxfp8Weight {
         data: concat(gpu, (qkv_l[0], local_qkv), (z_l[0], local_z), h)?,
         scales: concat(gpu, (qkv_l[1], local_qkv), (z_l[1], local_z), h / MX8_GROUP)?,
+        tiled: false,
     };
     if tp > 1 {
         // `concat` built the kept [Q|K|V|Z] buffers; the fresh per-segment
@@ -192,6 +193,7 @@ pub(super) fn build(
                 w: Mxfp8Weight {
                     data: out_l[0],
                     scales: out_l[1],
+                    tiled: false,
                 },
                 n: h as u32,
                 k: local_z as u32,

@@ -80,6 +80,7 @@ fn vision_weight(
                     w: crate::weight_map::Mxfp8Weight {
                         data: wptr,
                         scales: sptr,
+                        tiled: false,
                     },
                     n: wshape[0] as u32,
                     k: wshape[1] as u32,

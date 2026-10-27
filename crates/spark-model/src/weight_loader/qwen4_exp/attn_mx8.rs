@@ -86,6 +86,7 @@ pub(super) fn build(
             w: Mxfp8Weight {
                 data: local[0],
                 scales: local[1],
+                tiled: false,
             },
             n: ln as u32,
             k: lk as u32,

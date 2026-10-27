@@ -94,6 +94,7 @@ fn mxfp8_shared_expert_runs_at_decode_verify_and_prefill_rows() {
         w: crate::weight_map::Mxfp8Weight {
             data: DevicePtr(ptr),
             scales: DevicePtr(ptr + 0x1000),
+            tiled: false,
         },
         n: n as u32,
         k: k as u32,

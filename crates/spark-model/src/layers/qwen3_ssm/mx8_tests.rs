@@ -60,6 +60,7 @@ fn mx8(gpu: &MockGpuBackend, config: &ModelConfig) -> Mx8Gdn {
         w: Mxfp8Weight {
             data: gpu.alloc(n * k).unwrap(),
             scales: gpu.alloc(n * k / 32).unwrap(),
+            tiled: false,
         },
         n: n as u32,
         k: k as u32,

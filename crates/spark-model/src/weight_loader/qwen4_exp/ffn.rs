@@ -117,7 +117,11 @@ pub(super) fn build_moe(
             let [w, s] =
                 mx8_common::module(store, &format!("{lp}.mlp.shared_expert.{proj}"), n, k)?;
             Ok(Mxfp8Proj {
-                w: Mxfp8Weight { data: w, scales: s },
+                w: Mxfp8Weight {
+                    data: w,
+                    scales: s,
+                    tiled: false,
+                },
                 n: n as u32,
                 k: k as u32,
             })
@@ -152,6 +156,7 @@ pub(super) fn build_moe(
             w: Mxfp8Weight {
                 data: gu_w.offset(rows_off * h),
                 scales: gu_s.offset(rows_off * (h / 32)),
+                tiled: false,
             },
             n: inter as u32,
             k: h as u32,
@@ -161,6 +166,7 @@ pub(super) fn build_moe(
                 w: Mxfp8Weight {
                     data: gu_w,
                     scales: gu_s,
+                    tiled: false,
                 },
                 n: (2 * inter) as u32,
                 k: h as u32,
