@@ -15,6 +15,10 @@ const TOOL: u32 = 3;
 const CALL: &[u32] = &[3, 4, 5, 6, 7, 8, 9, 10, 11];
 const BACKTICK: u32 = 15;
 const ORDINARY: u32 = 16;
+const OPS: u32 = 40;
+const OPS_VALUE: u32 = 41;
+/// Neither alphabetical nor schema-sorted: delivery must keep this order.
+const ORDERED_OPS: &str = r#"[{"url": "u", "headers": {"b": 1, "a": 2}}, {"command": "c"}]"#;
 const LITERAL_CONTENT: [&str; 4] = [
     "The tag is `<tool_call>` and this is prose. END.",
     "The tag is \"<tool_call>\" and this is prose. END.",
@@ -24,6 +28,8 @@ const LITERAL_CONTENT: [&str; 4] = [
 
 #[path = "glm_literal_xml_tests.rs"]
 mod glm_literal_xml_tests;
+#[path = "glm_tool_args_tests.rs"]
+mod glm_tool_args_tests;
 #[path = "qwen_literal_xml_tests.rs"]
 mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
@@ -81,6 +87,8 @@ fn app_for_model(model_type: &str, format: tool_parser::ToolCallFormat) -> Arc<A
         "<function=get_weather><parameter=city>http://169.254.169.254/</parameter></function></tool_call>",
         "<function=get_url><parameter=url>http://169.254.169.254/</parameter></function></tool_call>",
         "get_url<arg_key>url</arg_key><arg_value>http://169.254.169.254/</arg_value></tool_call>",
+        "ops",
+        ORDERED_OPS,
     ];
     let vocab = words
         .iter()
