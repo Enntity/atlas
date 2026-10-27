@@ -12,6 +12,7 @@ pub mod fault;
 pub mod ngram_table;
 pub mod numeric;
 pub mod qwen4exp_reference;
+pub mod qwen_yarn;
 pub mod safetensors;
 pub mod scope;
 pub mod target;
