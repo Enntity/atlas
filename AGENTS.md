@@ -215,6 +215,6 @@ To ensure high code quality, all agents contributing to Atlas must strictly adhe
 - **Self-Improvement:** After user corrections, capture the lesson to prevent the same mistake.
 - **Demand Elegance:** For complex fixes, choose the elegant, well-architected solution over a hacky workaround.
 
-See `CONTRIBUTING.md` for coding style and contribution licensing,
+See `CONTRIBUTING.md` for coding style and the CLA expectations,
 `SECURITY.md` for disclosure, and `docs/adr/` for the authoritative
 architecture references.

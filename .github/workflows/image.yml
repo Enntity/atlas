@@ -112,8 +112,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Through the environment rather than `${{ }}` inside the script.
           # Neither value is attacker-controlled here, but this repo's rule is
-          # that no `github.*` field is ever expanded into a `run:` body,
-          # including this login step.
+          # that no `github.*` field is ever expanded into a `run:` body (see
+          # cla.yml), and a login line is the wrong place to make an exception.
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
