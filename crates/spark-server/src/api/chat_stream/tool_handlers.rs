@@ -552,7 +552,8 @@ pub(super) fn handle_tool_call_end(
         if !ctx.state.tool_guard.enabled {
             flush_buffered_tool_chunks(state, idx, deltas);
         }
-        if state.tool_arg_dedup_within.check(&name, &args_json) {
+        let reference = ctx.state.reference_mode;
+        if !reference && state.tool_arg_dedup_within.check(&name, &args_json) {
             tracing::warn!(
                 tool = %name,
                 "F11 within-response dedup tripped: 2+ identical streaming tool calls; ending response"

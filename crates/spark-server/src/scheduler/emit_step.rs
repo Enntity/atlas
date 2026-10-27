@@ -806,6 +806,9 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         return;
     }
 
+    let Some(m) = super::tool_markers::get() else {
+        return;
+    };
     if a.inside_parameter_body {
         // P0-1 (2026-07-09): PROVISIONAL close detection. The old code
         // exited the body on ANY `</` token (510) — but since the

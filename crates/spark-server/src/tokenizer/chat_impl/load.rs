@@ -133,6 +133,27 @@ impl ChatTokenizer {
             ChatEncoding::Jinja
         };
 
+        let omni_image_tokens = if model_type == "nemotron_h_omni" {
+            let encode_one = |text: &str| -> Option<u32> {
+                tokenizer.encode(text, false).ok().and_then(|encoding| {
+                    let ids = encoding.get_ids();
+                    (ids.len() == 1).then(|| ids[0])
+                })
+            };
+            match (
+                encode_one("<image>"),
+                encode_one("<img>"),
+                encode_one("</img>"),
+            ) {
+                (Some(image), Some(start), Some(end)) => Some((image, start, end)),
+                _ => anyhow::bail!(
+                    "nemotron_h_omni tokenizer is missing <image>/<img>/</img> special tokens"
+                ),
+            }
+        } else {
+            None
+        };
+
         tracing::info!("Loaded tokenizer from {}", tokenizer_path.display());
         Ok(Self {
             tokenizer,
@@ -153,6 +174,7 @@ impl ChatTokenizer {
             // different marker semantics and must retain their prompt bytes.
             glm_tool_markup_as_text: matches!(model_type, "glm5_next" | "qwen4_exp"),
             chat_encoding,
+            omni_image_tokens,
             chat_template,
             jinja_env,
             openai_jinja_env,

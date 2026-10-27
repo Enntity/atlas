@@ -32,6 +32,7 @@ use crate::tokenizer::{Glm5VisionPlaceholder, QwenVisionKind, QwenVisionPlacehol
 /// An item sized but (for a still) not yet decoded.
 enum Sized {
     Still(ProbedImage),
+    Ready(VisionItem),
     /// GLM keeps one item for the whole clip. Qwen splits the temporal groups
     /// into one item each so admission and chunked vision encoding can bound a
     /// long clip by the encoder window. The group buffers are moved out of
@@ -104,10 +105,28 @@ pub(super) fn preprocess_media(
     for input in media {
         sized.push(match input.kind {
             MediaKind::Image => {
-                let probed =
-                    probe_image(&input.uri, vcfg, vision_max_pixels).map_err(image_error)?;
-                admission.note(probed.pad_count(sms))?;
-                Sized::Still(probed)
+                if let Some(omni) = &vcfg.omni {
+                    let (pixels, grid_h, grid_w) =
+                        spark_model::radio_preprocess::preprocess_image_omni(
+                            &input.uri,
+                            vcfg,
+                            &omni.norm_mean,
+                            &omni.norm_std,
+                            vcfg.patch_size,
+                            omni.downsample_ratio,
+                            omni.max_num_patches,
+                            omni.min_num_patches,
+                        )
+                        .map_err(image_error)?;
+                    let item = VisionItem::image(pixels, grid_h, grid_w);
+                    admission.note(item.pad_count(sms))?;
+                    Sized::Ready(item)
+                } else {
+                    let probed =
+                        probe_image(&input.uri, vcfg, vision_max_pixels).map_err(image_error)?;
+                    admission.note(probed.pad_count(sms))?;
+                    Sized::Still(probed)
+                }
             }
             MediaKind::Video => {
                 // Decoded before admission (no header probe): under the
@@ -135,10 +154,14 @@ pub(super) fn preprocess_media(
                         format!("Video decode error: {e:#}"),
                     )
                 })?;
-                let timestamps = v.timestamps;
+                let timestamps = if vcfg.is_qwen3vl_video {
+                    v.timestamps_hf
+                } else {
+                    v.timestamps
+                };
                 let grid_h = v.grid_h;
                 let grid_w = v.grid_w;
-                if vcfg.is_glm5_next {
+                if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                     let item = VisionItem::video(v.groups, grid_h, grid_w);
                     let pad_count = item.pad_count(sms);
                     admission.note(pad_count)?;
@@ -185,12 +208,13 @@ pub(super) fn preprocess_media(
                 let (pixels, grid_h, grid_w) = probed.preprocess(vcfg).map_err(image_error)?;
                 let item = admitted.attach(VisionItem::image(pixels, grid_h, grid_w));
                 pad_counts[idx] = item.pad_count(sms);
-                if vcfg.is_glm5_next {
+                if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                     placeholders.push(glm5_vision::placeholder(
                         input.kind,
                         &item,
                         pad_counts[idx],
                         Vec::new(),
+                        vcfg.is_qwen3vl_video,
                     )?);
                 } else {
                     qwen_placeholders.push(QwenVisionPlaceholder {
@@ -202,6 +226,11 @@ pub(super) fn preprocess_media(
                 }
                 items.push(item);
             }
+            Sized::Ready(item) => {
+                let item = admitted.attach(item);
+                pad_counts[idx] = item.pad_count(sms);
+                items.push(item);
+            }
             Sized::Video {
                 items: video_items,
                 timestamps,
@@ -211,13 +240,13 @@ pub(super) fn preprocess_media(
                     .first()
                     .expect("preprocess_video produces at least one temporal group");
                 pad_counts[idx] = pad_count;
-                if vcfg.is_glm5_next {
-                    // GLM's existing single-item video contract is retained.
+                if vcfg.is_glm5_next || vcfg.is_qwen3vl_video {
                     placeholders.push(glm5_vision::placeholder(
                         input.kind,
                         first,
                         pad_counts[idx],
                         timestamps,
+                        vcfg.is_qwen3vl_video,
                     )?);
                 } else {
                     let per_frame_pad_count = (first.grid_h / sms) * (first.grid_w / sms);

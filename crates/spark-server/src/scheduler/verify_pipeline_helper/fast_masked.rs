@@ -36,13 +36,12 @@
 //! removes non-argmax candidates, so masked-greedy == `argmax_ids[i]` by
 //! definition and the call does no D2H at all.
 //!
-//! State-staleness parity: the slow path keeps `a.*` flags and
+//! State-staleness parity: the slow path evaluates `a.*` flags and
 //! `a.output_tokens` FIXED across the K loop (they only advance in
-//! `emit_token`, after the helper) EXCEPT `inside_tool_body`, which it
-//! mirrors per row. The penalty gate here therefore simulates that same
-//! flag advance over the argmax picks (`fast_gate_over_rows`) and takes
-//! the worst gate — any row whose state turns Blocked sends the whole
-//! call to the unmodified slow path, so the equivalence stays exact.
+//! `emit_token`, after the helper), and the gates here read exactly that
+//! same fixed state — eligibility is uniform across positions and the
+//! equivalence is per-call exact. Any ineligible position falls through
+//! to the unmodified slow path for the whole call.
 //! Kill-switch: `ATLAS_DISABLE_FAST_MASKED=1`.
 
 use super::selection_io::CopyFailurePolicy;
@@ -65,7 +64,7 @@ pub(super) fn masked_verify_required(configured: bool, lightning_product: bool) 
 pub(super) fn try_chat_fast_path(
     model: &dyn Model,
     argmax_ids: &[u32],
-    a: &mut ActiveSeq,
+    a: &ActiveSeq,
     ctx: &LogitsContext,
     row_base: usize,
     policy: CopyFailurePolicy,

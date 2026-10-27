@@ -170,7 +170,7 @@ fn glm_native_tool_boundary_blocking_preserves_validated_call() {
         let req = request();
         let response = response(tokens(explicit_close, true));
         let (reasoning, content) =
-            crate::api::chat_blocking::decode_response_text(&state, &response, true, true);
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, false, true);
         assert_eq!(
             reasoning.as_deref().map(str::trim),
             Some("plan"),
@@ -331,7 +331,7 @@ fn glm_native_tool_boundary_first_token_and_malformed_envelope() {
         };
         let response = response(raw.to_vec());
         let (reasoning, content) =
-            crate::api::chat_blocking::decode_response_text(&state, &response, true, true);
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, false, true);
         assert!(reasoning.is_none());
         let choice = crate::api::chat_blocking_choice::build_choice_message(
             &state, &req, &response, reasoning, content, true, None, 0,
@@ -361,7 +361,7 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         let state = app(glm);
         let response = response(tokens(false, true));
         let (_, content) =
-            crate::api::chat_blocking::decode_response_text(&state, &response, true, tools);
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, false, tools);
         assert!(content.is_empty());
         let (stream, _) = stream(glm, tools, false, true);
         assert!(!stream.thinking_done);
@@ -371,7 +371,7 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
     let req = request();
     let response = response(tokens(false, false));
     let (reasoning, content) =
-        crate::api::chat_blocking::decode_response_text(&state, &response, true, true);
+        crate::api::chat_blocking::decode_response_text(&state, &response, true, false, true);
     let choice = crate::api::chat_blocking_choice::build_choice_message(
         &state, &req, &response, reasoning, content, true, None, 0,
     );
@@ -388,7 +388,7 @@ fn glm_native_tool_boundary_keeps_request_model_and_name_guards() {
         let state = app(glm);
         let response = self::response(tokens(true, false));
         let (reasoning, content) =
-            crate::api::chat_blocking::decode_response_text(&state, &response, true, true);
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, false, true);
         let choice = crate::api::chat_blocking_choice::build_choice_message(
             &state, &req, &response, reasoning, content, true, None, 0,
         );
@@ -435,7 +435,7 @@ fn glm_native_literal_opener_is_preserved_by_blocking_decode() {
     let state = app(true);
     let response = response(vec![1, BACKTICK, TOOL, ORDINARY, BACKTICK]);
     let (reasoning, content) =
-        crate::api::chat_blocking::decode_response_text(&state, &response, true, true);
+        crate::api::chat_blocking::decode_response_text(&state, &response, true, false, true);
     let combined = format!("{}{}", reasoning.as_deref().unwrap_or_default(), content);
     assert!(combined.contains("<tool_call>"), "combined={combined:?}");
     let choice = crate::api::chat_blocking_choice::build_choice_message(

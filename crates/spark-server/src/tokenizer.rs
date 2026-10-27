@@ -126,23 +126,6 @@ pub(crate) struct Glm5VisionPlaceholder {
     pub(crate) qwen3vl: bool,
 }
 
-/// One GLM-5 multimodal placeholder after CPU preprocessing. The chat
-/// template emits one compact marker per media item; the tokenizer expands
-/// it to the exact number of encoder rows before the prompt reaches prefill.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Glm5VisionKind {
-    Image,
-    Video,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Glm5VisionPlaceholder {
-    pub(crate) kind: Glm5VisionKind,
-    pub(crate) pad_count: usize,
-    pub(crate) per_frame_pad_count: usize,
-    pub(crate) timestamps: Vec<f32>,
-}
-
 /// One compact Qwen vision marker after CPU preprocessing. Qwen3.8's
 /// processor expands a video marker into one timestamped vision range per
 /// temporal group; images keep the ordinary single range shape.

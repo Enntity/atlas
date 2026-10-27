@@ -220,7 +220,6 @@ pub fn step_verify_k3(
         sched.levers.dflash_masked_verify,
         model,
         a,
-        &result_vec,
     );
     let Ok(scored) =
         super::verify_pipeline_helper::scored::requested(model, 3, a, verify_ctx, 0, None)

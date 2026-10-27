@@ -45,7 +45,7 @@ fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
     };
 
     for (key, prop) in props {
-        let Some(ty) = super::validation::resolve_schema_type(prop) else {
+        let Some(val) = obj.get_mut(key) else {
             continue;
         };
         // Poolside emits JSON null as the same raw text as a string "null".

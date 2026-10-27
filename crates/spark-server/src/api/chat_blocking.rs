@@ -223,8 +223,13 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
-        let (reasoning_content_i, output_text_i) =
-            decode_response_text(&state, &response, enable_thinking, tools_active);
+        let (reasoning_content_i, output_text_i) = decode_response_text(
+            &state,
+            &response,
+            enable_thinking,
+            force_nonempty_content,
+            tools_active,
+        );
         let (output_text_i, matched_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
 
@@ -273,6 +278,7 @@ pub(super) fn decode_response_text(
     state: &AppState,
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
+    force_nonempty_content: bool,
     tools_active: bool,
 ) -> (Option<String>, String) {
     let output_tokens =

@@ -193,6 +193,7 @@ macro_rules! test_request {
             logit_bias: vec![],
             stop_tokens: vec![],
             enable_thinking: false,
+            force_nonempty_content: false,
             thinking_budget: None,
             repetition_detection: None,
             require_tool_call: false,

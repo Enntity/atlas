@@ -72,6 +72,7 @@ fn glm_literal_xml_reasoning_matches_blocking_through_end_and_done() {
                             &state,
                             &response(tokens.clone()),
                             true,
+                            false,
                             tools,
                         );
                     let deltas = finish(tools, &tokens, reason);

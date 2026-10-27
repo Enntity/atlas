@@ -46,6 +46,7 @@ mod logprobs;
 pub mod loop_steer;
 mod min_tokens_ban;
 mod mod_helpers;
+mod tool_markers;
 pub use mod_helpers::capture_runtime_handle;
 pub mod dumps;
 pub mod levers;

@@ -170,6 +170,8 @@ pub(crate) fn load_model(
     let vision_max_pixels = resolve_vision_max_pixels(&args, image.map(|d| d.max_pixels))?;
     if let Some(v) = config.vision.as_mut() {
         v.max_pixels = vision_max_pixels;
+        v.is_qwen3vl_video =
+            super::vision_processor::read_is_qwen3vl_video(&model_dir).unwrap_or_default();
         if v.is_glm5_next {
             v.token_budgets = read_glm_token_budgets(&model_dir);
         }

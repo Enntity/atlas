@@ -353,6 +353,7 @@ pub(crate) async fn chat_completions_inner(
         prompt_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
         repeat_run,
     } = match prepared {
         Ok(p) => p,

@@ -10,7 +10,6 @@ mod load;
 mod qwen_vision;
 mod vision_markup;
 
-mod glm5_vision;
 mod qwen3vl_vision;
 
 use super::{

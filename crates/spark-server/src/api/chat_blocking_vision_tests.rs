@@ -144,6 +144,7 @@ async fn blocking_choices_each_receive_vision_and_share_admission() {
         stop_tokens: vec![],
         enable_thinking: false,
         thinking_budget: None,
+        force_nonempty_content: false,
         tools_active: false,
         tool_choice_required: false,
         suppress_tool_call: false,

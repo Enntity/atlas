@@ -38,6 +38,7 @@ pub(crate) struct PreparedChat {
     pub(crate) prompt_tokens: Vec<u32>,
     pub(crate) enable_thinking: bool,
     pub(crate) thinking_budget: Option<u32>,
+    pub(crate) force_nonempty_content: bool,
     /// Trailing run of identical tool rounds
     /// ([`crate::hint_injector::identical_tool_round_run`]); 0 without tools.
     pub(crate) repeat_run: usize,
@@ -179,6 +180,7 @@ pub(crate) fn prepare_chat_prompt(
     }
     let gen_max =
         thinking::generation_max_tokens(req.max_tokens, tools_active, state.tool_max_tokens);
+    let force_nonempty_content = req.force_nonempty_content;
     let (enable_thinking, mut thinking_budget) =
         thinking::resolve_thinking(state, thinking_directive, gen_max as u32, tools_active);
     // Escalate a server-chosen budget for the repeat turn (an explicit
@@ -244,6 +246,7 @@ pub(crate) fn prepare_chat_prompt(
         prompt_tokens,
         enable_thinking,
         thinking_budget,
+        force_nonempty_content,
         repeat_run,
     })
 }
