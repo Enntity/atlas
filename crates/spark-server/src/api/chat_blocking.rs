@@ -141,7 +141,9 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             // ride on choice 0's leftover encoder rows; since the per-request
             // vision state is cleared for a request without media (#174),
             // they would answer about nothing (vision-fidelity
-            // `multi-choice-image`).
+            // `multi-choice-image`). Each scheduler request carries its media
+            // so prefill can prepare vision state after shared encoder buffers
+            // have been reused.
             image_pixels: image_pixels.clone(),
             max_tokens,
             min_tokens: req.min_tokens,

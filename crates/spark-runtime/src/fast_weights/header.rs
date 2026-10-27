@@ -155,6 +155,9 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
             }
             // Every other dtype maps exactly as on the buffered and RDMA paths:
             // one table (`from_safetensors_str`), so the loaders cannot drift.
+            "U16" | "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
+                (WeightDtype::UInt8, false)
+            }
             other => (
                 WeightDtype::from_safetensors_str(other)
                     .with_context(|| format!("tensor {name}"))?,

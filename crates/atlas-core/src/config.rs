@@ -728,8 +728,9 @@ pub struct QuantizationConfig {
 }
 
 /// One `quantized_layers` entry: the algorithm applied to that module path
-/// (`"NVFP4"`, `"FP8"`, `"FP8_PB_WO"`, …) plus its scaling group when given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// (`"NVFP4"`, `"MXFP8"`, `"W4A16_NVFP4"`, `"FP8_PB_WO"`, …) plus its scaling
+/// group when given.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct QuantLayerSpec {
     pub quant_algo: String,
     pub group_size: usize,
