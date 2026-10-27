@@ -457,7 +457,8 @@ fn the_fp4_local_config_parses_to_the_same_architecture() {
         q.quantized_layers
             .values()
             .filter(|s| {
-                s.quant_algo == algo && s.weight_scale_encoding.as_deref().unwrap_or_default() == enc
+                s.quant_algo == algo
+                    && s.weight_scale_encoding.as_deref().unwrap_or_default() == enc
             })
             .count()
     };

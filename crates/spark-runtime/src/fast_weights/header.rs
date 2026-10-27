@@ -39,6 +39,7 @@ pub(super) struct TensorMeta {
 /// `tensors/model-000NN-of-00021.safetensors`), and a bare-name comparison then
 /// matches nothing — every shard "loads" zero tensors and the build fails far
 /// from the cause, on a missing embedding.
+#[cfg(test)]
 pub(super) fn tensors_routed_to(
     map: &HashMap<String, String>,
     model_dir: &Path,
