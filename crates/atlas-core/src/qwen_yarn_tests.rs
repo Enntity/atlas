@@ -81,7 +81,7 @@ fn rank_agreement_uses_effective_scaling() {
 fn frequency_table_is_within_two_ulps_of_float32_reference() {
     // Float32 translation of Hugging Face modeling_rope_utils.compute_yarn_parameters:
     // https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py
-    // theta**(arange(0,64,2)/64), inverse native/interpolated frequencies,
+    // theta**(range(0,64,2)/64), inverse native/interpolated frequencies,
     // then the [14,22] ramp blend, with every intermediate rounded to F32.
     // Rust uses F64 intermediates; this checks numerical proximity, not bit equality.
     let tables = [
