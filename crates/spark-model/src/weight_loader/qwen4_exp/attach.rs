@@ -55,7 +55,7 @@ pub(super) fn attach_qsa(
         let index_qk = crate::weight_map::dense_auto(store, &qk_name, gpu)
             .with_context(|| format!("qwen4_exp layer {i}: indexer {qk_name}"))?
             .weight;
-        let qsa = crate::layers::qsa::QsaIndexer::new(
+        let mut qsa = crate::layers::qsa::QsaIndexer::new(
             index_qk,
             up("q_layernorm.weight")?,
             up("k_layernorm.weight")?,
@@ -76,11 +76,13 @@ pub(super) fn attach_qsa(
         let any = layer
             .as_any_mut()
             .ok_or_else(|| anyhow::anyhow!("qwen4_exp layer {i}: no as_any_mut for QSA"))?;
-        any.downcast_mut::<crate::layers::Qwen3AttentionLayer>()
+        let attention = any
+            .downcast_mut::<crate::layers::Qwen3AttentionLayer>()
             .ok_or_else(|| {
                 anyhow::anyhow!("qwen4_exp layer {i}: indexer on a non-attention layer")
-            })?
-            .set_qsa(qsa);
+            })?;
+        qsa.set_yarn_rope(attention.yarn_inv_freq, config.yarn_attention_factor, gpu)?;
+        attention.set_qsa(qsa);
     }
     Ok(())
 }

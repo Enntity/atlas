@@ -129,7 +129,7 @@ impl Qwen3AttentionLayer {
         // Only these targets ship native MXFP8 projection kernels.
         let glm_target = config.model_type == "glm5_next";
         let native_mxfp8 = glm_target || config.model_type == "qwen4_exp";
-        let layer = Self {
+        let mut layer = Self {
             input_norm,
             attn,
             post_attn_norm,
@@ -358,6 +358,7 @@ impl Qwen3AttentionLayer {
             ),
             rope_yarn_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn"),
             rope_yarn_scaled_k: super::super::try_kernel(gpu, "rope", "rope_forward_yarn_scaled"),
+            rope_yarn_mrope_k: spark_runtime::gpu::KernelHandle(0),
             // Interleaved (GPT-J / is_neox_style=False) YaRN RoPE — DeepSeek-V4 MLA.
             rope_yarn_interleaved_k: super::super::try_kernel(
                 gpu,
@@ -915,6 +916,7 @@ impl Qwen3AttentionLayer {
                 None
             },
         };
+        layer.configure_qwen_yarn(config, gpu)?;
         if independent {
             layer.validate_independent_kernels()?;
         }
