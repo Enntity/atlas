@@ -117,9 +117,6 @@ dispatch2 = { version = "0.3", optional = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 
-[dev-dependencies]
-sha2 = { workspace = true }
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
