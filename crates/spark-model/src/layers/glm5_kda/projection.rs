@@ -9,6 +9,8 @@ use crate::layers::ops;
 use crate::weight_map::{DenseWeight, QuantizedWeight};
 #[path = "projection_fp8.rs"]
 mod fp8;
+#[path = "projection_mx.rs"]
+mod mx;
 
 /// Balanced `(first_row, rows)` chunks of at most the batch-M GEMV cap, so an
 /// owner-batched verify of `m > 8` rows reuses the exact short-batch kernels.
@@ -37,6 +39,13 @@ pub struct Glm5Projection {
     pub nvfp4: QuantizedWeight,
     /// Optional `[K/2, N]` twin for Atlas' tensor-core prefill GEMMs.
     pub prefill_nvfp4_t: Option<QuantizedWeight>,
+    /// The checkpoint's MXFP8 bytes as this rank's twin, which then serves
+    /// every decode and verify row (`ATLAS_GLM_FP4L_KDA_MXFP8_DECODE`,
+    /// `projection_mx.rs`).
+    pub mxfp8: Option<crate::weight_map::Mxfp8Weight>,
+    /// The checkpoint's MXFP8 bytes as the W8A8 prefill operand, which then
+    /// serves every prefill row (`ATLAS_GLM_FP4L_KDA_W8A8_PREFILL`).
+    pub w8a8: Option<ops::MxW8a8>,
 }
 
 pub struct Glm5KdaWeights {
@@ -53,6 +62,13 @@ pub struct Glm5KdaWeights {
     pub dt_bias: DenseWeight,
     pub o_norm: DenseWeight,
     pub o_proj: Glm5Projection,
+    /// The whole o_proj over every rank's heads, for this rank's rows
+    /// (`ATLAS_GLM_SP_KDA_OPROJ_A2A`, `sp_oproj_a2a.rs`).
+    pub o_proj_full: Option<ops::MxW8a8>,
+    /// The whole b_proj (every rank's heads), for the quantized gather's
+    /// beta of this rank's rows (`ATLAS_GLM_SP_KDA_QUANT_GATHER`,
+    /// `sp_quant_gather.rs`).
+    pub b_proj_full: Option<DenseWeight>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +80,25 @@ pub(super) enum ProjectionPath {
 
 impl ProjectionPath {
     pub(super) fn for_forward(decode: bool, has_transposed: bool, tokens: u32) -> Self {
+        Self::for_forward_pinned(
+            decode,
+            has_transposed,
+            tokens,
+            crate::layers::glm_packed_scope::active(),
+        )
+    }
+
+    /// `packed` (`glm_packed_scope`): the transposed M128 tiles at every row
+    /// count when present, so the family does not depend on the pass height.
+    pub(super) fn for_forward_pinned(
+        decode: bool,
+        has_transposed: bool,
+        tokens: u32,
+        packed: bool,
+    ) -> Self {
         if decode {
             Self::DecodeGemv
-        } else if has_transposed && tokens > 128 {
+        } else if has_transposed && (tokens > 128 || packed) {
             Self::PrefillTransposedM128
         } else {
             Self::PrefillBase
@@ -116,6 +148,9 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
         if crate::layers::canonical_verify::enabled() {
             // One tensor-core family for every row count (1..=32).
             return crate::layers::canonical_verify::w4a16(
@@ -232,6 +267,9 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        if self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(());
+        }
         // ATLAS_GLM_DECODE_GEMV_BATCH: the same bodies behind a weight touch.
         let tier = self.w4a16_gemv_batchm.kernel(m);
         let nvfp4 = &weight.nvfp4;
@@ -341,8 +379,17 @@ impl Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
+        if decode && self.try_project_mxfp8(input, weight, output, m, n, k, ctx, stream)? {
+            return Ok(false);
+        }
+        if !decode && self.try_project_w8a8(input, weight, output, m, n, k, cast, ctx, stream)? {
+            // `input`'s MXFP8 image stays in the scratch for the next
+            // projection of the same rows (`cast` false reuses it).
+            return Ok(true);
+        }
         if !decode
             && m >= 2048
+            && !crate::layers::glm_packed_scope::active()
             && fp8::try_project(
                 ctx.gpu,
                 input,
@@ -467,6 +514,26 @@ mod tests {
         );
     }
 
+    /// A packed prefill keeps one family at every row count.
+    #[test]
+    fn packed_prefill_pins_the_transposed_tiles() {
+        for tokens in [2, 50, 128, 129, 4096] {
+            assert_eq!(
+                ProjectionPath::for_forward_pinned(false, true, tokens, true),
+                ProjectionPath::PrefillTransposedM128,
+                "{tokens}"
+            );
+            assert_eq!(
+                ProjectionPath::for_forward_pinned(false, false, tokens, true),
+                ProjectionPath::PrefillBase
+            );
+        }
+        assert_eq!(
+            ProjectionPath::for_forward_pinned(true, true, 1, true),
+            ProjectionPath::DecodeGemv
+        );
+    }
+
     #[test]
     fn glm_kda_dense_takes_cutlass_only_for_short_k_in_whole_k16_steps() {
         // f_b / g_b (K = dim = 128) on CUTLASS rows.
@@ -491,5 +558,21 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "projection_row_tests.rs"]
-mod verify_row_chunk_tests;
+mod verify_row_chunk_tests {
+    use super::verify_row_chunks;
+
+    #[test]
+    fn verify_row_chunks_cover_rows_within_the_kernel_cap() {
+        for m in 9..=96u32 {
+            let chunks: Vec<_> = verify_row_chunks(m).collect();
+            let mut next = 0;
+            for &(start, rows) in &chunks {
+                assert_eq!(start, next, "m={m} chunks must be contiguous");
+                assert!((2..=8).contains(&rows), "m={m} chunk of {rows} rows");
+                next += rows;
+            }
+            assert_eq!(next, m, "m={m} chunks must cover every row");
+        }
+        assert_eq!(verify_row_chunks(12).collect::<Vec<_>>(), [(0, 6), (6, 6)]);
+    }
+}

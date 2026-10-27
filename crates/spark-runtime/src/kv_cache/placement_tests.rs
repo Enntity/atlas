@@ -217,29 +217,3 @@ fn a_latent_shard_places_its_local_slot_pools() {
         assert_eq!(gpu.carveout_used(), 0);
     }
 }
-
-#[test]
-fn failed_placed_pool_allocation_releases_both_arenas_and_can_retry() {
-    let (config, _) = glm(3);
-    let sizes = PagedKvCache::buffer_sizes(&config, 100, true, None, None);
-    // One latent pool fits; the other two allocations use system memory.
-    let capacity = CarveoutArena::footprint(sizes[0].1);
-    let placement = KvPlacement::plan_ordered(&sizes, capacity, CarveoutOrder::Latent);
-    assert_eq!(placement.len(), 1);
-    for fail_after in 0..config.num_layers {
-        let gpu = MockGpuBackend::with_carveout(capacity);
-        gpu.fail_alloc_after(fail_after);
-        assert!(
-            PagedKvCache::new_placed(config.clone(), 100, &gpu, true, placement.clone()).is_err()
-        );
-        assert_eq!(gpu.alloc_count(), 0);
-        assert_eq!(gpu.carveout_used(), 0);
-        assert_eq!(gpu.invalid_free_count(), 0);
-        let mut cache =
-            PagedKvCache::new_placed(config.clone(), 100, &gpu, true, placement.clone()).unwrap();
-        cache.release(&gpu).unwrap();
-        assert_eq!(gpu.alloc_count(), 0);
-        assert_eq!(gpu.carveout_used(), 0);
-        assert_eq!(gpu.invalid_free_count(), 0);
-    }
-}

@@ -40,8 +40,11 @@ fn checked_output(
     owner: DevicePtr,
     capacity: usize,
 ) -> Result<usize> {
-    let (pn, pk, _) = projection.geometry();
-    anyhow::ensure!((n, k) == (pn, pk), "GLM shared M16 projection geometry");
+    let (projection_n, projection_k, _) = projection.geometry();
+    anyhow::ensure!(
+        (n, k) == (projection_n, projection_k),
+        "GLM shared M16 projection geometry"
+    );
     let bytes = 5 * n as usize * 2;
     anyhow::ensure!(
         output == owner && capacity >= bytes,
@@ -87,7 +90,7 @@ impl MoeLayer {
             fp8_cache: self.shared_gate_fp8.is_some()
                 || self.shared_up_fp8.is_some()
                 || self.shared_down_fp8.is_some(),
-            bf16_override: self.separate_shared_expert.is_some(),
+            bf16_override: self.bf16_shared_expert.is_some(),
             // Hook is after the earlier exact-M5 GEMV arm returned.
             exact_gemv: false,
         };

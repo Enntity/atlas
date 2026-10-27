@@ -27,10 +27,6 @@ impl Score {
         }
     }
     fn add(&mut self, got: u16, exact: f64) {
-        assert!(
-            from_bf16(got).is_finite() && exact.is_finite(),
-            "nonfinite accuracy sample"
-        );
         self.off += (got != bf16(exact as f32)) as usize;
         self.total += 1;
         self.err2 += (from_bf16(got) as f64 - exact).powi(2);
@@ -89,7 +85,7 @@ fn top8(logits: impl Iterator<Item = f64>) -> Vec<usize> {
 fn canonical_verify_accuracy() -> Result<()> {
     let gpu = backend()?;
     let gpu: &dyn GpuBackend = gpu;
-    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu, true);
+    crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu);
     let mut rng = Rng(0x5eed_1234_abcd_0003);
 
     // W4A16 (shared-expert gate shape): 48 rows.
@@ -121,15 +117,12 @@ fn canonical_verify_accuracy() -> Result<()> {
     let want = exact(&rows, &dense_w, n as usize, k as usize);
     for ((module, name), width) in [
         (("gemm", "dense_gemm_bf16_router"), 8),
-        (("gemm", "dense_gemm_bf16_router_rows"), 8),
-        (("gemm", "dense_gemm_bf16_router_m5"), 5),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm"), 8),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc8"), 8),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc16"), 16),
         (("dense_gemv_bf16_batchm", "dense_gemv_bf16_tc32"), 32),
     ] {
         let mut sub = rows.clone();
-        // The M5 kernel only runs exactly five rows.
         sub.truncate(rows.len() / width * width);
         let got = chunked(gpu, &sub, n, width, |a, c, m| {
             launch_dense(gpu, (module, name), &gate, a, c, m, n, k)

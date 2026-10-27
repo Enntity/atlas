@@ -303,37 +303,6 @@ fn assembler_refuses_lone_duplicate_and_mistyped_halves() {
     assert!(a.offer("x.weight_scale", &[1], &[0]).is_err());
 }
 
-#[test]
-fn assembler_refuses_components_after_the_scale_is_complete() {
-    let g = golden().remove(0);
-    for deferred in [false, true] {
-        let mut a = CsfAssembler::new();
-        for (name, shape, bytes) in [
-            (
-                "x.weight_scale.nvfp4_csf_fixed",
-                g.fixed_shape.clone(),
-                g.fixed.as_slice(),
-            ),
-            (
-                "x.weight_scale.nvfp4_csf_exceptions",
-                vec![g.exceptions.len() / 4],
-                g.exceptions.as_slice(),
-            ),
-        ] {
-            if deferred {
-                a.defer(name, &shape, bytes.len()).unwrap();
-            } else {
-                a.offer(name, &shape, bytes).unwrap();
-            }
-        }
-        assert!(
-            a.offer("x.weight_scale.nvfp4_csf_fixed", &g.fixed_shape, &g.fixed)
-                .is_err()
-        );
-        assert!(a.offer("x.weight_scale.csf32_bases", &[1], &[0]).is_err());
-    }
-}
-
 /// Shapes come from a file header: every size computed from them must be
 /// checked, or a hostile header wraps in release builds (or panics in debug)
 /// instead of being refused.

@@ -29,23 +29,6 @@ pub struct Mxfp8Weight {
     pub tiled: bool,
 }
 
-/// An MXFP8 projection with its geometry: `out = act @ W^T`, `W` `[n, k]`.
-#[derive(Debug, Clone, Copy)]
-pub struct Mxfp8Proj {
-    pub w: Mxfp8Weight,
-    /// Output features (weight rows).
-    pub n: u32,
-    /// Input features; a multiple of 32.
-    pub k: u32,
-}
-
-impl Mxfp8Proj {
-    /// Bytes of the exact BF16 expansion a prefill GEMM multiplies by.
-    pub fn bf16_bytes(&self) -> usize {
-        self.n as usize * self.k as usize * 2
-    }
-}
-
 /// E8M0 exponents whose scale keeps EVERY E4M3 value exact in BF16.
 ///
 /// E4M3 values are multiples of 2^-9 with at most 4 significant bits, up to
@@ -145,16 +128,9 @@ pub fn dequant_mxfp8_to_bf16(gpu: &dyn GpuBackend, src: &RawMxfp8) -> Result<Den
     let mult = mxfp8_scales_f32(&e8m0)?;
     let mult_bytes: Vec<u8> = mult.iter().flat_map(|f| f.to_le_bytes()).collect();
     let scale_f32 = gpu.alloc(mult_bytes.len())?;
-    let out = match gpu
-        .copy_h2d(&mult_bytes, scale_f32)
-        .and_then(|()| gpu.alloc(n * k * 2))
-    {
-        Ok(out) => out,
-        Err(error) => {
-            let _ = gpu.free(scale_f32);
-            return Err(error.context("preparing MXFP8 expansion buffers"));
-        }
-    };
+    gpu.copy_h2d(&mult_bytes, scale_f32)?;
+
+    let out = gpu.alloc(n * k * 2)?;
     let stream = gpu.default_stream();
     let launched = gpu
         .kernel(
@@ -179,14 +155,10 @@ pub fn dequant_mxfp8_to_bf16(gpu: &dyn GpuBackend, src: &RawMxfp8) -> Result<Den
         .and_then(|()| gpu.synchronize(stream));
     // The widened scales are dead once the kernel has run (synchronized
     // above), and are freed on the error path too.
-    let released = gpu.free(scale_f32);
+    gpu.free(scale_f32)?;
     if let Err(e) = launched {
         let _ = gpu.free(out);
         return Err(e.context(format!("MXFP8 -> BF16 dequant [{n}, {k}]")));
-    }
-    if let Err(error) = released {
-        let _ = gpu.free(out);
-        return Err(error.context("releasing MXFP8 expansion scales"));
     }
     Ok(DenseWeight { weight: out })
 }

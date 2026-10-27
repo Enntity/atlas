@@ -45,7 +45,6 @@ fn up(g: &dyn GpuBackend, d: &[f32]) -> DevicePtr {
 fn down(g: &dyn GpuBackend, p: DevicePtr, n: usize) -> Vec<u32> {
     let mut b = vec![0u8; n * 4];
     g.copy_d2h(p, &mut b).unwrap();
-    crate::layers::glm_gpu_test_backend::finite_f32("KDA committed state", &b).unwrap();
     b.chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
@@ -153,15 +152,17 @@ fn setup(g: &dyn GpuBackend, p: &Pools) -> (DevicePtr, DevicePtr) {
     (up(g, &p.state), up(g, &p.records))
 }
 
-fn backend() -> &'static spark_runtime::cuda_backend::AtlasCudaBackend {
-    crate::layers::glm_gpu_test_backend::backend().expect("GLM GPU test backend")
+fn backend() -> spark_runtime::cuda_backend::AtlasCudaBackend {
+    let set = atlas_kernels::ptx_for_exact_target("glm-5.3-flash", "nvfp4")
+        .expect("glm-5.3-flash/nvfp4 not in this build");
+    spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend")
 }
 
 #[test]
 #[ignore]
 fn kda_commit_layer_batched_byte_identical() {
     let gpu = backend();
-    let g: &dyn GpuBackend = gpu;
+    let g: &dyn GpuBackend = &gpu;
     // Slot 2 is a spare no owner commits; owner ranges cover none, one row,
     // a leaf-split tail and the full verify.
     let owners: [(usize, std::ops::Range<usize>); 4] =
@@ -211,7 +212,7 @@ fn kda_commit_layer_batched_byte_identical() {
 #[ignore]
 fn kda_commit_layer_batched_timing() {
     let gpu = backend();
-    let g: &dyn GpuBackend = gpu;
+    let g: &dyn GpuBackend = &gpu;
     let p = Pools::new(34, 5, 7);
     let (state, records) = setup(g, &p);
     let dev = Dev {
@@ -265,7 +266,7 @@ fn kda_commit_layer_batched_timing() {
 #[ignore]
 fn kda_commit_beside_a_copy_timing() {
     let gpu = backend();
-    let g: &dyn GpuBackend = gpu;
+    let g: &dyn GpuBackend = &gpu;
     let p = Pools::new(34, 1, 11);
     let (state, records) = setup(g, &p);
     let side = g.create_stream().unwrap();

@@ -151,8 +151,8 @@ count -> 4): 1 row 47 -> 72, 2: 49 -> 74, 3: 56 -> 74, 4: 64 -> 76,
 The canonical form is on by default and needs nothing from the shard: a GLM
 pair (`tp_world_size == 2`) with 32 heads per rank. `ATLAS_GLM_KV_CANONICAL=0`
 restores the earlier unsharded kernels (the verify split over the whole
-selection, the unsplit TC kernel, the dense BF16 kernel, the native sparse
-prefill path), whose bits differ from the shard's. Its scratch is the MoE expert scratch
+selection, the unsplit TC kernel, the dense BF16 kernel, the native bridge),
+whose bits differ from the shard's. Its scratch is the MoE expert scratch
 past 64 KiB (the dense decode row's causal ids sit before it); an arena too
 small for an owner (at most ~31 MiB at 64 rows) logs once and keeps the
 earlier kernels for it. The kernels are loaded and run once on zero rows at
@@ -387,15 +387,17 @@ it hides behind — roughly 0.4-0.7 ms per 8-row step.
 The fork-only GB10 display carveout (`spark display-carveout`,
 `factory::build::kv_carveout`) lends ~2 GiB of device memory outside the
 system pool and moves whole per-layer KV buffers into it; with
-`ATLAS_KV_CARVEOUT_ORDER=latent` (the default) only latent pools go there,
-because the carveout is not cached in L2 and the latent pools are read only
-at the selected rows. Under the shard each rank's latent pool of layer `l`
-holds `ceil(N / 2)` slots (`PagedKvCache::buffer_sizes_with_k_slots`), and
-the shard's scratch allocation, which grows with the pool through its
-identity table, is counted with the system-memory bytes the plan must not
-exceed (`KvShape::side_bytes`). The plan and the agreement are otherwise the
-same: each rank plans the largest pool whose system-memory share fits what
-its budgeted pool would have used, the ranks agree on the smaller count, and
+`ATLAS_KV_CARVEOUT_ORDER=latent` (the default) only latent pools go there.
+(That order dates from the L2-uncached memory-list export; the carveout is
+now allocated GPU-cacheable from the driver's scanout heap, and under the
+shard the latent pools fill it anyway.) Under the shard each rank's latent
+pool of layer `l` holds `ceil(N / 2)` slots
+(`PagedKvCache::buffer_sizes_with_k_slots`), and the shard's scratch
+allocation, which grows with the pool through its identity table, is counted
+with the system-memory bytes the plan must not exceed
+(`KvShape::side_bytes`). The plan and the agreement are otherwise the same:
+each rank plans the largest pool whose system-memory share fits what its
+budgeted pool would have used, the ranks agree on the smaller count, and
 `PagedKvCache::new_latent_sharded_placed` allocates the placed pools from
 the carveout. Both ranks size identical buffers (a shard's latents differ
 between ranks, its pool sizes do not), so they plan the same count.
@@ -431,11 +433,11 @@ None of it is measured on hardware yet.
   view-form owner hands the unchanged kernels its assembled history and the
   identity table where they took the pool and the sequence's table
   (`glm_owner_latents`). Under the pipe a sparse owner gets no BF16 view
-  unless the native sparse prefill path admits it, so the pipelined kernel
-  reads the assembled `fp8_g128` view directly; a BF16 view, when wanted,
-  is dequantized from the assembled view. The native sparse prefill path
-  requires a BF16 view for sharded latents. Merge-form owners never build
-  a view and always run the `*_kv_pad_split` kernels.
+  unless the native library admits it, so the pipelined kernel reads the
+  assembled `fp8_g128` view directly; a BF16 view, when wanted, is
+  dequantized from the assembled view. The native bridge is refused for
+  sharded latents without a BF16 view. Merge-form owners never build a view
+  and always run the `*_kv_pad_split` kernels.
 - **KV write floor.** The floored cache write maps only the written rows'
   slots (`joint.slot + floor`) to local slots. Rows below the floor sit in
   blocks a prefix match adopted at their own logical index, whose latents
@@ -493,6 +495,36 @@ owners take the tensor-core split kernel over causal ids instead of the BF16
 dense kernel. Prompt-logprob and greedy-text references taken on the older
 unsharded engine change once, to the shard's new values.
 
+## Beyond the pair: the TP4 chain
+
+On four ranks (`--world-size 4 --tp-size 4` over the RDMA chain) block `l` is
+stored by rank `l % 4` (the same allocator and device rule at `world` 4) and
+each rank holds 16 of the 64 heads. The pair's swaps become the chain's
+in-place all-gather (`CommBackend::gather_async`, `glm_kv_shard::gather`;
+`paged_glm_shard_chain.rs`):
+
+- **Merge form**: the ranks gather their heads' absorbed queries
+  (`rows x 16 x 512` BF16 each); each rank regroups them into the pair's two
+  32-head groups and runs the same paired counted split over the tokens it
+  stores (all 64 heads, the pair's kernel work), merges each group's
+  partitions to one FP32 partial + LSE (`_f32`), and the ranks gather those
+  (`rows x 64 x 513 x 4` bytes each). Each rank then merges its 16 heads'
+  partial from every rank as the 4 partitions of one exact LSE merge to BF16.
+  Its bits are not TP2's (a different merge tree), and there is no canonical
+  form beyond the pair; GPU test `chain_shard_merge_matches_attention` holds
+  every rank's heads to double-precision softmax attention (worst error at
+  0.13-0.20 of the pair test's tolerance), including rows one rank stores
+  none of.
+- **View form**: the ranks gather their history blocks in logical order in
+  rounds of 1,024 per rank; rank `o`'s `k`-th is logical block `o + 4k`
+  (`chain_shard_view_assembles_the_history`: bitwise).
+- The table check gathers every rank's 8-byte verdict.
+
+Per MLA layer a verify owner gathers `rows x 16 KiB` of queries and
+`rows x 131 KiB` of partials per rank (the latter carries all 64 heads, of
+which each receiver keeps 16). Graphs stay off under the shard, as on the
+pair.
+
 ## Supported / not supported
 
 Supported (implemented): prefill chunks (incl. sequence-parallel prefill,
@@ -509,8 +541,10 @@ from its peer's, a shard variable that is not 0 or 1, a tuning or the check
 without the shard, the environment lanes listed under "Startup refusals"
 (multi-sequence sparse decode, the repaired MTP, C4 and independent decode
 lanes, the long-verify serial diagnostic), `--high-speed-swap`, a world
-other than a TP2 pair with 32 heads per rank, a latent dtype other than BF16
-or `fp8_g128`.
+other than a TP2 pair with 32 heads per rank or a TP4 chain with 16, a latent
+dtype other than BF16 or `fp8_g128`; beyond the pair also the overlap, which
+is the pair's. The NVMe tier supports TP2 and TP4 with one record class per
+rank: own latent-plus-index records and index-only records for every peer.
 
 Not supported and not selected by a variable a shard could refuse (the
 production profile sets `ATLAS_GLM_MLA_MULTI_SEQ=1`), so still failing closed

@@ -104,8 +104,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
             QuantLayerSpec {
                 quant_algo: "NVFP4".into(),
                 group_size: 16,
-                weight_scale_encoding: None,
-                weight_block_size: vec![],
+                weight_scale_encoding: String::new(),
             },
         );
     }
@@ -114,8 +113,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
         QuantLayerSpec {
             quant_algo: "FP8_PB_WO".into(),
             group_size: 128,
-            weight_scale_encoding: None,
-            weight_block_size: vec![],
+            weight_scale_encoding: String::new(),
         },
     );
     map.insert(
@@ -123,8 +121,7 @@ fn mixed_precision_map_resolves_standard_despite_mtp_scale_inv() {
         QuantLayerSpec {
             quant_algo: "FP8".into(),
             group_size: 0,
-            weight_scale_encoding: None,
-            weight_block_size: vec![],
+            weight_scale_encoding: String::new(),
         },
     );
     cfg.quantization_config = Some(QuantizationConfig {
@@ -171,8 +168,7 @@ fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
                 QuantLayerSpec {
                     quant_algo: "FP8".into(),
                     group_size: 128,
-                    weight_scale_encoding: None,
-                    weight_block_size: vec![],
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -182,8 +178,7 @@ fn mixed_precision_fp8_attn_nvfp4_mlp_resolves_standard() {
                 QuantLayerSpec {
                     quant_algo: "NVFP4".into(),
                     group_size: 16,
-                    weight_scale_encoding: None,
-                    weight_block_size: vec![],
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -227,8 +222,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
                 QuantLayerSpec {
                     quant_algo: "FP8".into(),
                     group_size: 128,
-                    weight_scale_encoding: None,
-                    weight_block_size: vec![],
+                    weight_scale_encoding: String::new(),
                 },
             );
         }
@@ -237,8 +231,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
             QuantLayerSpec {
                 quant_algo: "W4A16_NVFP4".into(),
                 group_size: 16,
-                weight_scale_encoding: None,
-                weight_block_size: vec![],
+                weight_scale_encoding: String::new(),
             },
         );
         for proj in ["gate_proj", "up_proj", "down_proj"] {
@@ -247,8 +240,7 @@ fn mixed_precision_w4a16_nvfp4_labels_resolve_standard() {
                 QuantLayerSpec {
                     quant_algo: "W4A16_NVFP4".into(),
                     group_size: 16,
-                    weight_scale_encoding: None,
-                    weight_block_size: vec![],
+                    weight_scale_encoding: String::new(),
                 },
             );
         }

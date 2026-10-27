@@ -44,6 +44,7 @@ mod lm_head_dp4a;
 mod meta;
 mod meta_argmax;
 mod mtp_stream_rows;
+mod native_mtp_context;
 mod prefill_a;
 pub(in crate::model) mod prefill_b;
 mod prefill_c;
@@ -69,6 +70,23 @@ impl Model for TransformerModel {
         self.glm_verify_logits_argmax_only()
     }
 
+    fn verify_split_sampling(&self) -> bool {
+        self.glm_verify_sample_supported()
+    }
+
+    fn verify_split_candidates(
+        &self,
+        rows: usize,
+        temperature: f32,
+        specials: &[u32],
+    ) -> Result<Vec<crate::model::SplitRow>> {
+        self.glm_verify_candidates(rows, temperature, specials)
+    }
+
+    fn verify_split_full_rows(&self, rows: usize, out: &mut [u8]) -> Result<()> {
+        self.glm_verify_full_rows(rows, out)
+    }
+
     fn lightning_dspark_product_policy(
         &self,
     ) -> Option<&crate::layers::dflash_head::LightningDsparkProductPolicy> {
@@ -90,8 +108,26 @@ impl Model for TransformerModel {
         }
     }
 
-    fn prepare_vision_embed(&self, images: &[crate::VisionItem]) -> Result<()> {
-        self.prepare_vision_embed_dispatch(images)
+    fn prepare_vision_embed(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_dispatch(seq, images)
+    }
+    fn vision_row_limits(&self) -> (usize, usize) {
+        let b = self.vision_row_bounds();
+        (b.window, b.request)
+    }
+    fn prepare_vision_embed_for_chunked(
+        &self,
+        seq: &mut SequenceState,
+        images: Vec<crate::VisionItem>,
+    ) -> Result<()> {
+        self.prepare_vision_embed_deferred_dispatch(seq, images)
+    }
+    fn stage_vision_grids(&self, seq: &mut SequenceState, images: &[crate::VisionItem]) {
+        self.stage_vision_grids_dispatch(seq, images);
     }
     fn prepare_vision_embed_batched(
         &self,
@@ -101,15 +137,17 @@ impl Model for TransformerModel {
     }
     fn set_vision_slice_base(
         &self,
+        seq: &mut SequenceState,
         row_base: usize,
         grid_base: usize,
         owned_images: usize,
         slice_rows: usize,
     ) {
-        self.set_vision_slice_base_entry(row_base, grid_base, owned_images, slice_rows);
+        Self::set_vision_slice_base_entry(seq, row_base, grid_base, owned_images, slice_rows);
     }
     fn ep_broadcast_vision_state_for_seq(
         &self,
+        seq: &SequenceState,
         seq_id: u32,
         enabled: bool,
         row_base: usize,
@@ -118,6 +156,7 @@ impl Model for TransformerModel {
         slice_rows: usize,
     ) -> Result<()> {
         self.ep_broadcast_vision_state_for_seq_dispatch(
+            seq,
             seq_id,
             enabled,
             row_base,
@@ -234,6 +273,7 @@ impl Model for TransformerModel {
             self.gpu.abort_capture_if_active(self.gpu.default_stream());
         }
         let out = r?;
+        self.try_mtp_prompt_absorb(prefill_seq, prefill_tokens, stream);
         self.try_eager_drafter_prefill(prefill_seq, prefill_is_last, stream)?;
         Ok(out)
     }
@@ -538,6 +578,16 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 2]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        if self.native_glm_mtp_enabled() {
+            let allow = self.take_verify_row_masks(2)?;
+            let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
+            anyhow::ensure!(
+                rows.len() == 2,
+                "native GLM K2 verifier returned {} rows",
+                rows.len()
+            );
+            return Ok([rows[0], rows[1]]);
+        }
         self.decode_verify_graphed_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k3(
@@ -573,6 +623,23 @@ impl Model for TransformerModel {
     }
     fn has_shared_prompt_capture(&self) -> bool {
         self.has_shared_prompt_capture_impl()
+    }
+    fn packed_prefill_admits(&self, prompt: &[u32], adapter_id: u64) -> bool {
+        self.glm_packed_admits(prompt, adapter_id)
+    }
+    fn packed_prefill_capacity(&self) -> (usize, usize) {
+        if self.glm_packed_supported() {
+            self.glm_packed_capacity()
+        } else {
+            (0, 0)
+        }
+    }
+    fn prefill_packed(
+        &self,
+        prompts: &[&[u32]],
+        seqs: &mut [&mut SequenceState],
+    ) -> Result<Vec<DevicePtr>> {
+        self.prefill_packed_impl(prompts, seqs)
     }
     fn can_fuse_glm_prefill_verify(
         &self,
@@ -705,8 +772,34 @@ impl Model for TransformerModel {
     fn select_mtp_stream_row(&self, row: usize) -> Result<()> {
         self.select_mtp_stream_row_dispatch(row)
     }
+    fn stage_mtp_absorb(
+        &self,
+        seq: &mut SequenceState,
+        row: usize,
+        accepted: &[u32],
+    ) -> Result<()> {
+        self.stage_mtp_absorb_dispatch(seq, row, accepted)
+    }
     fn save_hidden_for_mtp(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_hidden_for_mtp_dispatch(token_idx, _stream)
+    }
+    fn native_mtp_bootstrap_enabled(&self) -> bool {
+        self.native_glm_mtp_enabled()
+    }
+    fn native_mtp_enabled(&self) -> bool {
+        self.native_glm_mtp_enabled()
+    }
+    fn native_prefix_admission_blocks(
+        &self,
+        owner: &SequenceState,
+        tokens: &[u32],
+        session_hash: u64,
+        private_blocks: usize,
+    ) -> Result<Option<usize>> {
+        self.native_prefix_admission_blocks_impl(owner, tokens, session_hash, private_blocks)
+    }
+    fn save_native_mtp_prompt_hidden(&self, seq: &SequenceState) -> Result<()> {
+        self.save_native_mtp_prompt_hidden_dispatch(seq)
     }
     fn save_dflash_hidden_for_propose(&self, token_idx: usize, _stream: u64) -> Result<()> {
         self.save_dflash_hidden_dispatch(token_idx, _stream)
@@ -1037,6 +1130,25 @@ impl Model for TransformerModel {
     ) -> Result<()> {
         self.trim_proposer_state_dispatch(seq, num_accepted, _stream)
     }
+    fn repair_mtp_after_verify(
+        &self,
+        accepted_draft: u32,
+        position: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        self.repair_mtp_after_verify_dispatch(accepted_draft, position, seq, stream)
+    }
+    fn repair_mtp_after_verify_row(
+        &self,
+        accepted_draft: u32,
+        position: usize,
+        target_row: usize,
+        seq: &mut SequenceState,
+        stream: u64,
+    ) -> Result<()> {
+        self.repair_mtp_after_verify_row_dispatch(accepted_draft, position, target_row, seq, stream)
+    }
     fn compact_sequence(&self, seq: &mut SequenceState, new_slot: usize) -> Result<bool> {
         self.gdn_fuse_flush_all()?;
         self.compact_sequence_dispatch(seq, new_slot)
@@ -1098,7 +1210,8 @@ impl Model for TransformerModel {
         num_accepted: usize,
         k: usize,
     ) -> Result<()> {
-        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)
+        self.commit_accepted_prefix_dispatch(seq, num_accepted, k)?;
+        self.capture_native_mtp_committed(seq, num_accepted)
     }
     fn ep_worker_step(&self, slots: &mut [Option<SequenceState>]) -> Result<bool> {
         self.ep_worker_step_dispatch(slots)
@@ -1119,6 +1232,9 @@ impl Model for TransformerModel {
 
     fn kv_block_size(&self) -> Option<usize> {
         Some(self.kv_cache.lock().block_size())
+    }
+    fn prefill_row_multiple(&self) -> usize {
+        self.glm_sp_row_multiple()
     }
     fn pc_inflight_min_tokens(&self) -> Option<usize> {
         self.pc_inflight_min_dispatch()

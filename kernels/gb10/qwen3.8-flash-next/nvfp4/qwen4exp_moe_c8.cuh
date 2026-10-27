@@ -24,7 +24,6 @@ __device__ __forceinline__ float c8_dec_e4m3(unsigned char b) {
     *(unsigned char*)&f = b;
     return (float)f;
 }
-
 // ── plan: one block of 1024 threads ──
 // Entries ranked by (expert, q); a unit head every C8_RMAX entries of one
 // expert; shared units of C8_RMAX tokens; units placed by (rows desc, index).

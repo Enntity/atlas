@@ -141,6 +141,8 @@ impl MoeLayer {
             && self.correction_bias_dev.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
+            // Its multi-row GEMM is not the one-row GEMV; an MXFP8 one runs below.
+            && !self.has_mixed_bf16_shared_expert()
             && self.router_logits_n as usize == ctx.config.num_experts)
         {
             return Ok(false);
@@ -190,28 +192,15 @@ impl MoeLayer {
         for first in (0..num_tokens).step_by(ops::QWEN4EXP_MOE_MAX_ROWS) {
             let rows = (num_tokens - first).min(ops::QWEN4EXP_MOE_MAX_ROWS);
             let chunk_indices = indices.offset(first * top_k * 4);
-            // A checkpoint-native separate shared expert never reaches the
-            // fused kernels: NULL `_t` weights make them skip it, and the
-            // separate chain fills `shared_out` for the same rows.
-            let separate = self.has_separate_shared_expert();
-            let (sh_gate_t, sh_up_t, sh_down_t) = if separate {
-                (&null_qw, &null_qw, &null_qw)
-            } else {
-                (
-                    self.shared_gate_t.as_ref().unwrap_or(&null_qw),
-                    self.shared_up_t.as_ref().unwrap_or(&null_qw),
-                    self.shared_down_t.as_ref().unwrap_or(&null_qw),
-                )
-            };
             self.qwen4exp_fast_gate_up(
                 ctx,
                 input.offset(first * h * bf16),
                 expert_gate_out,
                 expert_up_out,
                 chunk_indices,
-                sh_gate_t,
+                self.shared_gate_t.as_ref().unwrap_or(&null_qw),
                 shared_gate_scratch,
-                sh_up_t,
+                self.shared_up_t.as_ref().unwrap_or(&null_qw),
                 shared_up_scratch,
                 rows,
                 stream,
@@ -224,13 +213,14 @@ impl MoeLayer {
                 chunk_indices,
                 shared_gate_scratch,
                 shared_up_scratch,
-                sh_down_t,
+                self.shared_down_t.as_ref().unwrap_or(&null_qw),
                 shared_out,
                 rows,
                 stream,
             )?;
-            if separate {
-                self.run_separate_shared_expert(
+            // FP4-Local's MXFP8 shared expert (no shared tables above).
+            if self.has_unfused_shared_expert() {
+                self.run_unfused_shared_expert(
                     input.offset(first * h * bf16),
                     rows as u32,
                     h as u32,
@@ -239,35 +229,19 @@ impl MoeLayer {
                     shared_up_scratch,
                     shared_out,
                     ctx,
-                    true,
                     stream,
                 )?;
             }
-            // EP fix (the `forward_row_local` contract): the shared expert is
-            // replicated on all ranks, so the pre-reduce blend takes a zero
-            // row and `forward_ep_reduce` adds `shared_out` once per row
-            // after the all-reduce. Outside EP, each row blends ITS OWN
-            // shared output (`shared_out.offset(t * h * bf16)`).
-            // The zero row may itself be NULL (`ep_blend_zero_row` under
-            // ATLAS_QWEN4EXP_DECODE_FUSE, read by the kernel as zeros), so
-            // select on EP, never on the pointer.
-            let is_ep = ctx.comm.is_some() && ctx.config.ep_world_size > 1;
-            let zero_row = if is_ep && !shared_out.is_null() {
-                Some(self.ep_blend_zero_row(ctx, stream)?)
-            } else {
-                None
-            };
             for t in 0..rows {
                 let row = first + t;
                 let output_t = ctx.buffers.moe_output().offset(row * h * bf16);
-                let shared_t = zero_row.unwrap_or_else(|| shared_out.offset(t * h * bf16));
                 ops::moe_weighted_sum_blend(
                     ctx.gpu,
                     self.moe_weighted_sum_blend,
                     output_t,
                     expert_down_out.offset(t * top_k * h * bf16),
                     weights.offset(row * top_k * 4),
-                    shared_t,
+                    shared_out.offset(t * h * bf16),
                     input.offset(row * h * bf16),
                     self.weights.shared_expert_gate.weight,
                     h as u32,
@@ -275,16 +249,16 @@ impl MoeLayer {
                     h as u32,
                     stream,
                 )?;
+                if let Some(comm) = ctx.comm
+                    && ctx.config.ep_world_size > 1
+                {
+                    if ctx.graph_capture {
+                        comm.all_reduce(output_t.0, h * 2)?;
+                    } else {
+                        comm.all_reduce_async(output_t.0, h * 2, stream)?;
+                    }
+                }
             }
-            self.forward_ep_reduce(
-                ctx.buffers.moe_output().offset(first * h * bf16),
-                shared_out,
-                input.offset(first * h * bf16),
-                rows,
-                None,
-                ctx,
-                stream,
-            )?;
         }
         Ok(true)
     }

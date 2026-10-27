@@ -64,7 +64,9 @@ fn normalize_tool_call_arguments(messages: &[serde_json::Value]) -> Vec<serde_js
 mod chat_impl;
 mod chat_render;
 mod deepseek_v4;
-mod jinja_helpers;
+mod ids_only;
+pub(crate) mod jinja_helpers;
+mod large_encode;
 mod message_preprocess;
 
 pub(crate) use message_preprocess::{
@@ -79,8 +81,17 @@ enum ChatEncoding {
 
 pub struct ChatTokenizer {
     tokenizer: Tokenizer,
+    /// Shared by every caller of this tokenizer; limits only large CPU encodes.
+    large_encode_gate: Option<std::sync::Arc<large_encode::Gate>>,
+    /// Explicitly skip unused token spellings and offsets during serving encode.
+    ids_only: bool,
     eos_token_id: u32,
     supports_thinking: bool,
+    /// GLM-5 and Qwen4_exp register their tool-envelope XML as added tokens.
+    /// Incoming prose needs the tokenizer-side sentinel escape; other model
+    /// families must retain their existing prompt bytes. The historical field
+    /// name remains because the mechanism originated in the GLM path.
+    pub(crate) glm_tool_markup_as_text: bool,
     chat_encoding: ChatEncoding,
     /// Compiled Jinja chat template (from tokenizer_config.json).
     #[allow(dead_code)]
@@ -113,6 +124,40 @@ pub(crate) struct Glm5VisionPlaceholder {
     /// Qwen3-VL's nested per-group timestamp + start/end markers. Homogeneous
     /// within a request — a checkpoint's processor is one or the other.
     pub(crate) qwen3vl: bool,
+}
+
+/// One GLM-5 multimodal placeholder after CPU preprocessing. The chat
+/// template emits one compact marker per media item; the tokenizer expands
+/// it to the exact number of encoder rows before the prompt reaches prefill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Glm5VisionKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Glm5VisionPlaceholder {
+    pub(crate) kind: Glm5VisionKind,
+    pub(crate) pad_count: usize,
+    pub(crate) per_frame_pad_count: usize,
+    pub(crate) timestamps: Vec<f32>,
+}
+
+/// One compact Qwen vision marker after CPU preprocessing. Qwen3.8's
+/// processor expands a video marker into one timestamped vision range per
+/// temporal group; images keep the ordinary single range shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenVisionKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QwenVisionPlaceholder {
+    pub(crate) kind: QwenVisionKind,
+    pub(crate) pad_count: usize,
+    pub(crate) per_frame_pad_count: usize,
+    pub(crate) timestamps: Vec<f32>,
 }
 
 /// Wrapper around tokenizers::DecodeStream that hides the generic parameters.

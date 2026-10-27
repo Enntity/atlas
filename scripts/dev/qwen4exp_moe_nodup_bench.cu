@@ -34,7 +34,7 @@ static unsigned char e4m3(float f) {
 // One projection of every local expert, in both layouts: N-major (the
 // checkpoint's [N, K/2] / [N, K/16]) and K-major ([K/2, N] / [K/16, N]).
 struct Proj {
-    Buf<unsigned char> pn, sn, pk, sk;               // slabs
+    Buf<unsigned char> packed_n, sn, pk, sk;         // slabs
     Buf<unsigned long long> tpn, tsn, tpk, tsk;      // per-expert tables
     Buf<float> s2;
     size_t pb = 0, sb = 0;
@@ -53,13 +53,13 @@ struct Proj {
                     st[e * sb + (size_t)c * N + n] = s[e * sb + (size_t)n * (K / 16) + c];
             }
         auto up = [&](Buf<unsigned char>& b, const std::vector<unsigned char>& h) { b.alloc(h.size()); b.put(h); };
-        up(pn, p); up(sn, s); up(pk, pt); up(sk, st);
+        up(packed_n, p); up(sn, s); up(pk, pt); up(sk, st);
         auto table = [&](Buf<unsigned long long>& t, const Buf<unsigned char>& b, size_t each) {
             std::vector<unsigned long long> v(E);
             for (unsigned e = 0; e < E; ++e) v[e] = (unsigned long long)(b.p + e * each);
             t.alloc(E); t.put(v);
         };
-        table(tpn, pn, pb); table(tsn, sn, sb); table(tpk, pk, pb); table(tsk, sk, sb);
+        table(tpn, packed_n, pb); table(tsn, sn, sb); table(tpk, pk, pb); table(tsk, sk, sb);
         std::vector<float> v(E);
         std::uniform_real_distribution<float> u2(0.5f, 2.0f);
         for (auto& x : v) x = u2(rng);

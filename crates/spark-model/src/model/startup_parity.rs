@@ -35,12 +35,6 @@
 //! setting that only matters under a switch reads 0 while that switch is off
 //! (`while_on`), so stale leftovers do not fail a boot.
 //!
-//! Runtime facts a rank cannot set but the pair must share — the process's
-//! own linked library versions — live in `RUNTIME`, chained ahead of
-//! `SETTINGS` and compared exactly alike: the cuBLASLt heuristic picks other
-//! kernels in other versions, so ranks on different libcublasLt round the
-//! same GEMMs differently and serve diverging numerics.
-//!
 //! Not here: what the ranks already reconcile (`ATLAS_KV_MAX_BLOCKS` takes
 //! the pair's minimum; the RDMA pair compares its capacity and one-shot
 //! settings at bootstrap), what is local to a rank (the drafter, the rails,
@@ -58,7 +52,7 @@ use spark_runtime::gpu::GpuBackend;
 
 #[path = "startup_parity_table.rs"]
 mod table;
-use table::{SETTINGS, SETTINGS_TAIL};
+use table::SETTINGS;
 
 /// One agreed setting: its name and a rank's value.
 pub type Setting = (&'static str, u64);
@@ -73,20 +67,10 @@ fn warn_only() -> bool {
     std::env::var("ATLAS_STARTUP_PARITY").as_deref() == Ok("warn")
 }
 
-/// Process-runtime facts every rank must share, compared like the settings.
-/// The cuBLASLt heuristic picks other kernels in other versions, so ranks
-/// on different libcublasLt round the same GEMMs differently.
-const RUNTIME: &[(&str, fn() -> Result<u64>)] =
-    &[("cuBLASLt runtime version (libcublasLt)", || {
-        Ok(spark_runtime::cublaslt::version() as u64)
-    })];
-
-/// This process's settings: [`RUNTIME`], [`SETTINGS`], then the `caller`'s.
+/// This process's settings: [`SETTINGS`], then the `caller`'s.
 fn settings(caller: &[Setting]) -> Result<Vec<Setting>> {
-    RUNTIME
+    SETTINGS
         .iter()
-        .chain(SETTINGS.iter())
-        .chain(SETTINGS_TAIL.iter())
         .map(|&(name, read)| Ok((name, read()?)))
         .chain(caller.iter().copied().map(Ok))
         .collect()

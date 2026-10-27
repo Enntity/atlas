@@ -8,8 +8,8 @@ use spark_runtime::kv_cache::KvCacheDtype;
 
 use super::GlmSparsePrefillTc;
 use crate::layer::ForwardContext;
-#[path = "glm_sparse_native_dispatch.rs"]
-mod dispatch;
+#[path = "glm_sparse_native_loader.rs"]
+mod loader;
 #[path = "glm_sparse_native_plan.rs"]
 mod plan;
 use plan::{Plan, Span};
@@ -19,10 +19,10 @@ fn validate_geometry(c: &ModelConfig) -> Result<()> {
         c.model_type == "glm5_next"
             && c.hidden_size == 4096
             && c.hc_mult == 4
-            && c.tp_world_size == 2
-            && c.ep_world_size == 2
-            && c.num_attention_heads == 32
-            && c.num_key_value_heads == 32
+            && matches!(c.tp_world_size, 2 | 4)
+            && c.ep_world_size == c.tp_world_size
+            && c.num_attention_heads == 64 / c.tp_world_size
+            && c.num_key_value_heads == c.num_attention_heads
             && c.head_dim == 256
             && c.kv_lora_rank == 512
             && c.qk_rope_head_dim == 0
@@ -30,7 +30,7 @@ fn validate_geometry(c: &ModelConfig) -> Result<()> {
             && c.index_kpool == 4
             && c.index_n_heads == 32
             && c.index_head_dim == 128,
-        "native sparse requires GLM TP2/EP2 H4096/HC4,32heads,NoPE512,index2048/pool4"
+        "native sparse requires GLM TP2/EP2 or TP4/EP4 H4096/HC4,64 total heads,NoPE512,index2048/pool4"
     );
     Ok(())
 }
@@ -53,16 +53,16 @@ fn validate_startup(
             && seq == plan::MAX_CONTEXT
             && block == 16
             // Only the arena capacity below depends on the sequence count;
-            // the kernel path runs each sequence's attention on its own.
+            // the library runs each sequence's attention on its own.
             && (1..=crate::layer::glm_long_owner::MAX_OWNERS).contains(&active)
-            // An fp8_g128 cache reaches the kernel path through its BF16 view.
+            // An fp8_g128 cache reaches the library through its BF16 view.
             && matches!(dtype, KvCacheDtype::Bf16 | KvCacheDtype::Fp8G128)
             && layer_dtypes.iter().all(|&d| d == dtype),
         "native sparse requires a >=4100-row arena,32K context,C4,block16,BF16/fp8_g128 cache"
     );
     let sizes = BufferSizes::from_config(c, rows, seq, block, active);
-    let (required, _) =
-        plan::required_bytes(rows, seq, 1, seq / block).map_err(anyhow::Error::msg)?;
+    let (required, _) = plan::required_bytes(rows, seq, 1, seq / block, c.num_attention_heads)
+        .map_err(anyhow::Error::msg)?;
     let capacities = [
         sizes.ssm_deinterleaved,
         sizes.expert_down_out,
@@ -82,7 +82,7 @@ fn validate_startup(
     Ok(())
 }
 
-/// Whether the selected kernel path takes this ordinary continued-prefill piece;
+/// Whether the selected library takes this ordinary continued-prefill piece;
 /// rank-identical (rows, start and capture state only).
 pub fn glm_sparse_native_admits(
     ctx: &ForwardContext<'_>,
@@ -91,7 +91,7 @@ pub fn glm_sparse_native_admits(
     capture_verify_intermediates: bool,
     stream: u64,
 ) -> Result<bool> {
-    Ok(dispatch::enabled()?
+    Ok(loader::enabled()?
         && plan::admit(
             rows as usize,
             seq_start,
@@ -106,8 +106,8 @@ fn qualified_context(seq: usize) -> usize {
     seq.min(plan::MAX_CONTEXT)
 }
 
-/// Validate the optional native profile before preload and KV sizing.
-/// The factory then calls [`preload_glm_sparse_native`] on its serving backend.
+/// Load/configure the optional module on the serving context before KV sizing.
+/// The module init allocates no device buffers and never launches attention.
 #[allow(clippy::too_many_arguments)]
 pub fn initialize_glm_sparse_native(
     c: &ModelConfig,
@@ -118,7 +118,7 @@ pub fn initialize_glm_sparse_native(
     dtype: KvCacheDtype,
     layer_dtypes: &[KvCacheDtype],
 ) -> Result<()> {
-    if !dispatch::enabled()? {
+    if !loader::enabled()? {
         return Ok(());
     }
     let qualified_seq = qualified_context(seq);
@@ -134,16 +134,18 @@ pub fn initialize_glm_sparse_native(
         cfg!(feature = "cuda"),
         "native sparse requires the CUDA backend"
     );
-    Ok(())
+    loader::initialize(c.num_attention_heads as u32)
 }
 
-/// Resolve every native CUDA entry on this serving context before KV sizing.
-/// Does not allocate, launch, or synchronize. Call after profile validation.
-pub fn preload_glm_sparse_native(gpu: &dyn spark_runtime::gpu::GpuBackend) -> Result<()> {
-    if dispatch::enabled()? {
-        dispatch::resolve(gpu)?;
-        tracing::info!("Atlas GLM sparse kernels resolved before KV sizing");
-    }
+fn execute(plan: &Plan, run: loader::Run) -> Result<()> {
+    // SAFETY: Plan checks geometry, capacities, alignment, and disjoint live
+    // byte ranges. ABI2 consumes the host struct synchronously and queues only
+    // onto its supplied serving stream. The retained mapping owns this function.
+    let status = unsafe { run(&plan.abi) };
+    ensure!(
+        status == 0,
+        "native sparse forward failed ({status}); no fallback after native submission"
+    );
     Ok(())
 }
 
@@ -167,7 +169,7 @@ pub fn try_glm_sparse_native(
     ensure!(
         a.dtype == KvCacheDtype::Bf16
             && a.identical_kv_latent
-            && a.heads == 32
+            && a.heads as usize == ctx.config.num_attention_heads
             && a.head_dim == 512
             && a.index_width == 2051
             && a.block_size == 16
@@ -195,6 +197,7 @@ pub fn try_glm_sparse_native(
         seq_start,
         physical_blocks,
         block_table_count,
+        a.heads as usize,
         [
             span(a.query, s.ssm_deinterleaved),
             span(a.k_cache, cache_bytes),
@@ -210,14 +213,10 @@ pub fn try_glm_sparse_native(
         stream,
     )
     .map_err(anyhow::Error::msg)?;
-    dispatch::execute(&plan, ctx.gpu)?;
+    execute(&plan, loader::run()?)?;
     Ok(true)
 }
 
 #[cfg(test)]
 #[path = "glm_sparse_native_tests.rs"]
 mod tests;
-
-#[cfg(all(test, feature = "cuda", feature = "gpu-examples"))]
-#[path = "glm_sparse_native_gpu_tests.rs"]
-mod gpu_tests;

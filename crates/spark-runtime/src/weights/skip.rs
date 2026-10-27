@@ -17,17 +17,11 @@ impl SafetensorsLoader {
         {
             return true;
         }
-        // MTP head weights for a model whose loader does not build one.
-        if self.skip_mtp && name.starts_with("mtp.") {
+        if self.skip_vision && super::is_vision_tower_tensor(name) {
             return true;
         }
-        // Dead namespaces the model's loader never reads (nemotron_h_omni's
-        // vision tower / mtp / projector).
-        if self
-            .skip_prefixes
-            .iter()
-            .any(|p| name.starts_with(p.as_str()))
-        {
+        // MTP head weights for a model whose loader does not build one.
+        if self.skip_mtp && name.starts_with("mtp.") {
             return true;
         }
         // W4A4 activation scales: never read on the w4a16 path (the NVFP4

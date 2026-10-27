@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! GPU check of [`dequant_mxfp8_to_bf16`] (`#[ignore]`: a GB10 and a
-//! glm-5.3-flash kernel build): the kernel path is byte-identical to the
+//! qwen3.8-flash-next kernel build): the kernel path is byte-identical to the
 //! host reference, on the two real FP4-Local projections and on random bytes
 //! that cover every finite E4M3 code and both ends of the exact exponent range.
 //!
@@ -12,8 +12,10 @@
 use super::*;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
-fn backend() -> &'static AtlasCudaBackend {
-    crate::layers::glm_gpu_test_backend::backend().expect("GLM CUDA backend")
+fn backend() -> AtlasCudaBackend {
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL=qwen3.8-flash-next");
+    AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend")
 }
 
 fn up(g: &dyn GpuBackend, bytes: &[u8]) -> DevicePtr {
@@ -64,7 +66,7 @@ fn mxfp8_gpu_kernel_matches_host_on_real_projections() {
     for tag in ["l0_gdn_in_proj_a", "l0_gdn_in_proj_b"] {
         let data = std::fs::read(dir.join(format!("{tag}.weight.bin"))).unwrap();
         let scales = std::fs::read(dir.join(format!("{tag}.scale.bin"))).unwrap();
-        kernel_vs_host(g, &data, &scales, 48, 2560);
+        kernel_vs_host(&g, &data, &scales, 48, 2560);
         eprintln!("{tag}: kernel == host");
     }
 }
@@ -98,5 +100,5 @@ fn mxfp8_gpu_kernel_matches_host_on_every_code_and_edge_exponent() {
             }
         })
         .collect();
-    kernel_vs_host(g, &data, &scales, n, k);
+    kernel_vs_host(&g, &data, &scales, n, k);
 }

@@ -464,11 +464,11 @@ impl QsaIndexer {
                     n += 1;
                     r0 += tile;
                 }
-                if n > 0 {
+                if let Some(avg) = tot.checked_div(n) {
                     line.push_str(&format!(
                         " tile{tile}: union={} ({:.2}x topk)",
-                        tot / n,
-                        (tot / n) as f64 / topk as f64
+                        avg,
+                        avg as f64 / topk as f64
                     ));
                 }
             }

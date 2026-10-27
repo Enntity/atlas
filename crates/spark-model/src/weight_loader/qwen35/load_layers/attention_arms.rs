@@ -103,6 +103,13 @@ pub(crate) fn build_full_attention_nvfp4(
         }
         Nvfp4Variant::Standard | Nvfp4Variant::Fp8Dequanted | Nvfp4Variant::Bf16Raw => {
             tracing::info!("Layer {i}: loading attention projections ({variant:?})");
+            // `--attn-proj-dtype bf16`: the layer gets no NVFP4 Q/K/V, its
+            // dense arms run on the BF16 sources, and O runs on its BF16 copy
+            // (`o_dense_bf16`), so no NVFP4 copy is built at all (they used
+            // to be built and left allocated, ~13 MB a layer per TP2 rank on
+            // FP4-Local, where `attn_mxfp8` forces this). `attn.o_proj` is
+            // then the NULL placeholder, as on Nemotron's keep-BF16 path.
+            let keep_bf16 = config.attn_proj_bf16;
             let load_bf16_then_nvfp4 = |name: &str,
                                         full_n: usize,
                                         full_k: usize,
@@ -148,16 +155,20 @@ pub(crate) fn build_full_attention_nvfp4(
                 let __t_q0 = std::time::Instant::now();
                 // The full matrix sets the global scale, so a TP shard holds
                 // exactly the NVFP4 bytes of the matching TP=1 rows.
-                let q = quantize_to_nvfp4_scaled_by(
-                    &sharded,
-                    local_n,
-                    local_k,
-                    (src.weight, full_n * full_k),
-                    gpu,
-                    absmax_k,
-                    quantize_k,
-                    stream,
-                )?;
+                let q = if keep_bf16 {
+                    crate::weight_map::QuantizedWeight::null()
+                } else {
+                    quantize_to_nvfp4_scaled_by(
+                        &sharded,
+                        local_n,
+                        local_k,
+                        (src.weight, full_n * full_k),
+                        gpu,
+                        absmax_k,
+                        quantize_k,
+                        stream,
+                    )?
+                };
                 if std::env::var("ATLAS_LOAD_TIMING").is_ok() {
                     tracing::info!(
                         "  attn-load L{i} {name}: dense_auto(fp8->bf16)={}ms quantize_nvfp4={}ms total(incl shard/rot)={}ms",
@@ -177,26 +188,22 @@ pub(crate) fn build_full_attention_nvfp4(
                 }
                 Ok((src, q))
             };
-            tracing::info!("Layer {i}: BF16 → NVFP4 (TP-aware)");
+            if !keep_bf16 {
+                tracing::info!("Layer {i}: BF16 → NVFP4 (TP-aware)");
+            }
             let [
                 (q_dense, q_nvfp4),
                 (k_dense, k_nvfp4),
                 (v_dense, v_nvfp4),
                 (o_dense, o_nvfp4),
             ] = load_qkvo_tp(config, load_bf16_then_nvfp4)?;
-            // `--attn-proj-dtype bf16`: hand the layer no NVFP4 Q/K/V so its
-            // dense arms run on the resident BF16 sources, and keep O's BF16
-            // copy for `o_dense_bf16`. The NVFP4 copies just built stay
-            // allocated but unused (a few MB per layer) — simpler than a
-            // second loader closure, and this is a quality-gate lever.
-            let keep_bf16 = config.attn_proj_bf16;
-            if keep_bf16 {
-                tracing::info!(
-                    "Layer {i}: --attn-proj-dtype bf16 — Q/K/V/O stay at checkpoint BF16"
-                );
-            }
             tracing::info!(
-                "Layer {i}: Q/K/V/O quantized, {:.1} GB free",
+                "Layer {i}: Q/K/V/O {}, {:.1} GB free",
+                if keep_bf16 {
+                    "stay at checkpoint BF16 (--attn-proj-dtype bf16)"
+                } else {
+                    "quantized"
+                },
                 gpu.free_memory()? as f64 / (1024.0 * 1024.0 * 1024.0)
             );
 

@@ -176,17 +176,7 @@ impl TransformerModel {
         // 5-10% of no-cache). With the plan refused, the tail-split checkpoint
         // at `tb - bs` is the anchor for both match points (`tb`, `tb - bs`),
         // the same path non-`atlas_scale` builds (GB10, #69) already take.
-        // On atlas_scale the plan's `h_dsts`/`conv_dsts` exist — but only a
-        // GDN writer (`qwen3_ssm::trait_prefill_recur`) actually fills them.
-        // `nemotron_mamba2` never reads `ctx.midchunk_capture`, so on this SSM
-        // family the tail anchor at `tb` (and its `tb - bs` sibling) would be
-        // registered UNWRITTEN and every subsequent warm hit would resume
-        // from a zeroed/stale recurrent state — the same failure the
-        // cfg!(atlas_scale) guard above documented for the NVIDIA arm.
-        // Refuse unless the SSM family has the writer.
-        if self.requires_aux_state()
-            || !midchunk_capture_writer_exists(self.config.capabilities().ssm_architecture)
-        {
+        if self.requires_aux_state() {
             return None;
         }
         // Reuse gate: capture costs a per-prefill kernel split + D2D copy and
@@ -367,8 +357,17 @@ impl TransformerModel {
         seq: &SequenceState,
         plan: &MidCapturePlan,
     ) {
+        // Register under the content key (`vision_cache`); a placeholder the
+        // key does not cover keeps the captures out of the index.
+        let Some(key) = self.pc_key(seq, tokens) else {
+            self.ssm_snapshots.free(plan.snap_slot);
+            if let Some(slot2) = plan.snap_slot_early {
+                self.ssm_snapshots.free(slot2);
+            }
+            return;
+        };
         for old in self.prefix_cache.insert_tail_snapshot(
-            &tokens[..plan.tb],
+            &key[..plan.tb],
             plan.snap_slot,
             seq.session_hash,
             seq.adapter_id,
@@ -388,7 +387,7 @@ impl TransformerModel {
             // the tail; must follow insert_tail_snapshot (its sweep clears the
             // session's previous tail + sibling).
             if let Some(old) = self.prefix_cache.insert_tail_sibling_snapshot(
-                &tokens[..tb_early],
+                &key[..tb_early],
                 slot2,
                 seq.session_hash,
                 seq.adapter_id,

@@ -74,6 +74,9 @@ pub struct NgramRowCache {
     segments: Option<Segments>,
     /// Per-row scale file mirror (FP8 tables), `None` for BF16 tables.
     scales: Option<ScaleCache>,
+    /// NVFP4 rows (`set_nvfp4_global_scale`): each row carries its own block
+    /// scales, and this one f32 multiplies them all. `None` otherwise.
+    nvfp4_global: Option<f32>,
     row_stride: usize,
     slots: usize,
     rows_total: u64,
@@ -96,10 +99,6 @@ pub struct NgramRowCache {
     keepalive: Option<keepalive::KeepAlive>,
     /// `ATLAS_PLE_FAULT_POOL=1` workers, built on the first multi-row fault.
     fault_pool: Option<fault_pool::FaultPool>,
-    /// Cumulative wall time of the fault passes (pass 2 of `resolve_inner`).
-    pub fault_us: u64,
-    /// Throttle for the periodic residency line (item: observability).
-    last_stats_log: std::time::Instant,
 }
 
 /// A table split across equal-sized shards at scattered file offsets, which
@@ -244,6 +243,7 @@ impl NgramRowCache {
             base_offset,
             segments: None,
             scales,
+            nvfp4_global: None,
             row_stride,
             slots,
             rows_total,
@@ -258,8 +258,6 @@ impl NgramRowCache {
             evictions: 0,
             keepalive: None,
             fault_pool: None,
-            fault_us: 0,
-            last_stats_log: std::time::Instant::now(),
         })
     }
 
@@ -285,6 +283,12 @@ impl NgramRowCache {
     /// Keepalive reads issued so far (0 when the ticker is off).
     pub fn keepalive_reads(&self) -> u64 {
         self.keepalive.as_ref().map_or(0, |k| k.reads())
+    }
+
+    /// The backing file of a flat (non-segmented) table, so a caller can
+    /// check it is the file it validated (`ngram_pack::PackedTable`).
+    pub(crate) fn backing_file(&self) -> &File {
+        &self.file
     }
 
     /// Device VA of the cache's row table — the `embed_table` argument of the

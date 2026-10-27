@@ -451,12 +451,6 @@ pub fn compute_and_reduce_scatter(
     Ok(true)
 }
 
-/// The landing stage's address (tests: the mock GPU runs no add kernel).
-#[cfg(test)]
-pub(crate) fn stage_ptr() -> DevicePtr {
-    DevicePtr(STAGE.with(Cell::get).0)
-}
-
 fn side(gpu: &dyn GpuBackend) -> Result<Side> {
     if let Some(s) = SIDE.with(Cell::get) {
         return Ok(s);

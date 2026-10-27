@@ -179,7 +179,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     decode_time_ms: decode_ms,
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
                     guard_stop: a.guard_stop,
                 },
                 "done frame",
@@ -197,7 +197,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                     logprobs: std::mem::take(&mut a.logprobs_data),
                     reasoning_tokens: a.thinking_tokens,
                     cached_prompt_tokens: a.cached_prompt_tokens,
-                    accepted_prediction_tokens: a.mtp_acct.accepted_total() as usize,
+                    accepted_prediction_tokens: a.mtp_acct.accepted_output_total() as usize,
                     prompt_logprobs: std::mem::take(&mut a.seq.prompt_logprobs)
                         .into_iter()
                         .map(|p| crate::api::TokenLogprobs {
@@ -206,6 +206,7 @@ pub fn finish_sequence(model: &dyn Model, a: &mut ActiveSeq, max_seq_len: usize)
                             top: p.top,
                         })
                         .collect(),
+                    guard_stop: a.guard_stop,
                 };
                 // A blocking client gets the engine error as an error (HTTP
                 // 500), not a completion carrying an odd finish reason.
@@ -285,11 +286,7 @@ pub fn send_error(model: &dyn Model, a: &mut ActiveSeq, msg: &str) {
 /// an ActiveSeq. Without this the sender is silently dropped, producing
 /// a misleading "Inference cancelled" error on the client side.
 pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
-    send_sink_error(
-        sink,
-        StreamEvent::Error(msg.to_string()),
-        anyhow::anyhow!("{msg}"),
-    );
+    send_sink_error(sink, msg, anyhow::anyhow!("{msg}"));
 }
 
 /// [`send_error_to_sink`] for a request the server cannot serve as asked
@@ -297,22 +294,12 @@ pub fn send_error_to_sink(sink: &mut ResponseSink, msg: &str) {
 pub fn send_invalid_request_to_sink(sink: &mut ResponseSink, msg: &str) {
     send_sink_error(
         sink,
-        StreamEvent::InvalidRequest(msg.to_string()),
+        msg,
         crate::api::InvalidRequestError(msg.to_string()).into(),
     );
 }
 
-/// Report a failed prefill: HTTP 400 when the request itself can never fit
-/// (resending the same images fails the same way, #180), otherwise 500.
-pub fn send_prefill_error_to_sink(sink: &mut ResponseSink, msg: &str, e: &anyhow::Error) {
-    if e.is::<spark_model::model::VisionCapacityError>() {
-        send_invalid_request_to_sink(sink, msg);
-    } else {
-        send_error_to_sink(sink, msg);
-    }
-}
-
-fn send_sink_error(sink: &mut ResponseSink, event: StreamEvent, err: anyhow::Error) {
+fn send_sink_error(sink: &mut ResponseSink, msg: &str, err: anyhow::Error) {
     match sink {
         ResponseSink::Streaming(tx) => {
             super::mod_helpers::spawn_terminal_send(tx, event, "pre-seq error frame");

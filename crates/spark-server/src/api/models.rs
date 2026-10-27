@@ -56,6 +56,9 @@ pub async fn list_models(
         state.model_name.clone(),
         state.max_seq_len,
     ));
+    for entry in &mut data {
+        entry.atlas_image_processor = image_processor(state.vision_config.as_ref());
+    }
     Json(ModelListResponse {
         object: "list".to_string(),
         data,
@@ -91,14 +94,9 @@ pub async fn get_model(
         || state.adapter_names.iter().any(|n| n == &model_id)
         || state.is_stageable_name(&model_id);
     if known {
-        Json(serde_json::json!({
-            "id": model_id,
-            "object": "model",
-            "created": crate::ids::unix_timestamp(),
-            "owned_by": "atlas-spark",
-            "max_model_len": state.max_seq_len,
-        }))
-        .into_response()
+        let mut entry = ModelInfo::advertise(model_id, state.max_seq_len);
+        entry.atlas_image_processor = image_processor(state.vision_config.as_ref());
+        Json(entry).into_response()
     } else {
         openai_error_response(
             StatusCode::NOT_FOUND,
@@ -113,4 +111,53 @@ pub async fn embeddings_stub() -> Response {
         StatusCode::NOT_IMPLEMENTED,
         "Embeddings are not supported by this model. Atlas serves generative (chat/completion) models only.".into(),
     )
+}
+
+/// Report only the bounded Qwen still-image policy supported by the reference
+/// benchmark. Video has separate bounds and must not consume this profile.
+fn image_processor(config: Option<&atlas_core::config::VisionConfig>) -> Option<serde_json::Value> {
+    let v = config?;
+    if v.is_glm5_next {
+        return None;
+    }
+    let grid = v.patch_size.checked_mul(v.spatial_merge_size)?;
+    let cell_area = grid.checked_mul(grid).filter(|&n| n > 0)?;
+    let max = v.max_pixels.filter(|&n| n >= cell_area)?;
+    let patches =
+        spark_model::layers::vision_encoder::derive_max_patches(v.max_pixels, v.patch_size).0;
+    Some(serde_json::json!({
+        "algorithm": "qwen-smart-resize-v1",
+        "patch_size": v.patch_size,
+        "spatial_merge_size": v.spatial_merge_size,
+        "min_pixels": v.min_pixels.unwrap_or(0),
+        "max_pixels": max,
+        "encoder_capacity_pixels": patches * v.patch_size.max(1) * v.patch_size.max(1),
+    }))
+}
+
+#[cfg(test)]
+mod image_profile_tests {
+    use super::*;
+    #[test]
+    fn image_profile_uses_resolved_bounds_and_encoder_capacity() {
+        let mut config = spark_model::vision_preprocess::fixtures::qwen_config();
+        config.max_pixels = Some(16_777_216);
+        config.min_pixels = Some(65_536);
+        let profile = image_processor(Some(&config)).unwrap();
+        assert_eq!(profile["max_pixels"], 16_777_216);
+        assert_eq!(profile["min_pixels"], 65_536);
+        assert_eq!(profile["encoder_capacity_pixels"], 4_194_304);
+        config.max_pixels = Some(262_144);
+        let profile = image_processor(Some(&config)).unwrap();
+        assert_eq!(profile["max_pixels"], 262_144);
+        assert_eq!(profile["encoder_capacity_pixels"], 262_144);
+        config.max_pixels = Some(1);
+        assert!(image_processor(Some(&config)).is_none());
+        config.is_glm5_next = true;
+        assert!(image_processor(Some(&config)).is_none());
+        config.is_glm5_next = false;
+        config.max_pixels = None;
+        assert!(image_processor(Some(&config)).is_none());
+        assert!(image_processor(None).is_none());
+    }
 }

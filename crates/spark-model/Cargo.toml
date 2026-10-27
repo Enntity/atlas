@@ -31,11 +31,17 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # no-GPU CI `cargo test --workspace` skips building them (they link CUDA
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
-gpu-examples = ["dep:safetensors"]
+gpu-examples = []
+# The NCCL/RDMA CommBackend, for the `comm_pair_bench` example (pair or chain).
+# The synthetic images and vision configs of `vision_preprocess::fixtures`,
+# for other crates' tests (spark-server enables it as a dev-dependency).
+test-fixtures = []
 # The NCCL/RDMA-pair CommBackend, for the two-rank `comm_pair_bench` example.
 nccl = ["cuda", "spark-comm/nccl"]
 
 [dependencies]
+# SparkGLM-only: dlopen of the out-of-tree FlashKDA and native sparse-MLA bridges.
+libloading = "0.8"
 atlas-core = { workspace = true }
 atlas-kernels = { workspace = true }
 atlas-tier = { workspace = true }
@@ -104,11 +110,23 @@ name = "moe_fp4_prefill_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "dflash_fast_load_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "fast_load_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "moe_verify_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "glm_hc_seam_bench"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "glm_fp4l_native_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
@@ -132,6 +150,10 @@ name = "glm_sparse_split_bench"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
+name = "glm_sparse_heads_check"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
 name = "kda_verify_bench"
 required-features = ["cuda", "gpu-examples"]
 
@@ -145,10 +167,6 @@ required-features = ["cuda", "gpu-examples", "nccl"]
 
 [[example]]
 name = "glm_topk_bench"
-required-features = ["cuda", "gpu-examples"]
-
-[[example]]
-name = "gdn_fla_scratch_garbage"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]
@@ -281,6 +299,10 @@ required-features = ["cuda", "gpu-examples"]
 
 [[example]]
 name = "w4a16_cpu_reference_microtest"
+required-features = ["cuda", "gpu-examples"]
+
+[[example]]
+name = "w4a16_kda_shard_check"
 required-features = ["cuda", "gpu-examples"]
 
 [[example]]

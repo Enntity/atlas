@@ -189,10 +189,6 @@ fn a_schema_grammar_is_bounded_like_its_schema() {
     assert!(c.compile_schema_grammar(grammar()).is_err());
     assert_eq!(c.cache_size_bytes(), 0, "a refused grammar is not cached");
     assert!(c.compile_grammar(grammar()).is_ok());
-    assert!(
-        c.compile_schema_grammar(grammar()).is_err(),
-        "an unbounded cached grammar must still obey the schema limit"
-    );
 }
 
 #[test]

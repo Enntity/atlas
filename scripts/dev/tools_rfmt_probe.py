@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only
-# Adapted from Jason McCartney / Enntity, commit ece58a9e2a0f5bff45a58b60f58f0264302f238d.
 """tools + response_format probe (ToolEvalBench TC-65..69 shape).
 
 Two turns against a live OpenAI-compatible server, both carrying `tools` AND a

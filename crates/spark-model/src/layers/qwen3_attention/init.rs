@@ -126,6 +126,9 @@ impl Qwen3AttentionLayer {
         } = GlmIndexSelection::from_config(config, &probes)?;
         // Short gate flags so each GLM/hyper-connection lookup stays one line.
         let (glm, hc) = (probes.glm_kpool_indexer, probes.hyper_connection);
+        // Only these targets ship native MXFP8 projection kernels.
+        let glm_target = config.model_type == "glm5_next";
+        let native_mxfp8 = glm_target || config.model_type == "qwen4_exp";
         let layer = Self {
             input_norm,
             attn,
@@ -181,6 +184,8 @@ impl Qwen3AttentionLayer {
             mla: None,
             mla_mx: Vec::new(),
             mla_q4: Vec::new(),
+            mla_native: Default::default(),
+            dense_mx: Default::default(),
             // ── DeepSeek-V4 Manifold-Constrained Hyper-Connections (mHC) ──
             // `hc` stays None for non-V4 models; the V4 loader attaches real
             // HcWeights after this constructor. Kernel handles are lazy (null
@@ -190,32 +195,17 @@ impl Qwen3AttentionLayer {
             qsa: None,
             hc_pre_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre")),
             hc_pre_from_raw_mix_k: gate(
-                hc && probes.glm_series,
+                hc,
                 gpu,
                 "hyper_connection",
                 &hc_name("hc_pre_from_raw_mix"),
             ),
-            hc_pre_mix_k: gate(
-                hc && (probes.glm_series || probes.qwen4_exp),
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_pre_mix"),
-            ),
+            hc_pre_mix_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_pre_mix")),
             hc_post_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post")),
-            hc_post_moe_blend_k: gate(
-                hc && probes.glm_series,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_post_moe_blend"),
-            ),
+            hc_post_moe_blend_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_post_moe_blend")),
             hc_expand_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_expand")),
             hc_head_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_head")),
-            hc_contract_k: gate(
-                hc && probes.glm_series,
-                gpu,
-                "hyper_connection",
-                &hc_name("hc_contract"),
-            ),
+            hc_contract_k: gate(hc, gpu, "hyper_connection", &hc_name("hc_contract")),
             qkv_nvfp4_t: None,
             q_nvfp4_t: None,
             k_nvfp4_t: None,
@@ -306,8 +296,8 @@ impl Qwen3AttentionLayer {
             dense_gemv_batchm_k: gpu
                 .kernel("dense_gemv_bf16_batchm", "dense_gemv_bf16_batchm")
                 .unwrap_or(KernelHandle(0)),
-            dense_gemv_batch5_k: gate(
-                probes.glm_mla,
+            dense_gemv_batch5_k: super::super::try_kernel_gated(
+                config.model_type == "glm5_next",
                 gpu,
                 "dense_gemv_bf16_batchm",
                 "dense_gemv_bf16_batch5",
@@ -382,23 +372,27 @@ impl Qwen3AttentionLayer {
             ),
             rope_proportional_k: super::super::try_kernel(gpu, "rope", "rope_forward_proportional"),
             reshape_cache_k: gpu.kernel(reshape_mod, reshape_fn)?,
-            glm_latent_dequant_k: if kv_dtype == KvCacheDtype::Fp8G128 {
-                gpu.kernel("reshape_and_cache", "glm_latent_dequant_fp8g128")?
-            } else {
-                KernelHandle(0)
-            },
-            glm_index_fill_causal_dev_k: if kv_dtype == KvCacheDtype::Fp8G128 {
-                gpu.kernel("glm_indexer", "glm_index_fill_causal_dev")?
-            } else {
-                KernelHandle(0)
-            },
-            glm_latent_qdq_k: if probes.glm_series
-                && std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1")
-            {
-                gpu.kernel("reshape_and_cache", "glm_latent_qdq_fp8g128")?
-            } else {
-                KernelHandle(0)
-            },
+            // These are GLM's FP8-G128 latent-cache paths. Keep the lookup
+            // behind the same architecture gate as the dispatch fields below
+            // so a Qwen target never requires GLM-only modules during boot.
+            glm_latent_dequant_k: gate(
+                glm && kv_dtype == KvCacheDtype::Fp8G128,
+                gpu,
+                "reshape_and_cache",
+                "glm_latent_dequant_fp8g128",
+            ),
+            glm_index_fill_causal_dev_k: gate(
+                glm && kv_dtype == KvCacheDtype::Fp8G128,
+                gpu,
+                "glm_indexer",
+                "glm_index_fill_causal_dev",
+            ),
+            glm_latent_qdq_k: gate(
+                glm && std::env::var("ATLAS_GLM_LATENT_QDQ").as_deref() == Ok("1"),
+                gpu,
+                "reshape_and_cache",
+                "glm_latent_qdq_fp8g128",
+            ),
             fused_k_norm_rope_cache_write_bf16_k: super::super::try_kernel(
                 gpu,
                 "fused_k_norm_rope_cache",
@@ -605,10 +599,10 @@ impl Qwen3AttentionLayer {
             ),
             dense_gemm_tc_k: super::super::try_kernel(gpu, "gemm_tc", "dense_gemm_tc"),
             mxfp8_gemv_k: ["mxfp8_gemv_tc8", "mxfp8_gemv_tc16", "mxfp8_gemv_tc32"]
-                .map(|name| gate(probes.glm_mla, gpu, "mxfp8_gemv", name)),
+                .map(|name| gate(native_mxfp8, gpu, "mxfp8_gemv", name)),
             mxfp8_gemv_grouped_k: ["mxfp8_gemv_tc8_grouped", "mxfp8_gemv_tc16_grouped"]
-                .map(|name| gate(probes.glm_mla, gpu, "mxfp8_gemv", name)),
-            mxfp8_quantize_k: gate(probes.glm_mla, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
+                .map(|name| gate(glm_target, gpu, "mxfp8_gemv", name)),
+            mxfp8_quantize_k: gate(glm_target, gpu, "mxfp8_gemv", "mxfp8_quantize_bf16"),
             paged_decode_splitk_k: match kv_dtype {
                 KvCacheDtype::Nvfp4 => {
                     Some(gpu.kernel("paged_decode_nvfp4", "paged_decode_attn_splitk_nvfp4")?)
@@ -667,17 +661,18 @@ impl Qwen3AttentionLayer {
             w4a16_gemv_qg_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_qg_batch3")?,
             w4a16_gemv_dual_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_dual_batch3")?,
             w4a16_gemv_batch3_k: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
+            // The qwen4_exp exact K=4 verify's Q+gate tier: only the
+            // qwen3.8-flash-next target ships it (glm-5.3-flash's shadow of
+            // w4a16_gemv.cu is shadow-exempt for it), so other models never
+            // issue the lookup.
             w4a16_gemv_qg_batch4_k: gate(
-                !probes.glm_series,
+                config.model_type == "qwen4_exp",
                 gpu,
                 "w4a16_gemv",
                 "w4a16_gemv_qg_batch4",
             ),
             wide_rows: crate::layers::ops::Qwen4ExpWideRows::resolve(gpu, &config.model_type),
-            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(
-                gpu,
-                probes.glm_series,
-            ),
+            w4a16_batchm: crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers::resolve(gpu),
             w4a16_gemv_batch16_k: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_batch16"),
             // `w4a16_gemv_dp4a` exists only in kernels/strix-hip/common —
             // ATLAS_TARGET_HW=strix-hip sets cfg!(atlas_hip). On every other

@@ -9,15 +9,10 @@
 //! allocation, after the KV budget is measured, so the mapping never counts
 //! as this process's footprint in that measurement.
 //!
-//! The GPU maps it L2-uncached: RM creates every memory-list descriptor with
-//! `NV_MEMORY_UNCACHED` and the sysmem list path never changes it
-//! (open-gpu-kernel-modules 580.173.02 `mem_desc.c`, `mem_list.c`). One pass
-//! over it streams at `cuMemAlloc` speed (~250 GB/s on spark03), but data
-//! read again comes from DRAM each time: a 4 MiB region re-read runs at
-//! 266 GB/s against 1,679 GB/s, and a dependent load takes 408 ns against
-//! 161 ns. Copy-engine transfers (`cuMemcpy*`) run at about half speed, which
-//! only the NVMe prefix tier's block spills use. So only buffers that are
-//! seldom re-read belong here (`kv_cache::placement`).
+//! The launcher allocates it GPU-cacheable, so it behaves like `cuMemAlloc`
+//! memory: on spark03 a 4 MiB region re-read runs at 1,759 against
+//! 1,762 GB/s and a dependent load takes 156 against 156 ns. (The earlier
+//! memory-list export was L2-uncached: 266 GB/s and 408 ns.)
 
 use std::sync::OnceLock;
 
@@ -26,10 +21,6 @@ use parking_lot::Mutex;
 
 use crate::gpu::DevicePtr;
 use crate::gpu::carveout::{self, CarveoutArena};
-
-#[cfg(not(atlas_scale))]
-#[path = "display_carveout_lease.rs"]
-mod lease;
 
 static ARENA: Mutex<Option<CarveoutArena>> = Mutex::new(None);
 
@@ -101,8 +92,6 @@ fn map() -> Result<CarveoutArena> {
         fn cuMemAddressReserve(ptr: *mut u64, size: usize, align: usize, addr: u64, f: u64) -> i32;
         fn cuMemMap(ptr: u64, size: usize, offset: usize, handle: u64, flags: u64) -> i32;
         fn cuMemRelease(handle: u64) -> i32;
-        fn cuMemUnmap(ptr: u64, size: usize) -> i32;
-        fn cuMemAddressFree(ptr: u64, size: usize) -> i32;
         fn cuMemSetAccess(ptr: u64, size: usize, desc: *const AccessDesc, count: usize) -> i32;
     }
     let check = |status: i32, what: &str| -> Result<()> {
@@ -125,26 +114,16 @@ fn map() -> Result<CarveoutArena> {
         unsafe { cuMemImportFromShareableHandle(&mut handle, os_handle, HANDLE_TYPE_POSIX_FD) },
         "import",
     )?;
-    let mut lease = lease::Lease {
-        handle: Some(handle),
-        address: None,
-        mapped: false,
-        size,
-        unmap: cuMemUnmap,
-        release: cuMemRelease,
-        free_address: cuMemAddressFree,
-    };
+    // The import holds its own reference; the fd is no longer needed.
+    unsafe { libc::close(fd) };
     let mut va = 0u64;
     check(
         unsafe { cuMemAddressReserve(&mut va, size, 2 << 20, 0, 0) },
         "address reserve",
     )?;
-    lease.address = Some(va);
     check(unsafe { cuMemMap(va, size, 0, handle, 0) }, "map")?;
-    lease.mapped = true;
     // The mapping keeps the memory alive; drop the handle's reference.
     check(unsafe { cuMemRelease(handle) }, "release handle")?;
-    lease.handle = None;
     let access = AccessDesc {
         location_type: LOCATION_DEVICE,
         location_id: device,
@@ -156,10 +135,6 @@ fn map() -> Result<CarveoutArena> {
     )?;
     check(unsafe { super::cuMemsetD8Async(va, 0, size, 0) }, "zero")?;
     check(unsafe { super::cuStreamSynchronize(0) }, "zero sync")?;
-    // Keep the exported fd open on failure so a reserve-balloon retry can
-    // import it again. A successful map holds its own reference.
-    unsafe { libc::close(fd) };
-    lease.address = None; // The process-lifetime arena now owns the mapping.
     tracing::info!(
         "Display carveout: {} MiB mapped at 0x{va:x} for KV pools",
         size >> 20

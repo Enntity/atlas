@@ -22,7 +22,7 @@ use crate::layers::ops;
 
 /// Which projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GdnProj {
+pub(crate) enum GdnProj {
     /// `in_proj_qkvz`: `[rows, hidden] -> [rows, qkvz]` (sequential layout).
     Qkvz,
     /// `out_proj`: `[rows, value_dim] -> [rows, hidden]`.
@@ -32,14 +32,11 @@ pub(super) enum GdnProj {
 impl Qwen3SsmLayer {
     /// `rows` rows of `input` through projection `proj` into `output` (rows
     /// contiguous at the projection's width), each row byte-identical to
-    /// `ssm_forward`'s single-row GEMV. `Ok(false)`, nothing launched, when
-    /// the switch is off or serial decode would take an arm this has no
-    /// exact batched twin for (Q2, interleaved QKVZ, `ATLAS_GDN_FP8_DECODE`):
-    /// the caller keeps its own dispatch.
-    ///
-    /// Native MXFP8 projections (`mx8`) are handled here whatever the switch
-    /// says: they are the layer's only copy, and `mxfp8_proj_batchm` rows are
-    /// the single-row kernel's bytes, so the exact path is the only path.
+    /// `ssm_forward`'s single-row GEMV. The MXFP8 copy (`init_mxfp8.rs`)
+    /// takes every call when installed. Otherwise `Ok(false)`, nothing
+    /// launched, when the switch is off or serial decode would take an arm
+    /// this has no exact batched twin for (Q2, interleaved QKVZ,
+    /// `ATLAS_GDN_FP8_DECODE`): the caller keeps its own dispatch.
     pub(super) fn exact_rows_proj(
         &self,
         proj: GdnProj,
@@ -49,12 +46,10 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<bool> {
-        if let Some(mx8) = self.mx8.as_ref() {
-            let p = match proj {
-                GdnProj::Qkvz => &mx8.qkvz,
-                GdnProj::Out => &mx8.out,
-            };
-            ops::mxfp8_proj_exact_rows(ctx.gpu, &mx8.kernels, p, input, output, rows, stream)?;
+        // The checkpoint's own MXFP8 copy (FP4-Local) is serial decode's arm
+        // whenever it is installed, and its tiers are row-invariant at every
+        // width, so it serves every batched caller, switch or not.
+        if self.mxfp8_rows_proj(ctx.gpu, proj, input, output, rows, stream)? {
             return Ok(true);
         }
         if !ctx.levers.qwen4exp_batch_fast

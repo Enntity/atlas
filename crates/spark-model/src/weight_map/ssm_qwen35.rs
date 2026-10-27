@@ -85,7 +85,9 @@ pub(crate) fn load_ssm_qwen35(
 /// Under EP (ep_world_size > 1), only local experts are loaded from the store.
 /// Remote experts get NULL pointers — kernels detect NULL and write zero output.
 /// `skip_routed_experts`: when true, routed experts get NULL weights (saves memory
-/// when native FP8 MoE dispatch handles them). Shared expert is always loaded.
+/// when native FP8 MoE dispatch handles them). `load_shared`: when false, the
+/// shared expert gets NULL weights (a caller that installs its own, e.g.
+/// qwen4_exp FP4-Local's MXFP8 one); else it is always loaded.
 pub(crate) fn load_moe_qwen35(
     store: &WeightStore,
     layer_prefix: &str,
@@ -97,7 +99,7 @@ pub(crate) fn load_moe_qwen35(
     quantize_k: spark_runtime::gpu::KernelHandle,
     stream: u64,
     skip_routed_experts: bool,
-    null_shared_expert: bool,
+    load_shared: bool,
 ) -> Result<MoeWeights> {
     let p = format!("{layer_prefix}.mlp");
 
@@ -262,13 +264,10 @@ pub(crate) fn load_moe_qwen35(
         })
     };
 
-    // `null_shared_expert`: the caller serves the shared expert natively
-    // (FP4-Local's MXFP8) and installs it on the MoeLayer itself — the fused
-    // kernels see NULL shared weights and skip them.
-    let shared_expert = if null_shared_expert {
-        ExpertWeight::null()
-    } else {
+    let shared_expert = if load_shared {
         load_expert(&format!("{p}.shared_expert"))?
+    } else {
+        ExpertWeight::null()
     };
 
     let mut experts = Vec::with_capacity(num_experts);

@@ -402,18 +402,6 @@ fn a_csf32_scale_missing_a_component_refuses_the_load() {
     }
 }
 
-#[test]
-fn slab_packing_preserves_decoded_csf32_scales() {
-    let dir = Dir::new("c32slab");
-    csf32_checkpoint(&dir.0, None);
-    let gpu = MockGpuBackend::new();
-    let mut fast = FastSafetensorsLoader::new();
-    fast.try_direct_io = false;
-    fast.pack_slab = true;
-    let store = fast.load(&dir.0, &gpu, 0).unwrap();
-    check_csf32(&store, &gpu, "packed fast");
-}
-
 /// Under EP the remote expert's five components are all skipped.
 #[test]
 fn ep_skips_every_component_of_a_remote_csf32_scale() {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only AND Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Golden vectors for the csf_32x2_v1 NVFP4 block-scale decoder
 (`crates/spark-runtime/src/weights/nvfp4_csf32.rs`).
@@ -27,14 +27,13 @@ The Rust test reads the five inputs, decodes them, and must be byte-identical
 
 THE REFERENCE
 -------------
-`_geometry`, `encode_scales` and `decode_scales` below are adapted from the
-Local Inference Lab FlashInfer fork, `scripts/encode_csf.py` at commit
+`_geometry`, `encode_scales` and `decode_scales` below are copied verbatim
+(minus the MXFP4 branches and the lru_cache decorator) from the Local Inference
+Lab FlashInfer fork, `scripts/encode_csf.py` at commit
 7e203806a82b588b9113f5a0866a028564847741 (spec: `docs/csf-scale-blocks.md`).
-Changes to the reference: MXFP4 branches and the lru_cache decorator removed.
-The reference remains Apache-2.0; the surrounding Atlas fixture generator is
-AGPL-3.0-only. See `third_party/csf_references/LICENSE` and `NOTICE` for the
-original license, notices and pinned source URLs. Jason McCartney / Enntity
-integrated this reference into the Atlas fixture generator.
+Copyright the FlashInfer / Local Inference Lab contributors, Apache-2.0. It is
+deliberately the unmodified reference rather than a re-derivation, so the
+golden tests the Rust decoder against someone else's reading of the format.
 
 USAGE
 -----
@@ -99,8 +98,6 @@ def synthetic(rows, cols):
 
 
 # ---- Reference (Apache-2.0, see module docstring) ----------------------------
-# Copyright 2025-2026 NVIDIA
-# Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
 def _geometry(rows, columns):
     if rows <= 0 or rows % 32 or columns <= 0:
         raise ValueError("CSF requires positive 32-row extents and positive columns")

@@ -66,6 +66,7 @@ impl TransformerModel {
     /// + layer forward before read. Saves 7 memsets × (chunks-1) per prefill.
     pub(super) fn prefill_b_zero_and_embed(
         &self,
+        seq: &SequenceState,
         run: bool,
         tokens: &[u32],
         chunk_start: usize,
@@ -85,15 +86,24 @@ impl TransformerModel {
         self.warm_trace_sync(stream)?;
         let zero = t0.elapsed();
         // ── Phase 1+1b: embed chunk + vision pad overlay ──
-        self.prefill_b_embed_chunk(tokens, chunk_start, chunk_len, stream)?;
+        self.prefill_b_embed_chunk(seq, tokens, chunk_start, chunk_len, stream)?;
         self.warm_trace_sync(stream)?;
         Ok([zero, t0.elapsed() - zero])
     }
 
     /// The multi-rank zero before a chunk: the whole arena, or with
     /// `ATLAS_GLM_ZERO_ROWS` what may be dirty (`ZeroRows`).
-    fn warm_zero_arena(&self, stream: u64) -> Result<()> {
-        let (gpu, arena) = (self.gpu.as_ref(), &self.buffers);
+    pub(in crate::model) fn warm_zero_arena(&self, stream: u64) -> Result<()> {
+        self.warm_zero_arena_of(&self.buffers, stream)
+    }
+
+    /// [`Self::warm_zero_arena`] for `arena` (a pipelined half-chunk's too).
+    pub(in crate::model) fn warm_zero_arena_of(
+        &self,
+        arena: &spark_runtime::buffers::BufferArena,
+        stream: u64,
+    ) -> Result<()> {
+        let gpu = self.gpu.as_ref();
         match self.warm.zero_rows {
             ZeroRows::Off => arena.zero_all(gpu, stream),
             ZeroRows::Trim(floor) => arena.zero_dirty(gpu, stream, floor),

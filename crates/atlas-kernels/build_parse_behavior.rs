@@ -25,6 +25,7 @@ pub(crate) struct ParsedBehavior {
     pub default_num_drafts: u32,
     pub disable_tool_steering: bool,
     pub template_owns_tool_definitions: bool,
+    pub verbatim_reasoning_effort: bool,
     pub disable_cwd_hint_injection: bool,
     pub use_sampling_presets_for_core: bool,
     pub use_sampling_preset_penalties_for_core: bool,
@@ -89,6 +90,14 @@ pub(crate) struct ParsedBehavior {
     /// = do not inject the Jinja variable; the model template's own default
     /// applies. See `ModelBehavior::preserve_thinking`.
     pub preserve_thinking: Option<bool>,
+    /// See `ModelBehavior::verbatim_prompt`.
+    pub verbatim_prompt: bool,
+    /// See `ModelBehavior::default_reasoning_effort`.
+    pub default_reasoning_effort: String,
+    /// See `ModelBehavior::eos_ends_thinking`.
+    pub eos_ends_thinking: bool,
+    /// See `ModelBehavior::tool_call_steering`.
+    pub tool_call_steering: bool,
 }
 
 impl Default for ParsedBehavior {
@@ -103,6 +112,7 @@ impl Default for ParsedBehavior {
             default_num_drafts: 0,
             disable_tool_steering: false,
             template_owns_tool_definitions: false,
+            verbatim_reasoning_effort: false,
             disable_cwd_hint_injection: false,
             use_sampling_presets_for_core: false,
             use_sampling_preset_penalties_for_core: true,
@@ -129,6 +139,10 @@ impl Default for ParsedBehavior {
             rom_head: String::new(),
             tool_retry: true,
             preserve_thinking: None,
+            verbatim_prompt: false,
+            default_reasoning_effort: String::new(),
+            eos_ends_thinking: false,
+            tool_call_steering: true,
         }
     }
 }
@@ -184,6 +198,10 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         .unwrap_or(false);
     let template_owns_tool_definitions = b
         .and_then(|v| v.get("template_owns_tool_definitions"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let verbatim_reasoning_effort = b
+        .and_then(|v| v.get("verbatim_reasoning_effort"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let disable_cwd_hint_injection = b
@@ -308,6 +326,23 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
     let preserve_thinking = b
         .and_then(|v| v.get("preserve_thinking"))
         .and_then(|v| v.as_bool());
+    let verbatim_prompt = b
+        .and_then(|v| v.get("verbatim_prompt"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let default_reasoning_effort = b
+        .and_then(|v| v.get("default_reasoning_effort"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let eos_ends_thinking = b
+        .and_then(|v| v.get("eos_ends_thinking"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tool_call_steering = b
+        .and_then(|v| v.get("tool_call_steering"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     ParsedBehavior {
         thinking_in_tools,
         max_thinking_budget,
@@ -318,6 +353,7 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         default_num_drafts,
         disable_tool_steering,
         template_owns_tool_definitions,
+        verbatim_reasoning_effort,
         disable_cwd_hint_injection,
         use_sampling_presets_for_core,
         use_sampling_preset_penalties_for_core,
@@ -344,5 +380,9 @@ pub(crate) fn parse_behavior(model_dir: &std::path::Path) -> ParsedBehavior {
         rom_head,
         tool_retry,
         preserve_thinking,
+        verbatim_prompt,
+        default_reasoning_effort,
+        eos_ends_thinking,
+        tool_call_steering,
     }
 }

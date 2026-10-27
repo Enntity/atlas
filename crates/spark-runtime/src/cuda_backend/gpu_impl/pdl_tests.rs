@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Source contract between each PDL target list and the kernels it serves.
+//! Source contract between [`PDL_KERNELS`] and every kernel a PDL target serves.
 
 use super::PDL_TARGETS;
 use std::collections::BTreeMap;
@@ -44,16 +44,7 @@ fn weight_param(signature: &str, name: &str) -> bool {
 /// of its wait, which is safe only while every touched region is a weight
 /// parameter of `signature` (a predecessor may still be writing anything else).
 fn waits_first(signature: &str, body: &str) -> bool {
-    // Local constexpr initializers are evaluated at compile time: they cannot
-    // read activations a predecessor still writes. Everything else, including
-    // an ordinary const initializer, must remain behind the dependency wait.
-    let mut body = body.trim_start();
-    while let Some(decl) = body.strip_prefix("constexpr ") {
-        let Some((_, rest)) = decl.split_once(';') else {
-            return false;
-        };
-        body = rest.trim_start();
-    }
+    let body = body.trim_start();
     let touch = body
         .strip_prefix("atlas_pdl_enter_touch(")
         .or_else(|| body.strip_prefix("atlas_pdl_enter_touch_pair("))
@@ -146,6 +137,25 @@ fn served_sources(common: &Path, quant: &Path) -> Vec<(PathBuf, bool)> {
     files.into_values().collect()
 }
 
+/// The comment-free text of `path`, then of the namesakes it includes
+/// (`#include "../../common/reshape_and_cache.cu"` in the GLM shadow of that
+/// file): a shadow serves its namesake's kernels verbatim, under its own name.
+fn with_namesakes(path: &Path) -> Vec<String> {
+    let src = without_comments(&std::fs::read_to_string(path).unwrap());
+    let mut texts = Vec::new();
+    for line in src.lines() {
+        let Some(inc) = line.trim().strip_prefix("#include \"") else {
+            continue;
+        };
+        let inc = Path::new(inc.trim_end_matches('"'));
+        if inc.file_name() == path.file_name() {
+            texts.extend(with_namesakes(&path.parent().unwrap().join(inc)));
+        }
+    }
+    texts.insert(0, src);
+    texts
+}
+
 #[test]
 fn parser_sees_direct_and_wrapped_waits() {
     let src = without_comments(
@@ -165,23 +175,6 @@ __device__ __forceinline__ void wrapper(const float* a) {
     body<NT>(a);
 }
 __device__ void not_a_wrapper(const float* a) { body<1>(a); atlas_pdl_enter(); }
-template <bool PERSIST>
-__device__ void constexpr_wrapper(const float* a) {
-    constexpr int buffers = PERSIST ? 3 : 2;
-    constexpr int lanes = buffers * 32;
-    atlas_pdl_enter();
-    body<lanes>(a);
-}
-extern "C" __global__ void wrapped_constexpr(const float* a) { constexpr_wrapper<true>(a); }
-extern "C" __global__ void constexpr_then_runtime(const float* a) {
-    constexpr int index = 0;
-    const float value = a[index];
-    atlas_pdl_enter();
-}
-extern "C" __global__ void ordinary_const(const float* a) {
-    const int index = 0;
-    atlas_pdl_enter();
-}
 extern "C" __global__ void wrapped(const float* a) { wrapper<2>(a); }
 extern "C" __global__ void plain(const float* a) { not_a_wrapper(a); }
 extern "C" __global__ void late(const float* a) {
@@ -228,9 +221,6 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
         kernels(&src),
         [
             ("direct", true),
-            ("wrapped_constexpr", true),
-            ("constexpr_then_runtime", false),
-            ("ordinary_const", false),
             ("wrapped", true),
             ("plain", false),
             ("late", false),
@@ -254,12 +244,10 @@ extern "C" __global__ void tri_input(const unsigned char* __restrict__ w0, float
 ///   predecessor's output early);
 /// * a kernel of the target's own dirs that waits is listed (one that is not
 ///   pays the launch gap PDL exists to remove: the five-row KDA triple did,
-///   at every width-5 verify step), except the GLM persistent twins whose
-///   overlapping launch has not been qualified;
+///   at every width-5 verify step);
 /// * a `common/` kernel that waits is listed by some PDL target. It need not
 ///   be listed by every target that serves it: without the launch attribute
 ///   its wait is a no-op, and each target opts its own decode chain in.
-///   RDMA one-shot is launched directly by spark-comm with its own PDL policy.
 #[test]
 fn pdl_target_kernels_wait_exactly_when_listed() {
     let gb10 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/gb10");
@@ -272,26 +260,23 @@ fn pdl_target_kernels_wait_exactly_when_listed() {
             }
             let mut defined = Vec::new();
             for (path, own) in served_sources(&gb10.join("common"), &quant) {
-                let src = without_comments(&std::fs::read_to_string(&path).unwrap());
-                for (name, waits) in kernels(&src) {
-                    let listed = target.kernels.contains(&name);
-                    assert!(
-                        waits || !listed,
-                        "{}: {name} is on the {} PDL list but does not wait on PDL entry",
-                        path.display(),
-                        target.model
-                    );
-                    assert!(
-                        !waits
-                            || listed
-                            || (!own && listed_anywhere(name))
-                            || name == "rdma_oneshot_bf16"
-                            || (target.model == "glm-5.3-flash" && name.ends_with("_l2pf_p")),
-                        "{}: {name} waits on PDL entry but is not on the {} PDL list",
-                        path.display(),
-                        target.model
-                    );
-                    defined.push(name.to_owned());
+                for src in with_namesakes(&path) {
+                    for (name, waits) in kernels(&src) {
+                        let listed = target.kernels.contains(&name);
+                        assert!(
+                            waits || !listed,
+                            "{}: {name} is on the {} PDL list but does not wait on PDL entry",
+                            path.display(),
+                            target.model
+                        );
+                        assert!(
+                            !waits || listed || (!own && listed_anywhere(name)),
+                            "{}: {name} waits on PDL entry but is not on the {} PDL list",
+                            path.display(),
+                            target.model
+                        );
+                        defined.push(name.to_owned());
+                    }
                 }
             }
             for listed in target.kernels {

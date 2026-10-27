@@ -20,9 +20,6 @@ mod gpu_impl;
 pub use gpu_impl::{configure_pdl, pdl_enabled};
 mod gpu_impl_graph;
 mod host_staging;
-mod meminfo;
-pub(crate) use meminfo::unified_free;
-use meminfo::{system_available_memory_bytes, system_meminfo_bytes};
 #[cfg(unix)]
 mod nvml;
 pub mod tensormap;
@@ -166,10 +163,6 @@ pub struct AtlasCudaBackend {
     /// `own_footprint` reports growth over the same span as the free-memory
     /// baseline (context and kernel modules are already in both).
     own_baseline: crate::own_footprint::Sample,
-    /// Slab base/extent pairs registered by pack-mode weight loaders.
-    /// Interior `DevicePtr`s passed to `free()` must become no-ops: they
-    /// are not cuMemAlloc'd, so freeing one would be CUDA_ERROR_INVALID_VALUE.
-    slab_regions: parking_lot::Mutex<Vec<(u64, u64)>>,
     /// Default CUDA stream handle (from the process CUDA host).
     default_stream: u64,
     /// CUDA context handle for cross-thread binding.
@@ -207,7 +200,6 @@ impl AtlasCudaBackend {
         Ok(Self {
             live_allocs: parking_lot::Mutex::default(),
             own_baseline: Self::own_sample(),
-            slab_regions: parking_lot::Mutex::new(Vec::new()),
             registry,
             debug_sync_kernels: std::env::var("ATLAS_DEBUG_SYNC_KERNELS").as_deref() == Ok("1"),
             op_cache: crate::op_cache::OpCache::new(),
@@ -216,23 +208,8 @@ impl AtlasCudaBackend {
         })
     }
 
-    /// True when `ptr` lies strictly inside a registered slab — carved
-    /// interior pointers own no storage and must never reach cuMemFree.
-    pub(crate) fn is_slab_interior(&self, ptr: u64) -> bool {
-        self.slab_regions
-            .lock()
-            .iter()
-            .any(|&(base, len)| ptr > base && ptr < base + len)
-    }
-
-    /// Drop the slab whose BASE is `ptr` (called on a real free of the base).
-    /// Without this the region stays registered after the base is freed, a
-    /// later cuMemAlloc can land inside it, and that fresh allocation's
-    /// `free()` would silently no-op — a leak with no diagnostic.
-    pub(crate) fn drop_slab_region(&self, base: u64) {
-        drop_slab_region(&mut self.slab_regions.lock(), base);
-    }
-
+    /// This model's kernel modules, for the paths that need the registry
+    /// directly rather than through `GpuBackend`.
     pub(crate) fn record_alloc(&self, ptr: crate::gpu::DevicePtr, bytes: usize) {
         self.live_allocs.lock().record(ptr.0, bytes);
     }
@@ -274,9 +251,6 @@ impl AtlasCudaBackend {
     /// removed from the ledger by `forget_alloc`, so it cannot double-free.
     pub fn sweep_unreleased(&self) -> usize {
         let outstanding = self.live_allocs.lock().drain();
-        // All regions die with the sweep — every outstanding base is being
-        // freed below, and keeping extents would mis-silence future frees.
-        self.slab_regions.lock().clear();
         let count = outstanding.len();
         for raw in outstanding {
             // Bypass `free`: the ledger is already drained, and a failure here

@@ -121,9 +121,14 @@ static Variant c8_units(bool fused, bool tc = false, bool v1 = false) {
 }
 // qwen4exp_moe_c8_tc3.cu: the v3 plan + gate/up and down in one persistent
 // launch (TC3_CTAS CTAs, default 2 a SM). Its time shows as gate_up, and only
-// the layer column is real: a gate_up rerun without the plan finds the claim
-// counter spent (LAYER_PASSES times layers only).
-static Variant tc3_units(const std::string& tag = "") {
+// the layer column is real: a gate/up rerun without the plan finds the claim
+// counter spent (LAYER_PASSES times layers only). `sh`: the shared expert
+// as the NVFP4 unit (0), absent (1: what the unit costs), or FP4-Local's
+// MXFP8 one apart (mxfp8_gemv.cu's `_swiglu` and plain tiers, random codes
+// at the checkpoint's scale range): after the launch (2; its time shows as
+// silu_down), or on a side stream forked before the plan and joined after
+// the launch (3: the layer column only).
+static Variant tc3_units(const std::string& tag = "", int sh = 0) {
     static std::vector<std::string> mods;
     mods.push_back(tag.empty() ? "qwen4exp_moe_c8_tc3" : "qwen4exp_moe_c8_tc3_" + tag);
     const char* M = mods.back().c_str();
@@ -135,19 +140,69 @@ static Variant tc3_units(const std::string& tag = "") {
                           : getenv("TC3_CTAS")         ? atoi(getenv("TC3_CTAS"))
                                                        : 2 * sms;
     Variant v;
-    v.name = "tc3 " + (tag.empty() ? std::string("") : tag + " ") + "fused";
+    v.name = "tc3 " + (tag.empty() ? std::string("") : tag + " ") +
+             (sh == 0 ? "fused" : sh == 1 ? "routed only" : sh == 2 ? "+ mxfp8 shared" : "+ mxfp8 side");
     v.plan = [=](Pool& p, Bufs& b, unsigned rows) {
-        unsigned topk = TOPK, R = rows;
-        launch(pl, dim3(1), dim3(1024), {&b.ids, &p.gp, &b.ws, &topk, &R});
+        unsigned topk = TOPK, R = rows, shared = sh == 0;
+        launch(pl, dim3(1), dim3(1024), {&b.ids, &p.gp, &b.ws, &topk, &R, &shared});
     };
     v.gate_up = [=](Pool& p, Bufs& b, unsigned rows) {
         unsigned topk = TOPK, R = rows;
+        void* null = nullptr;
+        void* s[6] = {p.sg.packed, p.sg.scale, p.su.packed, p.su.scale, p.sd.packed, p.sd.scale};
+        if (sh) for (auto& x : s) x = null;
         launch(fu, dim3(ctas), dim3(256),
-               {&b.A, &p.gp, &p.gs, &p.g2, &p.upk, &p.us, &p.u2, &p.dp, &p.ds, &p.d2, &p.sg.packed,
-                &p.sg.scale, &p.sg.s2, &p.su.packed, &p.su.scale, &p.su.s2, &p.sd.packed, &p.sd.scale,
+               {&b.A, &p.gp, &p.gs, &p.g2, &p.upk, &p.us, &p.u2, &p.dp, &p.ds, &p.d2, &s[0],
+                &s[1], &p.sg.s2, &s[2], &s[3], &p.su.s2, &s[4], &s[5],
                 &p.sd.s2, &b.ws, &b.act, &b.down, &b.shd, &topk, &R});
     };
     v.silu_down = [](Pool&, Bufs&, unsigned) {};
+    if (sh >= 2) {
+        struct Mx { unsigned char *w, *s; };
+        const auto mx = [](unsigned n, unsigned k) {
+            std::vector<unsigned char> w((size_t)n * k), s((size_t)n * k / 32);
+            for (auto& x : w) { x = (unsigned char)g_rng(); if ((x & 0x7f) == 0x7f) x--; }
+            for (auto& x : s) x = (unsigned char)(113 + g_rng() % 6);
+            return Mx{dput(w), dput(s)};
+        };
+        const Mx gu = mx(2 * I, H), dn = mx(H, I);
+        CUfunction swiglu[3] = {load("mxfp8_gemv", "mxfp8_gemv_tc8_swiglu"),
+                                load("mxfp8_gemv", "mxfp8_gemv_tc16_swiglu"),
+                                load("mxfp8_gemv", "mxfp8_gemv_tc32_swiglu")};
+        CUfunction plain[3] = {load("mxfp8_gemv", "mxfp8_gemv_tc8"), load("mxfp8_gemv", "mxfp8_gemv_tc16"),
+                               load("mxfp8_gemv", "mxfp8_gemv_tc32")};
+        const auto shared = [=](Bufs& b, unsigned rows, CUstream st) {
+            for (unsigned r0 = 0; r0 < rows; r0 += 32) {
+                unsigned m = std::min(32u, rows - r0), n = I, k = H, ld = I, nd = H, kd = I, ldd = H;
+                const unsigned t = m <= 8 ? 0 : m <= 16 ? 1 : 2;
+                void* a = (char*)b.A + (size_t)r0 * H * 2;
+                void* act = (char*)b.shg + (size_t)r0 * I * 2;
+                void* out = (char*)b.shd + (size_t)r0 * H * 2;
+                void* ga[8] = {&a, (void*)&gu.w, (void*)&gu.s, &act, &m, &n, &k, &ld};
+                void* da[8] = {&act, (void*)&dn.w, (void*)&dn.s, &out, &m, &nd, &kd, &ldd};
+                CU(cuLaunchKernel(swiglu[t], I / 8, 1, 1, 256, 1, 1, 0, st, ga, nullptr));
+                CU(cuLaunchKernel(plain[t], H / 16, 1, 1, 256, 1, 1, 0, st, da, nullptr));
+            }
+        };
+        if (sh == 2) {
+            v.silu_down = [=](Pool&, Bufs& b, unsigned rows) { shared(b, rows, 0); };
+        } else {
+            CUstream side;
+            cudaEvent_t fork, join;
+            CU(cuStreamCreate(&side, CU_STREAM_NON_BLOCKING));
+            CK(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&join, cudaEventDisableTiming));
+            const auto plan = v.plan;
+            v.plan = [=](Pool& p, Bufs& b, unsigned rows) {
+                CK(cudaEventRecord(fork, 0));
+                CK(cudaStreamWaitEvent((cudaStream_t)side, fork, 0));
+                shared(b, rows, side);
+                CK(cudaEventRecord(join, (cudaStream_t)side));
+                plan(p, b, rows);
+            };
+            v.silu_down = [=](Pool&, Bufs&, unsigned) { CK(cudaStreamWaitEvent(0, join, 0)); };
+        }
+    }
     return v;
 }
 
@@ -162,7 +217,8 @@ std::vector<Variant> variants() {
     v.push_back(c8_units(true, true));
     // NO_TC3=1: without tc3; TC3_TAGS=a,b: extra builds of it, modules
     // qwen4exp_moe_c8_tc3_<tag>.ptx (a tag "x<n>..." launches n CTAs).
-    if (!getenv("NO_TC3") || !atoi(getenv("NO_TC3"))) v.push_back(tc3_units());
+    if (!getenv("NO_TC3") || !atoi(getenv("NO_TC3")))
+        for (int sh = 0; sh < 4; sh++) v.push_back(tc3_units("", sh));
     if (const char* tags = getenv("TC3_TAGS")) {
         std::stringstream ss(tags);
         std::string t;

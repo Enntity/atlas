@@ -86,26 +86,26 @@ int main(int argc, char** argv) {
         memcpy(&x, &b, 2);
     }
 
-    void *dq, *dcache, *didx, *dtable, *dout0, *dout1;
+    void *dq, *dcache, *didx, *dtable, *device_output0, *device_output1;
     const size_t out_bytes = (size_t)rows * heads * dim * 2;
     CK(cudaMalloc(&dq, q.size() * 2));
     CK(cudaMalloc(&dcache, cache.size()));
     CK(cudaMalloc(&didx, idx.size() * 4));
     CK(cudaMalloc(&dtable, table.size() * 4));
-    CK(cudaMalloc(&dout0, out_bytes));
-    CK(cudaMalloc(&dout1, out_bytes));
+    CK(cudaMalloc(&device_output0, out_bytes));
+    CK(cudaMalloc(&device_output1, out_bytes));
     CK(cudaMemcpy(dq, q.data(), q.size() * 2, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dcache, cache.data(), cache.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(didx, idx.data(), idx.size() * 4, cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dtable, table.data(), table.size() * 4, cudaMemcpyHostToDevice));
-    CK(cudaMemset(dout0, 0xFF, out_bytes));
-    CK(cudaMemset(dout1, 0xEE, out_bytes));
+    CK(cudaMemset(device_output0, 0xFF, out_bytes));
+    CK(cudaMemset(device_output1, 0xEE, out_bytes));
 
     typedef void (*Kern)(GLM_KV_PAD_ARGS);
     const Kern kern[2] = {glm_sparse_mla_prefill_fp8g128_head32_tc_kv_pad,
                           glm_sparse_mla_prefill_fp8g128_head32_tc_pipe};
     const int smem[2] = {69376, GLM_PIPE_SMEM};
-    void* outs[2] = {dout0, dout1};
+    void* outs[2] = {device_output0, device_output1};
     for (int k = 0; k < 2; k++)
         CK(cudaFuncSetAttribute(kern[k], cudaFuncAttributeMaxDynamicSharedMemorySize, smem[k]));
     auto run = [&](int k) {
@@ -117,8 +117,8 @@ int main(int argc, char** argv) {
     CK(cudaDeviceSynchronize());
 
     std::vector<unsigned short> o0((size_t)rows * heads * dim), o1(o0.size());
-    CK(cudaMemcpy(o0.data(), dout0, out_bytes, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(o1.data(), dout1, out_bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(o0.data(), device_output0, out_bytes, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(o1.data(), device_output1, out_bytes, cudaMemcpyDeviceToHost));
     size_t diff = 0, nonfinite = 0;
     double max_abs = 0.0;
     for (size_t i = 0; i < o0.size(); i++) {

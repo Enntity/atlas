@@ -2,7 +2,8 @@
 
 //! GPU tests (`#[ignore]` per repo convention; a GB10 and a glm-5.3-flash
 //! kernel build, run with `ATLAS_W4A16_TC=1`): one probe row through every
-//! verify width 1..8, 16 and 32, at the first, middle and last slot, beside
+//! verify width 1..8, 16 and 32 (and 56, 64 for the canonical kernels), at
+//! the first, middle and last slot, beside
 //! other rows each time. The canonical kernels ([`w4a16`], [`dense`], the
 //! touch / strided / pair twins) must give the probe the same bits at every
 //! width; the width-tuned kernels they replace are shown to not (the test's
@@ -14,10 +15,14 @@
 
 use super::*;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
+use anyhow::Context;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
 pub(super) const WIDTHS: [u32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32];
+/// The widths the canonical kernels take: also the chain's owner verifies
+/// past one launch (56 and 64 rows, two launches).
+pub(super) const CANON_WIDTHS: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 56, 64];
 
 pub(super) struct Rng(pub u64);
 
@@ -49,7 +54,16 @@ pub(super) fn from_bf16(h: u16) -> f32 {
 /// One backend for the whole test process: the tier tables resolve their
 /// handles once (`OnceLock`), against the first backend that asks.
 pub(super) fn backend() -> Result<&'static AtlasCudaBackend> {
-    crate::layers::glm_gpu_test_backend::backend()
+    static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
+    if GPU.get().is_none() {
+        let gpu =
+            AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules()).context("CUDA backend")?;
+        let _ = GPU.set(gpu);
+    }
+    let gpu = GPU.get().expect("set above");
+    // Each test runs on its own thread.
+    gpu.bind_to_thread()?;
+    Ok(gpu)
 }
 
 pub(super) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
@@ -68,7 +82,6 @@ pub(super) fn rows_bytes(rows: &[Vec<u16>]) -> Vec<u8> {
 pub(super) fn download(gpu: &dyn GpuBackend, ptr: DevicePtr, elems: usize) -> Result<Vec<u16>> {
     let mut b = vec![0u8; elems * 2];
     gpu.copy_d2h(ptr, &mut b)?;
-    crate::layers::glm_gpu_test_backend::finite_bf16("canonical projection", &b)?;
     Ok(b.chunks(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect())
@@ -278,7 +291,7 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
     ensure!(enabled(), "run with ATLAS_W4A16_TC=1 and the switch on");
     let gpu = backend()?;
     let gpu: &dyn GpuBackend = gpu;
-    W4a16BatchmTiers::resolve(gpu, true);
+    W4a16BatchmTiers::resolve(gpu);
     let mut rng = Rng(0x5eed_1234_abcd_0001);
     let mut failed = 0;
     let mut legacy_varies = 0;
@@ -294,7 +307,7 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
     ] {
         let w = w4(gpu, &mut rng, n, k)?;
         let probe = wide_row(&mut rng, k);
-        let canon = probe_bits(&mut rng, &probe, k, &WIDTHS, |rows| {
+        let canon = probe_bits(&mut rng, &probe, k, &CANON_WIDTHS, |rows| {
             run_rows(gpu, rows, n, |a, c, m| {
                 w4a16(gpu, a, &w.q, c, m, n, k, gpu.default_stream())
             })
@@ -390,12 +403,6 @@ pub(super) fn launch_dense(
     let s = gpu.default_stream();
     match name {
         "dense_gemm_bf16_router" => ops::dense_gemm_router(gpu, kernel, a, weight, c, m, n, k, s),
-        "dense_gemm_bf16_router_rows" => {
-            ops::dense_gemm_router_rows(gpu, kernel, a, weight, c, m, n, k, s)
-        }
-        "dense_gemm_bf16_router_m5" => {
-            ops::dense_gemm_router_m5(gpu, kernel, a, weight, c, m, n, k, s)
-        }
         "dense_gemv_bf16_batchm" => {
             ops::dense_gemv_batchm(gpu, kernel, a, weight, c, m, n, k, n, s)
         }
@@ -407,9 +414,5 @@ pub(super) fn launch_dense(
 mod accuracy;
 #[path = "canonical_verify_bench_tests.rs"]
 mod bench;
-#[path = "canonical_verify_chain_tests.rs"]
-mod chain;
-#[path = "canonical_verify_dense_chain_tests.rs"]
-mod dense_chain;
 #[path = "canonical_verify_dense_tests.rs"]
 mod dense_tests;

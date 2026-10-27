@@ -90,7 +90,7 @@ pub const PERF_PATHS: [&str; 8] = [
 /// The four files here are the ones that decide a verdict. `GATE_MACHINERY`
 /// still covers the rest of the directory — record IO, telemetry rendering,
 /// the CODEOWNERS parser — where the exclusion's argument does hold.
-pub const BOUNDARY_FILES: [&str; 8] = [
+pub const BOUNDARY_FILES: [&str; 9] = [
     "crates/atlas-plugin/src/gate/coverage.rs",
     // `required_for` / `union` / `intent_only`: decides what the INTENT half
     // adds on top of the path-derived floor. Once intent can escalate a gate,
@@ -125,6 +125,8 @@ pub const BOUNDARY_FILES: [&str; 8] = [
     // `sources` / `configs` / `affected`: decides which targets a kernel edit
     // reaches, i.e. the input to `excuses`.
     "crates/atlas-plugin/src/gate/taxon.rs",
+    // Redirect and quant composition helpers determine closure inputs too.
+    "crates/atlas-plugin/src/gate/taxon_paths.rs",
     // `baseline_for`: decides WHICH thresholds a record is judged against.
     "crates/atlas-plugin/src/gate/bench.rs",
 ];

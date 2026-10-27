@@ -90,8 +90,15 @@ impl Qwen3SsmLayer {
         let value_dim = ctx.config.linear_num_value_heads * ctx.config.linear_value_head_dim;
         // ── 8. Output projection: [value_dim → hidden_size] ──
         let out = ctx.buffers.moe_output();
-        if let Some(mx8) = self.mx8.as_ref() {
-            self.mx8_out(mx8, ctx, normed_out, out, 1, stream)?;
+        if self.mxfp8_rows_proj(
+            ctx.gpu,
+            super::exact_rows::GdnProj::Out,
+            normed_out,
+            out,
+            1,
+            stream,
+        )? {
+            // The checkpoint's own MXFP8 copy (FP4-Local; `init_mxfp8.rs`).
         } else if let Some(ref fp8) = self.out_proj_fp8w {
             // `w8a16_gemv` consumes `[N/BS,K/BS] BF16` block scales —
             // the canonical Qwen FP8 release format.

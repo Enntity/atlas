@@ -77,8 +77,6 @@ int cuMemAlloc_v2(unsigned long long *a, unsigned long b) { (void)a; (void)b; re
 int cuMemImportFromShareableHandle(unsigned long long *a, void *b, unsigned int c) { (void)a; (void)b; (void)c; return 100; }
 int cuMemAddressReserve(unsigned long long *a, unsigned long b, unsigned long c, unsigned long long d, unsigned long long e) { (void)a; (void)b; (void)c; (void)d; (void)e; return 100; }
 int cuMemMap(unsigned long long a, unsigned long b, unsigned long c, unsigned long long d, unsigned long long e) { (void)a; (void)b; (void)c; (void)d; (void)e; return 100; }
-int cuMemUnmap(unsigned long long a, unsigned long b) { (void)a; (void)b; return 100; }
-int cuMemAddressFree(unsigned long long a, unsigned long b) { (void)a; (void)b; return 100; }
 int cuMemRelease(unsigned long long a) { (void)a; return 100; }
 int cuMemSetAccess(unsigned long long a, unsigned long b, const void *c, unsigned long d) { (void)a; (void)b; (void)c; (void)d; return 100; }
 int cuMemAllocManaged(unsigned long long *a, unsigned long b, unsigned int c) {
@@ -193,6 +191,7 @@ int cublasLtCreate(void){return 1;}
 int cublasLtDestroy(void){return 1;}
 int cublasLtMatmul(void){return 1;}
 int cublasLtMatmulAlgoGetHeuristic(void){return 1;}
+int cublasLtMatmulAlgoCheck(void){return 1;}
 int cublasLtMatmulAlgoConfigGetAttribute(void){return 1;}
 int cublasLtMatmulDescCreate(void){return 1;}
 int cublasLtMatmulDescDestroy(void){return 1;}
@@ -201,6 +200,7 @@ int cublasLtMatmulPreferenceCreate(void){return 1;}
 int cublasLtMatmulPreferenceDestroy(void){return 1;}
 int cublasLtMatmulPreferenceSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutCreate(void){return 1;}
+int cublasLtMatrixLayoutSetAttribute(void){return 1;}
 int cublasLtMatrixLayoutDestroy(void){return 1;}
 int cublasLtMatrixLayoutSetAttribute(void){return 1;}
 int cublasLtMatmulAlgoCheck(void){return 1;}

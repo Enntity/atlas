@@ -140,6 +140,7 @@ fn a_grammar_passes_the_end_token_through() {
         &[GRAMMAR_EOS],
         false,
         None,
+        None,
         &mut ResponseSink::Blocking(None),
     )
     .unwrap();

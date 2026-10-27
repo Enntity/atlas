@@ -16,7 +16,7 @@ pub(in crate::layers::moe) fn btile_shared_fixture(
 }
 
 impl MoeLayer {
-    pub(in crate::layers::moe) fn transpose_unified_shared_gate_up(
+    pub(super) fn transpose_unified_shared_gate_up(
         &mut self,
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
@@ -50,9 +50,6 @@ impl MoeLayer {
         Ok(())
     }
 
-    /// Frees through `free_original` so the pointers come back in the
-    /// caller's freed list — the weight store's teardown still owns them and
-    /// would free them a second time otherwise (#122).
     pub(super) fn release_unified_shared_gate_up(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -77,7 +74,6 @@ impl MoeLayer {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn transpose_unified_down_phase(
         &mut self,
         gpu: &dyn GpuBackend,
@@ -86,7 +82,8 @@ impl MoeLayer {
         keep_originals: bool,
         keep_shared_originals: bool,
         freed: &mut Vec<DevicePtr>,
-    ) -> Result<()> {
+    ) -> Result<Vec<DevicePtr>> {
+        let mut freed_down = Vec::new();
         self.transpose_unified_down_owned(
             gpu,
             config,
@@ -94,9 +91,10 @@ impl MoeLayer {
             keep_originals,
             keep_shared_originals,
             None,
-            freed,
-        )
-        .map(|_| ())
+            &mut freed_down,
+        )?;
+        freed.append(&mut freed_down);
+        Ok(freed_down)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -128,7 +126,7 @@ impl MoeLayer {
             .collect();
         // Owned checkpoint transforms keep their release callback; the normal
         // unified path retains upstream's in-place allocation ownership.
-        let inplace = !keep_originals && release.is_none();
+        let inplace = !keep_originals && release.is_none() && super::inplace_transpose::enabled();
         let mut scratch = super::inplace_transpose::TransposeScratch::new();
         let down_t = if inplace {
             self.transpose_experts_inplace(gpu, &down_src, h, inter, routed_group, &mut scratch)?
@@ -153,8 +151,8 @@ impl MoeLayer {
                         release(index, false, expert.down_proj.weight)?;
                         release(index, true, expert.down_proj.weight_scale)?;
                     } else if !inplace {
-                        gpu.free(expert.down_proj.weight)?;
-                        gpu.free(expert.down_proj.weight_scale)?;
+                        free_original(gpu, freed, expert.down_proj.weight)?;
+                        free_original(gpu, freed, expert.down_proj.weight_scale)?;
                     }
                     expert.down_proj.weight = DevicePtr::NULL;
                     expert.down_proj.weight_scale = DevicePtr::NULL;

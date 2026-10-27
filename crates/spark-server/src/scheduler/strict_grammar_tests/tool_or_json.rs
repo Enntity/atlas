@@ -6,7 +6,7 @@
 //! output on the emit path and in the strict verify walk alike.
 
 use super::*;
-use crate::scheduler::strict_spec::row_masks;
+use crate::scheduler::strict_spec::{row_masks, row_masks_with_history};
 use crate::scheduler::test_support::{GRAMMAR_TOOL_CALL as TOOL_CALL, GRAMMAR_VOCAB, THINK_END};
 use crate::tool_parser::{FunctionDefinition, PoolsideV1Parser, ToolDefinition};
 
@@ -39,6 +39,7 @@ pub(super) fn union(opens_in_thinking: bool) -> GrammarState {
         &[EOS],
         opens_in_thinking,
         Some(TOOL_CALL),
+        None,
         &mut sink,
     )
     .unwrap()
@@ -72,6 +73,7 @@ fn the_union_is_a_strict_grammar_that_knows_the_native_opener() {
         &[EOS],
         false,
         Some(TOOL_CALL),
+        None,
         &mut sink,
     )
     .unwrap()
@@ -160,22 +162,24 @@ fn the_verify_walk_masks_rows_after_a_drafted_opener() {
 }
 
 #[test]
-fn a_parser_without_a_tool_grammar_cannot_silently_drop_response_format() {
-    let mut spec = union_spec(Some(SCHEMA));
-    if let GrammarSpec::ToolCallOrJson { parser, .. } = &mut spec {
-        *parser = std::sync::Arc::new(crate::tool_parser::MistralNativeParser);
-    }
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    let mut sink = ResponseSink::Blocking(Some(tx));
-    let result = compile_grammar_state(&mut engine(), &Some(spec), &[EOS], false, None, &mut sink);
+fn the_verify_walk_keeps_a_quoted_native_opener_in_reasoning() {
+    let mut gs = union(true);
+    let history = [b'`' as u32];
+    let mut drafts = vec![TOOL_CALL, b'`' as u32, TOOL_CALL];
+    drafts.extend(bytes(CALL_BODY));
+    let v = row_masks_with_history(
+        &mut gs,
+        true,
+        (None, Some(THINK_END)),
+        &drafts,
+        GRAMMAR_VOCAB,
+        &history,
+    )
+    .unwrap();
+    assert_eq!(&v.drafts[..3], &drafts[..3]);
     assert!(
-        result.is_err(),
-        "an unsupported union must not decode unconstrained"
+        v.drafts.len() > 3,
+        "the real opener should enter the tool branch"
     );
-    let error = rx
-        .try_recv()
-        .unwrap()
-        .err()
-        .expect("client receives an error");
-    assert!(error.is::<crate::api::InvalidRequestError>());
+    assert_eq!(gs.num_history_steps(), 0, "the walk rolls back");
 }

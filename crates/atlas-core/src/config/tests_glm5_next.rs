@@ -51,6 +51,8 @@ fn nvidia_checkpoint_maps_hybrid_kda_mla_moe_shape() {
     assert_eq!(cfg.shared_expert_intermediate_size, 2048);
     assert_eq!(cfg.scoring_func, "sigmoid");
     assert!(cfg.use_routing_bias);
+    assert!(cfg.router_logits_f32);
+    assert_eq!(cfg.router_logit_bytes(), 4);
     assert_eq!(cfg.mlp_only_layers, vec![0, 1, 2]);
 
     // mHC and the k-pool semantic indexer.
@@ -86,6 +88,19 @@ fn layer_types_follow_the_checkpoint_not_a_fixed_period() {
         };
         assert_eq!(cfg.layer_type(layer), expected, "layer {layer}");
     }
+}
+
+#[test]
+fn router_logits_are_float32_and_nothing_else() {
+    let json = text_config_with(|t| {
+        t.remove("moe_router_dtype");
+    });
+    assert!(parse_config(&json).unwrap().router_logits_f32);
+    let json = text_config_with(|t| {
+        t["moe_router_dtype"] = "bfloat16".into();
+    });
+    let err = parse_config(&json).unwrap_err().to_string();
+    assert!(err.contains("moe_router_dtype"), "{err}");
 }
 
 #[test]
@@ -152,8 +167,7 @@ fn fp4_local_declares_csf32_routed_expert_scales() {
     let csf32 = |algo: &str| QuantLayerSpec {
         quant_algo: algo.into(),
         group_size: 16,
-        weight_scale_encoding: Some("csf_32x2_v1".into()),
-        weight_block_size: vec![],
+        weight_scale_encoding: "csf_32x2_v1".into(),
     };
     // Routed experts of layers 3..=44 ship csf_32x2_v1 scales; the MTP
     // layer's (45) are plain W4A16_NVFP4.
@@ -163,16 +177,13 @@ fn fp4_local_declares_csf32_routed_expert_scales() {
     }
     let mtp = spec("model.language_model.layers.45.mlp.experts");
     assert_eq!(
-        (
-            mtp.quant_algo.as_str(),
-            mtp.weight_scale_encoding.as_deref().unwrap_or_default()
-        ),
+        (mtp.quant_algo.as_str(), mtp.weight_scale_encoding.as_str()),
         ("W4A16_NVFP4", "")
     );
     let encoded = q
         .quantized_layers
         .values()
-        .filter(|s| s.weight_scale_encoding.is_some())
+        .filter(|s| !s.weight_scale_encoding.is_empty())
         .count();
     assert_eq!(
         encoded, 42,
@@ -183,6 +194,6 @@ fn fp4_local_declares_csf32_routed_expert_scales() {
         "model.language_model.layers.3.mlp.shared_experts.down_proj",
         "model.language_model.layers.45.self_attn.q_a_proj",
     ] {
-        assert_eq!(spec(path).weight_scale_encoding, None, "{path}");
+        assert_eq!(spec(path).weight_scale_encoding, "", "{path}");
     }
 }

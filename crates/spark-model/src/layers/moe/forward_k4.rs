@@ -17,10 +17,14 @@ impl MoeLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         self.btile_input_guard(input, 4, ctx, stream)?;
+        if self.grouped_only(ctx) {
+            self.forward_prefill(input, 4, ctx, stream)?;
+            return Ok(ctx.buffers.moe_output());
+        }
         let optimized = self.lora.is_none()
             && self.bf16_gate_weight_ptrs.is_none()
             && self.fp8_gate_weight_ptrs.is_none()
-            && !self.has_separate_shared_expert()
+            && !self.has_unfused_shared_expert()
             && matches!(
                 self.experts_scale_kind,
                 crate::weight_map::WeightQuantFormat::Nvfp4

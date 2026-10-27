@@ -7,10 +7,17 @@ mod dense;
 mod expert_tp;
 mod fp4l;
 pub(crate) use fp4l::release_expanded;
+mod kda_mx;
 mod kda_side_pack;
 mod layers;
+mod mla_native;
 mod mla_twins;
+mod mtp;
+pub(crate) use mtp::{
+    Glm5MtpModule, glm5_mtp_draft_config, glm5_mtp_marker_names, load_glm5_mtp_module,
+};
 pub(crate) mod retirement;
+mod shared_native;
 mod tp;
 mod vision;
 
@@ -91,8 +98,7 @@ impl ModelWeightLoader for Glm5WeightLoader {
         store: &WeightStore,
         config: &ModelConfig,
         gpu: &dyn GpuBackend,
-    ) -> Result<Option<crate::layers::VisionTower>> {
-        Ok(vision::load(store, config, gpu)?
-            .map(|enc| crate::layers::VisionTower::Qwen(Box::new(enc))))
+    ) -> Result<Option<crate::layers::VisionEncoder>> {
+        vision::load(store, config, gpu)
     }
 }

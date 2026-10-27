@@ -3,7 +3,7 @@
 //! verify FFN entries; the numerics are gated on hardware by
 //! scripts/moe-decode-bench.
 use super::*;
-use crate::layers::moe::decode_m16::{MAX_ROWS, STREAM_MAX_ROWS, m16_shape};
+use crate::layers::moe::decode_m16::{MAX_ROWS, STREAM_MAX_ROWS, WIDE_MAX_ROWS, m16_shape};
 
 #[test]
 fn m16_tiles_cover_their_row_slabs_of_k128_aligned_experts() {
@@ -160,11 +160,6 @@ fn verify_ffn(
     let stream = env_on("ATLAS_GLM_MOE_DECODE_M16")
         && env_on("ATLAS_GLM_MOE_DECODE_STREAM")
         && !lacks(|n| !n.ends_with("_l2pf") && !n.ends_with("_l2pf_p"));
-    let family = match (stream, rows as u32 <= MAX_ROWS) {
-        (false, _) => "m16",
-        (true, true) => "m16s",
-        (true, false) => "m32s",
-    };
     let skip = if env_on("ATLAS_GLM_MOE_DOWN_ZSKIP") {
         "_zskip"
     } else {
@@ -183,6 +178,13 @@ fn verify_ffn(
         && env_on("ATLAS_GLM_MOE_DOWN_ZSKIP")
         && env_on("ATLAS_GLM_MOE_DECODE_PERSIST")
         && !lacks(|n| n.ends_with("_l2pf_p"));
+    // With the persistent twins, the four-slab pair takes 33..=64 rows.
+    let family = match (stream, rows as u32) {
+        (false, _) => "m16",
+        (true, r) if r <= MAX_ROWS => "m16s",
+        (true, r) if r <= STREAM_MAX_ROWS || !persist => "m32s",
+        (true, _) => "m64s",
+    };
     let suffix = |on: bool| match (on, persist) {
         (false, _) => "",
         (true, false) => "_l2pf",
@@ -198,7 +200,7 @@ fn verify_ffn(
     );
     let [gate_up, down] = [gate_up_name.as_str(), down_name.as_str()].map(launches);
     // No other twin launches.
-    for other in ["m16", "m16s", "m32s"] {
+    for other in ["m16", "m16s", "m32s", "m64s"] {
         for kernel in [
             "gate_up_silu_k128w",
             "k128w",
@@ -226,7 +228,11 @@ fn verify_ffn(
     let grids = |bound: u32| [[inter / 128, bound, 1], [16, bound, 1]];
     let decode = entry != Entry::Prefill;
     // The stream twins take every batch they fit, verify decode or not.
-    let max_rows = if stream { STREAM_MAX_ROWS } else { MAX_ROWS };
+    let max_rows = match (stream, persist) {
+        (true, true) => WIDE_MAX_ROWS,
+        (true, false) => STREAM_MAX_ROWS,
+        (false, _) => MAX_ROWS,
+    };
     if (decode || stream) && env_on("ATLAS_GLM_MOE_DECODE_M16") && rows as u32 <= max_rows {
         // One tile per routed expert, at most one expert per routed row.
         assert_eq!((gate_up.len(), down.len()), (1, 1));
@@ -239,14 +245,22 @@ fn verify_ffn(
         };
         assert_eq!([gate_up[0].0, down[0].0], grid);
         assert_eq!([gate_up[0].1, down[0].1], [[256, 1, 1]; 2]);
-        // The K128W argument lists: 17 fused gate/up, 12 down, the worklist
+        // The K128W argument lists: 18 fused gate/up, 12 down, the worklist
         // scratch where they take the prefix.
-        assert_eq!((gate_up[0].2.len(), down[0].2.len()), (17, 12));
+        assert_eq!((gate_up[0].2.len(), down[0].2.len()), (18, 12));
         assert_eq!(gate_up[0].2[11], Arg::Ptr(scratch));
         assert_eq!(down[0].2[11], Arg::Ptr(scratch));
         // Gate/up leaves the NVFP4 SiLU product where the down reads it.
         let scales = up_out.offset((routed * inter / 2) as usize);
-        assert_eq!(gate_up[0].2[15..], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
+        // ...and, without ATLAS_GLM_FP4L_INPUT_SCALES, no down input scales.
+        assert_eq!(
+            gate_up[0].2[15..],
+            [
+                Arg::Ptr(up_out),
+                Arg::Ptr(scales),
+                Arg::Ptr(DevicePtr::NULL)
+            ]
+        );
         assert_eq!(down[0].2[..2], [Arg::Ptr(up_out), Arg::Ptr(scales)]);
         assert!(position(&gate_up_name) < position(&down_name));
         // Nothing of the M64 paths runs.
@@ -339,7 +353,7 @@ fn verify_ffn_launches_the_m16_twins_only_with_the_flag() {
     }
     // One verify block of 2..=8 rows, 3-row blocks of four owners, and
     // prefill batches of 12, 24 and 40 rows, which only the stream twins take
-    // (up to 32 rows).
+    // (up to 32 rows; 40 the four-slab persistent pair).
     let batches = (2..=8).map(|rows| (Entry::Independent, rows)).chain([
         (Entry::Owner, 12),
         (Entry::Prefill, 12),

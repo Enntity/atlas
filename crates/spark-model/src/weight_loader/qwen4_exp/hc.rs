@@ -127,12 +127,15 @@ fn load_site(
     let up_w = g("input_mix_weight_up")?;
     tr.apply(up_w)
         .with_context(|| format!("qwen4_exp mHC: transposing {prefix}.input_mix_weight_up"))?;
-    // `hc_norm` feeds kernels declared `const float*`: keep an F32 checkpoint
-    // native (FP4-Local ships it F32) and widen a BF16 one (NVFP4) by zero
-    // extension — exact in both directions.
-    let norm_w = dense_keep_f32(store, &format!("{prefix}.hc_norm.weight"), tr.gpu)
-        .map(|d| d.weight)
-        .with_context(|| format!("qwen4_exp mHC: {prefix}.hc_norm.weight"))?;
+    // F32 as the kernels read it; BF16 releases widen exactly (see `f32_norm`).
+    let norm_w = super::helpers::f32_norm(
+        store,
+        &format!("{prefix}.hc_norm.weight"),
+        tr.gpu,
+        tr.rows as usize,
+    )
+    .with_context(|| format!("qwen4_exp mHC: {prefix}.hc_norm.weight"))?
+    .weight;
     Ok(HcLowRank {
         norm_w,
         down_w: g("input_mix_weight_down")?,

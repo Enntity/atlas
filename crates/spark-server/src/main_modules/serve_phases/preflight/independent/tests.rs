@@ -5,6 +5,9 @@ use clap::Parser;
 #[path = "long_context_tests.rs"]
 mod long_context;
 
+#[path = "qwen_mode_tests.rs"]
+mod qwen_modes;
+
 // Supply only the I/O boundary; all topology/admission/accounting is production.
 fn prepare_reserve(
     args: &cli::ServeArgs,

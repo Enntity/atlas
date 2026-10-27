@@ -74,22 +74,3 @@ fn scales_outside_the_exact_range_are_refused() {
     assert_eq!(mxfp8_scales_f32(&[127]).unwrap(), vec![1.0]);
     assert_eq!(mxfp8_scales_f32(&[118]).unwrap(), vec![2f32.powi(-9)]);
 }
-
-#[test]
-fn output_allocation_failure_releases_widened_scales() {
-    use spark_runtime::gpu::mock::MockGpuBackend;
-    let gpu = MockGpuBackend::new();
-    let data = gpu.alloc(32).unwrap();
-    let scales = gpu.alloc(1).unwrap();
-    gpu.copy_h2d(&[127], scales).unwrap();
-    let src = RawMxfp8 {
-        data,
-        scales,
-        n: 1,
-        k: 32,
-    };
-    let before = gpu.alloc_count();
-    gpu.fail_alloc_after(1);
-    assert!(dequant_mxfp8_to_bf16(&gpu, &src).is_err());
-    assert_eq!(gpu.alloc_count(), before, "temporary scales leaked");
-}

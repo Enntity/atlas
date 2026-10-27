@@ -4,6 +4,10 @@
 
 use super::*;
 
+#[path = "init_router.rs"]
+mod init_router;
+mod validation;
+
 impl MoeLayer {
     pub fn new(
         weights: MoeWeights,
@@ -27,51 +31,21 @@ impl MoeLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<Self> {
-        // Sanity-check the routing config: top-k that exceeds the
-        // expert count would index OOB in the topk kernel and produce
-        // silent NaN routing. Catch the misconfiguration at load time.
-        let c2_compact_moe = super::forward_c2::c2_compact_requested()?;
-        anyhow::ensure!(
-            config.num_experts_per_tok <= num_experts && num_experts > 0,
-            "MoE config invalid: num_experts_per_tok={} must be in 1..={}",
-            config.num_experts_per_tok,
-            num_experts,
-        );
-        // The check above bounds top-k by the expert count, which is the OOB
-        // the topk kernel can READ. It says nothing about the OOB the kernel
-        // can WRITE: the sigmoid routing kernels stage their top-K in a
-        // fixed-size shared array, and `top_k` was passed to them unbounded.
-        anyhow::ensure!(
-            config.num_experts_per_tok <= crate::layers::ops::MOE_TOPK_SIGMOID_MAX_TOP_K
-                && num_experts <= crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
-            "MoE config exceeds the routing kernels' fixed shared-memory bounds: \
-             num_experts_per_tok={} (max {}), num_experts={} (max {}). Raise \
-             MAX_TOP_K / MAX_EXPERTS in kernels/gb10/common/moe_topk_sigmoid.cu \
-             and their mirrors in layers::ops together.",
-            config.num_experts_per_tok,
-            crate::layers::ops::MOE_TOPK_SIGMOID_MAX_TOP_K,
-            num_experts,
-            crate::layers::ops::MOE_TOPK_SIGMOID_MAX_EXPERTS,
-        );
+        let c2_compact_moe = validation::routing(config, num_experts)?;
         let m16_gate_up = super::gate_up_m16::M16GateUp::new(gpu, config)?;
         let m5_projections = super::m5_projections::M5Projections::new(gpu, config)?;
         let gate_ptrs = build_ptr_table(&weights.experts, |e| &e.gate_proj, gpu)?;
         let up_ptrs = build_ptr_table(&weights.experts, |e| &e.up_proj, gpu)?;
         let down_ptrs = build_ptr_table(&weights.experts, |e| &e.down_proj, gpu)?;
-
-        // Extract the optional correction-bias device pointer before the
-        // struct literal below moves `weights`. `.map(|dw| dw.weight)` turns
-        // an `Option<DenseWeight>` into an `Option<DevicePtr>` for the
+        // Extract the optional correction-bias device pointer before weights moves
+        // into the struct literal. This maps DenseWeight to DevicePtr for the
         // `moe_topk_sigmoid` kernel's bias arg.
         let weights_correction_bias: Option<DevicePtr> =
             weights.correction_bias.map(|dw| dw.weight);
 
-        // Resolve the gfx1151 F16-operand twins + whether both resolved; the
-        // forward engages them via the n128 launchers when `moe_f16_prefill` holds.
-        let (moe_grouped_gemm_t, moe_fused_gate_up_t, moe_f16_prefill) =
-            crate::layers::ops::moe_f16_prefill_handles(gpu)?;
-
-        let _ = num_experts;
+        let router_f32 = init_router::resolve(config.router_logits_f32, gate_nvfp4.is_none())?;
+        let dense_gemv = gpu.kernel("gemv", "dense_gemv_bf16")?;
+        let dense_gemm = gpu.kernel("gemm", "dense_gemm_bf16")?;
         let optional = super::init_optional::OptionalKernels::resolve(gpu, config);
         let rms_norm_k = gpu.kernel("norm", "rms_norm")?;
         let mut layer = Self {
@@ -85,27 +59,41 @@ impl MoeLayer {
             gate_nvfp4,
             pre_expert_norm: None,
             pre_expert_norm_k: rms_norm_k,
-            dense_gemv: gpu.kernel("gemv", "dense_gemv_bf16")?,
+            dense_gemv,
             dense_gemv_batchm: super::init_optional::router_gemv_batchm(gpu, config),
-            row_invariant_bf16_router: false,
             w4a16_gemv: gpu.kernel("w4a16_gemv", "w4a16_gemv")?,
             w4a16_gemv_sw: super::super::try_kernel(gpu, "w4a16_gemv", "w4a16_gemv_sw"),
-            // Untransposed router GEMM. On native HIP this resolves to the
-            // bit-identical `w4a16_gemm_s64` twin (64-deep K stage) when the
-            // target ships it; every other target keeps `w4a16_gemm`. See
-            // layers/ops/strix_s64.rs.
-            w4a16_gemm: crate::layers::ops::w4a16_gemm_kernel(gpu)?,
-            dense_gemm: gpu.kernel("gemm", "dense_gemm_bf16")?,
-            dense_gemm_router: super::super::try_kernel(gpu, "gemm", "dense_gemm_bf16_router"),
+            w4a16_gemm: gpu.kernel("w4a16", "w4a16_gemm")?,
+            dense_gemm,
+            router_f32,
+            router_gemv: if router_f32 {
+                gpu.kernel("gemv", "dense_gemv_bf16_fp32out")?
+            } else {
+                dense_gemv
+            },
+            router_gemm: if router_f32 {
+                gpu.kernel("gemm", "dense_gemm_bf16_f32out")?
+            } else {
+                dense_gemm
+            },
+            dense_gemm_router: super::super::try_kernel(
+                gpu,
+                "gemm",
+                if router_f32 {
+                    "dense_gemm_bf16_router_f32out"
+                } else {
+                    "dense_gemm_bf16_router"
+                },
+            ),
             router_prefill_bn32: router_prefill_bn32::resolve(config, gpu)?,
             dense_gemm_router_m5: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
+                router_f32 && config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_m5",
             ),
             dense_gemm_router_rows: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
+                router_f32 && config.model_type == "glm5_next",
                 gpu,
                 "gemm",
                 "dense_gemm_bf16_router_rows",
@@ -152,13 +140,8 @@ impl MoeLayer {
             moe_weighted_sum_blend_batch3: gpu
                 .kernel("moe_fused_batch3", "moe_weighted_sum_blend_batch3")?,
             w4a16_gemv_batch3: gpu.kernel("w4a16_gemv", "w4a16_gemv_batch3")?,
-            w4a16_batchm: W4a16BatchmTiers::resolve(gpu, config.model_type == "glm5_next"),
-            w4a16_batch5_dual_k: super::super::try_kernel_gated(
-                config.model_type == "glm5_next",
-                gpu,
-                "w4a16_gemv",
-                "w4a16_gemv_batch5_dual",
-            ),
+            w4a16_batchm: W4a16BatchmTiers::resolve(gpu),
+            w4a16_batch5_dual_k: optional.w4a16_batch5_dual_k,
             moe_expert_gate_up_shared_token_major: gpu
                 .kernel("moe_prefill", "moe_expert_gate_up_shared_prefill")?,
             moe_expert_silu_down_shared_token_major: gpu
@@ -194,6 +177,7 @@ impl MoeLayer {
             moe_w4a4_prequant_t_k128w: optional.moe_w4a4_prequant_t_k128w,
             moe_w4a4_prequant_gate_up_silu: optional.moe_w4a4_prequant_gate_up_silu,
             k128w_persist_ctas: optional.k128w_persist_ctas,
+            down_e4m3: optional.down_e4m3,
             moe_mtile_prefix_k: optional.moe_mtile_prefix_k,
             moe_w4a4_prequant_t_k64_compact: optional.moe_w4a4_prequant_t_k64_compact,
             moe_w4a4_prequant_t_k64_vecscale_compact: optional
@@ -216,8 +200,7 @@ impl MoeLayer {
             moe_expert_silu_down_shared_mmq_k: optional.moe_expert_silu_down_shared_mmq_k,
             quantize_nvfp4_k: gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
             silu_mul_quant_nvfp4_k: optional.silu_mul_quant_nvfp4_k,
-            moe_fused_gate_up_t,
-            moe_f16_prefill,
+            moe_fused_gate_up_t: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t")?,
             moe_fused_gate_up_t_k64: gpu.kernel("moe_w4a16", "moe_w4a16_fused_gate_up_t_k64")?,
             moe_grouped_gemm_e8m0: optional.moe_grouped_gemm_e8m0,
             moe_grouped_gemm_t_e8m0: optional.moe_grouped_gemm_t_e8m0,
@@ -264,6 +247,8 @@ impl MoeLayer {
             gate_ptrs_t: None,
             up_ptrs_t: None,
             down_ptrs_t: None,
+            input_scales: None,
+            w4a4: None,
             cutlass_grouped_host: None,
             _cutlass_sfb_owned: Vec::new(),
             routed_scales_released: false,
@@ -409,6 +394,7 @@ impl MoeLayer {
             shared_gate_up_receipt: None,
             shared_up_t: None,
             shared_down_t: None,
+            shared_native: None,
             gate_fp8: None,
             shared_gate_fp8: None,
             shared_fp8_cache: Default::default(),
@@ -457,7 +443,8 @@ impl MoeLayer {
             bf16_gate_weight_ptrs: None,
             bf16_up_weight_ptrs: None,
             bf16_down_weight_ptrs: None,
-            separate_shared_expert: None,
+            bf16_shared_expert: None,
+            mxfp8_shared_expert: None,
             fp8_shared_expert: None,
             moe_down_t_k64_fp4: super::super::try_kernel_gated(
                 super::init_optional::gateup_fp4_series(&config.model_type),
@@ -489,11 +476,15 @@ impl MoeLayer {
             // softmax-MoE model startup (observed on Qwen3.5-35B-A3B-FP8 in
             // alpha-2.43: "Module 'moe_topk_sig' not loaded" during model
             // build).
-            moe_topk_sigmoid_k: super::super::try_kernel(gpu, "moe_topk_sig", "moe_topk_sigmoid"),
+            moe_topk_sigmoid_k: super::super::try_kernel(
+                gpu,
+                "moe_topk_sig",
+                &init_router::kernel_name(router_f32, "moe_topk_sigmoid"),
+            ),
             moe_topk_sigmoid_batched_k: super::super::try_kernel(
                 gpu,
                 "moe_topk_sig",
-                "moe_topk_sigmoid_batched",
+                &init_router::kernel_name(router_f32, "moe_topk_sigmoid_batched"),
             ),
         };
         if crate::model::glm_independent::enabled(&config.model_type)? {
@@ -502,12 +493,5 @@ impl MoeLayer {
             layer.validate_independent_handles()?;
         }
         Ok(layer)
-    }
-
-    /// Opt in to row-invariant BF16 routing for decode/verify (`types.rs`).
-    /// Called only by the qwen4_exp FP4-Local builder, which ships mlp.gate
-    /// as BF16; other models keep the scalar `dense_gemm` router arm.
-    pub fn set_row_invariant_bf16_router(&mut self) {
-        self.row_invariant_bf16_router = true;
     }
 }

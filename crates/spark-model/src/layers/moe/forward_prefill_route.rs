@@ -31,36 +31,40 @@ impl MoeLayer {
                 stream,
             )?;
         } else if let Some(ref nvfp4) = self.gate_nvfp4 {
-            // ATLAS_QWEN4EXP_PREFILL_MOE: the same logits, byte for byte.
-            if !self.try_q38_router(
+            ops::w4a16_gemm(
+                ctx.gpu,
+                self.w4a16_gemm,
                 router_in,
                 nvfp4,
                 gate_logits,
                 n,
                 self.router_logits_n,
                 h,
-                ctx,
                 stream,
-            )? {
-                ops::w4a16_gemm(
-                    ctx.gpu,
-                    self.w4a16_gemm,
-                    router_in,
-                    nvfp4,
-                    gate_logits,
-                    n,
-                    self.router_logits_n,
-                    h,
-                    stream,
-                )?;
-            }
+            )?;
+        } else if self.try_q38_router(
+            router_in,
+            gate_logits,
+            n,
+            self.router_logits_n,
+            h,
+            ctx,
+            stream,
+        )? {
+            // ATLAS_QWEN4EXP_PREFILL_MOE: the BF16 router on the tile GEMM.
         } else if ctx.config.model_type == "glm5_next"
             && n <= crate::layers::canonical_verify::MAX_ROWS
             && crate::layers::canonical_verify::enabled()
         {
             // ATLAS_GLM_CANONICAL_VERIFY: one tensor-core family for every
-            // verify width, so near-tied experts do not flip with the width.
-            crate::layers::canonical_verify::dense(
+            // verify width, so near-tied experts do not flip with the width
+            // (its FP32-output twin for FP32 router logits).
+            let canonical = if self.router_f32 {
+                crate::layers::canonical_verify::dense_f32
+            } else {
+                crate::layers::canonical_verify::dense
+            };
+            canonical(
                 ctx.gpu,
                 router_in,
                 &self.weights.gate,
@@ -81,24 +85,6 @@ impl MoeLayer {
             self.independent_router_logits(router_in, gate_logits, 2, ctx, stream)?;
         } else if self.glm_c4_grouped(ctx, n) {
             self.c4_router_logits(router_in, gate_logits, ctx, stream)?;
-        } else if self.row_invariant_bf16_router
-            && h.is_multiple_of(16)
-            && let Ok(k_gemm) = ctx.gpu.kernel("gemm", "dense_gemm_bf16_pipelined")
-        {
-            // FP4-Local's prefill contract allows different numerics than
-            // decode: the shipped BF16 gate already sits in the layout the
-            // pipelined GEMM reads, so no NVFP4 dequant step is needed —
-            // the same kernel try_q38_router runs after dequantizing the
-            // NVFP4 pack's router. Chunk-invariant (every logit is an
-            // independent in-order m16n8k16 chain), which the cached-prefix
-            // gate requires.
-            super::forward_prefill_route_sp::q38_router_gemm(
-                ctx.gpu,
-                k_gemm,
-                [router_in, self.weights.gate.weight, gate_logits],
-                [n, self.router_logits_n, h],
-                stream,
-            )?;
         } else {
             // Selection numerics — see router_gate_gemm_dense for why this
             // must stay on the scalar kernel and why ATLAS_CUBLAS_GEMM must

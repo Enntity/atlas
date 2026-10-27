@@ -32,7 +32,6 @@ pub(super) fn placeholder(
     item: &spark_model::VisionItem,
     pad_count: usize,
     video_timestamps: Vec<f32>,
-    qwen3vl: bool,
 ) -> Result<Glm5VisionPlaceholder, Response> {
     let frame_count = item.t_len();
     let frame_pad_count = pad_count / frame_count.max(1);
@@ -54,6 +53,5 @@ pub(super) fn placeholder(
         pad_count,
         per_frame_pad_count: frame_pad_count,
         timestamps,
-        qwen3vl,
     })
 }

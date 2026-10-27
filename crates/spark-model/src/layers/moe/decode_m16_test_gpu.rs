@@ -13,8 +13,13 @@
 //! `persistent_rows_do_not_depend_on_the_batch` holds each row of a batch to
 //! the bits it gets alone.
 //!
+//! `a16_twins_match_a_host_w4a16_reference` holds the persistent twins'
+//! W4A16 pairs (`ATLAS_GLM_FP4L_DECODE_A16`: BF16 activations) to a host
+//! W4A16 reference within BF16 rounding, and each row to its bits alone.
+//!
 //!   cargo test --release -p spark-model --lib persistent_twins_match_the_grid_twins -- --ignored --nocapture
 //!   cargo test --release -p spark-model --lib persistent_rows_do_not_depend_on_the_batch -- --ignored --nocapture
+//!   cargo test --release -p spark-model --lib a16_twins_match_a_host_w4a16_reference -- --ignored --nocapture
 
 use super::*;
 use anyhow::{Context, ensure};
@@ -24,9 +29,6 @@ const I: u32 = 1024;
 const E: u32 = 64;
 const TOPK: usize = 8;
 const POISON: u8 = 0x5a;
-
-#[path = "decode_m16_chain_test_gpu.rs"]
-mod chain;
 
 struct Rng(u64);
 
@@ -230,8 +232,7 @@ impl<'a> Rig<'a> {
             self.a[1],
             self.gate,
             self.up,
-            self.q[0],
-            self.q[1],
+            [self.q[0], self.q[1], DevicePtr::NULL],
             self.offsets,
             self.sorted,
             E,
@@ -250,14 +251,7 @@ impl<'a> Rig<'a> {
 
     /// The down over `input` (the gate/up bytes) into a poisoned output:
     /// returns its BF16 bytes.
-    fn down(
-        &self,
-        kernel: KernelHandle,
-        rows: u32,
-        ctas: u32,
-        input: &[u8],
-        routing: (&Route, usize),
-    ) -> Result<Vec<u8>> {
+    fn down(&self, kernel: KernelHandle, rows: u32, ctas: u32, input: &[u8]) -> Result<Vec<u8>> {
         let routed = rows as usize * TOPK;
         let qb = routed * I as usize / 2;
         self.gpu.copy_h2d(&input[..qb], self.q[0])?;
@@ -287,7 +281,6 @@ impl<'a> Rig<'a> {
         self.gpu.synchronize(0)?;
         let mut out = vec![0u8; routed * H as usize * 2];
         self.gpu.copy_d2h(self.c, &mut out)?;
-        check_down_output(&out, &routing.0.offsets, routing.1)?;
         Ok(out)
     }
 }
@@ -327,15 +320,16 @@ fn signed_zeros(q: &[u8], routed: usize) -> Vec<u8> {
     z
 }
 
-fn backend() -> Result<&'static spark_runtime::cuda_backend::AtlasCudaBackend> {
-    crate::layers::glm_gpu_test_backend::backend()
+fn backend() -> Result<spark_runtime::cuda_backend::AtlasCudaBackend> {
+    spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules())
+        .context("CUDA backend")
 }
 
 #[test]
 #[ignore = "needs a GB10 and a glm-5.3-flash kernel build"]
 fn persistent_twins_match_the_grid_twins() -> Result<()> {
     let gpu = backend()?;
-    let gpu: &dyn GpuBackend = gpu;
+    let gpu: &dyn GpuBackend = &gpu;
     let mut rng = Rng(0x5eed_cafe);
     let rig = Rig::new(gpu, &mut rng)?;
     let families = [family(gpu, "m16s")?, family(gpu, "m32s")?];
@@ -352,8 +346,7 @@ fn persistent_twins_match_the_grid_twins() -> Result<()> {
                 let want_q = rig.gate_up(grid[0], rows, 0)?;
                 let routed = rows as usize * TOPK;
                 let zeros = signed_zeros(&want_q, routed);
-                let want_c = [&want_q, &zeros]
-                    .map(|input| rig.down(grid[1], rows, 0, input, (&r, (slab + 1) * 16)));
+                let want_c = [&want_q, &zeros].map(|input| rig.down(grid[1], rows, 0, input));
                 for ctas in [48, 7, 1] {
                     let case = format!(
                         "rows {rows} routing {kind} most {most} slabs {} ctas {ctas}",
@@ -363,9 +356,7 @@ fn persistent_twins_match_the_grid_twins() -> Result<()> {
                         failed.push(format!("{case}: gate/up"));
                     }
                     for (input, want) in [&want_q, &zeros].into_iter().zip(&want_c) {
-                        if &rig.down(persist[1], rows, ctas, input, (&r, (slab + 1) * 16))?
-                            != want.as_ref().unwrap()
-                        {
+                        if &rig.down(persist[1], rows, ctas, input)? != want.as_ref().unwrap() {
                             failed.push(format!("{case}: down"));
                         }
                     }
@@ -383,7 +374,7 @@ fn persistent_twins_match_the_grid_twins() -> Result<()> {
 #[ignore = "needs a GB10 and a glm-5.3-flash kernel build"]
 fn persistent_rows_do_not_depend_on_the_batch() -> Result<()> {
     let gpu = backend()?;
-    let gpu: &dyn GpuBackend = gpu;
+    let gpu: &dyn GpuBackend = &gpu;
     let mut rng = Rng(0x0dd_ba11);
     let rig = Rig::new(gpu, &mut rng)?;
     let families = [family(gpu, "m16s")?, family(gpu, "m32s")?];
@@ -395,13 +386,7 @@ fn persistent_rows_do_not_depend_on_the_batch() -> Result<()> {
             let [_, persist] = families[usize::from(rows > 16)];
             rig.set_route(&batch, 0)?;
             let q = rig.gate_up(persist[0], rows, 48)?;
-            let c = rig.down(
-                persist[1],
-                rows,
-                48,
-                &q,
-                (&batch, if rows > 16 { 32 } else { 16 }),
-            )?;
+            let c = rig.down(persist[1], rows, 48, &q)?;
             let (qb, routed) = (I as usize / 2, rows as usize * TOPK);
             let sb = I as usize / 16;
             for (t, row_ids) in ids.iter().enumerate() {
@@ -409,13 +394,7 @@ fn persistent_rows_do_not_depend_on_the_batch() -> Result<()> {
                 let alone = route(std::slice::from_ref(row_ids));
                 rig.set_route(&alone, t)?;
                 let q1 = rig.gate_up(persist[0], 1, 48)?;
-                let c1 = rig.down(
-                    persist[1],
-                    1,
-                    48,
-                    &q1,
-                    (&alone, if rows > 16 { 32 } else { 16 }),
-                )?;
+                let c1 = rig.down(persist[1], 1, 48, &q1)?;
                 for k in 0..TOPK {
                     let (p, p1) = (batch.pos[t][k], alone.pos[0][k]);
                     let same = q[p * qb..(p + 1) * qb] == q1[p1 * qb..(p1 + 1) * qb]
@@ -437,45 +416,5 @@ fn persistent_rows_do_not_depend_on_the_batch() -> Result<()> {
     Ok(())
 }
 
-/// Unsupported expert widths deliberately produce NaNs in the down kernel.
-/// Keep that backstop under test, without allowing a NaN in any row the
-/// chosen slab supports (every row production is allowed to consume).
-fn check_down_output(out: &[u8], offsets: &[i32], slab_rows: usize) -> Result<()> {
-    let row_bytes = H as usize * 2;
-    ensure!(
-        out.len() == *offsets.last().unwrap() as usize * row_bytes,
-        "down output shape"
-    );
-    for (expert, span) in offsets.windows(2).enumerate() {
-        let range = span[0] as usize * row_bytes..span[1] as usize * row_bytes;
-        let bytes = &out[range];
-        if (span[1] - span[0]) as usize <= slab_rows {
-            crate::layers::glm_gpu_test_backend::finite_bf16("MoE supported down rows", bytes)
-                .with_context(|| format!("expert {expert}, slabs {slab_rows}"))?;
-        } else {
-            ensure!(
-                bytes.chunks_exact(2).all(|word| {
-                    f32::from_bits((u16::from_le_bytes([word[0], word[1]]) as u32) << 16).is_nan()
-                }),
-                "expert {expert} exceeds {slab_rows} rows without the NaN capacity backstop"
-            );
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn down_finiteness_allows_only_the_capacity_backstop() {
-    let offsets = [0, 17, 18];
-    let mut out = vec![0u8; 18 * H as usize * 2];
-    assert!(check_down_output(&out, &offsets, 16).is_err());
-    for word in out[..17 * H as usize * 2].chunks_exact_mut(2) {
-        word.copy_from_slice(&0x7fc0u16.to_le_bytes());
-    }
-    assert!(check_down_output(&out, &offsets, 16).is_ok());
-    assert!(check_down_output(&out, &offsets, 32).is_err());
-    for bad in [0x7fc0u16, 0x7f80, 0xff80] {
-        out[17 * H as usize * 2..][..2].copy_from_slice(&bad.to_le_bytes());
-        assert!(check_down_output(&out, &offsets, 16).is_err());
-    }
-}
+#[path = "decode_m16_test_gpu/a16.rs"]
+mod a16;

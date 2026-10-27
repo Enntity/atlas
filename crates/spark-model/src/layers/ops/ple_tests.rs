@@ -71,11 +71,10 @@ impl Fx {
     }
 }
 
-/// Widen a BF16 blob to F32 by zero extension — what `dense_keep_f32` does
-/// at load now that the norm readers are `const float*`.
-fn bf16_to_f32_bytes(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .chunks_exact(2)
+/// BF16 bytes widened exactly to F32 (`bits << 16`), as the loader's
+/// `f32_norm` does for a BF16 release: the norm kernels read F32.
+fn widen_bf16(b: &[u8]) -> Vec<u8> {
+    b.chunks_exact(2)
         .flat_map(|c| ((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).to_le_bytes())
         .collect()
 }
@@ -168,11 +167,9 @@ fn ple_kernels_match_reference() {
     let hidden = upload(g, &f.bytes("hidden"));
     let key = upload(g, &f.bytes("key_proj_out"));
     let value = upload(g, &f.bytes("value_proj_out"));
-    // The PLE norms feed `const float*` kernels; the fixture ships the
-    // checkpoint's BF16, so widen it the way `dense_keep_f32` does at load.
-    let nq = upload(g, &bf16_to_f32_bytes(&f.bytes("w_norm_query")));
-    let nk = upload(g, &bf16_to_f32_bytes(&f.bytes("w_norm_key")));
-    let nc = upload(g, &bf16_to_f32_bytes(&f.bytes("w_norm_conv")));
+    let nq = upload(g, &widen_bf16(&f.bytes("w_norm_query")));
+    let nk = upload(g, &widen_bf16(&f.bytes("w_norm_key")));
+    let nc = upload(g, &widen_bf16(&f.bytes("w_norm_conv")));
     let gated = g.alloc(t * c * 4).unwrap();
     // FP32: the conv reads this, and BF16 here costs the output 2.7%.
     let gated_normed = g.alloc(t * c * 4).unwrap();

@@ -131,7 +131,6 @@ impl WeightLoader for SafetensorsLoader {
                 &skip_fn,
                 self.peak_memory_multiplier,
                 &mut deferred,
-                self.pack_slab,
                 &mut csf,
             )?
         } else if shard_files.len() == 1 {

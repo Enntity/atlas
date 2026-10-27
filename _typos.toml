@@ -23,6 +23,14 @@ extend-ignore-identifiers-re = [
     # typo of `BY`/`BE`.
     "BA_GEMM",
 ]
+extend-ignore-re = [
+    # Preserve the historical benchmark command's exact commit hash. The
+    # checker splits this hash at its first digit and flags the `daa` prefix.
+    '(?Rm)^//   d=kernels/gb10/glm-5\.3-flash/nvfp4; git show daa94067:\$d/glm_hc_prefill_vec\.cu > \$d/hc_old\.cu$',
+    # Preserve the deliberately malformed negative-test input exactly so the
+    # test continues to verify rejection of this value.
+    '(?Rm)^    assert!\(model_default_reasoning_effort\(&with\("hihg"\)\)\.is_err\(\)\);$',
+]
 
 [default.extend-words]
 # `suh` / `svh` — the ExLlamaV3 (EXL3) per-linear sign-and-scale vectors

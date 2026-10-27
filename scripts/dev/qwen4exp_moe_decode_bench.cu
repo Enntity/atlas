@@ -220,10 +220,10 @@ static Args gate_up_args(const Weights& W, const Call& c, const __nv_bfloat16* A
     return a;
 }
 static Args down_args(const Weights& W, const Call& c, const __nv_bfloat16* go, const __nv_bfloat16* uo,
-                      __nv_bfloat16* dout, const unsigned* idx, const __nv_bfloat16* sgi,
+                      __nv_bfloat16* device_output, const unsigned* idx, const __nv_bfloat16* sgi,
                       const __nv_bfloat16* sui, __nv_bfloat16* sdo) {
     Args a;
-    a.add(go).add(uo).add(W.tab[c.tp][2][0]).add(W.tab[c.tp][2][1]).add(W.s2[2]).add(dout).add(idx)
+    a.add(go).add(uo).add(W.tab[c.tp][2][0]).add(W.tab[c.tp][2][1]).add(W.s2[2]).add(device_output).add(idx)
      .add(sgi).add(sui).add(shp(W.sh_down, c.sh, false)).add(shp(W.sh_down, c.sh, true))
      .add(sh_s2(W, 2, c.sh)).add(sdo).add(H).add(I).add(TOPK);
     return a;

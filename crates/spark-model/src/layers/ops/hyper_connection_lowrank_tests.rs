@@ -153,11 +153,10 @@ fn transpose_bf16(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
     out
 }
 
-/// Widen a BF16 blob to F32 by zero extension — what `dense_keep_f32` does
-/// at load now that the norm readers are `const float*`.
-fn bf16_to_f32_bytes(bytes: &[u8]) -> Vec<u8> {
-    bytes
-        .chunks_exact(2)
+/// BF16 bytes widened exactly to F32 (`bits << 16`), as the loader's
+/// `f32_norm` does for a BF16 release: the norm kernels read F32.
+fn widen_bf16(b: &[u8]) -> Vec<u8> {
+    b.chunks_exact(2)
         .flat_map(|c| ((u16::from_le_bytes([c[0], c[1]]) as u32) << 16).to_le_bytes())
         .collect()
 }
@@ -166,10 +165,7 @@ fn bf16_to_f32_bytes(bytes: &[u8]) -> Vec<u8> {
 fn site_weights(g: &dyn GpuBackend, f: &Fixture, site: &str, inject: bool) -> HcLowRank {
     let up = f.bytes(&format!("{site}_w_up"));
     HcLowRank {
-        norm_w: upload(
-            g,
-            &bf16_to_f32_bytes(&f.bytes(&format!("{site}_w_hc_norm"))),
-        ),
+        norm_w: upload(g, &widen_bf16(&f.bytes(&format!("{site}_w_hc_norm")))),
         down_w: upload(g, &f.bytes(&format!("{site}_w_down"))),
         up_w: upload(g, &transpose_bf16(&up, f.hc * f.h, f.rank)),
         inject_w: if inject {

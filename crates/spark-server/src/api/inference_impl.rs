@@ -387,6 +387,11 @@ impl InferenceRequest {
     /// disabled for this request (set when tools are active and the
     /// env gate is on).
     pub fn disable_mtp(&self) -> bool {
+        // Strict GLM uses canonical one-row target decode until its A16
+        // speculative path is qualified across concurrent owners.
+        if spark_model::layers::glm_native::mode::strict_serial() {
+            return true;
+        }
         match self {
             InferenceRequest::Blocking { disable_mtp, .. } => *disable_mtp,
             InferenceRequest::Streaming { disable_mtp, .. } => *disable_mtp,

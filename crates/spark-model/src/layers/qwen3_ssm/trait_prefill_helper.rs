@@ -57,7 +57,9 @@ impl Qwen3SsmLayer {
     /// window the peer needs first. Taken only on the dense BF16 arm, whose
     /// rows are independent (the tile kernel, or under the k-chain pin a
     /// cuBLASLt k-chain kernel with the same bytes per row at every row
-    /// count), so every byte is the unsplit GEMM + reduce-scatter's.
+    /// count), or the W8A8 arm (`w8a8.rs`, `out_proj_dense` then holds the
+    /// NULL slot; per-row quant and in-order kernels), so every byte is the
+    /// unsplit GEMM + reduce-scatter's.
     /// `Ok(false)`: not taken, nothing launched.
     pub(super) fn out_proj_reduce_scatter_piped(
         &self,
@@ -108,9 +110,11 @@ impl Qwen3SsmLayer {
         value_dim: usize,
         stream: u64,
     ) -> Result<()> {
-        // Native MXFP8 (FP4-Local): the layer's only out_proj.
-        if let Some(mx8) = self.mx8.as_ref() {
-            return self.mx8_out(mx8, ctx, normed_out_buf, out_proj_buf, k as usize, stream);
+        // ATLAS_QWEN4EXP_PREFILL_W8A8 (`w8a8.rs`): ahead of every arm, as the
+        // BF16 copy the dense arm reads is gone.
+        let w8a8 = super::exact_rows::GdnProj::Out;
+        if self.w8a8_proj(ctx, w8a8, normed_out_buf, out_proj_buf, k as usize, stream)? {
+            return Ok(());
         }
         let force_w8a8 = matches!(std::env::var("ATLAS_FP8_W8A8").ok().as_deref(), Some("1"));
         // PER-ROW FP8 from the checkpoint (`ATLAS_FP8_ROWWISE=1`), dequantised
@@ -168,14 +172,29 @@ impl Qwen3SsmLayer {
             )
         } else if let Some(ref dense_out) = self.out_proj_dense {
             // SSM out_proj is kept BF16 dense for accuracy (decode uses FP8
-            // block-scaled, prefill stays BF16). On native HIP, hipBLASLt
-            // first (2.3x faster than the tile kernel at the Flash-Next
-            // 2560x6144 shape, 2026-10-04) with the tensor-core
-            // dense_gemm_bf16_pipelined kernel (~40x vs the old scalar
-            // dense_gemm, identical BF16 math, cosine=1.0) as fallback.
-            #[cfg(atlas_hip)]
-            return ops::hip_bf16_proj_or(
-                "ssm_out_proj",
+            // block-scaled, prefill stays BF16). Always routed through the
+            // tensor-core dense_gemm_bf16_pipelined kernel (~40× vs the old
+            // scalar dense_gemm, identical BF16 math, cosine=1.0).
+            // ATLAS_LT_KCHAIN_PIN (qwen4_exp, >= 2048 rows): the tile kernel's
+            // own in-order k-chain on a faster cuBLASLt kernel, byte for byte
+            // (TP2, 16016 x 2560 x 3072: 4.24 -> 3.46 ms a layer).
+            if ctx.config.model_type == "qwen4_exp"
+                && k >= 2048
+                && spark_runtime::cublaslt::bf16_gemm_act_weight_t_kchain(
+                    normed_out_buf.0,
+                    dense_out.weight.0,
+                    out_proj_buf.0,
+                    k,
+                    h as u32,
+                    value_dim as u32,
+                    stream,
+                )?
+            {
+                return Ok(());
+            }
+            ops::dense_gemm_bf16_pipelined(
+                ctx.gpu,
+                self.dense_gemm_pipelined_k,
                 normed_out_buf,
                 dense_out.weight,
                 out_proj_buf,

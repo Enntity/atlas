@@ -151,9 +151,6 @@ pub(super) fn load_sharded(
     skip_fn: &dyn Fn(&str) -> bool,
     peak_multiplier_override: Option<f64>,
     deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
-    // Only the Windows streaming path reads this; keep the binding alive on
-    // other platforms without a #[allow].
-    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] pack_slab: bool,
     csf: &mut CsfAssembler,
 ) -> Result<HashMap<String, WeightTensor>> {
     let index_json = std::fs::read_to_string(index_path)
@@ -254,7 +251,6 @@ pub(super) fn load_sharded(
                 deferred,
                 &mut skipped,
                 &mut offload_logged,
-                pack_slab,
                 csf,
             )?;
         }
@@ -331,10 +327,104 @@ pub(super) fn load_sharded(
 }
 
 #[cfg(target_os = "windows")]
-#[path = "load_windows.rs"]
-mod windows;
-#[cfg(target_os = "windows")]
-use windows::stream_shard_windows;
+fn stream_shard_windows(
+    file: &mut std::fs::File,
+    shard_path: &Path,
+    tensor_names: &[String],
+    skip_fn: &dyn Fn(&str) -> bool,
+    gpu: &dyn GpuBackend,
+    weights: &mut HashMap<String, WeightTensor>,
+    deferred: &mut HashMap<String, crate::weights::DeferredTensor>,
+    skipped: &mut usize,
+    offload_logged: &mut bool,
+    csf: &mut CsfAssembler,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // Safetensors layout: [u64 header_len][header JSON][tensor data]. Parse the
+    // header JSON directly — `SafeTensors::read_metadata` validates the whole
+    // file length, so it can't parse a header-only buffer. `TensorInfo` is
+    // Deserialize; the reserved `__metadata__` entry is dropped.
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf)
+        .context("Failed to read safetensors header length")?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let mut header_json = vec![0u8; header_len];
+    file.read_exact(&mut header_json)
+        .context("Failed to read safetensors header")?;
+    let header: HashMap<String, serde_json::Value> =
+        serde_json::from_slice(&header_json).context("Failed to parse safetensors header JSON")?;
+    let data_base = (8 + header_len) as u64;
+
+    let mut infos: HashMap<String, safetensors::tensor::TensorInfo> = HashMap::new();
+    for (k, v) in header {
+        if k == "__metadata__" {
+            continue;
+        }
+        let info: safetensors::tensor::TensorInfo = serde_json::from_value(v)
+            .with_context(|| format!("Failed to parse safetensors TensorInfo for {k}"))?;
+        infos.insert(k, info);
+    }
+
+    // Read each tensor into a reusable page-locked staging buffer, then H2D.
+    // A pinned source makes `cuMemcpyHtoDAsync` a true DMA; a pageable source
+    // would route through the driver's internal staging pool, which on the
+    // Windows UMA driver grows to ~the copied size and is not released — that
+    // was the second ~20GB phantom (a file-backed mmap had the same effect).
+    let max_len = tensor_names
+        .iter()
+        .filter(|n| !skip_fn(n) && !crate::weights::is_ngram_table(n))
+        .filter_map(|n| infos.get(n.as_str()))
+        .map(|i| i.data_offsets.1.saturating_sub(i.data_offsets.0))
+        .max()
+        .unwrap_or(0);
+    let pinned = gpu.alloc_host_pinned(max_len.max(1))?;
+    let staging = unsafe { std::slice::from_raw_parts_mut(pinned, max_len) };
+    let result = (|| -> Result<()> {
+        for name in tensor_names {
+            if skip_fn(name) {
+                *skipped += 1;
+                continue;
+            }
+            let info = infos
+                .get(name.as_str())
+                .with_context(|| format!("tensor {name} missing from shard metadata"))?;
+            let (begin, end) = info.data_offsets;
+            // n-gram TABLES are deferred, not uploaded — same contract as the
+            // mmap path. data_offsets are relative to the data section start.
+            if crate::weights::is_ngram_table(name) {
+                deferred.insert(
+                    name.to_string(),
+                    crate::weights::DeferredTensor {
+                        path: shard_path.to_path_buf(),
+                        offset: data_base + begin as u64,
+                        shape: info.shape.clone(),
+                        dtype: WeightDtype::from_safetensors(info.dtype)?,
+                    },
+                );
+                *skipped += 1;
+                continue;
+            }
+            let len = end.saturating_sub(begin);
+            file.seek(SeekFrom::Start(data_base + begin as u64))?;
+            file.read_exact(&mut staging[..len])
+                .with_context(|| format!("Failed to read tensor {name}"))?;
+            upload_or_assemble(
+                name,
+                &staging[..len],
+                info.dtype,
+                info.shape.clone(),
+                gpu,
+                weights,
+                offload_logged,
+                csf,
+            )?;
+        }
+        Ok(())
+    })();
+    gpu.free_host_pinned(pinned, max_len.max(1))?;
+    result
+}
 
 pub(super) fn load_single(
     path: &Path,

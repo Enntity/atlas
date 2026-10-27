@@ -31,6 +31,19 @@ use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 mod lmhead_arms;
 use lmhead_arms::*;
 
+/// Exact five-row BF16 vocabulary projection for GLM's K=5 verifier. The
+/// existing batched GEMV streams each BF16 weight row once and reuses it for
+/// all five hidden rows; the generic tiny-M GEMM is retained as an A/B fallback.
+fn glm_k5_bf16_lmhead_batchm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ATLAS_GLM_K5_BF16_LMHEAD_BATCHM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    })
+}
+
 impl TransformerModel {
     /// Scale in-place embeddings by config.embed_scale. The residual stream
     /// is always BF16, so this dispatches `embed_scale::bf16_scale_inplace`.
@@ -226,24 +239,6 @@ impl TransformerModel {
                     h,
                     stream,
                 )?;
-            } else if self.dense_gemv_bf16_batch2_kernel.0 != 0
-                && super::trait_impl::lm_head_batch_gemv_enabled()
-            {
-                // One BF16 weight pass for both verify tokens (Flash-Next ships a
-                // BF16 [248320, 2560] head: the fallback read 1.27 GB twice per
-                // step). Bit-identical to it on HIP, see the handle's lookup.
-                // Off with ATLAS_NO_LM_HEAD_BATCH_GEMV=1 like the other arms.
-                ops::dense_gemv_batch2(
-                    self.gpu.as_ref(),
-                    self.dense_gemv_bf16_batch2_kernel,
-                    hidden,
-                    &self.lm_head_weight,
-                    logits,
-                    v,
-                    h,
-                    v,
-                    stream,
-                )?;
             } else {
                 // Dense fallback: 2× GEMV — two full passes over the head,
                 // or one byte-identical batch-M pass under
@@ -260,31 +255,6 @@ impl TransformerModel {
                     2,
                     logits,
                     v as usize,
-                    stream,
-                )?;
-            }
-        } else if self.levers.mamba_verify_exact
-            && self.w4a16_gemv_batch16_kernel.0 != 0
-            && let Some(ref nvfp4) = self.lm_head_nvfp4
-        {
-            // Exact-verify LM head (omni, K-row verify): chunked
-            // w4a16_gemv_batchm at <=16 rows per call. The batchm twin is
-            // byte-identical to the serial w4a16 GEMV decode uses (proven at
-            // shared-expert dims; covered here at lm-head dims by
-            // lmhead_batchm_identical_to_serial). Chunking is result-free.
-            let bf16 = 2usize;
-            let mut c0 = 0usize;
-            while c0 < num_tokens as usize {
-                let m = (num_tokens as usize - c0).min(16);
-                ops::w4a16_gemv_batchm(
-                    self.gpu.as_ref(),
-                    self.w4a16_gemv_batch16_kernel,
-                    hidden.offset(c0 * h as usize * bf16),
-                    nvfp4,
-                    logits.offset(c0 * v as usize * bf16),
-                    m as u32,
-                    v,
-                    h,
                     stream,
                 )?;
                 c0 += m;

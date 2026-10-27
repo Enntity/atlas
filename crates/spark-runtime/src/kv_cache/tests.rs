@@ -8,7 +8,6 @@ use super::*;
 use crate::gpu::GpuBackend;
 use crate::gpu::mock::MockGpuBackend;
 
-mod allocation_failure;
 mod latent_shard;
 mod nvme_bench;
 mod nvme_fast;

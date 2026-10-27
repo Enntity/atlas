@@ -229,6 +229,7 @@ impl TransformerModel {
         let ssm_snapshots = ssm_pools.snapshots;
         let ssm_tier_store = ssm_pools.tier_store;
         let has_mtp = ssm_pools.has_mtp;
+        let native_glm_mtp = ssm_pools.native_glm_mtp;
         let dflash_kgamma = ssm_pools.dflash_kgamma;
         if ssm_checkpoint_interval > 0 && ssm_cache_slots > 0 {
             tracing::info!(
@@ -454,8 +455,9 @@ impl TransformerModel {
             Some(save)
         };
 
-        // EP command buffer for token broadcast (4 bytes, u32)
-        let ep_cmd_buf = gpu.alloc(4)?;
+        // EP command buffer for token broadcast (a u32 at 0), and one u32
+        // per rank 64 bytes apart for `ep_min_u32`'s gather.
+        let ep_cmd_buf = gpu.alloc(super::types::EP_CMD_BUF_BYTES)?;
 
         // SOLID Incr-4: dedicated fixed-address buffer for the batched-decode MoE
         // per-row fold map. max_batch_size i32 rows (e.g. 32·4 = 128 B). Allocated
@@ -510,6 +512,14 @@ impl TransformerModel {
             if let Ok(k) = gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16") {
                 comm.set_oneshot_kernel(k.0);
             }
+        }
+        // Graph-capturable RDMA collectives (ATLAS_RDMA_ONESHOT=1) over the
+        // pair or the chain; a backend without them ignores the handle.
+        if let Some(ref comm) = comm
+            && comm.world_size() > 1
+            && let Ok(k) = gpu.kernel("rdma_oneshot", comm.oneshot_kernel())
+        {
+            comm.set_oneshot_kernel(k.0);
         }
 
         // Allocate pinned host staging buffer for batched metadata H2D.
@@ -686,6 +696,7 @@ impl TransformerModel {
             lm_head_fp8,
             layers,
             buffers,
+            prefill_pipe: None,
             lora: None,
             lora_install_attempted: false,
             lora_rotatable: false,
@@ -741,6 +752,7 @@ impl TransformerModel {
             profile,
             profile_first_pending: std::sync::atomic::AtomicBool::new(profile_first),
             proposer,
+            native_glm_mtp,
             draft_assist: None,
             lightning_dspark_identity: Default::default(),
             mtp_hidden_save,
@@ -760,10 +772,13 @@ impl TransformerModel {
             mtp_prefill_capture_gen: std::sync::atomic::AtomicU64::new(0),
             dspark_sequence_generation: std::sync::atomic::AtomicU64::new(0),
             mtp_carry: parking_lot::Mutex::new(None),
+            native_mtp_prefix: parking_lot::Mutex::new(Vec::new()),
             mtp_store_range: parking_lot::Mutex::new((0, 0)),
             dflash_hidden_save,
             dflash_hidden_save_rows,
             dflash_hidden_save_nseq,
+            // `build_model` installs the reserved store (`set_dflash_warm_store`).
+            dflash_warm_store: crate::layers::dflash_head::WarmCtxStore::disabled(),
             dflash_capture_layers,
             verify2_graph: Mutex::new(std::collections::HashMap::new()),
             verify3_graph: Mutex::new(std::collections::HashMap::new()),
@@ -791,12 +806,6 @@ impl TransformerModel {
             last_mtp_hidden_idx: std::sync::atomic::AtomicUsize::new(0),
             verify_row_masks: Default::default(),
             vision_encoder,
-            vision_embed_patches: Mutex::new(0),
-            vision_image_grids: Mutex::new(Vec::new()),
-            vision_row_base: Mutex::new(0),
-            vision_grid_base: Mutex::new(0),
-            vision_owned_images: Mutex::new(0),
-            vision_slice_rows: Mutex::new(0),
             pinned_staging,
             ssm_checkpoint_interval,
             ssm_state_norm_kernel: ssm_norm_k,

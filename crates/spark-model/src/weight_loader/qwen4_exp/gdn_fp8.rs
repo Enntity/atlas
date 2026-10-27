@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! The GDN projection format, and the opt-in FP8 one (`ATLAS_QWEN4EXP_FP8_GDN`).
+//! An MXFP8 checkpoint's own decode copy is `gdn_mxfp8`.
 //!
 //! The checkpoint ships `in_proj_qkv`/`in_proj_z`/`out_proj` BF16 on all 36
 //! GDN layers, and so does Qwen's own FP8 release (`Qwen/Qwen3.8-Flash-Next-
@@ -28,29 +29,6 @@
 //! top: +28.9 MB a layer per TP2 rank.
 //! `=full` frees the BF16 copies (-57.7 MB a layer at TP1, where there is no
 //! headroom for `=1`) and prefill reads the FP8 copy too.
-//!
-//! Why BF16 is the default — measured on the NVFP4 pack, both arms, same
-//! prompt, util 0.85 / 16K / bf16 KV:
-//!
-//! ```text
-//!                      requantized NVFP4      BF16 (default)
-//! layer construction   7.43 GB / 154.8 MB/L   1.39 GB / 28.9 MB/L
-//! attn/GDN arms        7.34 GB                1.32 GB
-//! pre-KV               95.8 GB                90.0 GB
-//! KV budget            3.9 GB / 172144 tok    9.7 GB / 424464 tok
-//! decode               2.207 tok/s            2.188 tok/s
-//! ```
-//!
-//! 6.04 GB back for ~1% of decode. GDN weight bandwidth is simply not
-//! what bounds decode here at C=1 — something else dominates — so the
-//! usual w4a16-is-faster argument does not apply yet. Revisit if that
-//! changes.
-//!
-//! And it is not only a memory lever: ONLY the routed experts are
-//! quantized in this checkpoint. The GDN projections ship BF16, so
-//! requantizing them was a lossy round trip we chose, on 36 of 48
-//! layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
-//! the FP8 middle option (`gdn_fp8`).
 
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
@@ -66,12 +44,7 @@ use crate::weight_map::{DenseWeight, Nvfp4Variant, free_loader_source};
 /// The format of the GDN `in_proj_qkvz` / `out_proj` weights.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GdnProjections {
-    /// BF16 as shipped. The default, for two reasons. MEMORY: requantizing
-    /// is where this model's build spent 7.34 GB (152.8 MB a layer,
-    /// measured; the MoE costs nothing, its experts upload as shipped).
-    /// PRECISION: only the routed experts ship quantized, so BF16 -> NVFP4
-    /// would be a lossy round trip chosen, not forced, on 36 of 48 layers.
-    /// (FP4-Local's MXFP8 GDN projections bypass this enum: `gdn_mx8`.)
+    /// BF16 as shipped. The default.
     Bf16,
     /// Requantized to NVFP4 (`ATLAS_QWEN4EXP_BF16_GDN=0`).
     Nvfp4,
@@ -80,6 +53,10 @@ pub(crate) enum GdnProjections {
     Fp8Decode,
     /// Block-scaled FP8 for decode and prefill, BF16 freed (`=full`).
     Fp8Full,
+    /// The checkpoint's own MXFP8 bytes for decode, their BF16 dequant for
+    /// prefill: an MXFP8 checkpoint unless `ATLAS_QWEN4EXP_MXFP8_DECODE=0`
+    /// (`gdn_mxfp8`).
+    Mxfp8Decode,
 }
 
 impl GdnProjections {
@@ -89,6 +66,28 @@ impl GdnProjections {
             var("ATLAS_QWEN4EXP_BF16_GDN").as_deref(),
             var("ATLAS_QWEN4EXP_FP8_GDN").as_deref(),
         )
+    }
+
+    /// The format for this checkpoint (`mxfp8_backbone`: `Qwen4ExpFormat`'s
+    /// detection): an MXFP8 one decodes its own bytes unless
+    /// `ATLAS_QWEN4EXP_MXFP8_DECODE=0`, and refuses the requantizing options
+    /// beside them (each would be a second decode format). The switch is not
+    /// read for any other checkpoint.
+    pub(crate) fn for_checkpoint(self, mxfp8_backbone: bool) -> Result<Self> {
+        let mxfp8 = mxfp8_backbone && super::gdn_mxfp8::mxfp8_decode_requested();
+        Self::with_mxfp8(self, mxfp8)
+    }
+
+    fn with_mxfp8(self, mxfp8: bool) -> Result<Self> {
+        Ok(match (self, mxfp8) {
+            (Self::Bf16, true) => Self::Mxfp8Decode,
+            (_, false) => self,
+            (other, true) => bail!(
+                "this checkpoint's GDN projections are MXFP8 and decode reads them as \
+                 shipped; {other:?} would requantize their BF16 dequant. Set \
+                 ATLAS_QWEN4EXP_MXFP8_DECODE=0 to use it instead"
+            ),
+        })
     }
 
     fn parse(bf16_gdn: Option<&str>, fp8_gdn: Option<&str>) -> Result<Self> {
@@ -114,7 +113,7 @@ impl GdnProjections {
     /// Startup-parity word for `ATLAS_QWEN4EXP_FP8_GDN`: 0 off, 1 `=1`, 2 `=full`.
     pub(crate) fn fp8_word(self) -> u64 {
         match self {
-            Self::Bf16 | Self::Nvfp4 => 0,
+            Self::Bf16 | Self::Nvfp4 | Self::Mxfp8Decode => 0,
             Self::Fp8Decode => 1,
             Self::Fp8Full => 2,
         }
@@ -122,16 +121,17 @@ impl GdnProjections {
 
     pub(super) fn describe(self) -> &'static str {
         match self {
-            Self::Bf16 => {
-                "BF16 as shipped (no runtime NVFP4 requantization), or native MXFP8 where \
-                 the checkpoint ships MXFP8"
-            }
+            Self::Bf16 => "BF16 as shipped (no runtime NVFP4 requantization)",
             Self::Nvfp4 => "requantized to NVFP4 (ATLAS_QWEN4EXP_BF16_GDN=0)",
             Self::Fp8Decode => {
                 "BF16 + a 128x128 block-scaled FP8 copy for decode (ATLAS_QWEN4EXP_FP8_GDN=1)"
             }
             Self::Fp8Full => {
                 "128x128 block-scaled FP8, decode and prefill (ATLAS_QWEN4EXP_FP8_GDN=full)"
+            }
+            Self::Mxfp8Decode => {
+                "the checkpoint's MXFP8 for decode, its exact BF16 dequant for prefill \
+                 (ATLAS_QWEN4EXP_MXFP8_DECODE=0 decodes the BF16)"
             }
         }
     }
@@ -223,6 +223,19 @@ mod tests {
             [Bf16, Nvfp4, one, full].map(GdnProjections::fp8_word),
             [0, 0, 1, 2]
         );
+    }
+
+    #[test]
+    fn an_mxfp8_checkpoint_decodes_its_bytes_and_refuses_requantizing_beside_them() {
+        assert_eq!(Bf16.with_mxfp8(true).unwrap(), Mxfp8Decode);
+        for other in [Bf16, Nvfp4, Fp8Decode, Fp8Full] {
+            assert_eq!(other.with_mxfp8(false).unwrap(), other);
+        }
+        for other in [Nvfp4, Fp8Decode, Fp8Full] {
+            let e = other.with_mxfp8(true).unwrap_err();
+            assert!(e.to_string().contains("MXFP8_DECODE=0"), "{other:?}: {e}");
+        }
+        assert_eq!(Mxfp8Decode.fp8_word(), 0);
     }
 
     #[test]

@@ -30,7 +30,6 @@ mod batch_kernel;
 mod batch_kernel_tests;
 mod batched_layer;
 pub(in crate::model) mod embed_chunk;
-mod exact_direct;
 mod finalize_last;
 mod forward_layers;
 mod h_state_ptrs;
@@ -39,8 +38,6 @@ mod multi;
 mod multi_ep;
 mod multi_head;
 pub use multi_ep::{multi_cached, multi_requested};
-#[path = "prefill_b/dispatch.rs"]
-mod dispatch;
 pub(in crate::model) mod pc_inflight;
 pub(in crate::model) mod pc_policy;
 mod prefix_lookup;
@@ -55,6 +52,30 @@ mod upload_paged;
 mod warm;
 
 impl TransformerModel {
+    /// The chunk, optionally carrying DFlash verify owners after its rows
+    /// (`glm_fused_chunk`).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::model) fn prefill_chunk_dispatch_with(
+        &self,
+        tokens: &[u32],
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        chunk_len: usize,
+        is_last_chunk: bool,
+        stream: u64,
+        mut passengers: Option<&mut super::super::glm_fused_chunk::Passengers<'_, '_>>,
+    ) -> Result<DevicePtr> {
+        self.prefill_chunk_dispatch_with(
+            tokens,
+            seq,
+            chunk_start,
+            chunk_len,
+            is_last_chunk,
+            stream,
+            None,
+        )
+    }
+
     /// The chunk, optionally carrying DFlash verify owners after its rows
     /// (`glm_fused_chunk`).
     #[allow(clippy::too_many_arguments)]
@@ -106,14 +127,14 @@ impl TransformerModel {
         // state (its cold turn 1 saved no tail checkpoint). On EP>1 the
         // split is unconditional instead: rank-local radix contents diverge,
         // and chunk sequences must be deterministic on (tokens, config)
-        // across ranks (bug #33 invariant). Skipped for vision prompts (pad
-        // runs must not straddle chunk boundaries) and non-SSM models
+        // across ranks (bug #33 invariant). Skipped for vision prompts the
+        // cache cannot key (`vision_cache`) and non-SSM models
         // (KV-only cache hits need no snapshot).
         if is_last_chunk
             && self.config.num_ssm_layers() > 0
             && self.ssm_snapshots.is_enabled()
             && self.prefix_cache.is_active()
-            && !self.tokens_have_vision_pad(tokens)
+            && self.pc_key(seq, tokens).is_some()
         {
             let bs = self.kv_cache.lock().block_size();
             // One block below the last block boundary strictly under `total`.
@@ -143,13 +164,24 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
-            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
-            let in_pass = self.qwen4exp_ckpt_takes_tail();
+            // `ATLAS_TAIL_SPLIT_MIN_TOKENS` keeps a short prompt to one pass.
             // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
             // grid; without the in-pass checkpoint the last chunk stays whole.
-            let split_disabled =
-                pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass);
-            if !split_disabled && !in_pass && cut > chunk_start && cut < total {
+            let qwen4exp = self.config.model_type == "qwen4_exp";
+            let split_disabled = pc_policy::tail_split_disabled()
+                || (qwen4exp && crate::layers::ops::qwen4exp_rowinv::on());
+            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
+            let in_pass = qwen4exp && self.qwen4exp_ckpt_takes_tail();
+            if (qwen4exp && !split_disabled && !in_pass && cut > chunk_start && cut < total)
+                || (!qwen4exp
+                    && pc_policy::tail_split_at(
+                        total,
+                        chunk_start,
+                        cut,
+                        split_disabled,
+                        pc_policy::tail_split_min_tokens(),
+                    ))
+            {
                 anyhow::ensure!(
                     passengers.is_none(),
                     "GLM fused chunk cannot take the tail-checkpoint split"
@@ -190,13 +222,18 @@ impl TransformerModel {
             stream
         };
 
+        // A later chunk encodes its vision items before its embed, on every
+        // rank alike (chunk 0's run in its lookup, `vision_cache`).
+        self.vision_encode_chunk_items(seq, tokens, chunk_start, chunk_start + chunk_len, stream)?;
         // Zero the arena and embed the chunk (phases 1+1b, `warm`): here, or
         // with ATLAS_GLM_WARM_SKIP_CACHED after the prefix lookup and only
         // for a chunk that computes.
         let lookup_first = self.warm_lookup_first();
+        // A deferred vision encode runs in the lookup: embed after it.
+        let embed_after = lookup_first || Self::vision_encode_deferred(seq);
         let span = (chunk_start, chunk_len);
         let mut t_pre =
-            self.prefill_b_zero_and_embed(!lookup_first, tokens, span.0, span.1, stream)?;
+            self.prefill_b_zero_and_embed(seq, !embed_after, tokens, span.0, span.1, stream)?;
         let t_embed = tp.elapsed();
 
         let mut kv_cache = self.kv_cache.lock();
@@ -206,6 +243,7 @@ impl TransformerModel {
             tokens,
             seq,
             chunk_start,
+            chunk_len,
             total,
             &mut kv_cache,
             stream,
@@ -225,8 +263,8 @@ impl TransformerModel {
             return self.pc_branch_split(tokens, seq, span, at, is_last_chunk, stream);
         }
         let cached = lookup_first && seq.prefill_chunk_cached(span.0 + span.1, is_last_chunk);
-        if lookup_first {
-            t_pre = self.prefill_b_zero_and_embed(!cached, tokens, span.0, span.1, stream)?;
+        if embed_after {
+            t_pre = self.prefill_b_zero_and_embed(seq, !cached, tokens, span.0, span.1, stream)?;
         }
         let t_prefix = tp.elapsed();
 
@@ -378,27 +416,26 @@ impl TransformerModel {
         );
 
         // ── Phase 4: forward through all layers ──
-        if !self.prefill_b_exact_direct(seq, chunk_start + chunk_len, is_last_chunk, proc_count) {
-            self.prefill_b_forward_layers(
-                seq,
-                &mut kv_cache,
-                chunk_start,
-                chunk_len,
-                is_last_chunk,
-                proc_count,
-                effective_seq_len_start,
-                kv_write_start,
-                marconi_skip,
-                meta_base,
-                slot_offset,
-                pos_stream_bytes,
-                use_mrope,
-                needs_paged,
-                midcap_plan.as_ref(),
-                passengers.as_deref_mut().zip(passenger_run.as_ref()),
-                stream,
-            )?;
-        }
+        self.prefill_b_forward_layers(
+            seq,
+            tokens,
+            &mut kv_cache,
+            chunk_start,
+            chunk_len,
+            is_last_chunk,
+            proc_count,
+            effective_seq_len_start,
+            kv_write_start,
+            marconi_skip,
+            meta_base,
+            slot_offset,
+            pos_stream_bytes,
+            use_mrope,
+            needs_paged,
+            midcap_plan.as_ref(),
+            passengers.as_deref_mut().zip(passenger_run.as_ref()),
+            stream,
+        )?;
         let t_fwd = tp.elapsed();
         self.warm_trace_sync(stream)?;
         let marks = [t_lookup, t_prefix, t_blocks, t_meta, tp.elapsed()];
@@ -430,6 +467,16 @@ impl TransformerModel {
                 t_meta.saturating_sub(t_proc),
                 t_fwd.saturating_sub(t_meta),
                 t_fwd,
+            );
+        }
+        if spark_runtime::host_sync_trace::enabled() {
+            self.gpu.synchronize(stream)?;
+            tracing::info!(
+                "host waits in chunk {}..{} ({:.1} ms wall): {}",
+                chunk_start,
+                chunk_start + chunk_len,
+                tp.elapsed().as_secs_f64() * 1e3,
+                spark_runtime::host_sync_trace::take_report(15)
             );
         }
         if let Some(p) = passengers {

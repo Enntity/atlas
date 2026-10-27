@@ -43,11 +43,12 @@ struct Recorder {
     capture: AtomicU64,
     target_failure: AtomicBool,
     capture_failure: AtomicBool,
-    wait_failure: AtomicBool,
     /// What the peer rank sends for each word it roots (min-votes read it)
     /// once `script` (words it sends first, in order) runs out.
     peer_word: AtomicU32,
     script: Mutex<VecDeque<u32>>,
+    /// Words received as idle (unlatched) waits for rank 0.
+    idle_receives: AtomicU32,
 }
 
 struct Gpu {
@@ -82,10 +83,6 @@ impl GpuBackend for Gpu {
     }
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
         self.record.order.lock().push(Order::Wait(stream, event));
-        anyhow::ensure!(
-            !self.record.wait_failure.swap(false, Ordering::Relaxed),
-            "injected stream wait failure"
-        );
         Ok(())
     }
     fn default_stream(&self) -> u64 {
@@ -290,6 +287,10 @@ impl spark_comm::CommBackend for Rank {
     fn barrier(&self) -> Result<()> {
         Ok(())
     }
+    fn receive_idle_command_word(&self, ptr: u64) -> Result<()> {
+        self.2.idle_receives.fetch_add(1, Ordering::Relaxed);
+        self.broadcast(ptr, 4, 0)
+    }
     fn send_to(&self, _: u64, _: usize, _: usize, _: u64) -> Result<()> {
         Ok(())
     }
@@ -311,18 +312,15 @@ pub(super) struct Fixture {
 }
 impl Fixture {
     pub fn new(tp: usize, ep: usize, rank: usize) -> Self {
-        Self::build(tp, ep, rank, false, 1)
+        Self::build(tp, ep, rank, false)
     }
     /// A model whose final prompt chunk takes the real tail-checkpoint split:
     /// one SSM layer, Marconi slots, a live prefix cache and 4-token blocks
     /// (so both halves of a 24-token prompt fit the 8-token arena).
     pub fn with_tail_split(tp: usize, ep: usize, rank: usize) -> Self {
-        Self::build(tp, ep, rank, true, 1)
+        Self::build(tp, ep, rank, true)
     }
-    pub fn with_slots(tp: usize, ep: usize, rank: usize, slots: usize) -> Self {
-        Self::build(tp, ep, rank, false, slots)
-    }
-    fn build(tp: usize, ep: usize, rank: usize, split: bool, slots: usize) -> Self {
+    fn build(tp: usize, ep: usize, rank: usize, split: bool) -> Self {
         let record = Arc::new(Recorder::default());
         record.peer_word.store(u32::MAX, Ordering::Relaxed); // agrees with any min
         let inner = Arc::new(MockGpuBackend::new());
@@ -368,7 +366,7 @@ impl Fixture {
             CAPACITY,
             32,
             block_size,
-            slots,
+            1,
             gpu.as_ref(),
         )
         .unwrap();
@@ -397,7 +395,7 @@ impl Fixture {
         // (it must be free), so the commit-order test needs one to move to.
         let ssm_pools = crate::model::ssm_pools::SsmPools::new(
             &cfg,
-            slots,
+            2,
             false,
             false,
             true,
@@ -421,7 +419,7 @@ impl Fixture {
             vec![],
             gpu,
             32,
-            slots,
+            1,
             crate::layers::MtpQuantization::Bf16,
             false,
             if split {
@@ -438,7 +436,7 @@ impl Fixture {
             ssm_pools,
         )
         .unwrap();
-        model.levers.max_decode_seqs = u32::try_from(slots).unwrap();
+        model.levers.max_decode_seqs = 1;
         model.levers.drafter.prefill = true;
         model.levers.drafter.carry = false;
         model.mtp_prefill_hidden = model.gpu.alloc(CAPACITY * ROW_BYTES).unwrap();
@@ -458,12 +456,14 @@ impl Fixture {
     pub fn events(&self) -> Vec<Event> {
         self.record.events.lock().clone()
     }
+    /// Idle receives of rank 0's word so far (worker side).
+    #[allow(dead_code)]
+    pub fn idle_receives(&self) -> u32 {
+        self.record.idle_receives.load(Ordering::Relaxed)
+    }
     /// The [`Order`] calls since the previous call.
     pub fn order(&self) -> Vec<Order> {
         std::mem::take(&mut *self.record.order.lock())
-    }
-    pub fn fail_next_wait(&self) {
-        self.record.wait_failure.store(true, Ordering::Relaxed);
     }
     pub fn fail(&self, capture: bool) {
         if capture {

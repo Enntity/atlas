@@ -116,7 +116,6 @@ fn qwen4exp_oracle_ple_matches_the_cpu_reference() {
     let d_hidden = upload(g, &f32_bytes(&hidden_host));
     let d_key = upload(g, &bf16_bytes(&key_bf16));
     let d_value = upload(g, &bf16_bytes(&value_bf16));
-    // The PLE norms feed `const float*` kernels; upload F32 like the loader.
     let d_nq = upload(g, &f32_bytes(&norm_query));
     let d_nk = upload(g, &f32_bytes(&norm_key));
     let d_nc = upload(g, &f32_bytes(&norm_conv));

@@ -13,11 +13,14 @@ mod hc;
 mod indexed_core;
 mod init;
 mod multi_seq;
+mod packed;
 mod profile;
 mod projection;
 mod recurrent;
 mod shared_cache;
+mod sp_oproj_a2a;
 mod sp_overlap;
+mod sp_quant_gather;
 
 use std::mem::size_of;
 
@@ -53,7 +56,7 @@ pub(crate) fn kda_side_proj_lt_enabled() -> bool {
 /// `ATLAS_GLM_KDA_CONV_PLANES=1`: prefill convolves the projection's q / k /
 /// v planes in place instead of first copying them into packed rows
 /// (`kda_pack_qkv`); the same bytes.
-pub(crate) fn kda_conv_planes_enabled() -> bool {
+fn kda_conv_planes_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("ATLAS_GLM_KDA_CONV_PLANES").ok().as_deref() == Some("1"))
 }
@@ -140,6 +143,10 @@ pub struct Glm5KdaLayer {
     w4a16_gemv_batch3_k: KernelHandle,
     w4a16_gemv_batch5_qkv_k: KernelHandle,
     w4a16_gemv_batchm: W4a16BatchmTiers,
+    /// `mxfp8_gemv_tc{8,16,32}` for MXFP8 q/k/v/o twins (zero when absent).
+    mxfp8_gemv_k: [KernelHandle; 3],
+    /// `mxfp8_quant_act_bf16` for W8A8 prefill operands (zero when absent).
+    mx_quant_k: KernelHandle,
     w4a16_gemm_k: KernelHandle,
     w4a16_gemm_t_m128_k: KernelHandle,
     dense_gemm_k: KernelHandle,
@@ -225,6 +232,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         use crate::layer::glm_long_owner as owner;
         // Every row-local stage (mHC, norms, projections, TP reduce) runs once
         // over all owners' rows; only the recurrence is per owner.
@@ -256,6 +265,9 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The chunk's prompt rows, then the passengers' verify rows: the
+        // routed FFN runs each on its reference lane (ATLAS_GLM_FP4L_DECODE_A16).
+        let _prompt = crate::layers::moe::PromptRows::enter(num_tokens);
         let rows = crate::layer::glm_long_owner::owner_rows(passengers)?;
         ensure!(
             ctx.midchunk_capture.is_none(),
@@ -283,6 +295,18 @@ impl TransformerLayer for Glm5KdaLayer {
         self.forward_ffn(phase, ctx, stream)
     }
 
+    fn prefill_glm_packed(
+        &self,
+        hidden: DevicePtr,
+        total: usize,
+        owners: &mut [crate::layer::glm_packed::GlmPackedOwner<'_>],
+        _cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_packed(hidden, total, owners, ctx, stream)
+    }
+
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
@@ -300,6 +324,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.forward_inner(hidden, state, 1, true, false, ctx, stream)
     }
 
@@ -335,6 +361,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         // Speculative verify rows are one temporal sequence, not independent
         // requests. Batch the stateless projections/mHC work, but advance the
         // KDA recurrent state row-by-row and capture rollback intermediates.
@@ -354,6 +382,8 @@ impl TransformerLayer for Glm5KdaLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         let independent = crate::model::glm_independent::selected(ctx, num_seqs)?;
         if independent
             || crate::model::glm_c4::batched_kda_rows(

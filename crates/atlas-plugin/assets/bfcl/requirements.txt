@@ -7,3 +7,6 @@
 #
 # bfcl-eval carries both the AST checker and the BFCL v4 data files.
 bfcl-eval==2026.3.23
+
+# qwen-agent imports this while loading the AST checker.
+soundfile==0.13.1

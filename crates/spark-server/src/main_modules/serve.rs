@@ -208,8 +208,8 @@ pub(super) struct DefaultChatTemplateKwargs {
     pub thinking: crate::ir::ThinkingDirective,
     /// Template-side default effort string, injected in
     /// `api/chat/prepare.rs` when the request carries none and thinking
-    /// is on. `None` = the cross-template `"medium"` fallback in
-    /// `tokenizer/chat_render.rs` applies.
+    /// is on. `None` = MODEL.toml `[behavior].default_reasoning_effort`
+    /// ([`model_default_reasoning_effort`]), else the template's own default.
     pub reasoning_effort: Option<crate::ir::ReasoningEffort>,
     /// Server-level `preserve_thinking` pin; overrides the MODEL.toml
     /// `[behavior]` value, is overridden per-request.
@@ -281,6 +281,26 @@ pub(super) fn parse_default_chat_template_kwargs(
     })
 }
 
+/// MODEL.toml `[behavior].default_reasoning_effort` as the template effort an
+/// effort-silent request renders with when `--default-chat-template-kwargs`
+/// names none. Template-side only, like the "medium" fallback it replaced:
+/// the thinking budget stays the model's. Fail-fast on a spelling that is not
+/// a thinking-on tier.
+pub(crate) fn model_default_reasoning_effort(
+    behavior: &atlas_kernels::ModelBehavior,
+) -> anyhow::Result<Option<crate::ir::ReasoningEffort>> {
+    match behavior.default_reasoning_effort {
+        "" => Ok(None),
+        v => match crate::ir::parse_wire_effort(v) {
+            Some((effort @ Some(_), _)) => Ok(effort),
+            _ => anyhow::bail!(
+                "MODEL.toml [behavior].default_reasoning_effort {v:?}: expected one of \
+                 minimal, low, medium, high, xhigh, max"
+            ),
+        },
+    }
+}
+
 /// Resolve `--require-auth` / `--auth-tokens-file` / `--auth-token` into an
 /// optional `AuthConfig`. Validates at startup so misconfigurations fail
 /// loudly instead of letting an unauthenticated server run silently.
@@ -323,8 +343,8 @@ pub(super) fn build_auth_config(
 }
 
 /// Resolve the vision pixel budget: operator override, else the checkpoint's
-/// own `preprocessor_config.json`, else `None` (preprocessor falls back to
-/// its historical 1280px long-side clamp).
+/// own declared image bound (`processor_pixels`), else `None` (preprocessor
+/// falls back to its historical 1280px long-side clamp).
 ///
 /// The checkpoint half is the point. `preprocessor_config.json` was in the
 /// download plan but nothing ever parsed it, so a model declaring
@@ -334,7 +354,7 @@ pub(super) fn build_auth_config(
 /// checkpoint at the resolution it was built for.
 pub(super) fn resolve_vision_max_pixels(
     args: &cli::ServeArgs,
-    model_dir: &std::path::Path,
+    declared: Option<usize>,
 ) -> Result<Option<usize>> {
     if args.vision_max_pixels > 0 {
         return Ok(Some(args.vision_max_pixels));
@@ -350,76 +370,49 @@ pub(super) fn resolve_vision_max_pixels(
             }
         }
     }
-    Ok(read_preprocessor_max_pixels(model_dir))
+    Ok(declared)
 }
 
-/// Pull the IMAGE area bound out of the checkpoint's processor config, if it
-/// ships one. `None` on any absence or malformation — a model without the
-/// file, or with one we cannot read, must keep the historical behaviour
-/// rather than fail to serve.
-///
-/// TWO FILENAMES, because the ecosystem uses both and a checkpoint ships one
-/// or the other, never both. HF's `save_pretrained` writes
-/// `preprocessor_config.json` with the image fields at the top level
-/// (`Qwen/Qwen3.6-35B-A3B-FP8`), while a combined processor writes
-/// `processor_config.json` with each modality under its own key
-/// (`unsloth/Qwen3.6-27B-NVFP4` → `image_processor.size.longest_edge`).
-/// Reading only the first is why the unsloth checkpoints — the ones actually
-/// being served — still ran the 1280px fallback after the area bound was
-/// supposedly honoured: they declare 16777216 and nothing looked in the file
-/// that says so.
-///
-/// The nested form is also why this cannot be a search for the first
-/// `longest_edge` in the document. `processor_config.json` carries a SECOND,
-/// LARGER bound under `video_processor` (25165824 vs the image 16777216);
-/// picking that one would over-admit every still image by half again its
-/// permitted area. The image bound is addressed explicitly.
-///
-/// Two spellings are accepted within whichever object we land on. HF's
-/// Qwen2VL/Qwen3VL processors write `size = {longest_edge, shortest_edge}`,
-/// where — despite the names — both are pixel COUNTS, not edge lengths
-/// (16777216 = 4096², 65536 = 256²). Older/other processors write
-/// `max_pixels` directly.
-pub(super) fn read_preprocessor_max_pixels(model_dir: &std::path::Path) -> Option<usize> {
-    // Ordered by precedence. `preprocessor_config.json` is the dedicated
-    // image-processor file, so it wins if a checkpoint somehow ships both.
-    const SOURCES: [(&str, Option<&str>); 3] = [
-        ("preprocessor_config.json", None),
-        ("preprocessor_config.json", Some("image_processor")),
-        ("processor_config.json", Some("image_processor")),
-    ];
-    for (file, nest) in SOURCES {
-        let path = model_dir.join(file);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+/// GLM-5.3's token budgets from its nested `processor_config.json`:
+/// `min_image_tokens` / `max_image_tokens` under `image_processor` and
+/// `video_processor`. GLM declares no pixel area (`size` / `max_pixels`), so
+/// `read_preprocessor_max_pixels` finds nothing and these are the bound.
+/// A missing file or key keeps the processor classes' defaults, which the
+/// shipped checkpoint repeats.
+pub(super) fn read_glm_token_budgets(
+    model_dir: &std::path::Path,
+) -> atlas_core::config::VisionTokenBudgets {
+    let mut budgets = atlas_core::config::VisionTokenBudgets::default();
+    let path = model_dir.join("processor_config.json");
+    let Some(json) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+    else {
+        return budgets;
+    };
+    for (key, slot) in [
+        ("image_processor", &mut budgets.image),
+        ("video_processor", &mut budgets.video),
+    ] {
+        let read = |field: &str| {
+            json.get(key)
+                .and_then(|scope| scope.get(field))
+                .and_then(serde_json::Value::as_u64)
+                .filter(|&tokens| tokens > 0)
+                .map(|tokens| tokens as usize)
         };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
-        let scope = match nest {
-            Some(key) => match json.get(key) {
-                Some(v) => v,
-                None => continue,
-            },
-            None => &json,
-        };
-        let from_size = scope
-            .get("size")
-            .and_then(|s| s.get("longest_edge"))
-            .and_then(serde_json::Value::as_u64);
-        let direct = scope.get("max_pixels").and_then(serde_json::Value::as_u64);
-        let Some(px) = from_size.or(direct).filter(|&p| p > 0) else {
-            continue;
-        };
-        tracing::info!(
-            "Vision area bound {} px from {}{} (was: hard-coded 1280px long side)",
-            px,
-            path.display(),
-            nest.map(|k| format!(" [{k}]")).unwrap_or_default(),
+        *slot = (
+            read("min_image_tokens").unwrap_or(slot.0),
+            read("max_image_tokens").unwrap_or(slot.1),
         );
-        return Some(px as usize);
     }
-    None
+    tracing::info!(
+        "GLM vision token budgets from {}: image {:?}, video {:?}",
+        path.display(),
+        budgets.image,
+        budgets.video,
+    );
+    budgets
 }
 
 /// QV1 (2026-05-26): canonicalize the model's declared quantization to

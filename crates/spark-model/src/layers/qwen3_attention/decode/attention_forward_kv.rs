@@ -109,9 +109,8 @@ impl Qwen3AttentionLayer {
                         stream,
                     )?;
                 } else {
-                    ops::dense_gemv(
+                    self.dense_gemv_or_mx(
                         ctx.gpu,
-                        self.dense_gemv_k,
                         normed,
                         &self.attn.k_proj,
                         k_out,
@@ -132,9 +131,8 @@ impl Qwen3AttentionLayer {
                         stream,
                     )?;
                 } else {
-                    ops::dense_gemv(
+                    self.dense_gemv_or_mx(
                         ctx.gpu,
-                        self.dense_gemv_k,
                         normed,
                         &self.attn.v_proj,
                         v_out,

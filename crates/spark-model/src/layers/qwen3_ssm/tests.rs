@@ -628,3 +628,6 @@ fn gdn_defer_active_gates_on_lever_band_and_handles() {
         assert!(!Qwen3SsmLayer::gdn_defer_active(true, k, h(1), h(1)));
     }
 }
+
+#[path = "init_mxfp8_tests.rs"]
+mod mxfp8;

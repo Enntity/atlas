@@ -124,39 +124,46 @@ extern "C" __global__ void batched_embed_fp8(
     }
 }
 
-// NVFP4-table batched embedding gather (FP4-Local's PLE n-gram table):
-// rows are packed E2M1 pairs (low nibble first) with one E4M3 block scale
-// per `group` elements and a per-tensor f32 global. BIT-IDENTICAL to the
-// host decoder `atlas_core::modelopt_codec::nvfp4_rows_to_bf16`:
-// bf16_rne((e2m1 * e4m3) * global) in f32, in exactly that multiply order.
+// NVFP4 (ModelOpt, group 16) table gather: each row is PACKED as
+//   [head_dim/2 B: E2M1 code pairs, LOW nibble = even element]
+//   [head_dim/16 B: E4M3 block scales, one per 16 elements]
+//   [zero pad up to row_stride]
+// — the layout `spark_storage::ngram_pack` writes for the Qwen3.8-Flash-Next-
+// FP4-Local PLE table, whose checkpoint keeps the codes and the scales in two
+// tensors. One global f32 (`weight_scale_2`) multiplies every row.
 //
-// Grid: (num_tokens, 1, 1)  Block: (256, 1, 1)
-__device__ __forceinline__ float ngram_e2m1_decode(unsigned int nib) {
-    // FP4_E2M1 LUT, same order as modelopt_codec.
-    const float lut[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    return lut[nib & 15u];
-}
+// value = (e2m1 * e4m3_scale) * global, in f32, then RNE to BF16: the order of
+// flashinfer's oracle (flashinfer/experimental/b12x/sequence/ple_embedding/
+// reference.py `_dequantize_selected_nvfp4`, Apache-2.0). e2m1 x e4m3 is exact
+// in f32 (at most 6 significant bits), so only the global multiply rounds;
+// `--fmad=false` (common KERNEL.toml) keeps the compiler from fusing anything.
+// The scale decode is `ngram_fp8_decode`, which maps E4M3's NaN to 0 where the
+// reference would propagate NaN — a valid checkpoint has no NaN scale.
+//
+// Grid: (num_rows, 1, 1)  Block: (256, 1, 1)
 extern "C" __global__ void batched_embed_nvfp4(
-    const unsigned int* __restrict__ token_ids,    // [num_tokens] slot ids
-    const unsigned char* __restrict__ packed,      // [slots, dim/2] E2M1 pairs
-    const unsigned char* __restrict__ scales,      // [slots, dim/group] E4M3
-    float global,
-    __nv_bfloat16* __restrict__ output,            // [num_tokens, dim]
-    unsigned int dim,
-    unsigned int group
+    const unsigned int* __restrict__ token_ids,    // [num_rows] slot per row
+    const unsigned char* __restrict__ embed_table, // [slots, row_stride] packed
+    __nv_bfloat16* __restrict__ output,            // [num_rows, head_dim]
+    float global_scale,
+    unsigned int head_dim,
+    unsigned int row_stride
 ) {
-    const unsigned int token_idx = blockIdx.x;
-    const unsigned int slot = token_ids[token_idx];
-    const unsigned char* src = packed + (unsigned long long)slot * (dim / 2);
-    const unsigned char* srow = scales + (unsigned long long)slot * (dim / group);
-    __nv_bfloat16* dst = output + (unsigned long long)token_idx * dim;
-    for (unsigned int i = threadIdx.x; i < dim / 2; i += blockDim.x) {
-        const unsigned char byte = src[i];
-        const float block = ngram_fp8_decode(srow[(i * 2) / group]);
-        dst[i * 2]     = __float2bfloat16(ngram_e2m1_decode(byte & 15u) * block * global);
-        dst[i * 2 + 1] = __float2bfloat16(ngram_e2m1_decode(byte >> 4) * block * global);
+    const unsigned int row = token_ids[blockIdx.x];
+    const unsigned char* src = embed_table + (unsigned long long)row * row_stride;
+    const unsigned char* scales = src + head_dim / 2;
+    __nv_bfloat16* dst = output + (unsigned long long)blockIdx.x * head_dim;
+    for (unsigned int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const unsigned int b = src[i >> 1];
+        const unsigned int code = (i & 1u) ? (b >> 4) : (b & 0xFu);
+        // E2M1: 0, 0.5, 1, 1.5, 2, 3, 4, 6; bit 3 is the sign. Code 8 is -0,
+        // as in flashinfer's Triton kernel and `atlas_core::numeric::FP4_E2M1`
+        // (the oracle's table says +0; no product can tell them apart).
+        const unsigned int mag = code & 7u;
+        float v = mag < 4u ? 0.5f * (float)mag
+                           : (float)(2u << ((mag - 4u) >> 1)) * ((mag & 1u) ? 1.5f : 1.0f);
+        if (code & 8u) v = -v;
+        const float s = ngram_fp8_decode(scales[i >> 4]);
+        dst[i] = __float2bfloat16((v * s) * global_scale);
     }
 }

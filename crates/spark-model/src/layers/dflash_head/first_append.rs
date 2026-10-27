@@ -159,8 +159,12 @@ impl DflashProposerState {
     /// Context bookkeeping at the end of a prefill whose last pass ended at
     /// position `end` of a `prompt_len`-token prompt: the accumulator holds
     /// the window's last positions, and the propose at `seq_len` is the first.
+    /// A window never starts under `ctx_floor` (`warm_ctx`; 0 by default).
     pub(crate) fn seed_prefill_ctx(&mut self, prompt_len: usize, end: usize, seq_len: usize) {
-        let window_start = prompt_len.max(end).saturating_sub(self.max_ctx_len);
+        let window_start = prompt_len
+            .max(end)
+            .saturating_sub(self.max_ctx_len)
+            .max(self.ctx_floor);
         let new_len = end.saturating_sub(window_start).min(self.max_ctx_len);
         self.ctx_len = new_len;
         // Phase I (v2): seed per-slot fixed positions for the prompt
@@ -199,7 +203,7 @@ impl BlockDiffusionDraftHead {
             self.startup.diagnostics.first_append,
             self.startup.diagnostics.no_decode_append || eagle_skip,
             target_hidden_stack,
-            dstate.ctx_len < dstate.max_ctx_len && dstate.ctx_hidden_acc.0 != 0,
+            dstate.ctx_len < dstate.max_ctx_len,
             preceding,
             dstate.own_row,
         )

@@ -5,24 +5,15 @@
 use super::*;
 
 mod glm_owner;
+mod native_mtp;
+mod split_head;
 mod stats;
 mod think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 pub(super) use think_end::accept_with_forced_think_end;
 
-/// Width-generic γ-token verify with accept-prefix. `draft_conf` is the
-/// drafter's confidence in `drafts` (`ActiveSeq::take_drafts`; empty when
-/// not measured).
-///
-/// Routes `[last_token, drafts...]` through Atlas's width-generic target
-/// verifier and finds the first index where draft ≠ verified argmax. Tokens
-/// before the first mismatch are accepted; the target token at the mismatch
-/// becomes the bonus token and subsequent drafts are dropped.
-///
-/// Remaining DFlash-specific work:
-///   * Per-position logprobs extraction.
-///   * Sliding-window state rollback for sliding-attention layers
-///     (Gemma-4-style; not used by Qwen3.6 targets).
+/// Verify `[last_token, drafts...]`, accept the matching prefix, and emit the
+/// target correction or bonus. `draft_conf` is empty when not measured.
 #[allow(clippy::too_many_arguments)]
 pub fn step_verify_dflash(
     model: &dyn Model,
@@ -34,29 +25,15 @@ pub fn step_verify_dflash(
     verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
     dflash_verify_raw_argmax: bool,
 ) {
-    step_verify_dflash_inner(
-        model,
-        a,
-        sched,
-        drafts,
-        draft_conf,
-        num_drafts,
-        verify_ctx,
-        dflash_verify_raw_argmax,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn step_verify_dflash_inner(
-    model: &dyn Model,
-    a: &mut ActiveSeq,
-    sched: &crate::scheduler::sched_ctx::SchedCtx,
-    drafts: &[u32],
-    draft_conf: &[f32],
-    num_drafts: usize,
-    verify_ctx: &crate::scheduler::logit_processors::LogitsContext,
-    dflash_verify_raw_argmax: bool,
-) {
+    if model.native_mtp_enabled() && dflash_verify_raw_argmax {
+        a.abort_on_engine_error("native GLM MTP cannot use the DFlash raw-argmax verifier lane");
+        return;
+    }
+    // Reject unsupported sampled/logprob requests before any worker enters
+    // the verify command and waits for its verdict.
+    if let Err(e) = split_head::ensure_available(model, a) {
+        return a.abort_on_engine_error(format_args!("split verify admission: {e:#}"));
+    }
     let _step_timer = crate::scheduler::mtp_timing::StepTimer::new(&sched.timing, a.seq.seq_len);
 
     if let Err(e) = model.sync_secondary() {
@@ -78,11 +55,8 @@ fn step_verify_dflash_inner(
     tokens.push(a.last_token);
     tokens.extend_from_slice(drafts);
 
-    // EP rank 1 must execute the same K-row target forward in NCCL lockstep.
-    // F5 is width-generic: K, then K tokens, followed after verification by
-    // the accepted-draft count. Fixed K=2/3/4 retain their established wire
-    // commands, except repaired GLM K2/K3 which needs the explicit verdict hook.
-    // Strict masks are validated and uploaded before anything is sent.
+    // The worker runs the same K-row target forward before receiving its verdict.
+    // Validate masks before sending the F5 width-generic command.
     if let Err(e) = super::strict_spec::upload(model, &strict) {
         return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
     }
@@ -106,11 +80,13 @@ fn step_verify_dflash_inner(
         return a.abort_on_engine_error(format_args!("strict verify: {e:#}"));
     }
 
-    // STEP-TIMING (ATLAS_DFLASH_STEP_TIMING=1): split the ~0.88s/step into
-    // verify (target M=1+γ forward) vs propose (drafter forward, tail below).
-    // The ledger never had this split — it guessed "FFN + double sweep". This
-    // measures it. Gated so the hot path pays nothing when the env is unset.
-    let step_timing = std::env::var("ATLAS_DFLASH_STEP_TIMING").ok().as_deref() == Some("1");
+    // Native MTP and DFlash have separate timing switches.
+    let timing_env = if model.native_mtp_enabled() {
+        "ATLAS_MTP_TIMING"
+    } else {
+        "ATLAS_DFLASH_STEP_TIMING"
+    };
+    let step_timing = std::env::var(timing_env).ok().as_deref() == Some("1");
     let t_verify = std::time::Instant::now();
     let verified_argmax = match model.decode_verify_dflash(&tokens, &mut a.seq, 0) {
         Ok(v) => v,
@@ -170,24 +146,45 @@ pub(super) fn verify_dflash_tail(
     // it says nothing about the drafter.
     record_stats: bool,
 ) -> Option<usize> {
+    let native_mtp = model.native_mtp_enabled();
     let raw_trace = if std::env::var("ATLAS_LIGHTNING_VERIFY_TOKEN_TRACE").as_deref() == Ok("1") {
         Some(verified_argmax.clone())
     } else {
         None
     };
 
-    // DFlash drafter proposes on raw argmax; when dflash_verify_raw_argmax is set
-    // (process-wide DFlash mode), skip the rep_pen/DRY pipeline so verifier and
-    // drafter judge on the SAME (GOLD) basis. For non-DFlash callers (unreachable
-    // today since step_verify_dflash is only dispatched at drafts.len()>=4 which
-    // only DFlash produces), apply the full pre-sample pipeline as in K=2/3/4.
-    let mut verified = if crate::scheduler::helpers::dflash_seq_uses_raw_argmax(
-        dflash_verify_raw_argmax,
-        sched.levers.dflash_masked_verify,
+    // Use raw argmax only where the request policy permits it; otherwise
+    // process each row through the pipeline (split exchange for split heads).
+    // A sampled row accepts its draft only while it matches the sampled pick.
+    let (raw, masked) = (dflash_verify_raw_argmax, sched.levers.dflash_masked_verify);
+    let Ok(scored) = super::verify_pipeline_helper::scored::requested(
         model,
+        verified_argmax.len(),
         a,
-        &verified_argmax,
-    ) {
+        verify_ctx,
+        0,
+        Some(drafts),
+    ) else {
+        return None;
+    };
+    let split_rows = helpers::dflash_seq_uses_split_rows(raw, masked, model, a);
+    let mut verified = if let Some(scored) = &scored {
+        scored.tokens.clone()
+    } else if split_rows {
+        match crate::scheduler::verify_pipeline_helper::split_verify_picks(
+            model,
+            &verified_argmax,
+            drafts,
+            a,
+            verify_ctx,
+        ) {
+            Ok(picks) => picks,
+            Err(e) => {
+                split_head::abort_exchange(model, a, "sampled picks", &e);
+                return None;
+            }
+        }
+    } else if helpers::dflash_seq_uses_raw_argmax(raw, masked, model, a) {
         verified_argmax
     } else {
         crate::scheduler::verify_pipeline_helper::verify_pick_all_with_pipeline(
@@ -210,13 +207,24 @@ pub(super) fn verify_dflash_tail(
     // proposer's guess for the same slot. First mismatch terminates the
     // accepted prefix; verified[first_mismatch] becomes the bonus token.
     // An exhausted thinking budget may end the step early at `</think>`.
-    let num_accepted = accept_with_forced_think_end(
-        a,
-        verify_ctx.think_end_token,
-        verify_ctx.boundary_mask.as_deref(),
-        drafts,
-        &mut verified,
-    );
+    let num_accepted = if scored.is_some() || split_rows {
+        // Scored/split picks enforce boundaries using each row's shadow state.
+        // Replaying the raw helper here would use the restored pre-span fence.
+        drafts
+            .iter()
+            .zip(&verified)
+            .take_while(|(d, v)| d == v)
+            .count()
+            .min(verified.len().saturating_sub(1))
+    } else {
+        accept_with_forced_think_end(
+            a,
+            verify_ctx.think_end_token,
+            verify_ctx.boundary_mask.as_deref(),
+            drafts,
+            &mut verified,
+        )
+    };
     if let Some(raw) = raw_trace {
         tracing::info!(
             "LIGHTNING VERIFY TOKEN TRACE slot={} last={} drafts={:?} raw={:?} processed={:?} accepted={}",
@@ -239,24 +247,7 @@ pub(super) fn verify_dflash_tail(
         );
     }
 
-    // Logprobs for the tokens this step emits: the accepted prefix plus the
-    // bonus, which is exactly `verified[0..=num_accepted]` because an accepted
-    // draft is by definition equal to `verified` at that index. Extracted here,
-    // before `commit_ctx` reuses the logits buffer — the same ordering the
-    // verify_k2/k3/k4 paths use.
-    //
-    // Without this the DFlash path emitted every token with `logprobs: None`,
-    // so a request that asked for logprobs got the OpenAI four-array shape back
-    // filled entirely with nulls: structurally valid, informationally empty,
-    // and indistinguishable from "this model has no logprobs". The MTP verify
-    // paths have always extracted them; only this one did not. Gated on the
-    // request, so an ordinary run copies no logits and pays nothing.
-    let verify_lps = if let Some(k_logprobs) = a.top_logprobs {
-        let upto = (num_accepted + 1).min(verified.len());
-        extract_verify_logprobs(model, &verified[..upto], k_logprobs, 0)
-    } else {
-        Vec::new()
-    };
+    let verify_lps = scored.map(|s| s.logprobs).unwrap_or_default();
 
     if let Err(e) = model.ep_broadcast_cmd(num_accepted as u32) {
         tracing::error!("EP broadcast generic verify result: {e:#}");
@@ -301,17 +292,19 @@ pub(super) fn verify_dflash_tail(
     // Unified ctx commit (ATLAS_DFLASH_UNIFIED_CTX=1): ONE unconditional
     // commit at the K=gamma point — rows 0..=num_accepted at RoPE base
     // pre_verify_len. Structural replacement for dflash_eagle_kgamma_append.
-    if sched.levers.dflash_unified_ctx {
-        if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
-            tracing::error!("commit_ctx (kgamma): {e:#}");
-        }
-    } else {
-        let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
-        if eagle_fix
-            && let Err(e) =
-                model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
-        {
-            tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+    if !native_mtp {
+        if sched.levers.dflash_unified_ctx {
+            if let Err(e) = model.commit_ctx(&mut a.seq, num_accepted + 1, pre_verify_len) {
+                tracing::error!("commit_ctx (kgamma): {e:#}");
+            }
+        } else {
+            let eagle_fix = std::env::var("ATLAS_DFLASH_EAGLE_FIX").ok().as_deref() == Some("1");
+            if eagle_fix
+                && let Err(e) =
+                    model.dflash_eagle_kgamma_append(&mut a.seq, num_accepted, pre_verify_len)
+            {
+                tracing::error!("dflash_eagle_kgamma_append: {e:#}");
+            }
         }
     }
 
@@ -325,7 +318,9 @@ pub(super) fn verify_dflash_tail(
     // recurrent state. The worker rank has already committed these rows (it
     // acts on the verdict word above), so a head that returned first kept a
     // state that matched neither `seq.tokens` nor the other rank.
-    let k_verify = drafts.len() + 1;
+    // The rows the target verified: an owner of a batch with dead rows
+    // judges fewer drafts than it verified rows.
+    let k_verify = tokens.len();
     let total_accepted = num_accepted + 1; // bonus is always "accepted"
     if let Err(e) = model.commit_accepted_prefix(&mut a.seq, total_accepted, k_verify) {
         tracing::error!("commit_accepted_prefix (dflash): {e:#}");
@@ -379,26 +374,16 @@ pub(super) fn verify_dflash_tail(
         a.seq.seq_len,
     );
 
-    // DFlash hidden is captured per-layer inside the verify graph
-    // (verify_d.rs try_dflash_capture at position k-1), mirroring verify_b.rs.
-    // No post-loop save needed; calling save_dflash_hidden_for_propose here
-    // would overwrite the correct per-layer intermediates with a repeated
-    // final-layer hidden, collapsing all 5 slots to the same value.
     let bonus_token_idx = total_accepted.saturating_sub(1);
-    if let Err(e) = model.save_hidden_for_mtp(bonus_token_idx, 0) {
-        tracing::error!("save_hidden_for_mtp (dflash): {e:#}");
-        if spark_model::speculative::glm_repair_policy::enabled() {
-            a.finished = true;
-            return None;
-        }
-    }
-
-    if let Err(e) = model.trim_proposer_state(&mut a.seq, num_accepted, 0) {
-        tracing::error!("trim_proposer_state: {e:#}");
-        if spark_model::speculative::glm_repair_policy::enabled() {
-            a.finished = true;
-            return None;
-        }
+    if !native_mtp::save_and_repair(
+        model,
+        a,
+        drafts,
+        num_accepted,
+        pre_verify_len,
+        bonus_token_idx,
+    ) {
+        return None;
     }
 
     // Re-propose for next step — unless adaptive speculation just suspended
@@ -459,6 +444,10 @@ pub(super) fn verify_dflash_tail(
         match proposal {
             Ok(d) if !d.is_empty() => a.set_proposed_drafts(d),
             Ok(_) => {
+                if native_mtp {
+                    a.abort_on_engine_error("native GLM MTP re-propose returned no drafts");
+                    return None;
+                }
                 // Lightning product fail-closed boundary: an empty
                 // re-propose is an admission violation, not a silent
                 // serial-decode fallback on the next bootstrap.
@@ -472,7 +461,13 @@ pub(super) fn verify_dflash_tail(
                 }
             }
             Err(e) => {
-                tracing::error!("run_mtp_propose_multi (dflash): {e:#}");
+                if native_mtp {
+                    a.abort_on_engine_error(format_args!(
+                        "native GLM MTP re-propose failed: {e:#}"
+                    ));
+                    return None;
+                }
+                tracing::error!("run_mtp_propose_multi (generic verify): {e:#}");
                 crate::scheduler::helpers::handle_dspark_repropose_failure(
                     model,
                     a,
@@ -490,7 +485,8 @@ pub(super) fn verify_dflash_tail(
     if step_timing {
         let propose_ms = t_propose.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
-            "DFLASH STEP_TIMING: verify={:.1}ms propose={:.1}ms (K={}, accepted={})",
+            "{} STEP_TIMING: verify={:.1}ms propose={:.1}ms (K={}, accepted={})",
+            if native_mtp { "MTP" } else { "DFLASH" },
             verify_ms,
             propose_ms,
             tokens.len(),
@@ -499,3 +495,6 @@ pub(super) fn verify_dflash_tail(
     }
     None
 }
+
+#[cfg(test)]
+mod masked_path_tests;

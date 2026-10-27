@@ -30,6 +30,12 @@ impl Qwen3SsmLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // ATLAS_QWEN4EXP_PREFILL_W8A8: the checkpoint's MXFP8 bytes, W8A8
+        // (`w8a8.rs`); the layer has no BF16 copy left for the arms below.
+        let w8a8 = super::exact_rows::GdnProj::Qkvz;
+        if self.w8a8_proj(ctx, w8a8, normed, deinterleaved, k as usize, stream)? {
+            return Ok(());
+        }
         let proj_dst = if self.sequential_qkvz {
             deinterleaved
         } else {

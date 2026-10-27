@@ -21,8 +21,6 @@ mod prefill_inner_glm;
 pub(super) use diag::diag_norm;
 pub use diag::diag_norm_f32;
 
-#[path = "trait_impl/moe_transpose.rs"]
-mod moe_transpose;
 #[path = "trait_impl/state.rs"]
 mod state;
 
@@ -35,6 +33,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_glm_long_owners_mla(owners, cache, stage, ctx, stream)
     }
 
@@ -50,6 +50,18 @@ impl TransformerLayer for Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<()> {
         self.prefill_glm_passengers_mla(num_tokens, seq_len_start, passengers, cache, ctx, stream)
+    }
+
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        total: usize,
+        owners: &mut [crate::layer::glm_packed::GlmPackedOwner<'_>],
+        cache: &mut PagedKvCache,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<()> {
+        self.prefill_glm_packed_mla(total, owners, cache, ctx, stream)
     }
 
     fn uses_local_mla_prefill(&self) -> bool {
@@ -88,17 +100,14 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.prefill_mla_kv_only_impl(hidden, num_tokens, kv_cache, slots, ctx, stream)
     }
 
-    /// An indexer vetoes decode-graph capture: its ingest counter is host
-    /// state, its launch parameters depend on the position, the default top-k
-    /// arm sorts on the host — and a graph captured on the dense path would
-    /// replay wrong attention once selection activates.
+    /// An indexer vetoes decode-graph capture: host ingest state, position-
+    /// dependent launches, and a dense-path graph replays wrong once it selects.
     fn decode_graph_unsupported(&self) -> bool {
         self.qsa.is_some()
     }
 
-    /// Inert-step capture (`layers/qsa_staged.rs`): the mHC highway layer
-    /// with plain BF16 KV whose decode reads only device metadata, the
-    /// indexer's ingest staged. No MLA, adapters or host KV tier.
+    /// Inert-step capture (`layers/qsa_staged.rs`): mHC layer, plain BF16 KV,
+    /// device-only metadata, staged ingest; no MLA, adapters or host KV tier.
     fn qsa_inert_capturable(&self) -> bool {
         self.qsa_rows_static_ok() && self.lora.is_none()
     }
@@ -145,9 +154,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         qsa.reserve(st, tokens.min(qsa.capacity()), gpu, stream)
     }
 
-    /// `None` when the batched path can serve an ACTIVE selection per row
-    /// (`multi_seq/qsa_rows.rs`) — the same static allow-list the pre-mutation
-    /// guard applies, so the scheduler and the layer cannot disagree.
+    /// `None` when the batched path serves an ACTIVE selection per row
+    /// (`multi_seq/qsa_rows.rs`): the pre-mutation guard's own allow-list.
     fn verify_context_limit(&self) -> Option<usize> {
         if self.qsa_rows_static_ok() {
             return None;
@@ -263,6 +271,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_inner(
             hidden,
             residual,
@@ -314,9 +324,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         self.prefill_multi_hc(pass)
     }
 
-    /// Q12 Path B: batched-mode attention prefill via `prefill_inner` with
-    /// `batched_meta = Some` (`prefill_attn_batched_layer`). The per-stream
-    /// block_table is unused (batched_meta's block_table_ptrs carry them).
+    /// Q12 Path B: batched prefill via `prefill_inner` with `batched_meta`,
+    /// whose block_table_ptrs replace the per-stream block_table.
     fn prefill_inner_batched_q12(
         &self,
         hidden_stacked: DevicePtr,
@@ -328,20 +337,16 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
-        let mut empty_state = EmptyLayerState;
-        let mut empty_block_table: Vec<u32> = Vec::new();
-        let mut empty_disk_block_ids: Vec<u32> = Vec::new();
-        let mut empty_disk_last: Vec<u32> = Vec::new();
         self.prefill_inner(
             hidden_stacked,
             residual_stacked,
             num_tokens,
-            &mut empty_state,
+            &mut EmptyLayerState,
             kv_cache,
             seq_len_start,
-            &mut empty_block_table,
-            &mut empty_disk_block_ids,
-            &mut empty_disk_last,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
             0,
             Some(batched_meta),
             ctx,
@@ -363,6 +368,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_multi_seq_inner(
             hidden,
             residual,
@@ -391,6 +398,8 @@ impl TransformerLayer for Qwen3AttentionLayer {
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
+        // The reference's non-prompt rows (ATLAS_GLM_FP4L_DECODE_A16).
+        let _rows = crate::layers::moe::DecodeRows::enter();
         self.decode_multi_seq_inner(
             hidden,
             residual,
@@ -404,6 +413,15 @@ impl TransformerLayer for Qwen3AttentionLayer {
             ctx,
             stream,
         )
+    }
+
+    fn decode_rows_kv_only(
+        &self,
+        rows: crate::layer::KvRows<'_>,
+        kv: &mut PagedKvCache,
+        ctx: &ForwardContext,
+    ) -> Result<bool> {
+        self.decode_rows_kv_only_inner(rows, kv, ctx)
     }
 
     fn alloc_state(&self, _gpu: &dyn GpuBackend) -> Result<Box<dyn LayerState>> {

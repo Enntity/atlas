@@ -27,13 +27,16 @@ mod dispatch_config;
 mod dispatch_helpers;
 #[path = "ops/dispatch_proj.rs"]
 mod dispatch_proj;
+#[path = "ops/fp8b.rs"]
+mod fp8b;
 #[path = "ops/mxfp8.rs"]
 mod mxfp8;
-#[path = "ops/mxfp8_proj.rs"]
-mod mxfp8_proj;
-#[cfg(test)]
-#[path = "ops/mxfp8_proj32_tests.rs"]
-mod mxfp8_proj32_tests;
+#[path = "ops/mxfp8_act.rs"]
+mod mxfp8_act;
+#[path = "ops/mxfp8_w8a8.rs"]
+mod mxfp8_w8a8;
+#[path = "ops/rank_join.rs"]
+mod rank_join;
 // Row-wise FP8 routing, split out when it took dispatch_proj.rs over the cap.
 #[path = "ops/dispatch_proj_rowwise.rs"]
 mod dispatch_proj_rowwise;
@@ -71,8 +74,6 @@ mod gemm_fp4;
 pub mod model_stats;
 #[path = "ops/moe_gate_up_repack.rs"]
 pub(crate) mod moe_gate_up_repack;
-#[path = "ops/strix_f16.rs"]
-mod strix_f16;
 pub use model_stats::ModelStats;
 
 #[path = "ops/exl3_ops.rs"]
@@ -244,6 +245,8 @@ pub mod qwen4exp_rowinv;
 mod qwen4exp_w4_rows;
 #[path = "ops/qwen4exp_w4_wide.rs"]
 mod qwen4exp_w4_wide;
+#[path = "ops/qwen4exp_w8a8.rs"]
+pub mod qwen4exp_w8a8;
 #[path = "ops/qwen4exp_wide_rows.rs"]
 mod qwen4exp_wide_rows;
 // Shared harness for the oracle-parity tests, split for the 500-LoC cap.
@@ -306,6 +309,7 @@ pub use fp8_gemv_batch::*;
 pub use fp8_moe::*;
 pub use fp8_moe_batch_a::*;
 pub use fp8_moe_batch_b::*;
+pub use fp8b::*;
 pub use gemm_dense::*;
 pub use gemm_dense_int8::*;
 pub use gemm_dense_router::*;
@@ -316,7 +320,7 @@ pub use gemv_q2::*;
 pub use gemv_q2_vec::*;
 pub use gemv_sw::*;
 pub use gemv_touch::{
-    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, w4a16_pair_touch,
+    GemvTouch, Twin, gemv_touch, gemv_touch_resolve, mxfp8_tc_twin, native_touch, w4a16_pair_touch,
     w4a16_tc_twin, w4a16_verify_touch,
 };
 pub use glm_hc_prefill::*;
@@ -355,7 +359,8 @@ pub use moe_lora_grouped::*;
 pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
 pub use mxfp8::*;
-pub use mxfp8_proj::*;
+pub use mxfp8_act::*;
+pub use mxfp8_w8a8::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;
 pub use ple::*;
@@ -377,6 +382,7 @@ pub use qwen4exp_moe_rows::*;
 pub use qwen4exp_w4_rows::*;
 pub use qwen4exp_w4_wide::*;
 pub use qwen4exp_wide_rows::*;
+pub use rank_join::{rank_join_bf16, rank_join_kernel};
 pub use sampling::*;
 pub use ssm_gdn_a::*;
 pub use ssm_gdn_a2::*;

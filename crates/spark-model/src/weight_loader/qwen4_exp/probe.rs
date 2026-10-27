@@ -84,7 +84,7 @@ pub fn audit_namespace(store: &WeightStore, config: &ModelConfig) -> NamespaceRe
         }
     }
 
-    for &l in &config.ple_layer_ids {
+    for l in super::ple::ple_decoder_layers(config) {
         let lp = config.layer_prefix(l);
         let base = format!("{lp}.ple.ple_embedding.ngram_embedding");
         let parts = if config.split_ngram_parts > 0 {

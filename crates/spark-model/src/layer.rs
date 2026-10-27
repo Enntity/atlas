@@ -14,6 +14,7 @@ use spark_runtime::buffers::BufferArena;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 
 pub mod glm_long_owner;
+pub mod glm_packed;
 mod prefill_pieces;
 pub mod ssm_batch;
 pub use prefill_pieces::{
@@ -23,7 +24,7 @@ mod multi_seg;
 pub use multi_seg::{MultiPass, MultiSeg};
 mod transformer_layer;
 pub use transformer_layer::{
-    TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
+    KvRows, TransformerLayer, VERIFY_WY_LAYER_STRIDE_BYTES, VERIFY_WY_TABLE_SEQS,
     VERIFY_WY_TABLE_STRIDE_BYTES, VERIFY_WY_TABLES_PER_LAYER,
 };
 

@@ -16,7 +16,9 @@ use super::super::block_mgmt::{
     apply_evicted_blocks, ensure_blocks_through_decode, ensure_blocks_through_prefill,
     extract_layer_refs, reuse_prefix_match_disk_ids,
 };
-use super::super::ssm_batched_copy::{StateCopy, run_ssm_state_copies};
+use super::super::ssm_batched_copy::{
+    StateCopy, batched_ssm_copy_enabled, copy_plan_as_strided_run, run_ssm_state_copies,
+};
 use super::super::ssm_pool::SsmStatePool;
 use super::super::ssm_snapshot::SsmSnapshotPool;
 use super::super::types::{PinnedMetaStaging, TransformerModel};
@@ -468,3 +470,4 @@ impl TransformerModel {
 }
 
 mod gdn_exact_commit;
+mod kda_commit;

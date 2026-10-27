@@ -48,7 +48,31 @@ pub(super) fn emit_span_row(
     rows: usize,
 ) {
     let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    let prior = a.output_tokens.len();
     emit_token_at_position(a, tok, logprobs, sched, position);
+    // The final row is the target bonus. Earlier rows are accepted drafts.
+    if row + 1 < rows {
+        accepted_output(a, tok, prior);
+    }
+}
+
+/// Self-speculation emits its accepted drafts without a committed span index.
+pub(super) fn emit_accepted_token(
+    a: &mut ActiveSeq,
+    tok: u32,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    let prior = a.output_tokens.len();
+    emit_token(a, tok, None, sched);
+    accepted_output(a, tok, prior);
+}
+
+fn accepted_output(a: &mut ActiveSeq, tok: u32, prior: usize) {
+    // Emission may suppress/pop the token, or append synthetic grammar closes.
+    // Count only this draft, only if it remains at its original output position.
+    if a.output_tokens.get(prior) == Some(&tok) {
+        a.mtp_acct.record_accepted_output(prior);
+    }
 }
 
 /// Emit one already-verified row after its whole target prefix was committed.
@@ -334,13 +358,6 @@ pub(super) fn emit_token_at_position(
         // so it never counts toward the min_tokens floor (`min_tokens_eos_tests`).
         EndToken::Suppressed => {
             a.output_tokens.pop();
-            // The discarded token is not emitted content: undo the spec-resume
-            // count applied above (serial never records it). `thinking_tokens`
-            // stays advanced — serial's `advance_thinking` also counts the
-            // suppressed token before `end_token` runs.
-            if counted_post_think {
-                a.post_think_emitted = a.post_think_emitted.saturating_sub(1);
-            }
             return;
         }
         EndToken::No => {}
@@ -492,12 +509,25 @@ pub fn compile_grammar_state(
     eos_tokens: &[u32],
     opens_in_thinking: bool,
     native_opener: Option<u32>,
+    tool_call_start_token: Option<u32>,
     sink: &mut ResponseSink,
 ) -> Result<Option<GrammarState>> {
     let Some(spec) = grammar_spec.as_ref() else {
         return Ok(None);
     };
     let strict = spec.is_response_format();
+    // Required tool grammars must not force their opener into an explicit
+    // reasoning preamble. Later decode already leaves thinking unmasked.
+    // GLM's native opener can end thinking and retains its existing path.
+    let defer_required_tool = opens_in_thinking
+        && native_opener.is_none()
+        && matches!(
+            spec,
+            GrammarSpec::ToolCall {
+                use_triggers: false,
+                ..
+            }
+        );
     let native_opener =
         native_opener.filter(|_| matches!(spec, GrammarSpec::ToolCallOrJson { .. }));
     let compiled = match engine.as_mut() {
@@ -514,6 +544,9 @@ pub fn compile_grammar_state(
             s.strict_output(opens_in_thinking)
                 .with_native_opener(native_opener)
         })),
+        Ok(state) if defer_required_tool => {
+            Ok(state.map(|s| s.defer_first_token(tool_call_start_token)))
+        }
         Ok(state) => Ok(state),
         // A request the server cannot serve as asked: HTTP 400 for a blocking
         // client, not a retryable 500. A tool grammar too large to compile is
@@ -581,10 +614,12 @@ fn compile_spec(
         } => match engine.compile_tool_or_json_grammar(&**parser, tools, schema.as_deref()) {
             Some(result) => result,
             None => {
-                return Err(format!(
-                    "parser '{}' has no tool grammar for response_format + tools",
+                tracing::debug!(
+                    "Grammar: parser '{}' has no tool grammar; response_format + tools \
+                     decodes unconstrained",
                     parser.name(),
-                ));
+                );
+                return Ok(None);
             }
         },
     };
@@ -603,8 +638,16 @@ fn compile_spec(
     };
 
     let grammar = compiled.map_err(|e| format!("Grammar compilation failed: {e}"))?;
+    let auto_literal_dispatch = matches!(
+        spec,
+        GrammarSpec::ToolCall {
+            use_triggers: true,
+            ..
+        }
+    );
     let state = GrammarState::new(&grammar, engine.vocab_size())
-        .map_err(|e| format!("Grammar state creation failed: {e}"))?;
+        .map_err(|e| format!("Grammar state creation failed: {e}"))?
+        .with_auto_literal_dispatch(auto_literal_dispatch);
     tracing::info!("Grammar constrained decoding active: {label}");
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response
@@ -685,6 +728,25 @@ fn advance_envelope_streak(inside_parameter_body: bool, streak: u32) -> (u32, bo
     }
 }
 
+/// Native single-token value markers of the served model's tool format (GLM:
+/// `<arg_value>`, `</arg_value>`), resolved once from the tokenizer at startup.
+/// Unset for formats without them (Qwen `<parameter=…>` uses the scan below).
+static TOOL_VALUE_MARKERS: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+pub(crate) fn set_tool_value_markers(open: u32, close: u32) {
+    let _ = TOOL_VALUE_MARKERS.set((open, close));
+}
+
+/// Pure core: the value-body state after `tok`, or `None` when `tok` is not a
+/// marker transition (an open inside a value or a close outside one is content).
+fn native_value_transition(markers: (u32, u32), inside: bool, tok: u32) -> Option<bool> {
+    match (inside, tok) {
+        (false, t) if t == markers.0 => Some(true),
+        (true, t) if t == markers.1 => Some(false),
+        _ => None,
+    }
+}
+
 /// `quiet`: the verify replay's, which must not log a cut the stream never sees.
 pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if a.inside_thinking {
@@ -705,13 +767,16 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     if !a.inside_tool_body {
         return;
     }
-    // Without the served tokenizer's markers the value body cannot be told
-    // from the envelope, and counting file content as envelope kills large
-    // writes at MAX_TOOL_BODY_TOKENS. Leave both the tracking and the cap off;
-    // `--tool-max-tokens` still bounds a runaway envelope.
-    let Some(m) = super::tool_markers::get() else {
+    let native = TOOL_VALUE_MARKERS.get().copied();
+    if let Some(inside) =
+        native.and_then(|m| native_value_transition(m, a.inside_parameter_body, tok))
+    {
+        // A value opening or closing is forward progress.
+        a.inside_parameter_body = inside;
+        a.param_body_chars_emitted = 0;
+        a.tool_body_streak_tokens = 0;
         return;
-    };
+    }
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -731,6 +796,14 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
+    }
+    if native.is_some() {
+        // Native markers own value tracking; the scan below matches Qwen
+        // token ids, which are unrelated tokens in this vocabulary.
+        if a.inside_parameter_body {
+            a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+        }
+        return;
     }
 
     if a.inside_parameter_body {
@@ -901,5 +974,68 @@ mod cc6_envelope_streak_tests {
         let (s, exceeded) = advance_envelope_streak(false, u32::MAX);
         assert_eq!(s, u32::MAX);
         assert!(exceeded);
+    }
+}
+
+#[cfg(test)]
+mod native_value_marker_tests {
+    //! GLM-5.3-Flash tool calls carry each value between the single special
+    //! tokens `<arg_value>` / `</arg_value>`. The Qwen `<parameter=…>` scan never
+    //! fires on them, so before native markers every GLM value token counted as
+    //! envelope and any tool call longer than the cap was cut ("length").
+    use super::{MAX_TOOL_BODY_TOKENS, advance_envelope_streak, native_value_transition};
+
+    const GLM: (u32, u32) = (154849, 154850);
+
+    /// Drive the pure cores over a token stream inside one `<tool_call>` body,
+    /// as `update_tool_param_state` does. Returns (inside, streak, tripped).
+    fn run(tokens: &[u32]) -> (bool, u32, bool) {
+        let (mut inside, mut streak) = (false, 0u32);
+        for &tok in tokens {
+            if let Some(now) = native_value_transition(GLM, inside, tok) {
+                inside = now;
+                streak = 0;
+                continue;
+            }
+            let (s, exceeded) = advance_envelope_streak(inside, streak);
+            streak = s;
+            if exceeded {
+                return (inside, streak, true);
+            }
+        }
+        (inside, streak, false)
+    }
+
+    #[test]
+    fn transitions_only_on_the_matching_marker() {
+        assert_eq!(native_value_transition(GLM, false, GLM.0), Some(true));
+        assert_eq!(native_value_transition(GLM, true, GLM.1), Some(false));
+        // A close outside a value and an open inside one are not transitions.
+        assert_eq!(native_value_transition(GLM, false, GLM.1), None);
+        assert_eq!(native_value_transition(GLM, true, GLM.0), None);
+        assert_eq!(native_value_transition(GLM, true, 42), None);
+    }
+
+    #[test]
+    fn a_large_glm_value_streams_without_tripping_the_cap() {
+        // name + <arg_key>path</arg_key> + <arg_value>p</arg_value> + <arg_key>content</arg_key>
+        // + <arg_value> 6000 content tokens </arg_value>: a large write_file call.
+        let mut toks = vec![
+            7, 154847, 9, 154848, GLM.0, 11, GLM.1, 154847, 12, 154848, GLM.0,
+        ];
+        toks.extend(std::iter::repeat_n(500, 6000));
+        toks.push(GLM.1);
+        let (inside, streak, tripped) = run(&toks);
+        assert!(!tripped, "value content must never trip the envelope cap");
+        assert!(!inside);
+        assert_eq!(streak, 0, "a closed value is forward progress");
+    }
+
+    #[test]
+    fn a_never_closing_envelope_still_trips() {
+        let toks: Vec<u32> = std::iter::repeat_n(500, MAX_TOOL_BODY_TOKENS as usize + 5).collect();
+        let (_, streak, tripped) = run(&toks);
+        assert!(tripped);
+        assert_eq!(streak, MAX_TOOL_BODY_TOKENS + 1);
     }
 }

@@ -108,6 +108,7 @@ pub fn prefill_request(
             req_tools_present,
             tool_call_start_token,
         ),
+        tool_call_start_token,
         &mut sink,
     )?;
 
@@ -260,18 +261,21 @@ pub fn prefill_request(
         return Ok(None);
     }
 
+    let mut image_pixels = image_pixels;
+    let has_images = !image_pixels.is_empty();
     // Guard: free SSM slot on any error after allocation (Bug #16).
     let prefill_result = (|| -> Result<u32> {
         // Vision: encode images and store embeddings for prefill token overwrite.
-        if !image_pixels.is_empty() {
-            model.prepare_vision_embed(&image_pixels)?;
+        if has_images {
+            model.prepare_vision_embed(&mut seq, std::mem::take(&mut image_pixels))?;
         }
 
         // EP: broadcast prefill command + tokens to worker (bulk, single NCCL op).
         model.ep_broadcast_disable_mtp_for_seq(seq.slot_idx as u32, req_disable_mtp)?;
         model.ep_broadcast_vision_state_for_seq(
+            &seq,
             seq.slot_idx as u32,
-            !image_pixels.is_empty(),
+            has_images,
             0,
             0,
             0,
@@ -512,7 +516,7 @@ pub fn prefill_request(
         inside_thinking: thinking.inside_thinking,
         enable_thinking: req_enable_thinking,
         thinking_budget: if spontaneous_think {
-            Some(spontaneous_think_budget)
+            crate::ir::server_thinking_budget(spontaneous_think_budget)
         } else {
             req_thinking_budget
         },

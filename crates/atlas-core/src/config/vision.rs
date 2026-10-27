@@ -9,13 +9,6 @@ pub struct VisionConfig {
     /// True only for the native GLM-5.3 vision tower.  Its RMSNorm/SwiGLU/
     /// convolutional merger is not interchangeable with the Qwen ViT path.
     pub is_glm5_next: bool,
-    /// True only when the checkpoint's video processor is HF's Qwen3VL
-    /// (`video_processor_type: Qwen3VLVideoProcessor`, or `processor_class:
-    /// Qwen3VLProcessor`). Its prompt nests per-temporal-group timestamp
-    /// text and vision start/end markers inside the video's outer pair, and
-    /// its MRoPE gives every group its own t=1 plane. Resolved at serve
-    /// time from the checkpoint's preprocessor config, not config.json.
-    pub is_qwen3vl_video: bool,
     /// Input channel count for the visual patch embed (GLM uses 3).
     pub in_channels: usize,
     /// Number of ViT transformer blocks (depth=27).
@@ -81,11 +74,46 @@ pub struct VisionConfig {
     /// the encoder is constructed. `None` keeps the historical behaviour on
     /// both sides.
     pub max_pixels: Option<usize>,
+    /// GLM-5.3's processor token bounds, resolved by the server next to
+    /// [`Self::max_pixels`]; other towers ignore them.
+    pub token_budgets: VisionTokenBudgets,
+    /// The checkpoint's image `min_pixels` (`size.shortest_edge`): HF's Qwen
+    /// `smart_resize` scales a smaller still UP to it. `None` when the
+    /// checkpoint declares none.
+    pub min_pixels: Option<usize>,
+    /// The checkpoint's video processor bounds, as `t x h x w` pixel volumes
+    /// over a clip's sampled frames (`video_preprocessor_config.json`).
+    /// `None` sizes each frame like a still.
+    pub video_pixels: Option<PixelBounds>,
+}
 
-    /// Omni (`nemotron_h_omni`) RADIO-tower parameters. `Some` marks this
-    /// vision config as the RADIO preprocessing/encoder family rather
-    /// than the Qwen-VL one.
-    pub omni: Option<OmniVisionConfig>,
+/// `(min, max)` vision tokens per still and per video, as GLM-5.3's nested
+/// `processor_config.json` declares them (`image_processor` /
+/// `video_processor` → `min_image_tokens` / `max_image_tokens`). A vision
+/// token is one temporal group of one `merge × merge` patch block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionTokenBudgets {
+    pub image: (usize, usize),
+    pub video: (usize, usize),
+}
+
+impl Default for VisionTokenBudgets {
+    /// The processor classes' own defaults, which the shipped checkpoint
+    /// repeats: 16..8000 tokens per still, 16..240000 per video.
+    fn default() -> Self {
+        Self {
+            image: (16, 8_000),
+            video: (16, 240_000),
+        }
+    }
+}
+
+/// A processor's `size = {shortest_edge, longest_edge}`: pixel counts, not
+/// edge lengths, despite the names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelBounds {
+    pub min_pixels: usize,
+    pub max_pixels: usize,
 }
 
 impl VisionConfig {
@@ -93,35 +121,4 @@ impl VisionConfig {
     pub fn merger_input_size(&self) -> usize {
         self.spatial_merge_size * self.spatial_merge_size * self.hidden_size
     }
-}
-
-/// RADIO-tower parameters for `nemotron_h_omni`. Mirrors the keys the
-/// checkpoint's own `image_processing_nemotron_h_omni.py` and
-/// `modeling_radio.py` read.
-#[derive(Debug, Clone, Default)]
-pub struct OmniVisionConfig {
-    /// CLIP normalization stats (the checkpoint's `input_conditioner`
-    /// buffers — never hard-coded).
-    pub norm_mean: [f32; 3],
-    pub norm_std: [f32; 3],
-    /// Patch/token budget bounds for `_compute_target_patches`.
-    pub max_num_patches: usize,
-    pub min_num_patches: usize,
-    /// Pixel-shuffle factor (0.5 → 2×2 merge).
-    pub downsample_ratio: f64,
-    /// `<image>`(18)/`<img>`(19)/`</img>`(20) wrapper token ids.
-    pub image_token_id: u32,
-    pub image_start_token_id: u32,
-    pub image_end_token_id: u32,
-    /// `force_image_size` from the config (0 = unset).
-    pub force_image_size: usize,
-    /// cls+register prefix tokens the embedder prepends / strip count (10).
-    pub prefix_tokens: usize,
-    pub num_summary_tokens: usize,
-    /// ViT positional-embed table side (max_img_size / patch_size).
-    pub pos_grid_side: usize,
-    /// mlp1 RMSNorm eps.
-    pub projector_norm_eps: f64,
-    /// ViT layer-norm eps.
-    pub layer_norm_eps: f64,
 }

@@ -208,9 +208,7 @@ fn make_site(g: &dyn GpuBackend, rng: &mut Rng, inject: bool) -> Site {
     let inject_w = inject.then(|| bf16_round(&rng.vec(HC * wide, (wide as f32).sqrt().recip())));
     Site {
         dev: HcLowRank {
-            // `hc_norm` feeds `const float*` kernels; a bf16-rounded host
-            // value is exactly representable in F32, so this is the same
-            // weight the reference computes with.
+            // F32, as the kernels read it; the values stay BF16-representable.
             norm_w: upload(g, &f32_bytes(&norm)),
             down_w: upload(g, &bf16_bytes(&down)),
             // `up` stays [wide, RANK] for the reference below; the kernels

@@ -12,6 +12,16 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+/// The capturable collectives' kernel for `world_size` ranks (module
+/// `rdma_oneshot`): `rdma_oneshot_bf16` for two, `rdma_chain_bf16` beyond.
+pub(super) fn oneshot_kernel_name(world_size: usize) -> &'static str {
+    if world_size > 2 {
+        "rdma_chain_bf16"
+    } else {
+        "rdma_oneshot_bf16"
+    }
+}
+
 impl NcclBackend {
     /// `dst[i] += src[i]` over `count` BF16 values on `stream`.
     pub(super) fn launch_add(&self, dst: u64, src: u64, count: usize, stream: u64) -> Result<()> {
@@ -96,10 +106,19 @@ impl NcclBackend {
         Ok(false)
     }
 
-    /// One-shot exchange over the RDMA pair (`rdma_pair::oneshot`): on
-    /// `stream`, graph-capturable, sharing one device sequence between eager
-    /// calls and replays. `false` (nothing enqueued) when `ATLAS_RDMA_ONESHOT`
-    /// is off, the kernel is missing or the size is ineligible.
+    /// The one-shot channel (`rdma_pair::oneshot`) of the RDMA pair or chain,
+    /// when `ATLAS_RDMA_ONESHOT=1`.
+    #[cfg(atlas_rdma_verbs)]
+    fn oneshot(&self) -> Option<&rdma_pair::OneShot> {
+        let chain = self.chain.as_ref().map(|c| c.oneshot());
+        chain.or_else(|| self.rdma.as_ref().and_then(|r| r.oneshot()))
+    }
+
+    /// One-shot exchange over the RDMA pair or all-reduce over the chain
+    /// (`rdma_pair::oneshot`): on `stream`, graph-capturable, sharing one
+    /// device sequence between eager calls and replays. `false` (nothing
+    /// enqueued) when `ATLAS_RDMA_ONESHOT` is off, the kernel is missing or
+    /// the size (or, on a chain, the call) is ineligible.
     pub(super) fn try_oneshot(
         &self,
         src: u64,
@@ -109,54 +128,244 @@ impl NcclBackend {
         stream: u64,
     ) -> Result<bool> {
         #[cfg(atlas_rdma_verbs)]
-        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+        if let Some(oneshot) = self.oneshot() {
             return oneshot.enqueue(src, dst, bytes, add, stream);
         }
         let _ = (src, dst, bytes, add, stream);
         Ok(false)
     }
 
+    /// A chain all-reduce of any size on `stream`: consecutive one-shot ops of
+    /// at most the one-shot maximum (each capturable, like one). `false` off
+    /// the chain or while its kernel is missing.
+    pub(super) fn try_chain_all_reduce(&self, ptr: u64, bytes: usize, stream: u64) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.all_reduce(ptr, bytes, stream);
+        }
+        let _ = (ptr, bytes, stream);
+        Ok(false)
+    }
+
+    /// A chain all-gather of every rank's part (`CommBackend::gather_async`)
+    /// on `stream`; `false` off the chain or while its kernel is missing.
+    pub(super) fn try_chain_gather(
+        &self,
+        base: u64,
+        stride: i64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.gather(base, stride, bytes, stream);
+        }
+        let _ = (base, stride, bytes, stream);
+        Ok(false)
+    }
+
+    /// A chain broadcast of any size (`CommBackend::broadcast_async`) on
+    /// `stream`; `false` off the chain or while its kernel is missing.
+    pub(super) fn try_chain_broadcast_parts(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        root: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.broadcast(ptr, bytes, root, stream);
+        }
+        let _ = (ptr, bytes, root, stream);
+        Ok(false)
+    }
+
+    /// A four-rank chain reduce-scatter (`CommBackend::reduce_scatter_async`,
+    /// or with `fp8` `reduce_scatter_fp8_async`) on `stream`; `false` off the
+    /// chain or when it does not apply.
+    pub(super) fn try_chain_reduce_scatter(
+        &self,
+        seg0: u64,
+        stride: i64,
+        bytes: usize,
+        fp8: bool,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.reduce_scatter(seg0, stride, bytes, fp8, stream);
+        }
+        let _ = (seg0, stride, bytes, fp8, stream);
+        Ok(false)
+    }
+
+    /// The chain's fused reduce-scatter (`CommBackend::rs_fused_begin` and
+    /// the rest); `None` / `false` off the chain.
+    pub(super) fn try_chain_rs_fused_begin(
+        &self,
+        seg0: u64,
+        stride: i64,
+        bytes: usize,
+    ) -> Result<Option<crate::RsFused>> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.rs_fused_begin(seg0, stride, bytes);
+        }
+        let _ = (seg0, stride, bytes);
+        Ok(None)
+    }
+
+    pub(super) fn try_chain_reduce_scatter_fused(
+        &self,
+        fused: &crate::RsFused,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.reduce_scatter_fused(fused, stream);
+        }
+        let _ = (fused, stream);
+        Ok(false)
+    }
+
+    pub(super) fn try_chain_rs_fused_wait(
+        &self,
+        fused: &crate::RsFused,
+        piece: usize,
+        stream: u64,
+    ) -> Result<()> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.rs_fused_wait(fused, piece, stream);
+        }
+        let _ = (fused, piece, stream);
+        anyhow::bail!("fused reduce-scatter: no RDMA chain")
+    }
+
+    /// A chain all-to-all (`CommBackend::all_to_all_async`) on `stream`;
+    /// `false` off the chain or while its kernel is missing.
+    pub(super) fn try_chain_all_to_all(
+        &self,
+        planes: &[crate::AllToAllPlane],
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.all_to_all(planes, stream);
+        }
+        let _ = (planes, stream);
+        Ok(false)
+    }
+
+    /// Whether the chain's reduce-scatter can run (its kernel is set and a
+    /// slice fits the one-shot maximum).
+    pub(super) fn chain_rs_ready(&self) -> bool {
+        #[cfg(atlas_rdma_verbs)]
+        if self.chain.is_some() {
+            return rdma_pair::chain::RdmaChain::rs_slice(self.chain_oneshot_max_bytes()) > 0;
+        }
+        false
+    }
+
+    /// The chain's one-shot maximum (0 off the chain or while its kernel is
+    /// missing).
+    pub(super) fn chain_oneshot_max_bytes(&self) -> usize {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.oneshot().max_bytes();
+        }
+        0
+    }
+
+    /// A chain broadcast of rank `root`'s `ptr[..bytes]` on `stream` over the
+    /// one-shot channel; `false` off the chain or when ineligible.
+    pub(super) fn try_chain_broadcast(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        root: usize,
+        stream: u64,
+    ) -> Result<bool> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.oneshot().broadcast(ptr, bytes, root, stream);
+        }
+        let _ = (ptr, bytes, root, stream);
+        Ok(false)
+    }
+
     /// Largest one-shot payload (0 when the channel is unavailable).
     pub(super) fn oneshot_max_bytes(&self) -> usize {
         #[cfg(atlas_rdma_verbs)]
-        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+        if let Some(oneshot) = self.oneshot() {
             return oneshot.max_bytes();
         }
         0
     }
 
-    /// Provide `rdma_oneshot_bf16` to the one-shot channel, if it is up.
+    /// Provide the one-shot kernel ([`oneshot_kernel_name`]) to the channel,
+    /// if it is up.
     pub(super) fn set_oneshot_kernel_handle(&self, handle: u64) {
         #[cfg(atlas_rdma_verbs)]
-        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+        if let Some(chain) = &self.chain {
+            for oneshot in chain.channels() {
+                oneshot.set_kernel(handle);
+            }
+            tracing::info!(
+                "RDMA chain one-shot kernel set on {} channel(s)",
+                chain.channels().len()
+            );
+        } else if let Some(oneshot) = self.oneshot() {
             oneshot.set_kernel(handle);
             tracing::info!("RDMA one-shot kernel set (graph-capturable collectives enabled)");
         }
         let _ = handle;
     }
 
-    /// Why the one-shot channel stopped (the peer never arrived, the ranks
+    /// One-shot channels the RDMA chain opened (1 off a chain).
+    pub(super) fn oneshot_channels(&self) -> usize {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.channels().len();
+        }
+        1
+    }
+
+    /// Why the one-shot channel stopped (a peer never arrived, the ranks
     /// diverged, or the host could no longer serve it), if it did.
     pub fn oneshot_poisoned(&self) -> Option<String> {
         #[cfg(atlas_rdma_verbs)]
-        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+        if let Some(chain) = &self.chain {
+            return chain.channels().iter().find_map(|o| o.poisoned());
+        }
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(oneshot) = self.oneshot() {
             return oneshot.poisoned();
         }
         None
     }
 
-    /// The RDMA pair's host command ring, when `ATLAS_GLM_CMD_RDMA=1` (see
-    /// `rdma_pair::cmd_ring`): the words a message may carry, else 0.
+    /// The host command ring of the RDMA pair or chain, when
+    /// `ATLAS_GLM_CMD_RDMA=1` (see `rdma_pair::cmd_ring`): the words a
+    /// message may carry, else 0.
     pub(super) fn cmd_ring_max_words(&self) -> usize {
         #[cfg(atlas_rdma_verbs)]
-        if self.rdma.as_ref().and_then(|r| r.cmd()).is_some() {
+        if self.chain.as_ref().and_then(|c| c.cmd()).is_some()
+            || self.rdma.as_ref().and_then(|r| r.cmd()).is_some()
+        {
             return rdma_pair::cmd_ring::MAX_WORDS;
         }
         0
     }
 
-    /// Send `words` to the peer over the command ring.
+    /// Send `words` to the peer (on a chain: down the chain) over the
+    /// command ring.
     pub(super) fn cmd_ring_send(&self, words: &[u32]) -> Result<()> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.send_command_words(words);
+        }
         #[cfg(atlas_rdma_verbs)]
         if let Some(ring) = self.rdma.as_ref().and_then(|r| r.cmd()) {
             return ring.send(words);
@@ -167,8 +376,13 @@ impl NcclBackend {
         )
     }
 
-    /// Receive the peer's next `words.len()` words from the command ring.
+    /// Receive the peer's next `words.len()` words from the command ring (on
+    /// a chain also passing them on to the rank above).
     pub(super) fn cmd_ring_recv(&self, words: &mut [u32]) -> Result<()> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(chain) = &self.chain {
+            return chain.recv_command_words(words);
+        }
         #[cfg(atlas_rdma_verbs)]
         if let Some(ring) = self.rdma.as_ref().and_then(|r| r.cmd()) {
             return ring.recv(words);
@@ -194,6 +408,33 @@ impl NcclBackend {
         None
     }
 
+    /// The RDMA chain for three or four ranks when `ATLAS_RDMA_ALLREDUCE=1`,
+    /// bootstrapping through rank 0 on the NCCL bootstrap connections
+    /// (`peers`) at the pair's port.
+    #[cfg(atlas_rdma_verbs)]
+    pub(super) fn connect_chain(
+        rank: usize,
+        world_size: usize,
+        peers: &[std::net::TcpStream],
+        master_port: u16,
+    ) -> Result<Option<rdma_pair::chain::RdmaChain>> {
+        if world_size <= 2 || !rdma_pair::RdmaPair::requested() {
+            return Ok(None);
+        }
+        let socket = std::env::var("NCCL_NET").is_ok_and(|v| v.eq_ignore_ascii_case("socket"))
+            || std::env::var("NCCL_IB_DISABLE").as_deref() == Ok("1");
+        if !socket {
+            tracing::warn!(
+                "RDMA chain: NCCL still carries startup and rare collectives between ranks that \
+                 share no RDMA link; set NCCL_IB_DISABLE=1 (or NCCL_NET=Socket) and \
+                 NCCL_SOCKET_IFNAME to the routed IP interface on every rank"
+            );
+        }
+        let at =
+            rdma_pair::bootstrap::chain::Rendezvous::of(rank, peers, master_port.wrapping_add(2))?;
+        rdma_pair::chain::RdmaChain::connect(rank, world_size, &at).map(Some)
+    }
+
     /// The RDMA pair for a 2-rank world when `ATLAS_RDMA_ALLREDUCE=1`. Its
     /// bootstrap stays on the link of the NCCL bootstrap connection
     /// (`peers`; see `bootstrap::Link::of`).
@@ -216,7 +457,7 @@ impl NcclBackend {
                 recv_capacity.next_multiple_of(64),
             )?)
         } else {
-            if rdma_pair::cmd_ring::requested() {
+            if world_size == 2 && rdma_pair::cmd_ring::requested() {
                 tracing::warn!(
                     "ATLAS_GLM_CMD_RDMA=1 needs the RDMA pair (two ranks, ATLAS_RDMA_ALLREDUCE=1): \
                      command words stay on NCCL broadcasts"

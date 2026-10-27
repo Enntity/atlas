@@ -13,10 +13,14 @@ use crate::scheduler::{
 
 #[path = "strict_grammar_tests/decode.rs"]
 mod decode;
+#[path = "strict_grammar_tests/required_tool_thinking.rs"]
+mod required_tool_thinking;
 #[path = "strict_grammar_tests/tool_or_json.rs"]
 mod tool_or_json;
 #[path = "strict_grammar_tests/tool_or_json_branch.rs"]
 mod tool_or_json_branch;
+#[path = "strict_grammar_tests/tool_or_json_qwen.rs"]
+mod tool_or_json_qwen;
 
 const EOS: u32 = crate::scheduler::test_support::GRAMMAR_EOS;
 const SCHEMA: &str = r#"{"type":"object","additionalProperties":false,
@@ -33,6 +37,7 @@ fn compile(spec: GrammarSpec, opens_in_thinking: bool) -> Option<GrammarState> {
         &Some(spec),
         &[EOS],
         opens_in_thinking,
+        None,
         None,
         &mut sink,
     )
@@ -88,6 +93,7 @@ fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
         &[EOS],
         false,
         None,
+        None,
         &mut sink,
     )
     .err()
@@ -102,7 +108,7 @@ fn an_unarmable_response_format_is_reported_not_decoded_unconstrained() {
     // No grammar requested: nothing to arm, nothing reported.
     let mut sink = ResponseSink::Blocking(None);
     assert!(
-        compile_grammar_state(&mut None, &None, &[EOS], false, None, &mut sink)
+        compile_grammar_state(&mut None, &None, &[EOS], false, None, None, &mut sink)
             .unwrap()
             .is_none()
     );
@@ -193,6 +199,7 @@ fn a_schema_too_large_to_compile_is_a_400_not_a_crash() {
         &Some(GrammarSpec::JsonSchema { schema }),
         &[EOS],
         false,
+        None,
         None,
         &mut sink,
     )

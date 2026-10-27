@@ -43,9 +43,17 @@ impl Qwen3SsmLayer {
         let deinterleaved = ctx.buffers.ssm_deinterleaved();
         let qkvz_size = ctx.config.ssm_qkvz_size() as u32;
         prof!("qkvz", {
-            if let Some(mx8) = self.mx8.as_ref() {
-                // Native MXFP8 (FP4-Local): sequential, straight into place.
-                self.mx8_qkvz(mx8, ctx, normed, deinterleaved, 1, stream)
+            // The checkpoint's own MXFP8 copy (FP4-Local), when installed:
+            // the bytes every batched decode arm reads too (`init_mxfp8.rs`).
+            if self.mxfp8_rows_proj(
+                ctx.gpu,
+                exact_rows::GdnProj::Qkvz,
+                normed,
+                deinterleaved,
+                1,
+                stream,
+            )? {
+                Ok(())
             } else if let Some(ref fp8) = self.qkvz_fp8w {
                 // FP8 native: w8a16_gemv + deinterleave (no fused QKVZ variant yet).
                 // `w8a16_gemv` consumes `[N/BS,K/BS] BF16` block scales

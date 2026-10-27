@@ -192,9 +192,8 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
             } else {
-                ops::dense_gemv(
+                self.dense_gemv_or_mx(
                     ctx.gpu,
-                    self.dense_gemv_k,
                     normed,
                     &self.attn.q_proj,
                     q_out,
@@ -247,16 +246,7 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
-                    ctx.gpu,
-                    self.dense_gemv_k,
-                    normed,
-                    &self.attn.q_proj,
-                    q_out,
-                    q_dim,
-                    h,
-                    stream,
-                )?;
+                self.dense_gemv_or_mx(ctx.gpu, normed, &self.attn.q_proj, q_out, q_dim, h, stream)?;
             }
             // Ungated q_proj LoRA: no deinterleave — fold onto the final q_out.
             self.apply_q_lora(ctx, normed, q_out, stream)?;

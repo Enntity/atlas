@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Native MTP repair policy and shared GLM verification switches. The repair
-//! arena bound does not cap DFlash session positions. Actual positions, state
-//! ownership and storage are validated separately on the execution path.
+//! Rollout gating only. Actual positions, state ownership and storage are
+//! validated separately immediately before each existing E1 command.
 
 use anyhow::{Result, ensure};
 
@@ -14,6 +13,12 @@ pub fn enabled() -> bool {
 /// without the MTP repair machinery (`ATLAS_GLM_DFLASH=1` with `--dflash`).
 pub fn dflash_enabled() -> bool {
     std::env::var("ATLAS_GLM_DFLASH").as_deref() == Ok("1")
+}
+
+/// Both proposers verify against the same canonical GLM target. This does not
+/// select DFlash capture, sampling or draft-weight behavior for native MTP.
+pub fn canonical_target_enabled() -> bool {
+    dflash_enabled() || crate::layers::glm_native::mode::strict_native_mtp()
 }
 
 /// The DFlash lane verifies a block through the multi-row prefill path;
@@ -32,7 +37,7 @@ pub fn mtp_distributed() -> bool {
 
 /// A retained long-context GLM verify owner is active: repaired MTP or DFlash.
 pub fn long_lane_enabled() -> bool {
-    enabled() || dflash_enabled()
+    enabled() || canonical_target_enabled()
 }
 
 /// Widest DFlash block the GLM long-context verify admits (bonus + drafts).
@@ -42,17 +47,16 @@ pub fn long_context_enabled() -> bool {
     std::env::var("ATLAS_GLM_MTP_LONG_CONTEXT").as_deref() == Ok("1")
 }
 
-/// Default native MTP repair arena bound; also the fixed upper bound used by
-/// the sparse-decode factory's startup probe, not a DFlash session limit.
+/// Default repaired long-context domain; also the native sparse prefill
+/// plan's qualified context, which stays at this value.
 pub const MAX_LONG_CONTEXT: usize = 32_768;
-/// Largest configurable native MTP repair arena, independent of served context.
+/// Largest configurable repaired domain (the served 262K profile).
 pub const MAX_REPAIR_CONTEXT: usize = 262_144;
 
-/// Native MTP repair arena bound: `ATLAS_GLM_MTP_REPAIR_CONTEXT` (a multiple
-/// of 16 in 32768..=262144), else [`MAX_LONG_CONTEXT`]. Used for repair-policy
-/// validation and native MTP prompt-capture sizing. This value does not turn
-/// off DFlash above the bound; DFlash retains a sliding context window while
-/// target verification uses the served block-table and model position limits.
+/// The repaired verifier's indexed domain: `ATLAS_GLM_MTP_REPAIR_CONTEXT`
+/// (a multiple of 16 in 32768..=262144), else [`MAX_LONG_CONTEXT`]. Requests
+/// whose prompt+output budget crosses it are fenced into native decode; the
+/// MTP prompt capture and the drafters' private caches are sized to it.
 pub fn max_long_context() -> usize {
     static CONTEXT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CONTEXT.get_or_init(|| {
@@ -64,18 +68,27 @@ pub fn max_long_context() -> usize {
     })
 }
 
-/// Bound an arena before it is handed to native MTP repair. This allocation
-/// helper does not change serving limits or request speculation admission.
+/// Bound a serving arena's context before it is handed to the repaired
+/// verifier. The native serving lane may expose a larger context; requests
+/// beyond this indexed domain are admitted with MTP disabled.
 pub fn repair_context(context: usize) -> usize {
     context.min(max_long_context())
 }
 
-/// Native MTP prompt-capture arena: apply the repair bound only when native
-/// repair and long-context mode are both enabled for GLM. Repair-off DFlash
-/// leaves this result at served context and does not allocate the native MTP
-/// prompt-capture buffer; its own multi-layer capture has separate sizing.
-pub fn arena_context(model_type: &str, repair_long_enabled: bool, served_context: usize) -> usize {
-    if model_type == "glm5_next" && repair_long_enabled {
+/// The arena domain the repaired verifier actually indexes: the bounded repair
+/// window only on the opt-in long-context GLM lane, and the plain served
+/// context everywhere else (other models, repair off, long context off). Both
+/// the prompt-capture allocation and the private-cache quote derive from this
+/// one function so the two cannot disagree. Native appended MTP has per-request
+/// incremental state and uses the full served context, independently of the
+/// legacy repaired-DFlash rollout window.
+pub fn arena_context(
+    model_type: &str,
+    repair_long_enabled: bool,
+    native_mtp: bool,
+    served_context: usize,
+) -> usize {
+    if model_type == "glm5_next" && repair_long_enabled && !native_mtp {
         repair_context(served_context)
     } else {
         served_context
@@ -345,14 +358,21 @@ mod tests {
         assert_eq!(repair_context(MAX_LONG_CONTEXT + 4096), MAX_LONG_CONTEXT);
     }
     #[test]
+    fn native_mtp_keeps_full_served_context() {
+        for context in [32_768, 65_536, 262_144, 1_048_576] {
+            assert_eq!(arena_context("glm5_next", true, true, context), context);
+            assert_eq!(arena_context("glm5_next", false, true, context), context);
+        }
+    }
+    #[test]
     fn arena_context_only_bounds_selected_glm_repair() {
         for context in [2048, 32768, 36864, 262144, 524288] {
             assert_eq!(
-                arena_context("glm5_next", true, context),
+                arena_context("glm5_next", true, false, context),
                 context.min(32768)
             );
-            assert_eq!(arena_context("glm5_next", false, context), context);
-            assert_eq!(arena_context("qwen3", true, context), context);
+            assert_eq!(arena_context("glm5_next", false, false, context), context);
+            assert_eq!(arena_context("qwen3", true, false, context), context);
         }
     }
 }

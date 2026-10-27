@@ -16,7 +16,7 @@
 //! changes no collective: the ranks need not agree on it.
 //!
 //! Chunking, from the bench (GB10, weights streamed from DRAM): at most
-//! `WIDE_MIN_ROWS` rows stay on the narrow kernels, which are DRAM-bound
+//! [`WIDE_MIN_ROWS`] rows stay on the narrow kernels, which are DRAM-bound
 //! there; past it a chunk takes the narrowest wide tier that covers it, up
 //! to 32 rows. 16 rows of GDN qkvz cost what 8 did (177 us), 32 rows 278 us
 //! against 764 for four 8-row passes; the LM head 3.85 ms against 10.2.

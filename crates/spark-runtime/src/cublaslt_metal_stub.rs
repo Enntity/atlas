@@ -53,6 +53,18 @@ pub fn bf16_gemm_act_weight_t(
     unreachable!("cublaslt::bf16_gemm_act_weight_t is cuda-only (not built for metal)")
 }
 
+pub fn bf16_gemm_act_weight_t_f32out(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_act_weight_t_f32out is cuda-only (not built for metal)")
+}
+
 pub fn tf32_gemm_act_weight_t(
     _act: u64,
     _weight: u64,
@@ -122,4 +134,113 @@ pub fn fp8_gemm_act_weight_t_tensorwise(
     _stream: u64,
 ) -> anyhow::Result<()> {
     anyhow::bail!("cuBLASLt tensorwise FP8 requires CUDA")
+}
+
+pub fn available() -> bool {
+    false
+}
+
+pub fn version() -> usize {
+    0
+}
+
+pub fn bf16_gemm_act_weight_n(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::bf16_gemm_act_weight_n is cuda-only (not built for metal)")
+}
+
+pub fn bf16_gemm_act_weight_t_fixed(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _ref_m: u32,
+    _stream: u64,
+) -> Result<bool> {
+    unreachable!("cublaslt::bf16_gemm_act_weight_t_fixed is cuda-only (not built for metal)")
+}
+
+/// The CUDA k-chain is an optional replacement for the regular BF16 tile
+/// kernel.  Returning `false` keeps the caller's portable tile fallback
+/// available on Metal; there is no cuBLASLt implementation to try.
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_kchain(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// Row-invariant variant of [`bf16_gemm_act_weight_t_kchain`].
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_gemm_act_weight_t_kchain_any(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<bool> {
+    Ok(false)
+}
+
+pub fn fp8_blkscaled_pinned_prepare(_weight_sf: u64, _act_sf: u64, _n: u32, _k: u32) -> Result<()> {
+    unreachable!("cublaslt::fp8_blkscaled_pinned_prepare is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_act_weight_t_blkscaled_pinned(
+    _act_fp8: u64,
+    _act_scale: u64,
+    _weight_fp8: u64,
+    _weight_block_scale: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!(
+        "cublaslt::fp8_gemm_act_weight_t_blkscaled_pinned is cuda-only (not built for metal)"
+    )
+}
+
+pub fn fp8_gemm_act_weight_t_mx(
+    _act_fp8: u64,
+    _act_sf: u64,
+    _weight_fp8: u64,
+    _weight_sf: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_act_weight_t_mx is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_act_weight_t_mx_pinned(
+    _act_fp8: u64,
+    _act_sf: u64,
+    _weight_fp8: u64,
+    _weight_sf: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_act_weight_t_mx_pinned is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_mx_pinned_prepare(_n: u32, _k: u32, _ref_m: u32, _stream: u64) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_mx_pinned_prepare is cuda-only (not built for metal)")
+}
+
+pub fn fp8_gemm_mx_prepare(_n: u32, _k: u32, _m_max: u32, _stream: u64) -> Result<()> {
+    unreachable!("cublaslt::fp8_gemm_mx_prepare is cuda-only (not built for metal)")
 }

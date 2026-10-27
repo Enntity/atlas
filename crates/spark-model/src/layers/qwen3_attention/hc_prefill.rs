@@ -11,6 +11,10 @@ use crate::layer::ForwardContext;
 use crate::layers::ops;
 
 pub(super) fn fast_prefill(tokens: u32) -> bool {
+    // A packed prefill takes the fused mixer at every row count.
+    if crate::layers::glm_packed_scope::active() {
+        return true;
+    }
     tokens >= 128
         && matches!(
             std::env::var("ATLAS_HC_CUBLAS_PREFILL").ok().as_deref(),
@@ -153,7 +157,7 @@ pub(crate) fn hc_pre_prefill_mix(
 }
 
 /// The highway, post and comb rows from this rank's row `row0` on.
-fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePtr) {
+pub(crate) fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePtr) {
     let b = ctx.buffers;
     let highway_row = 4 * ctx.config.hidden_size * ops::hc_elem_bytes(&ctx.config.model_type);
     (
@@ -161,6 +165,24 @@ fn hc_rows(ctx: &ForwardContext, row0: usize) -> (DevicePtr, DevicePtr, DevicePt
         b.hc_post().offset(row0 * 4 * 4),
         b.hc_comb().offset(row0 * 16 * 4),
     )
+}
+
+/// Tokens a warp, kernel-name suffix and block size of the
+/// `glm_hc_mix_ss` / `glm_hc_post_mix_ss` tile a call runs: a row's bytes
+/// are the same at any tile (a token is one warp's, or with `m2` one warp
+/// pair's, its columns and order fixed), so the tile is chosen for speed
+/// alone. Cold-L2 medians on one GB10 (BF16 highway, register-prefetching
+/// kernels) at 512 / 2048 / 8192 rows: the post-mix at two tokens a warp
+/// 234 / 819 / 3115 us (one: 258 / 835 / 3092; the kernels before the
+/// prefetch 294 / 930 / 3473 at their best tile); the mix at two with the
+/// 24 dots split over a warp pair 170 / 491 / 1560 us (one, unsplit: 184 /
+/// 520 / 1774; before: 234 / 571 / 1652). At 1024 rows every tile is within
+/// 7%.
+fn mix_tile(post: bool) -> (u32, &'static str, u32) {
+    match post {
+        true => (2, "_w2", 256),
+        false => (2, "_w2m2", 512),
+    }
 }
 
 /// `glm_hc_mix_ss` (or, with the finishing site's `block_out`,
@@ -178,12 +200,13 @@ pub(super) fn mix_ss(
     let raw_mix = ctx.buffers.gate_logits_f32();
     let ss = raw_mix.offset(tokens as usize * 24 * 4);
     let (streams, post, comb) = hc_rows(ctx, row0);
+    let (per_warp, tile, threads) = mix_tile(block_out.is_some());
     let launch = |kernel: &str| -> Result<KernelLaunch<'_>> {
-        let name = ops::hc_kernel_name(&ctx.config.model_type, kernel);
+        let name = ops::hc_kernel_name(&ctx.config.model_type, &format!("{kernel}{tile}"));
         Ok(
             KernelLaunch::new(ctx.gpu, ctx.gpu.kernel("glm_hc_prefill_vec", &name)?)
-                .grid([tokens.div_ceil(32), 1, 1])
-                .block([256, 1, 1]),
+                .grid([tokens.div_ceil(8 * per_warp), 1, 1])
+                .block([threads, 1, 1]),
         )
     };
     match block_out {
@@ -263,8 +286,11 @@ pub(super) fn seam_forms(
             flag("ATLAS_GLM_HC_DECODE_SEAM"),
         )
     });
-    let prefill = prefill_on && with_post && tokens >= 512;
-    let decode = decode_on && (1..=32).contains(&tokens);
+    // A packed prefill: the prefill seam whenever it is on, never the decode
+    // one, so the form does not depend on the pass's row count.
+    let packed = crate::layers::glm_packed_scope::active();
+    let prefill = prefill_on && with_post && (tokens >= 512 || packed);
+    let decode = decode_on && !packed && (1..=32).contains(&tokens);
     let shaped = hc_mult == 4
         && ctx.config.hidden_size == 4096
         && ctx.config.model_type == "glm5_next"
@@ -386,6 +412,7 @@ impl Qwen3AttentionLayer {
         let h = ctx.config.hidden_size as u32;
         let hc_mult = hc.hc_mult as u32;
         if tokens <= 32
+            && !crate::layers::glm_packed_scope::active()
             && hc_post_pre_prefill_fused(
                 site,
                 None,

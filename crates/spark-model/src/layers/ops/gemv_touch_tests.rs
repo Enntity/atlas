@@ -172,20 +172,8 @@ fn twin_table_looks_up_every_twin_only_when_on() {
         .collect();
     let expected: Vec<_> = TWINS
         .iter()
-        .map(|&(m, f)| (m.to_owned(), twin_func(f, true)))
+        .map(|&(m, f)| (m.to_owned(), twin_func(f)))
         .collect();
-    let capability_probes = vec![
-        ("kda".to_owned(), "kda_commit_records".to_owned()),
-        (
-            "dense_gemv_bf16_batchm".to_owned(),
-            "dense_gemv_bf16_tc8_planes".to_owned(),
-        ),
-    ];
-    let expected = if crate::layers::canonical_verify::requested() {
-        [capability_probes, expected].concat()
-    } else {
-        expected
-    };
     assert_eq!(looked_up, expected);
     assert!(table.iter().all(|h| h.0 != 0));
 }
@@ -365,13 +353,8 @@ fn the_tc_twins_follow_the_canonical_tier() {
     for rows in [8, 16, 32] {
         let touch = format!("w4a16_gemv_tc{rows}_touch");
         let pair = format!("w4a16_gemv_tc{rows}_pair_touch");
-        assert_eq!(twin_func(&touch, true), "w4a16_gemv_tc8_touch");
-        assert_eq!(twin_func(&pair, true), "w4a16_gemv_tc8_pair_touch");
-        assert_eq!(twin_func(&touch, false), touch);
-        assert_eq!(twin_func(&pair, false), pair);
+        assert_eq!(twin_func(&touch), "w4a16_gemv_tc8_touch");
+        assert_eq!(twin_func(&pair), "w4a16_gemv_tc8_pair_touch");
     }
-    assert_eq!(
-        twin_func("mxfp8_gemv_tc16_touch", true),
-        "mxfp8_gemv_tc16_touch"
-    );
+    assert_eq!(twin_func("mxfp8_gemv_tc16_touch"), "mxfp8_gemv_tc16_touch");
 }

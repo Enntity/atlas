@@ -9,10 +9,20 @@
 
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 
-mod glm;
+pub(crate) mod glm;
 pub(crate) use glm::{
     GlmVisionBlockWeights, GlmVisionEncoder, GlmVisionMergerWeights, GlmVisionWeights,
 };
+
+/// Whether this rank only receives encoded vision rows: a worker of a
+/// multi-rank GLM-5 world. Rank 0 encodes every item and broadcasts its rows
+/// (`EP_CMD_VISION_STATE`), so a worker loads no vision weights and allocates
+/// only the row buffer. Decided from the configuration alone, so the weight
+/// loader and the model builder agree.
+pub fn vision_receive_only(config: &atlas_core::config::ModelConfig) -> bool {
+    config.vision.as_ref().is_some_and(|v| v.is_glm5_next)
+        && (config.tp_rank != 0 || config.ep_rank != 0)
+}
 
 pub(super) const IMAGE_PAD_TOKEN: u32 = 151_655;
 pub const IMAGE_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN;
@@ -122,6 +132,9 @@ pub struct VisionEncoder {
     pub out_hidden_size: usize,    // 2048
     pub intermediate_size: usize,  // 4304
     pub p_max: usize,              // 6400 (80×80 patches for 1280×1280 image)
+    /// Merged rows `buf_out` holds: one prefill chunk's items
+    /// (`crate::vision_limits::window_rows`), at least `p_max`.
+    pub out_rows: usize,
     // num_grid_per_side = sqrt(num_position_embeddings) = 48 for Qwen3-VL/3.6.
     pub num_grid_per_side: usize,
     // pre-allocated scratch buffers
@@ -131,7 +144,7 @@ pub struct VisionEncoder {
     pub buf_wide: DevicePtr,          // [p_max × 4304] bf16 — QKV/MLP scratch
     pub buf_merge_in: DevicePtr,      // [p_max/4 × 4608] bf16
     pub buf_merge_fc1: DevicePtr,     // [p_max/4 × 4608] bf16
-    pub buf_out: DevicePtr,           // [p_max × 2048] bf16 — final output
+    pub buf_out: DevicePtr,           // [out_rows × 2048] bf16 — final output
     pub buf_pos_resampled: DevicePtr, // [p_max × 1152] bf16 — per-image interp pos_embed
     pub buf_rope_cos: DevicePtr,      // [p_max × head_dim] bf16 — per-image rotary cos
     pub buf_rope_sin: DevicePtr,      // [p_max × head_dim] bf16 — per-image rotary sin
@@ -151,6 +164,7 @@ pub struct VisionEncoder {
 }
 
 mod enc_impl;
+pub use enc_impl::init::derive_max_patches;
 
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_oracle_tests.rs"]
@@ -159,3 +173,59 @@ mod glm_oracle_tests;
 #[cfg(all(test, feature = "cuda"))]
 #[path = "vision_encoder/glm_attention_gpu_tests.rs"]
 mod glm_attention_gpu_tests;
+
+#[cfg(all(test, feature = "cuda"))]
+#[path = "vision_encoder/qwen_passes_gpu_tests.rs"]
+mod qwen_passes_gpu_tests;
+
+#[cfg(test)]
+mod receive_only_tests {
+    use super::vision_receive_only;
+    use atlas_core::config::{ModelConfig, VisionConfig};
+
+    fn glm_vision() -> VisionConfig {
+        VisionConfig {
+            is_glm5_next: true,
+            in_channels: 3,
+            depth: 1,
+            hidden_size: 64,
+            num_heads: 1,
+            patch_size: 14,
+            temporal_patch_size: 2,
+            spatial_merge_size: 2,
+            intermediate_size: 64,
+            out_hidden_size: 64,
+            projection_intermediate_size: 64,
+            rms_norm_eps: 1e-5,
+            swiglu_limit: 10.0,
+            deepstack_visual_indexes: Vec::new(),
+            image_pad_token_id: 0,
+            video_pad_token_id: 0,
+            image_start_token_id: 0,
+            image_end_token_id: 0,
+            video_start_token_id: 0,
+            video_end_token_id: 0,
+            max_pixels: None,
+            token_budgets: Default::default(),
+            min_pixels: None,
+            video_pixels: None,
+        }
+    }
+
+    #[test]
+    fn only_a_glm_worker_skips_the_vision_weights() {
+        let mut c = ModelConfig::qwen3_next_80b_nvfp4();
+        c.tp_rank = 1;
+        c.ep_rank = 1;
+        assert!(!vision_receive_only(&c), "no vision config");
+        c.vision = Some(glm_vision());
+        assert!(vision_receive_only(&c));
+        c.tp_rank = 0;
+        c.ep_rank = 0;
+        assert!(!vision_receive_only(&c), "rank 0 encodes");
+        c.ep_rank = 1;
+        assert!(vision_receive_only(&c), "an orthogonal-mesh worker");
+        c.vision.as_mut().unwrap().is_glm5_next = false;
+        assert!(!vision_receive_only(&c), "other towers keep their weights");
+    }
+}

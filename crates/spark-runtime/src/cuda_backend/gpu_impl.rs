@@ -160,12 +160,16 @@ impl GpuBackend for AtlasCudaBackend {
 
     fn copy_d2h(&self, src: DevicePtr, dst: &mut [u8]) -> Result<()> {
         d2h_trace_tick();
-        AtlasCudaBackend::copy_d2h_impl(self, src, dst)
+        crate::host_sync_trace::traced("copy_d2h", || {
+            AtlasCudaBackend::copy_d2h_impl(self, src, dst)
+        })
     }
 
     fn copy_d2h_on_stream(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
         d2h_trace_tick();
-        AtlasCudaBackend::copy_d2h_on_stream_impl(self, src, dst, stream)
+        crate::host_sync_trace::traced("copy_d2h_on_stream", || {
+            AtlasCudaBackend::copy_d2h_on_stream_impl(self, src, dst, stream)
+        })
     }
 
     fn copy_d2h_async(&self, src: DevicePtr, dst: &mut [u8], stream: u64) -> Result<()> {
@@ -237,7 +241,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn synchronize(&self, stream: u64) -> Result<()> {
-        let status = unsafe { cuStreamSynchronize(stream) };
+        let status = crate::host_sync_trace::traced("synchronize", || unsafe {
+            cuStreamSynchronize(stream)
+        });
         if status != 0 {
             bail!("cuStreamSynchronize failed: {}", cuda_error_text(status));
         }
@@ -245,7 +251,9 @@ impl GpuBackend for AtlasCudaBackend {
     }
 
     fn synchronize_device(&self) -> Result<()> {
-        let status = unsafe { super::cuCtxSynchronize() };
+        let status = crate::host_sync_trace::traced("synchronize_device", || unsafe {
+            super::cuCtxSynchronize()
+        });
         if status != 0 {
             bail!("cuCtxSynchronize failed: {}", cuda_error_text(status));
         }
@@ -478,7 +486,7 @@ impl GpuBackend for AtlasCudaBackend {
         self.stream_wait_event_cu(stream, event)
     }
     fn event_synchronize(&self, event: u64) -> Result<()> {
-        self.event_synchronize_cu(event)
+        crate::host_sync_trace::traced("event_synchronize", || self.event_synchronize_cu(event))
     }
     fn destroy_event(&self, event: u64) -> Result<()> {
         self.destroy_event_cu(event)
@@ -522,6 +530,22 @@ impl GpuBackend for AtlasCudaBackend {
     }
 }
 
-#[path = "gpu_impl/kernel_name.rs"]
-mod kernel_name;
-use kernel_name::kernel_name;
+/// The kernel's name for a launch-failure message; `?` where the driver
+/// cannot say (SCALE / HIP shim builds, or an old driver).
+fn kernel_name(func: *mut c_void) -> String {
+    #[cfg(not(atlas_scale))]
+    {
+        let mut name: *const std::ffi::c_char = std::ptr::null();
+        // SAFETY: `func` is a live CUfunction handle from the registry, and the
+        // driver writes a NUL-terminated string it owns (valid for the module's
+        // lifetime) into `name`, which is only read here.
+        let rc = unsafe { super::cuFuncGetName(&mut name, func) };
+        if rc == 0 && !name.is_null() {
+            return unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    let _ = func;
+    "?".to_string()
+}

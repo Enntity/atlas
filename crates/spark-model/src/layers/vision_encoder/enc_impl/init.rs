@@ -2,11 +2,11 @@
 
 //! `VisionEncoder::new` constructor.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::super::{
-    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder, VitWeight,
+    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder,
 };
 
 /// Encoder capacity, in patches, when nothing bounds the image.
@@ -76,6 +76,7 @@ impl VisionEncoder {
         intermediate_size: usize,
         patch_size: usize,
         max_pixels: Option<usize>,
+        max_chunk_tokens: usize,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         let head_dim = hidden_size / num_heads;
@@ -120,7 +121,25 @@ impl VisionEncoder {
         let buf_wide = gpu.alloc(p_max * intermediate_size * 2)?;
         let buf_merge_in = gpu.alloc((p_max / 4) * merger_in_dim * 2)?;
         let buf_merge_fc1 = gpu.alloc((p_max / 4) * merger_in_dim * 2)?;
-        let buf_out = gpu.alloc(p_max * out_hidden_size * 2)?;
+        // One prefill chunk's items, not one encoder batch: a chunk encodes
+        // every item it touches, in passes of at most `p_max` patches.
+        let out_rows =
+            crate::vision_limits::window_rows(p_max, spatial_merge_size, max_chunk_tokens);
+        let buf_out = gpu.alloc(out_rows * out_hidden_size * 2)?;
+        let window_mib = (out_rows * out_hidden_size * 2) as f64 / (1024.0 * 1024.0);
+        if window_mib > 256.0 {
+            // Linear in the chunk: a large --max-prefill-tokens or
+            // ATLAS_MAX_BATCH_TOKENS buys this much more per rank.
+            tracing::warn!(
+                "Vision output window {out_rows} rows ({window_mib:.0} MiB per rank) for prefill \
+                 chunks of up to {max_chunk_tokens} tokens; a smaller chunk shrinks it"
+            );
+        } else {
+            tracing::info!(
+                "Vision output window {out_rows} rows ({window_mib:.0} MiB) for prefill chunks of \
+                 up to {max_chunk_tokens} tokens"
+            );
+        }
         let buf_pos_resampled = gpu.alloc(p_max * hidden_size * 2)?;
         let buf_rope_cos = gpu.alloc(p_max * head_dim * 2)?;
         let buf_rope_sin = gpu.alloc(p_max * head_dim * 2)?;
@@ -256,6 +275,7 @@ impl VisionEncoder {
             out_hidden_size,
             intermediate_size,
             p_max,
+            out_rows,
             num_grid_per_side,
             buf_f32,
             buf_h1,
@@ -282,13 +302,14 @@ impl VisionEncoder {
     /// Construct the distinct GLM-5.3 visual tower while retaining the
     /// historical `VisionEncoder` wrapper used by model prefill/splicing.
     pub(crate) fn new_glm(
-        weights: GlmVisionWeights,
+        weights: Option<GlmVisionWeights>,
         config: &atlas_core::config::VisionConfig,
         gpu: &dyn GpuBackend,
     ) -> Result<Self> {
         let glm = GlmVisionEncoder::new(weights, config, gpu)?;
         let glm_buf_out = glm.buf_out;
         let glm_p_max = glm.p_max;
+        let glm_out_rows = glm.out_rows;
         Ok(Self {
             glm: Some(Box::new(glm)),
             patch_embed_w: DevicePtr::NULL,
@@ -300,9 +321,9 @@ impl VisionEncoder {
             merger: MergerLayer {
                 norm_w: DevicePtr::NULL,
                 norm_b: DevicePtr::NULL,
-                fc1_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
+                fc1_w: DevicePtr::NULL,
                 fc1_b: DevicePtr::NULL,
-                fc2_w: super::super::VitWeight::Bf16(DevicePtr::NULL),
+                fc2_w: DevicePtr::NULL,
                 fc2_b: DevicePtr::NULL,
             },
             k_gemm: KernelHandle(0),
@@ -319,8 +340,6 @@ impl VisionEncoder {
             k_merge: KernelHandle(0),
             k_f32_bf16: KernelHandle(0),
             k_copy: KernelHandle(0),
-            k_nvfp4_dq: KernelHandle(0),
-            k_mx8_dq: KernelHandle(0),
             hidden_size: config.hidden_size,
             num_heads: config.num_heads,
             head_dim: config.hidden_size / config.num_heads,
@@ -328,12 +347,12 @@ impl VisionEncoder {
             out_hidden_size: config.out_hidden_size,
             intermediate_size: config.intermediate_size,
             p_max: glm_p_max,
+            out_rows: glm_out_rows,
             num_grid_per_side: 0,
             buf_f32: DevicePtr::NULL,
             buf_h1: DevicePtr::NULL,
             buf_h2: DevicePtr::NULL,
             buf_wide: DevicePtr::NULL,
-            buf_vit_dq: DevicePtr::NULL,
             buf_merge_in: DevicePtr::NULL,
             buf_merge_fc1: DevicePtr::NULL,
             buf_out: glm_buf_out,

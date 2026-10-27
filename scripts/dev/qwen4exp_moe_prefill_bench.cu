@@ -9,8 +9,6 @@
 //             moe_w4a16_grouped_gemm_ptrtable_t_k64   (moe_w4a16_grouped_gemm.cu)
 //   fast      moe_q38_gate_up_silu (gate+up+SiLU*mul, one kernel) ->
 //             moe_q38_down                             (moe_prefill_q38.cu)
-//   router    w4a16_gemm  vs  moe_q38_router_dequant + dense_gemm_bf16_pipelined
-//             ([tokens, 2560] x 512 experts; logits must match byte for byte)
 //
 // The `act` (SiLU*up) and down outputs must match byte for byte, as must the
 // W2 twins' (moe_q38w_*, ATLAS_QWEN4EXP_PREFILL_MOE_W2) against q38's.
@@ -21,8 +19,7 @@
 //   nvcc $F -o $D/moe_w4a16.ptx $K/moe_w4a16_grouped_gemm.cu
 //   nvcc $F -o $D/moe_silu_mul.ptx $C/moe_silu_mul.cu
 //   nvcc $F -o $D/moe_prefill_q38.ptx $K/moe_prefill_q38.cu
-//   nvcc $F -o $D/w4a16.ptx $K/w4a16_gemm.cu      # router: the default
-//   nvcc $F -o $D/gemm.ptx $C/dense_gemm_bf16.cu  # router: the q38 arm
+//   nvcc $F -o $D/w4a16.ptx $K/w4a16_gemm.cu      # shared expert: the default
 //   nvcc $F -o $D/moe.ptx $C/moe_permute.cu        # unpermute: the default
 //   nvcc -O3 -std=c++17 -o $D/bench scripts/dev/qwen4exp_moe_prefill_bench.cu -lcuda
 //   $D/bench $D [tokens=8192]
@@ -245,48 +242,9 @@ int main(int argc, char** argv) {
         printf("W2:      gate_up+silu %.3f ms (%.1f TFLOP/s, %.2fx)  down %.3f ms (%.1f TFLOP/s, %.2fx)\n",
                tw, gu_tf / tw * 1e3, t / tw, tw2, dn_tf / tw2 * 1e3, t2 / tw2);
     }
-    // ── router: w4a16_gemm vs moe_q38_router_dequant + dense_gemm_bf16_pipelined ──
-    PtxModule m_w4, m_gemm;
-    if (have_q38 && m_w4.try_load(dir + "/w4a16.ptx") && m_gemm.try_load(dir + "/gemm.ptx")) {
-        CUfunction k_w4 = m_w4.fn("w4a16_gemm");
-        CUfunction k_dq = m_q38.fn("moe_q38_router_dequant");
-        CUfunction k_dg = m_gemm.fn("dense_gemm_bf16_pipelined");
-        const unsigned NR = E_ALL;
-        std::vector<unsigned char> rp((size_t)NR * H / 2), rs((size_t)NR * H / 16);
-        for (auto& x : rp) x = (unsigned char)(rng() & 0xFF);
+    PtxModule m_w4;
+    if (have_q38 && m_w4.try_load(dir + "/w4a16.ptx")) {
         std::uniform_real_distribution<float> us(0.004f, 0.06f);
-        for (auto& x : rs) x = e4m3(us(rng));
-        Buf<unsigned char> d_rp, d_rs;
-        Buf<unsigned short> d_rw, d_l1, d_l2;
-        d_rp.alloc(rp.size()); d_rp.put(rp);
-        d_rs.alloc(rs.size()); d_rs.put(rs);
-        d_rw.alloc((size_t)NR * H);
-        d_l1.alloc((size_t)T * NR); d_l2.alloc((size_t)T * NR);
-        const float s2 = 0.73f;
-        auto router_old = [&]() {
-            Args x;
-            x.add(d_a.p).add(d_rp.p).add(d_rs.p).add(s2).add(d_l1.p).add(T).add(NR).add(H);
-            launch(k_w4, dim3(NR / 64, (T + 63) / 64), dim3(128), 0, x);
-        };
-        auto router_new = [&]() {
-            Args x;
-            x.add(d_rp.p).add(d_rs.p).add(s2).add(d_rw.p).add(NR).add(H);
-            launch(k_dq, dim3((NR * H / 2 + 255) / 256), dim3(256), 0, x);
-            Args y;
-            y.add(d_a.p).add(d_rw.p).add(d_l2.p).add(T).add(NR).add(H);
-            launch(k_dg, dim3((NR + 127) / 128, (T + 127) / 128), dim3(256), 0, y);
-        };
-        d_l1.fill(0x12); d_l2.fill(0x34);
-        router_old();
-        router_new();
-        CK(cudaDeviceSynchronize());
-        size_t d = diff_bytes(d_l1.get(), d_l2.get());
-        printf("bitwise router logits (w4a16_gemm vs dequant + dense_gemm_bf16_pipelined): %zu differing bytes\n", d);
-        ok = ok && d == 0;
-        const double r_tf = 2.0 * T * NR * H / 1e12;
-        float t1 = time_ms(router_old), t2 = time_ms(router_new);
-        printf("router: w4a16_gemm %.3f ms (%.1f TFLOP/s) -> dequant + dense_gemm %.3f ms (%.1f TFLOP/s), %.2fx\n",
-               t1, r_tf / t1 * 1e3, t2, r_tf / t2 * 1e3, t1 / t2);
 
         // ── shared expert: w4a16_gemm_t x3 + moe_silu_mul vs the dense q38 pair ──
         CUfunction k_wt = m_w4.fn("w4a16_gemm_t");

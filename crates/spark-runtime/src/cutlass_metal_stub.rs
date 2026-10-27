@@ -123,3 +123,60 @@ pub fn transpose_nvfp4_packed_kton(
 ) -> Result<()> {
     unreachable!("cutlass::transpose_nvfp4_packed_kton is cuda-only (not built for metal)")
 }
+
+pub fn bf16_gemm_tuned(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _lda: u32,
+    _ldc: u32,
+    _config: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::bf16_gemm_tuned is cuda-only (not built for metal)")
+}
+
+pub fn bf16_gemm_tuned_f32out(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _lda: u32,
+    _ldc: u32,
+    _config: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::bf16_gemm_tuned_f32out is cuda-only (not built for metal)")
+}
+
+pub fn bf16_grouped_gemm_act_weight_t(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _g: u32,
+    _n: u32,
+    _k: u32,
+    _a_stride: u32,
+    _c_stride: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::bf16_grouped_gemm_act_weight_t is cuda-only (not built for metal)")
+}
+
+pub fn fp8_blockwise_gemm_act_weight_t(
+    _act: u64,
+    _act_sf: u64,
+    _weight: u64,
+    _weight_sf: u64,
+    _out: u64,
+    [_m, _n, _k]: [u32; 3],
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cutlass::fp8_blockwise_gemm_act_weight_t is cuda-only (not built for metal)")
+}

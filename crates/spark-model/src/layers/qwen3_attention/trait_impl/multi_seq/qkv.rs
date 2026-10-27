@@ -46,8 +46,9 @@ impl Qwen3AttentionLayer {
         // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
         if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
             self.ms_qkv_seq_rows(c)?;
-        } else if self.ms_qkv_batch_mx8(c)? {
-            // Native MXFP8 (FP4-Local): `qkv_mx8.rs`.
+        } else if self.ms_qkv_mx(c)? {
+            // The checkpoint's MXFP8 Q/K/V (`dense_mx.rs`): one launch each
+            // for every row, each row serial decode's bytes.
         } else if self.ms_qkv_exact4(c)? {
             // qwen4_exp exact K=4 verify: serial decode's arithmetic per row
             // (`qkv_exact4.rs`).
@@ -328,7 +329,7 @@ impl Qwen3AttentionLayer {
     /// Shared q/k RMS-norm pass over the per-seq `qkv_buf` regions. Extracted
     /// so all projection branches (seq / batch2 / batch3 / batchn) defer norms
     /// to one place, after the pre-norm K/V LoRA delta.
-    fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
+    pub(super) fn ms_qkv_norms(&self, c: &MultiSeqCtx<'_>) -> Result<()> {
         let MultiSeqCtx {
             fwd,
             n,
@@ -1187,9 +1188,8 @@ impl Qwen3AttentionLayer {
                     )?;
                 }
             } else {
-                ops::dense_gemv(
+                self.dense_gemv_or_mx(
                     fwd.gpu,
-                    self.dense_gemv_k,
                     normed_i,
                     &self.attn.q_proj,
                     q_out_i,
@@ -1236,9 +1236,8 @@ impl Qwen3AttentionLayer {
                 stream,
             )?;
         } else {
-            ops::dense_gemv(
+            self.dense_gemv_or_mx(
                 fwd.gpu,
-                self.dense_gemv_k,
                 normed_i,
                 &self.attn.q_proj,
                 q_out_i,
@@ -1324,9 +1323,8 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.dense_gemv_or_mx(
                     fwd.gpu,
-                    self.dense_gemv_k,
                     normed_i,
                     &self.attn.k_proj,
                     k_out_i,
@@ -1347,9 +1345,8 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             } else {
-                ops::dense_gemv(
+                self.dense_gemv_or_mx(
                     fwd.gpu,
-                    self.dense_gemv_k,
                     normed_i,
                     &self.attn.v_proj,
                     v_out_i,

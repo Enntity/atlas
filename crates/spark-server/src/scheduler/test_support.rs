@@ -174,7 +174,6 @@ macro_rules! test_request {
             num_beams: 1,
             length_penalty: 1.0,
             early_stopping: false,
-            force_nonempty_content: false,
             image_pixels: vec![],
             max_tokens: 600,
             min_tokens: 0,

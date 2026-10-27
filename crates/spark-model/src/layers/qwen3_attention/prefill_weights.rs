@@ -307,6 +307,10 @@ impl Qwen3AttentionLayer {
         attn: crate::layers::ops::lora_delta::LoraAttnWeights,
         ffn: Option<crate::layers::ops::lora_delta::LoraFfnWeights>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            self.dense_mx.w8a8.is_none() || !super::w8a8::adapts_projections(Some(&attn)),
+            super::w8a8::LORA
+        );
         self.lora = Some(attn);
         if let Some(f) = ffn {
             match &mut self.ffn {

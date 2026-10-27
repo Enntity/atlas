@@ -25,7 +25,10 @@ impl Qwen3AttentionLayer {
         stream: u64,
     ) -> Result<DevicePtr> {
         let o_out = ctx.buffers.norm_output();
-        if self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)? {
+        // ATLAS_QWEN4EXP_PREFILL_W8A8 (`w8a8.rs`; no BF16 o_proj left after).
+        if self.w8a8_oproj(attn_out, o_out, [n, h, nq * hd], ctx, stream)?
+            || self.oproj_reduce_scatter_piped(attn_out, o_out, [n, h, nq * hd], ctx, stream)?
+        {
             return Ok(o_out);
         }
         // ATLAS_QWEN4EXP_PREFILL_BF16_PROJ: BF16 at decode's weight values,
@@ -36,7 +39,7 @@ impl Qwen3AttentionLayer {
             ops::bf16_gemm(attn_out, w.0, o_out, n, h, nq * hd, stream)?;
             return Ok(o_out);
         }
-        // Native MXFP8 / keep-packed Q2_0: not GEMM-ready as stored.
+        // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
         if let Some(r) =
             self.try_unpacked_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
         {
@@ -46,7 +49,10 @@ impl Qwen3AttentionLayer {
         let force_w8a8 = ctx.dispatch.fp8_blockscaled_prefill;
         // Native FP4 o_proj: quantize attn_out to NVFP4 and consume o_proj in
         // its original NVFP4 form. OPT-IN ONLY -- see the QKV path's comment.
+        // Not without an NVFP4 o_proj: a keep-BF16 layer's is the NULL
+        // placeholder and runs on `o_dense_bf16` below.
         let w4a4 = n >= 256
+            && !self.attn.o_proj.is_null()
             && self.w4a4_gemm_k.0 != 0
             && self.quantize_nvfp4_k.0 != 0
             && ctx.buffers.fp8_act_bytes() >= (n as usize) * (nq as usize) * (hd as usize)

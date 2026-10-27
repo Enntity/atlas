@@ -16,9 +16,14 @@
 //! hash of an empty source set is a constant, so a silent resolution failure
 //! would make every target look identical to every other. [`sources`] returns
 //! `None` rather than an empty vector for exactly that reason.
+//! Unresolvable model redirects are a hard enumeration error, as in the native
+//! build: omitting an alias with no local quant directory would excuse it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+#[path = "taxon_paths.rs"]
+mod paths;
 
 /// One compiled unit: `(hardware, model, quant)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,7 +85,8 @@ fn vendor(root: &Path, hardware: &str) -> Option<String> {
 ///
 /// Mirrors `resolve_targets()` with both wildcards expanded: a hardware dir is
 /// one holding `HARDWARE.toml`, a model dir one holding `MODEL.toml` (which is
-/// what excludes `common/`), and every subdir of a model is a quant.
+/// what excludes `common/`), and every subdir of its resolved kernel source
+/// model is a quant.
 pub fn walk(root: &Path) -> Vec<Target> {
     let kernels = root.join("kernels");
     let mut targets = Vec::new();
@@ -94,7 +100,9 @@ pub fn walk(root: &Path) -> Vec<Target> {
             if !model_dir.join("MODEL.toml").exists() {
                 continue;
             }
-            for quant in subdirs(&model_dir) {
+            let source_dir = paths::model_dir(&hw_dir, &model)
+                .unwrap_or_else(|| panic!("{hardware}/{model}: cannot resolve kernel_source"));
+            for quant in subdirs(&source_dir) {
                 targets.push(Target {
                     hardware: hardware.clone(),
                     model: model.clone(),
@@ -109,8 +117,8 @@ pub fn walk(root: &Path) -> Vec<Target> {
 /// Kernel sources for `target`, after shadowing.
 ///
 /// Mirrors `collect_cu_files`: `common/` is the base layer and the model's
-/// quant dir overrides it, keyed by file STEM — so the model dir holds
-/// overrides, not the model's kernels. Sorted, so callers get a stable order.
+/// quant overlays override it, keyed by file STEM. Model redirects and base
+/// quant composition follow the native build. Sorted for a stable order.
 ///
 /// `None` means resolution failed (unknown vendor, or no source resolved at
 /// all). Callers must treat that as affected; see the fail-closed note above.
@@ -118,21 +126,29 @@ pub fn sources(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
     let hw_dir = root.join("kernels").join(&target.hardware);
     let ext = source_ext(&vendor(root, &target.hardware)?)?;
 
+    let model_dir = paths::model_dir(&hw_dir, &target.model)?;
+    let overlays = paths::overlays(&model_dir, &target.quant)?;
     let mut by_stem: BTreeMap<String, PathBuf> = BTreeMap::new();
-    for dir in [
-        hw_dir.join("common"),
-        hw_dir.join(&target.model).join(&target.quant),
-    ] {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+    let mut overlay_stems = BTreeSet::new();
+    for (index, dir) in std::iter::once(hw_dir.join("common"))
+        .chain(overlays)
+        .enumerate()
+    {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        for path in entries.flatten().map(|e| e.path()) {
+        for entry in entries {
+            let path = entry.ok()?.path();
             if path.extension().and_then(|e| e.to_str()) != Some(ext) {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
+            let stem = path.file_stem()?.to_str()?;
+            // The build refuses an overlay shadowing its base quant.
+            if index > 0 && !overlay_stems.insert(stem.to_string()) {
+                return None;
+            }
             by_stem.insert(stem.to_string(), path);
         }
     }
@@ -142,27 +158,38 @@ pub fn sources(root: &Path, target: &Target) -> Option<Vec<PathBuf>> {
     if by_stem.is_empty() {
         return None;
     }
-    Some(by_stem.into_values().collect())
+    let mut sources: Vec<_> = by_stem.into_values().collect();
+    sources.sort();
+    Some(sources)
 }
 
 /// Config files that steer a target's compile without being sources.
 ///
-/// Their contents are inside the closure hash, so editing a tuned constant in
-/// `MODEL.toml` invalidates the target that reads it — and only that target.
+/// Match the native build attestation: hardware, target and source-model
+/// metadata, common kernel config, and quant configs including a composed base.
+/// Alias behavior and shared module mappings are compile inputs too.
 pub fn configs(root: &Path, target: &Target) -> Vec<PathBuf> {
     let hw_dir = root.join("kernels").join(&target.hardware);
-    [
+    let Some(model_dir) = paths::model_dir(&hw_dir, &target.model) else {
+        return Vec::new(); // sources() rejects this unresolved target first.
+    };
+    let Some(overlays) = paths::overlays(&model_dir, &target.quant) else {
+        return Vec::new();
+    };
+    let mut configs: Vec<_> = [
         hw_dir.join("HARDWARE.toml"),
         hw_dir.join("common").join("KERNEL.toml"),
         hw_dir.join(&target.model).join("MODEL.toml"),
-        hw_dir
-            .join(&target.model)
-            .join(&target.quant)
-            .join("KERNEL.toml"),
+        model_dir.join("MODEL.toml"),
+        hw_dir.join("common/KERNEL.toml"),
     ]
     .into_iter()
-    .filter(|p| p.exists())
-    .collect()
+    .chain(overlays.into_iter().map(|dir| dir.join("KERNEL.toml")))
+    .filter(|p| p.is_file())
+    .collect();
+    configs.sort();
+    configs.dedup();
+    configs
 }
 
 /// The hardware node a repo-relative path sits under, if any.
@@ -195,7 +222,8 @@ pub fn model_of(path: &str) -> Option<(&str, &str)> {
 /// A path under `common/` affects every target on that hardware — it is shared,
 /// and whether a given target actually compiles it is the closure hash's
 /// question, not this one. A path under a model's quant dir affects that target
-/// alone. A path outside `kernels/` affects nothing *here*; the caller's path
+/// and models that reuse its kernel sources. A path outside `kernels/` affects
+/// nothing *here*; the caller's path
 /// boundary already invalidates everything for those.
 pub fn affected(root: &Path, changed: &[String]) -> BTreeSet<Target> {
     let all = walk(root);
@@ -207,7 +235,14 @@ pub fn affected(root: &Path, changed: &[String]) -> BTreeSet<Target> {
         match model_of(path) {
             Some((_, model)) => out.extend(
                 all.iter()
-                    .filter(|t| t.hardware == hw && t.model == model)
+                    .filter(|t| {
+                        t.hardware == hw
+                            && (t.model == model
+                                || paths::model_dir(&root.join("kernels").join(hw), &t.model)
+                                    .is_none_or(|dir| {
+                                        dir.file_name().is_some_and(|name| name == model)
+                                    }))
+                    })
                     .cloned(),
             ),
             None => out.extend(all.iter().filter(|t| t.hardware == hw).cloned()),

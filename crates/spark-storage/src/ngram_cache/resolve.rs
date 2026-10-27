@@ -48,7 +48,6 @@ impl NgramRowCache {
         if let Some(k) = &self.keepalive {
             k.touch();
         }
-        self.maybe_log_stats();
         if let Some(out) = out_slots.as_deref_mut() {
             out.clear();
             out.reserve(row_ids.len());

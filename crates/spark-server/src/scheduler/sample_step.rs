@@ -151,12 +151,8 @@ pub(super) fn effective_min_p(
 ///  * `FinalDecode` → the caller passes the effective `temperature`, the
 ///    per-token `seed` and the base `logit_bias` (`ActiveSeq.logit_bias`,
 ///    cloned) it computed for this step.
-///  * `Verify` → the MTP/DFlash verify bootstrap emission is a penalty-aware
-///    greedy ARGMAX, so callers pass `temperature = 0.0`, `seed = None`, and
-///    the sequence's own base bias (`a.logit_bias`) — the same bias vec
-///    FinalDecode would apply at this position. Passing an empty vec used to
-///    suppress the `<tool_call>` opener nudge inside speculative verify and
-///    was the root cause of spec-on != spec-off on tool-call workloads.
+///  * `Verify` → the MTP verify/bootstrap emission is a penalty-aware
+///    greedy ARGMAX: [`verify_penalty_params`].
 pub(super) fn penalty_params_for(
     a: &ActiveSeq,
     kind: PositionKind,
@@ -193,11 +189,9 @@ pub(super) fn penalty_params_for_with_floor(
     floor: u32,
 ) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
-    // is temperature 0.0, no seed. The base bias is the sequence's own
-    // (a.logit_bias — must match FinalDecode at the same position). Pin it so
-    // a future caller can't silently pass stochastic params on the
-    // speculative path. The A4 floor below is appended for BOTH kinds
-    // (intended delta).
+    // is temperature 0.0 and no seed. Pin it so a future caller can't silently
+    // pass stochastic params on the speculative path. The A4 floor below is
+    // appended for BOTH kinds (intended delta).
     debug_assert!(
         kind != PositionKind::Verify || (temperature == 0.0 && seed.is_none()),
         "Verify positions must pass temperature=0.0, seed=None"
@@ -408,15 +402,9 @@ pub fn sample_token(
         }
     }
     if temperature == 0.0 {
-        // Greedy argmax over FP32.
-        //
-        // FIRST-WINS on exact ties: unified with the GPU argmax kernels
-        // (lowest-lane), every verify pick and torch.argmax/vLLM greedy —
-        // BF16 logits tie exactly, and last-wins here made serial decode
-        // emit a different token than verify picked (lossy spec-off != gamma
-        // on tool-call requests, which always take this host path).
-        let best = spark_runtime::sampler::argmax_first_wins_f32(&f32_logits);
-        return Ok(best);
+        // Greedy argmax over FP32; exact ties go to the lowest index, the
+        // engine-wide rule (`argmax_first_wins_f32`).
+        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
@@ -553,9 +541,7 @@ pub fn sample_token_with_grammar(
     // output-token history — identical stage to the non-MTP path.
     apply_penalties_and_bias(&mut f32_logits, penalties, history);
     if temperature == 0.0 {
-        // FIRST-WINS — same tie unification as the branch above.
-        let best = spark_runtime::sampler::argmax_first_wins_f32(&f32_logits);
-        return Ok(best);
+        return Ok(spark_runtime::sampler::argmax_first_wins_f32(&f32_logits));
     }
     let f32_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_logits.as_ptr() as *const u8, vocab_size * 4) };
@@ -637,11 +623,15 @@ pub fn sample_first_token(
     grammar_state: Option<&mut GrammarState>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
-    // A strict grammar whose response opens inside `<think>` starts after
+    // A grammar whose response opens with explicit `<think>` starts after
     // `</think>`: this token is reasoning (GrammarState::masks_first_token).
     let gs = match grammar_state {
         Some(gs) if gs.masks_first_token() => gs,
         reasoning => {
+            let suppressed = reasoning
+                .as_ref()
+                .and_then(|gs| gs.first_token_suppress())
+                .map(|opener| [suppress_ids, &[opener]].concat());
             let tok = sample_token(
                 model,
                 logits,
@@ -649,7 +639,7 @@ pub fn sample_first_token(
                 top_k,
                 top_p,
                 min_p,
-                suppress_ids,
+                suppressed.as_deref().unwrap_or(suppress_ids),
                 levers,
             )?;
             // A native tool opener ends that reasoning as the grammar's first

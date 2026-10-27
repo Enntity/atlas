@@ -61,10 +61,11 @@ pub struct PleLayer {
     /// Device VA of the table's per-slot f32 dequant scale array, `None` for a
     /// BF16 table. Its presence is what selects the FP8 gather.
     scale_va: Option<u64>,
-    /// NVFP4 gather kernel (`Some` when `nvfp4` is set).
+    /// NVFP4 global scale, `Some` for a packed NVFP4 table (`ngram_nvfp4`),
+    /// whose rows carry their block scales. Selects `embed_nvfp4_k`.
+    nvfp4_global: Option<f32>,
+    /// Resolved only for an NVFP4 table, so other targets need not ship it.
     embed_nvfp4_k: KernelHandle,
-    /// Device VA of the cache's `[slots, dim/group]` E4M3 block-scale arena.
-    block_scale_va: Option<u64>,
     /// Packed EXL3 n-gram rows. Host-dequanted into `emb` before the GEMM.
     trellis: Option<ngram_trellis::NgramTrellis>,
     /// NVFP4 n-gram rows (FP4-Local): packed rows + block scales stay in the
@@ -150,6 +151,8 @@ impl PleLayer {
                 ngram_nvfp4::check_packed_stride(stride, &n.geom, scaled)?;
             } else if let Some(t) = trellis.as_ref() {
                 ngram_trellis::check_packed_stride(stride, t, scaled)?;
+            } else if cache.nvfp4_global_scale().is_some() {
+                ngram_nvfp4::check_packed_stride(stride, head_dim, scaled)?;
             } else {
                 gather_matches_element_size(stride, head_dim, scaled)?;
             }
@@ -197,6 +200,18 @@ impl PleLayer {
                 #[cfg(feature = "cuda")]
                 NgramTable::ResidentNvfp4 { scales, .. } => Some(scales.0),
                 _ => None,
+            },
+            nvfp4_global: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) => c.nvfp4_global_scale(),
+                _ => None,
+            },
+            embed_nvfp4_k: match &table {
+                #[cfg(feature = "cuda")]
+                NgramTable::Cached(c) if c.nvfp4_global_scale().is_some() => {
+                    gpu.kernel("embed_from_argmax", "batched_embed_nvfp4")?
+                }
+                _ => KernelHandle(0),
             },
             trellis,
             nvfp4,

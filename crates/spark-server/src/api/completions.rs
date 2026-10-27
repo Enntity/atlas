@@ -107,6 +107,12 @@ pub async fn completions(
             );
         }
     };
+    if req.return_token_ids && req.stream {
+        return openai_error_response(
+            StatusCode::BAD_REQUEST,
+            "return_token_ids requires stream=false on /v1/completions".to_string(),
+        );
+    }
     let prompts = match resolve_prompts(&state, &req.prompt) {
         Ok(t) => t,
         Err((status, msg)) => return openai_error_response(status, msg),
@@ -340,7 +346,7 @@ pub(super) async fn completions_stream(
         // Completions API defines no tools — multi-tool-call continuation off.
         tools_present: false,
         suppress_tool_call: false,
-        disable_mtp: false,
+        disable_mtp: req.disable_mtp,
         grammar_spec: None,
         seed: req.seed,
         top_logprobs: logprobs_k,

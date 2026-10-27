@@ -123,7 +123,7 @@ impl Dflash2CandidateSelector {
     pub fn walk_lists(
         &self,
         anchor: SelectorAnchor,
-        lists: [DevicePtr; 2],
+        lists: ops::SelectorLists,
         projected_hidden_buf: DevicePtr,
         draft_tokens_dev: DevicePtr,
         gamma: usize,
@@ -230,7 +230,7 @@ impl Dflash2CandidateSelector {
             let mut top_candidates = topk_unary(&logits_row, self.top_k);
             // Below the min_tokens floor an end token only truncates the
             // chain; score it out like the kernel does.
-            if ops::DFLASH2_SELECTOR_BANS_END_TOKENS && mask_row <= anchor.ban_depth as usize {
+            if mask_row <= anchor.ban_depth as usize {
                 for (value, id) in top_candidates.iter_mut() {
                     if anchor.end_ids.contains(&(*id as u32)) {
                         *value = f32::NEG_INFINITY;

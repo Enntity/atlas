@@ -92,73 +92,47 @@ fn actual_fp8_packed_and_keep_f32_conversion_sources_keep_exact_provenance() {
     }
 }
 
+/// Production loads without a log. A BF16 source is the store's own tensor:
+/// replacing it by its TP shard must reclaim it, so teardown does not free it
+/// a second time (FP4-Local's BF16 KDA conv1d, the NVFP4 release's BF16 KDA
+/// projections). A converted source is a loader allocation, freed directly.
 #[test]
-fn production_dense_conversion_and_sharding_keep_one_checkpoint_owner() {
+fn logless_replacement_reclaims_a_store_alias_and_frees_a_conversion() {
     use atlas_core::scope::ModelResource;
-    for (dtype, keep_f32) in [
-        (WeightDtype::BF16, false),
-        (WeightDtype::FP32, false),
-        (WeightDtype::BF16, true),
-        (WeightDtype::FP32, true),
-    ] {
+    for dtype in [WeightDtype::BF16, WeightDtype::FP32] {
         let gpu = MockGpuBackend::new();
-        let original = gpu.alloc(16 * dtype.byte_size()).unwrap();
         let mut store = WeightStore::from_map(HashMap::from([(
             "q.weight".into(),
             WeightTensor {
-                ptr: original,
+                ptr: gpu.alloc(16 * dtype.byte_size()).unwrap(),
                 shape: vec![4, 4],
                 dtype,
             },
         )]));
-        let loaded = LoadedDense::load(&store, "q.weight", &gpu, None, keep_f32).unwrap();
-        let native = if keep_f32 {
-            dtype == WeightDtype::FP32
-        } else {
-            dtype == WeightDtype::BF16
-        };
-        let derived = gpu.alloc(16).unwrap();
-        loaded
-            .replaced(derived, 16, &gpu)
+        let source = LoadedDense::load(&store, "q.weight", &gpu, None, false).unwrap();
+        let (local, _, _) = shard_dense_bf16(
+            source.dense.weight,
+            4,
+            4,
+            TpShardKind::ColumnParallel,
+            0,
+            2,
+            &gpu,
+        )
+        .unwrap();
+        source
+            .replaced(local, 16, &gpu)
             .unwrap()
             .release(&gpu)
             .unwrap();
-        assert_eq!(store.was_reclaimed("q.weight"), native);
-        store.release(&gpu).unwrap();
-        assert_eq!(gpu.alloc_count(), 0);
+        assert_eq!(store.was_reclaimed("q.weight"), dtype == WeightDtype::BF16);
         assert_eq!(gpu.invalid_free_count(), 0);
+        store.release(&gpu).unwrap();
+        assert_eq!(
+            gpu.invalid_free_count(),
+            0,
+            "{dtype:?}: no double free at teardown"
+        );
+        assert_eq!(gpu.alloc_count(), 0);
     }
-}
-
-#[test]
-fn production_checkpoint_free_failure_remains_backend_owned_not_retried_by_store() {
-    use atlas_core::scope::ModelResource;
-    let gpu = MockGpuBackend::new();
-    let original = gpu.alloc(32).unwrap();
-    let mut store = WeightStore::from_map(HashMap::from([(
-        "q.weight".into(),
-        WeightTensor {
-            ptr: original,
-            shape: vec![4, 4],
-            dtype: WeightDtype::BF16,
-        },
-    )]));
-    let loaded = LoadedDense::load(&store, "q.weight", &gpu, None, false).unwrap();
-    gpu.fail_next_free();
-    assert!(
-        loaded
-            .release(&gpu)
-            .unwrap_err()
-            .to_string()
-            .contains("mock free failed")
-    );
-    assert!(store.was_reclaimed("q.weight"));
-    store.release(&gpu).unwrap();
-    assert_eq!(
-        gpu.alloc_count(),
-        1,
-        "failed free remains the backend's responsibility"
-    );
-    assert_eq!(gpu.invalid_free_count(), 0);
-    gpu.free(original).unwrap(); // Stand in for the backend's final cleanup sweep.
 }

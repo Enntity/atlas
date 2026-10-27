@@ -381,6 +381,7 @@ pub(super) fn build_sampling(
     if !force_temp_zero
         && !state.reference_mode
         && tools_active
+        && state.behavior.tool_call_steering
         && !suppress_tool_call
         && let Some(tc_id) = state.tool_call_start_token_id
     {

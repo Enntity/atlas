@@ -44,6 +44,7 @@ impl Qwen3SsmLayer {
             qkvz_fp8w: None,
             out_proj_fp8w: None,
             fp8w_decode_only: false,
+            gdn_mx: None,
             qkvz_fp8w_t: None,
             out_proj_fp8w_t: None,
             qkvz_fp8w_rowwise: None,

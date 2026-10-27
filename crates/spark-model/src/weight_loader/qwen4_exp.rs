@@ -77,20 +77,28 @@ use crate::weight_map::{DenseWeight, MtpWeights, dense};
 // compiler ran. `attach` is also the better name: the module is the three
 // per-layer attach helpers.
 mod attach;
-mod attn_mx8;
+mod attn_mxfp8;
 mod ffn;
+mod format;
 mod gdn_fp8;
-mod gdn_mx8;
+mod gdn_mxfp8;
 mod hc;
+pub mod mode;
 mod mtp;
-mod mx8_common;
+mod native_format;
 mod ple;
 mod probe;
+mod w8a8;
 
+pub use format::{Mxfp8Component, Qwen4ExpFormat};
 pub(crate) use gdn_fp8::GdnProjections;
+pub(crate) use gdn_mxfp8::mxfp8_decode_requested;
 pub use mtp::{Qwen4ExpMtpModule, load_qwen4exp_mtp_module};
 pub use probe::audit_namespace;
 
+#[cfg(all(test, feature = "cuda"))]
+#[path = "qwen4_exp/fp4local_gpu_tests.rs"]
+mod fp4local_gpu_tests;
 #[cfg(all(test, feature = "cuda"))]
 mod shard_layout;
 #[cfg(all(test, feature = "cuda"))]
@@ -126,6 +134,20 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         let report = audit_namespace(store, config);
         report.log();
         report.ensure_loadable()?;
+        // Which release this is (FP8/NVFP4 vs FP4-Local), said once. An
+        // MXFP8 backbone adds the GDN and QSA decode twins (the `gdn` and
+        // `attn_mxfp8` arms below) and the per-layer release of its source
+        // bytes; everything else it ships loads through the shared paths
+        // (see `format.rs`).
+        let format = Qwen4ExpFormat::detect(store, config)?;
+        if mode::selected()?.is_some() {
+            anyhow::ensure!(
+                format.mxfp8_backbone,
+                "Qwen Strict/Spark require FP4-Local MXFP8 target weights"
+            );
+            native_format::validate_target(store, config)?;
+        }
+        let (mut mxfp8_released, mut w8a8) = (0usize, w8a8::W8a8Load::default());
 
         let h = config.hidden_size;
         let variant = crate::weight_map::detect_nvfp4_variant(store, config);
@@ -233,9 +255,27 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         // With PLE disabled for bisection, skip the 21 MB arena and the
         // 128-shard open entirely rather than building what we will not run.
         let ple_off = std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref() == Ok("1");
-        // GDN projections stay BF16 by DEFAULT (measured trade-off in
-        // `gdn_fp8`'s docs); FP4-Local's MXFP8 ones are served natively.
-        let gdn = GdnProjections::from_env()?;
+        // GDN projections stay BF16 by DEFAULT on this checkpoint. Measured,
+        // both arms, same prompt, util 0.85 / 16K / bf16 KV:
+        //
+        //                      requantized NVFP4      BF16 (default)
+        //   layer construction   7.43 GB / 154.8 MB/L   1.39 GB / 28.9 MB/L
+        //   attn/GDN arms        7.34 GB                1.32 GB
+        //   pre-KV               95.8 GB                90.0 GB
+        //   KV budget            3.9 GB / 172144 tok    9.7 GB / 424464 tok
+        //   decode               2.207 tok/s            2.188 tok/s
+        //
+        // 6.04 GB back for ~1% of decode. GDN weight bandwidth is simply not
+        // what bounds decode here at C=1 — something else dominates — so the
+        // usual w4a16-is-faster argument does not apply yet. Revisit if that
+        // changes.
+        //
+        // And it is not only a memory lever: ONLY the routed experts are
+        // quantized in this checkpoint. The GDN projections ship BF16, so
+        // requantizing them was a lossy round trip we chose, on 36 of 48
+        // layers. `=0` opts back into it for A/B. `ATLAS_QWEN4EXP_FP8_GDN` is
+        // the FP8 middle option (`gdn_fp8`).
+        let gdn = GdnProjections::from_env()?.for_checkpoint(format.mxfp8_backbone)?;
         tracing::info!(
             "GDN projections: {} on the {} linear-attention layers",
             gdn.describe(),
@@ -261,7 +301,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
         for i in 0..config.num_hidden_layers {
             let lp = config.layer_prefix(i);
             let f0 = free_now(gpu);
-            let ffn = ffn::build_moe(store, &lp, config, gpu, variant, &mut mx8_scratch)?;
+            let ffn = ffn::build_moe(store, &lp, config, gpu, variant, format.mxfp8_backbone)?;
             let f1 = free_now(gpu);
             moe_bytes += f0.saturating_sub(f1);
 
@@ -275,21 +315,31 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             let post_attn_norm = ones_norm(h, gpu)?;
 
             let layer = match config.layer_types[i] {
-                // FP4-Local ships these MXFP8: served on those bytes.
-                LayerType::LinearAttention if gdn_mx8::present(store, &lp) => {
-                    let scratch = mx8_common::scratch_for(&mut mx8_scratch, config, gpu)?;
-                    gdn_mx8::build(
-                        i, store, &lp, gpu, config, input_norm, post_attn_norm, ffn, scratch,
-                    )
-                    .with_context(|| format!("qwen4_exp: GDN layer {i} (MXFP8)"))?
-                }
-                // BF16 as shipped, not requantized: see `GdnProjections::Bf16`.
                 LayerType::LinearAttention if gdn == GdnProjections::Bf16 => {
+                    // Keep the GDN projections BF16 instead of requantizing
+                    // them to NVFP4 at load.
+                    //
+                    // Two reasons, and the second is the interesting one.
+                    // (1) MEMORY: the requantization is where this model's
+                    // build spends its 7.34 GB (152.8 MB/layer, measured —
+                    // the MoE costs zero because its experts ship NVFP4 and
+                    // upload straight through).
+                    // (2) PRECISION: these tensors ship as BF16 in this
+                    // checkpoint. Only the routed experts are quantized. So
+                    // BF16 -> NVFP4 here is a lossy round trip we chose, not
+                    // one the checkpoint forced, and it lands on the GDN
+                    // projections of 36 of 48 layers.
                     crate::weight_loader::qwen35::load_layers::linear_attn_arms::build_linear_attention_dense_bf16(
                         i, store, &lp, gpu, variant, config, h,
                         input_norm, post_attn_norm, ffn,
                     )
                     .with_context(|| format!("qwen4_exp: GDN layer {i} (BF16)"))?
+                }
+                LayerType::LinearAttention if gdn == GdnProjections::Mxfp8Decode => {
+                    gdn_mxfp8::build(
+                        i, store, &lp, gpu, variant, config, input_norm, post_attn_norm, ffn,
+                    )
+                    .with_context(|| format!("qwen4_exp: GDN layer {i} (MXFP8 decode)"))?
                 }
                 LayerType::LinearAttention
                     if matches!(gdn, GdnProjections::Fp8Decode | GdnProjections::Fp8Full) =>
@@ -323,7 +373,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                         .get(attn_idx)
                         .copied()
                         .unwrap_or(KvCacheDtype::Bf16);
-                    let l = crate::weight_loader::qwen35::load_layers::attention_arms::build_full_attention_nvfp4(
+                    let l = attn_mxfp8::build_full_attention(
                         i, store, &lp, gpu, variant, config, h, absmax_k, quantize_k, stream,
                         kv_dtype, attn_idx, input_norm, post_attn_norm, ffn,
                     )
@@ -358,11 +408,41 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
             if let Some(p) = ple_layer {
                 attach::attach_ple(&mut layer, i, p)?;
             }
+            w8a8.install(&mut layer, format.mxfp8_backbone, config, gpu, stream)?;
+            // Every reader of this layer's MXFP8 bytes is done: the GDN and
+            // QSA decode twins, the exact BF16 dequants (prefill, the QSA
+            // indexer's `index_qk_proj` in `attach_qsa` above), and the
+            // shared expert's twins (`build_moe`). This is the one place
+            // they are released.
+            if format.mxfp8_backbone {
+                mxfp8_released += format::release_mxfp8_sources(
+                    store,
+                    gpu,
+                    &lp,
+                    format::layer_components(config.layer_types[i]),
+                )?;
+            }
             layers.push(layer);
             hc_bytes += f2.saturating_sub(free_now(gpu));
         }
         if let Some(tr) = up_tr.take() {
             tr.finish()?;
+        }
+        w8a8.log(format.mxfp8_backbone);
+        if format.mxfp8_backbone {
+            tracing::info!(
+                "qwen4_exp: MXFP8 backbone loaded: GDN/QSA decode reads {}, prefill as \
+                 the ATLAS_QWEN4EXP_PREFILL_W8A8 line says; QSA indexer exact BF16; shared \
+                 expert on the checkpoint's MXFP8 bytes (decode twins; prefill W8A8 on them, \
+                 or their decode tiers with ATLAS_QWEN4EXP_PREFILL_W8A8 off). Released \
+                 {:.2} GB of MXFP8 source bytes",
+                if gdn == GdnProjections::Mxfp8Decode {
+                    "the checkpoint's MXFP8 bytes"
+                } else {
+                    "the exact BF16 dequant (ATLAS_QWEN4EXP_MXFP8_DECODE=0)"
+                },
+                mxfp8_released as f64 / 1e9,
+            );
         }
         tracing::info!(
             "qwen4_exp layer construction: MoE {:.2} GB ({:.1} MB/layer), \
@@ -384,7 +464,7 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
                 "ATLAS_QWEN4EXP_NO_PLE=1: PLE n-gram injection at model layer {} \
                  is DISABLED. Output is wrong by construction — this arm exists \
                  to bisect the mHC spine, nothing else.",
-                config.ple_layer_ids[0].saturating_sub(1),
+                ple::ple_decoder_layers(config).next().unwrap_or(0),
             );
         }
         tracing::info!(
@@ -464,11 +544,33 @@ impl ModelWeightLoader for Qwen4ExpWeightLoader {
     ) -> Result<Option<crate::layers::VisionTower>> {
         // The ViT tower IS the Qwen3-VL family shape the qwen35 loader
         // already reads: 27 blocks under `model.visual.*`, patch 16,
-        // spatial-merge 2, plain BF16 weights (no quant tensors under
-        // `visual` in this checkpoint), empty deepstack list. The
-        // qwen3.8-flash-next kernel target ships its own vision_encoder.cu
-        // shadow, so kernels resolve per-target as usual.
-        crate::weight_loader::qwen35::Qwen35WeightLoader.load_vision_encoder(store, config, gpu)
+        // spatial-merge 2, empty deepstack list. The FP8/NVFP4 releases ship
+        // it plain BF16; FP4-Local ships the attention MXFP8 and the MLP and
+        // merger W4A16 NVFP4, which `vision_dense_auto` expands to the same
+        // BF16 the tower runs on. The qwen3.8-flash-next kernel target ships
+        // its own vision_encoder.cu shadow, so kernels resolve per-target.
+        let ve = crate::weight_loader::qwen35::Qwen35WeightLoader
+            .load_vision_encoder(store, config, gpu)?;
+        // FP4-Local's ViT attention is MXFP8: the encoder now holds its exact
+        // BF16 copies, and nothing else reads the sources.
+        if let (Some(_), Some(v)) = (&ve, &config.vision) {
+            let mut released = 0;
+            for b in 0..v.depth {
+                released += format::release_mxfp8_sources(
+                    store,
+                    gpu,
+                    &format!("model.visual.blocks.{b}"),
+                    &[Mxfp8Component::Vision],
+                )?;
+            }
+            if released > 0 {
+                tracing::info!(
+                    "qwen4_exp ViT: released {:.1} MB of MXFP8 attention source bytes",
+                    released as f64 / 1e6
+                );
+            }
+        }
+        Ok(ve)
     }
 
     fn load_mtp_weights(

@@ -21,10 +21,7 @@ impl MoeLayer {
             anyhow::ensure!(ptr == expected, "changed down allocation before release");
             log.release_origin(log.store(), origin, gpu)
         };
-        // Shared originals are retained (keep_shared=true), so nothing it
-        // frees lands in this list; routed down releases go through the
-        // retirement-log callback above.
-        let mut untracked = Vec::new();
+        let mut freed = Vec::new();
         self.transpose_unified_down_owned(
             gpu,
             config,
@@ -32,7 +29,7 @@ impl MoeLayer {
             false,
             true,
             Some(&mut release),
-            &mut untracked,
+            &mut freed,
         )
     }
 

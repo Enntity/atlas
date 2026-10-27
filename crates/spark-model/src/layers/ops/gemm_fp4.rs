@@ -27,13 +27,32 @@ pub fn quantize_bf16_to_nvfp4(
     k: u32,
     stream: u64,
 ) -> Result<()> {
+    // scale2 = 1.0 (single-level; activation range fits E4M3 group scales)
+    quantize_bf16_to_nvfp4_scaled(gpu, kernel, input, packed_out, scale_out, 1.0, m, k, stream)
+}
+
+/// [`quantize_bf16_to_nvfp4`] under activation global scale `1 / scale2`
+/// (`scale2` = a ModelOpt `input_scale`): block scales `e4m3(amax / (6 *
+/// scale2))`, dequantized by `scale2` in the consuming GEMM's alpha.
+#[allow(clippy::too_many_arguments)]
+pub fn quantize_bf16_to_nvfp4_scaled(
+    gpu: &dyn GpuBackend,
+    kernel: KernelHandle,
+    input: DevicePtr,
+    packed_out: DevicePtr,
+    scale_out: DevicePtr,
+    scale2: f32,
+    m: u32,
+    k: u32,
+    stream: u64,
+) -> Result<()> {
     KernelLaunch::new(gpu, kernel)
         .grid([m, 1, 1])
         .block([128, 1, 1])
         .arg_ptr(input)
         .arg_ptr(packed_out)
         .arg_ptr(scale_out)
-        .arg_f32(1.0) // scale2 = 1.0 (single-level; activation range fits E4M3 group scales)
+        .arg_f32(scale2)
         .arg_u32(m) // kernel's N param = rows = tokens
         .arg_u32(k)
         .launch(stream)

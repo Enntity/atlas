@@ -33,13 +33,17 @@ use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
 mod types;
+mod gif_access;
+mod glm;
+mod patchify;
 
 pub use types::{group_indices, sample_indices};
 
 use crate::vision_preprocess::{
     MEAN, STD, decode_data_uri_bytes, glm_resize_or_pad, glm_target_size, normalize_channel,
-    patch_coordinates, target_size_for,
+    patch_coordinates, qwen_fit, target_size_for,
 };
+use patchify::patchify_group;
 
 /// Frames per second to sample at, when the caller has no better idea.
 /// Matches the `fps: 2` every Qwen3-VL `video_processor` block declares.
@@ -201,7 +205,8 @@ fn decode_gif(
     let budget = policy
         .max_frames
         .max(1)
-        .saturating_mul(policy.max_decoded_pixels.max(1));
+        .saturating_mul(policy.max_decoded_pixels.max(1))
+        .min(policy.max_total_decoded_pixels.unwrap_or(usize::MAX));
     ensure!(
         count.saturating_mul(max_area) <= budget,
         "animated GIF would decode to {} frames of up to {max_area} pixels each, above the \
@@ -257,7 +262,13 @@ fn decode_gif(
 
     // Decode once, keeping only the frames the plan selected, in plan order.
     let wanted_indices: Vec<usize> = plan.times.iter().map(|&t| index_for(t)).collect();
-    let keep: std::collections::BTreeSet<usize> = wanted_indices.iter().copied().collect();
+    let mut selected_indices = Vec::with_capacity(wanted_indices.len());
+    for index in wanted_indices {
+        if selected_indices.last().copied() != Some(index) {
+            selected_indices.push(index);
+        }
+    }
+    let keep: std::collections::BTreeSet<usize> = selected_indices.iter().copied().collect();
     let mut chosen: Vec<Option<RgbImage>> = vec![None; count];
     for (i, frame) in GifDecoder::new(std::io::Cursor::new(bytes.to_vec()))
         .context("not a decodable GIF")?
@@ -271,12 +282,12 @@ fn decode_gif(
         chosen[i] = Some(image::DynamicImage::ImageRgba8(frame.into_buffer()).to_rgb8());
     }
 
-    let mut frames = Vec::with_capacity(wanted_indices.len());
-    let mut times = Vec::with_capacity(wanted_indices.len());
-    for (t, &i) in plan.times.iter().zip(&wanted_indices) {
+    let mut frames = Vec::with_capacity(selected_indices.len());
+    let mut times = Vec::with_capacity(selected_indices.len());
+    for i in selected_indices {
         if let Some(img) = chosen[i].take() {
             frames.push(img);
-            times.push(*t);
+            times.push((cumulative[i] / 1000.0) as f32);
         }
     }
     ensure!(!frames.is_empty(), "the GIF sampled to zero frames");
@@ -296,6 +307,12 @@ pub fn preprocess_video(
         vcfg.patch_size > 0 && vcfg.spatial_merge_size > 0 && vcfg.temporal_patch_size > 0,
         "vision_config geometry is invalid (patch/merge/temporal size is 0)"
     );
+    if vcfg.is_glm5_next {
+        return glm::preprocess_glm_video(data_uri, vcfg, max_pixels, target_fps, ffmpeg);
+    }
+    if !vcfg.is_qwen3vl_video {
+        return preprocess_qwen4_exp_video(data_uri, vcfg, max_pixels, target_fps, ffmpeg);
+    }
     let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
     let tp = vcfg.temporal_patch_size;
 
@@ -416,8 +433,73 @@ pub fn preprocess_video(
     })
 }
 
+fn preprocess_qwen4_exp_video(
+    data_uri: &str,
+    vcfg: &VisionConfig,
+    max_pixels: Option<usize>,
+    target_fps: f32,
+    ffmpeg: &crate::video_decode_ffmpeg::FfmpegPolicy,
+) -> Result<PreprocessedVideo> {
+    let (frames, frame_times) = decode_frames(data_uri, target_fps, ffmpeg)?;
+    let tp = vcfg.temporal_patch_size;
+    ensure!(!frames.is_empty(), "frame sampling selected no frames");
+
+    let first = &frames[0];
+    let (th, tw) = qwen_fit(
+        vcfg,
+        first.height(),
+        first.width(),
+        max_pixels,
+        Some(frames.len()),
+    )?;
+    let ps = vcfg.patch_size;
+    let grid_h = th as usize / ps;
+    let grid_w = tw as usize / ps;
+    let grid_t = frames.len().div_ceil(tp);
+    if let Some(budget) = ffmpeg.max_total_decoded_pixels {
+        let volume = grid_t
+            .saturating_mul(tp)
+            .saturating_mul(th as usize)
+            .saturating_mul(tw as usize);
+        ensure!(
+            volume <= budget,
+            "video grid needs {volume} pixels, above the {budget}-pixel volume bound; \
+             reduce frames or use a less extreme aspect ratio"
+        );
+    }
+    let groups = (0..grid_t)
+        .map(|g| {
+            let resized: Vec<RgbImage> = (0..tp)
+                .map(|k| {
+                    let frame = &frames[(g * tp + k).min(frames.len() - 1)];
+                    image::imageops::resize(frame, tw, th, image::imageops::FilterType::CatmullRom)
+                })
+                .collect();
+            patchify_group(vcfg, &resized, grid_h, grid_w)
+        })
+        .collect();
+    Ok(PreprocessedVideo {
+        groups,
+        grid_t,
+        grid_h,
+        grid_w,
+        timestamps: (0..grid_t)
+            .map(|g| {
+                let first = frame_times[g * tp];
+                let last = frame_times[(g * tp + tp - 1).min(frames.len() - 1)];
+                (first + last) / 2.0
+            })
+            .collect(),
+        timestamps_hf: Vec::new(),
+    })
+}
+
 mod timestamps;
 
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../video_preprocess_tests.rs"]
+mod fork_tests;

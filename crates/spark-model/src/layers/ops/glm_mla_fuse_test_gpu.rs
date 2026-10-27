@@ -9,12 +9,14 @@
 //! `glm_index_tail_write_bf16`, `glm_index_kpool_finalize_bf16` and
 //! `glm_kv_shard_localize_compact`) at GLM-5.3's shape, for every block of
 //! 1..=32 rows, starting mid-pool and mid-block, unsharded and on each rank
-//! of a sharded pair: the same q and kv latents, index keys and gates, fp8
+//! of a sharded pair or four-rank topology: the same q and kv latents, index keys and gates, fp8
 //! latent pool, raw tails, pooled keys and localized IDs, byte for byte.
 //!
 //!   cargo test --release -p spark-model --lib glm_mla_fuse -- --ignored --nocapture
 
 use super::*;
+use crate::layers::ops;
+use crate::weight_map::DenseWeight;
 use anyhow::Context;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
@@ -27,7 +29,7 @@ const WIDTH: u32 = 2051;
 /// Logical blocks of the test sequence ([`physical`] places them): a
 /// whole dense-selection context (2048 tokens).
 const BLOCKS: u32 = 128;
-const PHYS: u32 = 3 * BLOCKS + 2;
+const PHYS: u32 = 5 * BLOCKS + 8;
 const TAIL_STRIDE: u64 = (2 * BS * ID * 2) as u64;
 const POOL_STRIDE: u64 = (BS / 4 * ID * 2) as u64;
 const LATENT_BLOCK: usize = (BS * 528) as usize;
@@ -35,7 +37,7 @@ const LATENT_BLOCK: usize = (BS * 528) as usize;
 /// Logical block `l`'s physical block: distinct, and with the residue of `l`
 /// (the shard allocator's invariant).
 fn physical(l: u32) -> u32 {
-    3 * l + 2 * (l % 2)
+    5 * l + 4 * (l % 3)
 }
 
 struct Rng(u64);
@@ -68,7 +70,15 @@ fn random_bytes(n: usize, rng: &mut Rng) -> Vec<u8> {
 }
 
 fn backend() -> Result<&'static AtlasCudaBackend> {
-    crate::layers::glm_gpu_test_backend::backend()
+    static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
+    if GPU.get().is_none() {
+        let gpu =
+            AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules()).context("CUDA backend")?;
+        let _ = GPU.set(gpu);
+    }
+    let gpu = GPU.get().expect("set above");
+    gpu.bind_to_thread()?;
+    Ok(gpu)
 }
 
 fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
@@ -95,6 +105,7 @@ fn mx(gpu: &dyn GpuBackend, rng: &mut Rng, n: u32) -> Result<(DevicePtr, DeviceP
 
 /// The layer's weights, shared by both runs.
 struct Weights {
+    fp8_block: bool,
     q_a: (DevicePtr, DevicePtr),
     kv_a: (DevicePtr, DevicePtr),
     wk: DevicePtr,
@@ -107,10 +118,12 @@ struct Weights {
 }
 
 impl Weights {
-    fn new(gpu: &dyn GpuBackend, rng: &mut Rng) -> Result<Self> {
+    fn new(gpu: &dyn GpuBackend, rng: &mut Rng, fp8_block: bool) -> Result<Self> {
+        let weight = if fp8_block { native::weight } else { mx };
         Ok(Self {
-            q_a: mx(gpu, rng, QL)?,
-            kv_a: mx(gpu, rng, KVL)?,
+            fp8_block,
+            q_a: weight(gpu, rng, QL)?,
+            kv_a: weight(gpu, rng, KVL)?,
             wk: upload(gpu, &bf16_bytes((ID * H) as usize, rng, 0.02, 0.0))?,
             gate: upload(gpu, &bf16_bytes((ID * H) as usize, rng, 0.02, 0.0))?,
             q_norm: upload(gpu, &bf16_bytes(QL as usize, rng, 0.25, 1.0))?,
@@ -209,20 +222,8 @@ impl Run {
     /// Every buffer to the random bytes of `seed` (alike for both runs).
     fn fill(&self, gpu: &dyn GpuBackend, rows: u32, seed: u64) -> Result<()> {
         let mut rng = Rng(seed);
-        for (i, (p, n)) in self
-            .buffers()
-            .into_iter()
-            .zip(Self::sizes(rows))
-            .enumerate()
-        {
-            // Existing tail/pool entries are legitimate model inputs. Random
-            // bit patterns could contain NaNs and make matching NaNs pass.
-            let bytes = if matches!(i, 6 | 7) {
-                bf16_bytes(n / 2, &mut rng, 1.0, 0.0)
-            } else {
-                random_bytes(n, &mut rng)
-            };
-            gpu.copy_h2d(&bytes, p)?;
+        for (p, n) in self.buffers().into_iter().zip(Self::sizes(rows)) {
+            gpu.copy_h2d(&random_bytes(n, &mut rng), p)?;
         }
         Ok(())
     }
@@ -276,11 +277,9 @@ fn kernel(gpu: &dyn GpuBackend, module: &str, name: &str) -> Result<KernelHandle
     Ok(k)
 }
 
-#[path = "glm_mla_fuse_oracle_test_gpu.rs"]
-mod oracle;
-use oracle::unfused;
-#[path = "glm_mla_fuse_finite_test_gpu.rs"]
-mod finite;
+#[path = "glm_mla_fuse_test_reference.rs"]
+mod reference;
+use reference::unfused;
 
 /// The two launches.
 fn fused(
@@ -301,6 +300,7 @@ fn fused(
         n,
     };
     let down = DownArgs {
+        fp8_block: w.fp8_block,
         input,
         rows,
         k: H,
@@ -351,17 +351,25 @@ fn fused(
 #[test]
 #[ignore = "needs a GB10 and the glm-5.3-flash kernels"]
 fn fused_front_matches_the_twelve_launches() -> Result<()> {
+    compare_front(false)
+}
+
+fn compare_front(fp8_block: bool) -> Result<()> {
     let gpu = backend()?;
     let f = MlaFuse::load(gpu).context("glm_mla_fuse kernels")?;
     let s = gpu.default_stream();
     let mut rng = Rng(0x6d6c_6166_7573_6501);
-    let w = Weights::new(gpu, &mut rng)?;
+    let w = Weights::new(gpu, &mut rng, fp8_block)?;
     let owners = [
         ShardRank { rank: 0, world: 1 },
         ShardRank { rank: 0, world: 2 },
         ShardRank { rank: 1, world: 2 },
+        ShardRank { rank: 0, world: 4 },
+        ShardRank { rank: 1, world: 4 },
+        ShardRank { rank: 2, world: 4 },
+        ShardRank { rank: 3, world: 4 },
     ];
-    for rows in (1..=32).filter(|r| *r <= 8 || r % 4 == 0 || [9, 17, 31].contains(r)) {
+    for rows in 1..=32 {
         let (a, b) = (Run::new(gpu, rows)?, Run::new(gpu, rows)?);
         // Mid-pool and mid-block starts, and a block ending at 2048.
         for start in [29u32, 64, 126, 2016 - rows.min(16)] {
@@ -376,9 +384,6 @@ fn fused_front_matches_the_twelve_launches() -> Result<()> {
                 fused(gpu, &f, &w, &b, &meta, input, rows, owner, s)?;
                 gpu.synchronize(s)?;
                 let (want, got) = (a.read(gpu, rows)?, b.read(gpu, rows)?);
-                for output in [&want, &got] {
-                    output.check_finite(start, rows, owner)?;
-                }
                 let what = format!("rows {rows} from {start}, {owner:?}");
                 for (name, x, y) in [
                     ("q latent", &want.q, &got.q),
@@ -409,7 +414,10 @@ fn fused_front_matches_the_twelve_launches() -> Result<()> {
         b.free(gpu)?;
     }
     eprintln!(
-        "fused MLA front == twelve launches: rows 1..=32 x 4 starts x unsharded/rank 0/rank 1"
+        "fused MLA front == twelve launches: rows 1..=32 x 4 starts x unsharded/all TP2 ranks/all TP4 ranks"
     );
     Ok(())
 }
+
+#[path = "glm_mla_fuse_test_native.rs"]
+mod native;

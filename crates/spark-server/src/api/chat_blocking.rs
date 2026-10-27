@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Json, Response};
 
 use crate::AppState;
 use crate::ir;
+use crate::literal_xml::state_after;
 use crate::tool_parser;
 
 use super::chat_blocking_choice::{build_choice_message, build_logprobs};
@@ -83,7 +84,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         num_beams,
         length_penalty,
         early_stopping,
-        image_pixels,
+        mut image_pixels,
         max_tokens,
         temperature,
         top_k,
@@ -137,14 +138,14 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             num_beams,
             length_penalty,
             early_stopping,
-            // Every choice carries the pixels. Choices 1.. used to send none and
-            // ride on choice 0's leftover encoder rows; since the per-request
-            // vision state is cleared for a request without media (#174),
-            // they would answer about nothing (vision-fidelity
-            // `multi-choice-image`). Each scheduler request carries its media
-            // so prefill can prepare vision state after shared encoder buffers
-            // have been reused.
-            image_pixels: image_pixels.clone(),
+            // VisionItem clones share the pixel storage and in-flight permit.
+            // Keep the images present for every serial choice; move the final
+            // vector so n=1 and the last choice avoid an extra Vec clone.
+            image_pixels: if choice_idx + 1 == n {
+                std::mem::take(&mut image_pixels)
+            } else {
+                image_pixels.clone()
+            },
             max_tokens,
             min_tokens: req.min_tokens,
             ignore_eos: req.ignore_eos,
@@ -169,7 +170,7 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
             require_tool_call: tool_choice_required,
             tools_present: tools_active,
             suppress_tool_call,
-            disable_mtp: false,
+            disable_mtp: req.disable_mtp,
             grammar_spec: grammar_spec.clone(),
             seed: req.seed.map(|s| s.wrapping_add(choice_idx as u64)),
             top_logprobs,
@@ -222,13 +223,8 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         // n>1 we only charge once (same prompt reused).
         total_cached_prompt_tokens = total_cached_prompt_tokens.max(response.cached_prompt_tokens);
 
-        let (reasoning_content_i, output_text_i) = decode_response_text(
-            &state,
-            &response,
-            enable_thinking,
-            tools_active,
-            force_nonempty_content,
-        );
+        let (reasoning_content_i, output_text_i) =
+            decode_response_text(&state, &response, enable_thinking, tools_active);
         let (output_text_i, matched_stop) =
             super::inference_impl::strip_stop_sequences_matched(output_text_i, &req.stop);
 
@@ -246,7 +242,9 @@ pub(super) async fn run_blocking_path(args: BlockingPathArgs) -> super::chat::Ch
         choice.matched_stop = matched_stop;
         choice.finish_reason =
             stop_match_corrected(choice.finish_reason, choice.matched_stop.is_some());
-        choice.logprobs = build_logprobs(&state, &response);
+        if choice.guard_stop != Some(atlas_tool_guard::GUARD_STOP) {
+            choice.logprobs = build_logprobs(&state, &response);
+        }
         all_choices.push(choice);
     }
 
@@ -276,7 +274,6 @@ pub(super) fn decode_response_text(
     response: &super::inference_types::InferenceResponse,
     enable_thinking: bool,
     tools_active: bool,
-    force_nonempty_content: bool,
 ) -> (Option<String>, String) {
     let output_tokens =
         output_tokens_without_stop(&response.output_tokens, response.finish_reason.as_str());
@@ -285,15 +282,24 @@ pub(super) fn decode_response_text(
     // tool call. This never scans arbitrary reasoning text for call syntax.
     let native_split = if enable_thinking && tools_active {
         state.glm_tool_boundary.and_then(|opener| {
-            let pos = output_tokens.iter().position(|&token| token == opener)?;
-            if output_tokens[..pos]
+            output_tokens
                 .iter()
-                .any(|token| Some(*token) == state.think_end_token_id)
-            {
-                None
-            } else {
-                Some((&output_tokens[..pos], &output_tokens[pos..]))
-            }
+                .enumerate()
+                .filter(|(_, token)| **token == opener)
+                .find_map(|(pos, _)| {
+                    if output_tokens[..pos]
+                        .iter()
+                        .any(|token| Some(*token) == state.think_end_token_id)
+                    {
+                        return None;
+                    }
+                    let prefix_is_literal = state
+                        .tokenizer
+                        .decode(&output_tokens[..pos])
+                        .ok()
+                        .is_some_and(|prefix| state_after(&prefix).is_literal());
+                    (!prefix_is_literal).then_some((&output_tokens[..pos], &output_tokens[pos..]))
+                })
         })
     } else {
         None
@@ -608,3 +614,7 @@ mod tests {
         assert_eq!(calls[0].function.name, "get_weather");
     }
 }
+
+#[cfg(test)]
+#[path = "chat_blocking_vision_tests.rs"]
+mod vision_fanout_tests;

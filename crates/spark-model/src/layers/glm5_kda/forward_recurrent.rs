@@ -23,9 +23,12 @@ impl Glm5KdaLayer {
         // ATLAS_GLM_KDA_CONV_PLANES: a prefill convolves the projection's
         // q / k / v planes where they are, without the packed copy.
         let planar = !decode && !capture_verify_intermediates && kda_conv_planes_enabled();
+        // Sub-steps of forward_attention's `core` step (not to be added to it).
+        let mut timer = profile::start(ctx, stream)?;
         if !planar {
             ops::kda_pack_qkv(ctx.gpu, self.pack_k, projected, packed, m, p as u32, stream)?;
         }
+        profile::step(ctx, stream, &mut timer, "core.pack")?;
         let convolved = ctx.buffers.ssm_conv_out_f32();
         let core_out = ctx.buffers.attn_output();
         if capture_verify_intermediates {
@@ -35,7 +38,8 @@ impl Glm5KdaLayer {
         } else {
             let input = (if planar { projected } else { packed }, planar);
             self.sequence_recurrent_rows(
-                input, convolved, g1, beta, core_out, state, tokens, decode, ctx, stream,
+                input, convolved, g1, beta, core_out, state, tokens, decode, &mut timer, ctx,
+                stream,
             )?;
         }
         Ok(core_out)
@@ -45,7 +49,7 @@ impl Glm5KdaLayer {
     /// `g1`/`beta` and the q|k|v `input` (`ops::kda_conv_prefill`'s packed
     /// rows or planes; prefill or single-row decode).
     #[allow(clippy::too_many_arguments)]
-    fn sequence_recurrent_rows(
+    pub(super) fn sequence_recurrent_rows(
         &self,
         input: (DevicePtr, bool),
         convolved: DevicePtr,
@@ -55,25 +59,42 @@ impl Glm5KdaLayer {
         state: &mut SsmLayerState,
         tokens: usize,
         decode: bool,
+        timer: &mut Option<std::time::Instant>,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
         let m = tokens as u32;
+        let flash = self
+            .flash_prefill
+            .as_ref()
+            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture));
+        // ATLAS_GLM_KDA_FLASH_PLANES: convolve into FlashKDA's q / k / v planes.
+        let planes = flash.is_some_and(|f| f.takes_planes());
         ops::kda_conv_prefill(
             ctx.gpu,
             [self.conv_prefill_k, self.conv_prefill_tp_k],
             state.conv_state,
             input,
             &self.weights.conv,
-            convolved,
+            (convolved, planes),
             [m, (self.heads * self.dim) as u32, self.conv_width as u32],
             stream,
         )?;
-        if let Some(flash) = self
-            .flash_prefill
-            .as_ref()
-            .filter(|_| flash_prefill::eligible(tokens, decode, ctx.graph_capture))
-        {
+        profile::step(ctx, stream, timer, "core.conv")?;
+        if let Some(flash) = flash.filter(|_| planes) {
+            flash.forward_planes(
+                convolved,
+                g1,
+                beta,
+                self.weights.a_log.weight,
+                self.weights.dt_bias.weight,
+                state.h_state,
+                core_out,
+                tokens,
+                ctx,
+                stream,
+            )?;
+        } else if let Some(flash) = flash {
             // Convolution has finished reading packed. Its storage and the
             // idle expert buffers can now be borrowed on this same stream.
             flash.forward(
@@ -87,7 +108,7 @@ impl Glm5KdaLayer {
                 tokens,
                 ctx,
                 stream,
-            )
+            )?;
         } else {
             self.run_recurrent(
                 convolved,
@@ -99,8 +120,9 @@ impl Glm5KdaLayer {
                 decode,
                 ctx,
                 stream,
-            )
+            )?;
         }
+        profile::step(ctx, stream, timer, "core.recurrent")
     }
 
     /// Fused prefill chunk + verify owners: pack every row once, advance
@@ -145,6 +167,7 @@ impl Glm5KdaLayer {
             state,
             chunk,
             false,
+            &mut None,
             ctx,
             stream,
         )?;

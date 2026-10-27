@@ -213,36 +213,39 @@ pub(in crate::model) fn tail_split_disabled() -> bool {
     std::env::var("ATLAS_NO_TAIL_SPLIT").as_deref() == Ok("1")
 }
 
-/// `ATLAS_QWEN4EXP_PREFILL_ROWINV=1`: the last chunk runs unsplit, since
-/// a block-grid cut is off the GDN grid. Without the in-pass checkpoint
-/// (`_MIDCHUNK_CKPT`, `in_pass`) no tail checkpoint is saved at all, so
-/// every warm turn recomputes its whole prompt: measured on Flash-Next
-/// FP4-Local agentic-webserver, 0 checkpoints, TTFT p50 632 -> 3062 ms.
-/// Warns once in that case.
-pub(in crate::model) fn rowinv_tail_unsplit(in_pass: bool) -> bool {
-    static WARN: std::sync::Once = std::sync::Once::new();
-    let rowinv = crate::layers::ops::qwen4exp_rowinv::on();
-    rowinv_tail_unsplit_with(rowinv, in_pass, &WARN, || {
-        tracing::warn!(
-            "ATLAS_QWEN4EXP_PREFILL_ROWINV=1 without \
-             ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT=1 saves no tail SSM checkpoint: \
-             warm turns will recompute their whole prompt"
-        )
-    })
+/// `ATLAS_TAIL_SPLIT_MIN_TOKENS=N` (default 0 = every prompt): a prompt of
+/// fewer than `N` tokens runs its last chunk as one pass, without the
+/// tail-checkpoint split.
+///
+/// The split's second pass sweeps the activated experts again (~150 ms on
+/// GLM-5.3-Flash), which on a 60-150-token chat prompt doubles its prefill,
+/// and every short prompt of a burst pays it in series. What the split buys
+/// is a checkpoint at most two blocks under the prompt end for the next
+/// turn; without it that turn restores from an older snapshot (or none) and
+/// replays at most `N` more rows inside its own pass, which on this
+/// weight-bound MoE costs little next to a pass. The decision reads only the
+/// prompt length and this setting, so every rank, cold and warm, takes the
+/// same pass shapes for a given prompt (`ATLAS_STARTUP_PARITY` checks the
+/// setting agrees across ranks).
+pub(in crate::model) fn tail_split_min_tokens() -> usize {
+    parse_tail_split_min_tokens(std::env::var("ATLAS_TAIL_SPLIT_MIN_TOKENS").ok().as_deref())
 }
 
-/// [`rowinv_tail_unsplit`] with the flag, the once-guard and the warning
-/// passed in, so tests can drive it without the read-once env flag.
-fn rowinv_tail_unsplit_with(
-    rowinv: bool,
-    in_pass: bool,
-    warn: &std::sync::Once,
-    emit: impl FnOnce(),
+pub(super) fn parse_tail_split_min_tokens(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+/// Whether the last chunk `[chunk_start, total)` splits at `cut`
+/// (`ATLAS_NO_TAIL_SPLIT` = `disabled`, [`tail_split_min_tokens`]).
+pub(super) fn tail_split_at(
+    total: usize,
+    chunk_start: usize,
+    cut: usize,
+    disabled: bool,
+    min_tokens: usize,
 ) -> bool {
-    if rowinv && !in_pass {
-        warn.call_once(emit);
-    }
-    rowinv
+    !disabled && total >= min_tokens && cut > chunk_start && cut < total
 }
 
 /// The tail-split cut for a `total`-token prompt: one block below the last

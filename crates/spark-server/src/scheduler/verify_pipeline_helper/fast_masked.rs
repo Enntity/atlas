@@ -13,7 +13,7 @@
 //! NOSPEC on the prose probe at γ17 — the masking was correct but the
 //! detour ate the spec win).
 //!
-//! For a grammarless request the pipeline can change the emitted pick
+//! For a greedy, grammarless request the pipeline can change the emitted pick
 //! ONLY when one of these holds:
 //!  (a) the raw argmax IS a maskable structural id: think_end
 //!      (MidWordThinkEndMask / PostCloseThinkMask), think_start
@@ -82,6 +82,11 @@ pub(super) fn try_chat_fast_path(
     if !masked_verify {
         return Ok(None);
     }
+    // Masked-greedy equivalence says nothing about a sampled target row.
+    // Let the ordinary pipeline apply its temperature and sampling filters.
+    if !(a.temperature == 0.0 || ctx.sampling.force_temp_zero) {
+        return Ok(None);
+    }
     let fast_masked_enabled = ctx.sampling.fast_masked;
     let adadec_recording = ctx.sampling.adadec_diagnostic;
     if !fast_masked_enabled || a.grammar_state.is_some() || adadec_recording {
@@ -103,10 +108,11 @@ pub(super) fn try_chat_fast_path(
     } || a.sentence_defer_count >= MAX_SENTENCE_DEFER_TOKENS;
     let think_end_inject_armed = a.inside_thinking && (a.force_end_thinking || defer_hard_override);
     let pin_tool_armed = crate::scheduler::fast_greedy::tool_pin_armed(a);
-    // (c) penalty gate — PER ROW via `fast_gate_over_rows`: the slow path
-    // advances `inside_tool_body` across the K picks, so a mid-block tool
-    // close changes later rows' params (penalty_params_for reads the flag).
-    let penalty_gate = crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids);
+    // (c) penalty gate — same construction the slow path uses per
+    // position (penalty_params_for is position-independent here).
+    let penalty_gate = crate::scheduler::fast_greedy::classify_penalties(
+        &crate::scheduler::sample_step::verify_penalty_params(a),
+    );
     if f2_active
         || think_end_inject_armed
         || pin_tool_armed
@@ -169,7 +175,52 @@ pub(super) fn try_chat_fast_path(
 
 #[cfg(test)]
 mod tests {
-    use super::masked_verify_required;
+    use super::{CopyFailurePolicy, masked_verify_required, try_chat_fast_path};
+    use crate::scheduler::cancel_test_model::TestModel;
+    use crate::scheduler::sched_ctx::SchedCtx;
+    use crate::scheduler::test_support::test_seq;
+
+    #[test]
+    fn sampled_chat_declines_argmax_shortcut_but_greedy_keeps_it() {
+        // No logits or GPU backend: exercise the actual shortcut decision.
+        let model = TestModel {
+            tokens: vec![],
+            host_logits: false,
+            cancel_after_sampling: None,
+            cancel_after_row_commit: None,
+            verify: None,
+        };
+        let (mut a, _rx) = test_seq(vec![], 8, None, 8);
+        a.lz_penalty = 0.0;
+        let sched = SchedCtx::for_test();
+        let mut ctx = sched.verify_logits_ctx(None, None, None, None);
+        let argmax = [300, 301];
+        for (temperature, force_temp_zero, greedy) in [
+            (0.0, false, true),
+            (0.7, false, false),
+            (1.0, false, false),
+            (0.7, true, true),
+            (1.0, true, true),
+        ] {
+            a.temperature = temperature;
+            ctx.sampling.force_temp_zero = force_temp_zero;
+            let picks = try_chat_fast_path(
+                &model,
+                &argmax,
+                &a,
+                &ctx,
+                0,
+                CopyFailurePolicy::LegacyFallback,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                picks,
+                greedy.then(|| argmax.to_vec()),
+                "temperature={temperature}, force_temp_zero={force_temp_zero}"
+            );
+        }
+    }
 
     #[test]
     fn lightning_forces_masked_verify_without_environment_toggle() {

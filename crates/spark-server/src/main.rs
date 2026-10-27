@@ -39,6 +39,7 @@ mod halluc_probe;
 mod hint_injector;
 mod ids;
 mod ir;
+mod literal_xml;
 mod llmlingua;
 mod lookback_lens;
 mod loop_detector;
@@ -140,8 +141,9 @@ async fn run(cli: Cli) -> Result<()> {
             drop(shutdown_rx);
             cli::bench_run::dispatch(args).await
         }
-        Command::DisplayCarveout(_) => {
-            anyhow::bail!("display-carveout must run before the async runtime starts")
+        Command::DisplayCarveout(args) => {
+            drop(shutdown_rx);
+            display_carveout::run(args)
         }
         Command::Serve(args) => {
             let serving = serve(args, tui_channels);

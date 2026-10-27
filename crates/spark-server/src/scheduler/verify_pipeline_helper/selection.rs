@@ -167,11 +167,9 @@ pub(super) fn fast(
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        // Per row, not once at block start: `penalty_params_for` reads
-        // `inside_tool_body`, which the pick loop advances across the span —
-        // a mid-block `</tool_call>` changes later rows' gates (#241, BFCL
-        // parallel_multiple_78).
-        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
+        crate::scheduler::fast_greedy::classify_penalties(
+            &crate::scheduler::sample_step::verify_penalty_params(a),
+        )
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -280,11 +278,9 @@ pub(super) fn fast(
         && !a.inside_thinking
         && (a.temperature == 0.0 || ctx.sampling.force_temp_zero)
     {
-        // Per row, not once at block start: `penalty_params_for` reads
-        // `inside_tool_body`, which the pick loop advances across the span —
-        // a mid-block `</tool_call>` changes later rows' gates (#241, BFCL
-        // parallel_multiple_78).
-        crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
+        crate::scheduler::fast_greedy::classify_penalties(
+            &crate::scheduler::sample_step::verify_penalty_params(a),
+        )
     } else {
         crate::scheduler::fast_greedy::PenaltyGate::Blocked
     };
@@ -339,6 +335,39 @@ pub(super) fn slow(
     ctx: &LogitsContext,
 ) -> Vec<u32> {
     let elem_bytes = 2usize;
+    // ATLAS_VERIFY_PICK_PAR: the rows' dequant and F2 sums up front, in
+    // parallel (`prepick`); the loop below is unchanged either way.
+    let mut pre = (super::prepick::enabled() && k > 1).then(|| {
+        let t = std::time::Instant::now();
+        let p =
+            super::prepick::Prepicked::build(buf, k, vocab, super::prepick::f2_may_run(a, ctx, k));
+        ctx.timing
+            .record(crate::scheduler::mtp_timing::Phase::Dequant, t);
+        p
+    });
+    span_picks(k, a, ctx, None, |i, a| {
+        Ok(match pre.as_mut() {
+            Some(p) => p.pick(i, vocab, a, ctx),
+            None => {
+                let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
+                verify_pick_with_pipeline(slice, false, vocab, a, ctx)
+            }
+        })
+    })
+    .unwrap_or_else(|never: std::convert::Infallible| match never {})
+}
+
+/// The span loop every host verify pick runs: `pick(i, a)` is row `i`'s
+/// pick, made against serial decode's state at that row. With `drafts`, the
+/// loop ends at the first pick that is not its row's draft: the step emits
+/// nothing past it, and a sampled row costs a draw.
+pub(super) fn span_picks<E>(
+    k: usize,
+    a: &mut ActiveSeq,
+    ctx: &LogitsContext,
+    drafts: Option<&[u32]>,
+    mut pick: impl FnMut(usize, &mut ActiveSeq) -> Result<u32, E>,
+) -> Result<Vec<u32>, E> {
     let mut picks: Vec<u32> = Vec::with_capacity(k);
     // Snapshot the matcher's history depth BEFORE speculative advances so we
     // roll back exactly the ACTUAL advances afterward. BUG#3 (2026-06-02):
@@ -357,22 +386,13 @@ pub(super) fn slow(
         crate::scheduler::emit_step::CommitEnv::of_ctx(ctx),
         k,
     );
-    // ATLAS_VERIFY_PICK_PAR: the rows' dequant and F2 sums up front, in
-    // parallel (`prepick`); the loop below is unchanged either way.
-    let mut pre = (super::prepick::enabled() && k > 1).then(|| {
-        let t = std::time::Instant::now();
-        let p =
-            super::prepick::Prepicked::build(buf, k, vocab, super::prepick::f2_may_run(a, ctx, k));
-        ctx.timing
-            .record(crate::scheduler::mtp_timing::Phase::Dequant, t);
-        p
-    });
+    let mut failed = None;
     for i in 0..k {
-        let pick = match pre.as_mut() {
-            Some(p) => p.pick(i, vocab, a, ctx),
-            None => {
-                let slice = &buf[i * vocab * elem_bytes..(i + 1) * vocab * elem_bytes];
-                verify_pick_with_pipeline(slice, false, vocab, a, ctx)
+        let pick = match pick(i, a) {
+            Ok(p) => p,
+            Err(e) => {
+                failed = Some(e);
+                break;
             }
         };
         picks.push(pick);
@@ -385,6 +405,9 @@ pub(super) fn slow(
                 i,
                 "verify_pick: grammar refused a pick; stopping here"
             );
+            break;
+        }
+        if drafts.is_some_and(|d| d.get(i) != Some(&pick)) {
             break;
         }
     }
@@ -402,5 +425,8 @@ pub(super) fn slow(
         }
     }
 
-    picks
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(picks),
+    }
 }

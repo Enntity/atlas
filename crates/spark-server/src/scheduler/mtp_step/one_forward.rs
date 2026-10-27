@@ -33,23 +33,6 @@ fn decode_rows_disabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("ATLAS_NO_MTP_ONE_FORWARD").is_some())
 }
 
-/// `ATLAS_GRAMMAR_SERIAL_VERIFY=1` restores the pre-batch behaviour: every
-/// grammar-bearing sequence verifies on the serial path. Read once, like the
-/// neighbouring kill switches.
-fn grammar_serial_verify() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("ATLAS_GRAMMAR_SERIAL_VERIFY").is_some())
-}
-
-/// Whether a sequence may ride the batched verify. Grammarless always; a
-/// NON-STRICT grammar sequence also, unless the kill switch is on — the
-/// batched pick runs the same per-sequence fast/slow selection the serial
-/// path does, with per-row masks keeping picks grammar-legal. Strict
-/// grammars keep the serial path either way.
-fn grammar_rides_batch(a: &ActiveSeq, serial_verify: bool) -> bool {
-    a.grammar_state.is_none() || (!a.strict_grammar() && !serial_verify)
-}
-
 /// The batched verify of one step.
 pub(super) struct VerifyPlan {
     /// Members in dispatch order (`active` indices).
@@ -96,7 +79,8 @@ pub(super) fn plan_verify(
     // DSpark is included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP
     // still uses !dflash via the model self-gate (`dflash_hidden_save`).
     let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
-    if spark_model::speculative::glm_repair_policy::enabled()
+    if model.native_mtp_enabled()
+        || spark_model::speculative::glm_repair_policy::enabled()
         || !spark_model::speculative::mtp_multi_seq_mode()
         || !dspark_batch_ok
         || batch_verify_disabled()
@@ -115,7 +99,12 @@ pub(super) fn plan_verify(
     };
     for &idx in verify_idxs {
         let a = &active[idx];
-        if grammar_rides_batch(a, grammar_serial_verify()) && a.pending_drafts.len() >= min_drafts {
+        // Batched DFlash cannot report generated scores. Keep those requests
+        // on the single-sequence scored path; native MTP batches can score.
+        if a.grammar_state.is_none()
+            && a.pending_drafts.len() >= min_drafts
+            && (!dflash_verify_raw_argmax || a.top_logprobs.is_none())
+        {
             plan.batch.push(idx);
         } else {
             plan.serial.push(idx);
@@ -130,12 +119,12 @@ pub(super) fn plan_verify(
         plan.decode_rows = bootstrap_idxs
             .iter()
             .copied()
-            .filter(|&i| grammar_rides_batch(&active[i], grammar_serial_verify()))
+            .filter(|&i| active[i].grammar_state.is_none())
             .collect();
         plan.batch.extend_from_slice(&plan.decode_rows);
     }
     if let Some(ceiling) = deep_ceiling {
-        deep_truncate(sched, active, &plan.batch, ceiling, ladder_nd);
+        deep_truncate(model, sched, active, &plan.batch, ceiling, ladder_nd);
     }
     if let [lone] = plan.batch[..]
         && deep_ceiling.is_some()
@@ -161,12 +150,12 @@ pub(super) fn plan_verify(
         plan.decode_rows.clear();
         return plan;
     }
-    // Surplus drafts past the ladder depth are not verified. Keep the
-    // copy-draft metadata aligned for DFlash; MTP leaves confidences as
-    // before so D-Cut reads a truncated sequence as unmeasured.
+    // Surplus drafts past the ladder depth are not verified (their
+    // confidences are left as they were, as before: D-Cut then reads the
+    // sequence as unmeasured).
     for &idx in &plan.batch {
-        active[idx].pending_drafts.truncate(ladder_nd);
-        if dflash_verify_raw_argmax {
+        if active[idx].pending_drafts.len() > ladder_nd {
+            active[idx].pending_drafts.truncate(ladder_nd);
             crate::scheduler::copy_drafts::cut_conf(&mut active[idx]);
         }
     }
@@ -203,8 +192,10 @@ pub(super) fn plan_verify(
 }
 
 /// Cut each member's drafts to its own dynamic ceiling (at most the step's
-/// `ladder_nd`), then the batch to the deep row budget, deepest first.
+/// `ladder_nd`; a lone copy, the step's `ceiling`: `copy_drafts::mtp`), then
+/// the batch to the deep row budget, deepest first.
 fn deep_truncate(
+    model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     active: &mut [ActiveSeq],
     members: &[usize],
@@ -212,12 +203,18 @@ fn deep_truncate(
     ladder_nd: usize,
 ) {
     use crate::scheduler::mtp_deep_depth::fit_row_budget;
+    let lone = members.len() == 1;
     let mut caps: Vec<usize> = members
         .iter()
         .map(|&i| {
             let a = &active[i];
-            let own = a.mtp_acct.depth_drafts(ceiling, sched.levers.depth());
-            a.pending_drafts.len().min(own).min(ladder_nd)
+            let own = a
+                .mtp_acct
+                .depth_drafts(ceiling, sched.levers.depth())
+                .min(ladder_nd);
+            let cap =
+                crate::scheduler::copy_drafts::mtp::deep_cap(model, sched, a, lone, own, ceiling);
+            a.pending_drafts.len().min(cap)
         })
         .collect();
     let budget = spark_model::speculative::deep_depth::row_budget(

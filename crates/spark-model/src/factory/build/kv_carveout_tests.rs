@@ -34,6 +34,7 @@ fn sparkglm(config: &KvCacheConfig) -> KvShape<'_> {
             sequences: 5,
         }),
         latent_shard: None,
+        auxiliary_block_bytes: 0,
     }
 }
 
@@ -53,9 +54,9 @@ fn sparkglm_gains_about_a_fifth_more_blocks_at_no_system_memory_cost() {
     let budgeted = 95_535;
     let (n, placement) = plan(shape, budgeted, GB10);
     // 2046 MiB over ~104 KB per block is ~20.6K blocks. The default order
-    // places latent pools only (`ATLAS_KV_CARVEOUT_ORDER=latent`, the
-    // carveout is L2-uncached), so whole ~0.9 GB K pools strand up to one
-    // pool's worth: ~18.5K blocks (+19.4%, as on the pair).
+    // places latent pools only (`ATLAS_KV_CARVEOUT_ORDER=latent`), so whole
+    // ~0.9 GB K pools strand up to one pool's worth: ~18.5K blocks (+19.4%,
+    // as on the pair before the KV shard).
     assert!(n >= budgeted + 18_000, "{n}");
     assert!(n <= budgeted + GB10 / 104_192 + 1, "{n}");
     assert!(
@@ -97,6 +98,7 @@ fn a_generic_cache_with_separate_k_and_v_grows_too() {
         index: None,
         tail_slots: None,
         latent_shard: None,
+        auxiliary_block_bytes: 0,
     };
     let (n, placement) = plan(shape, 1_000, 64 * MIB);
     assert!(n > 1_000);
@@ -171,4 +173,54 @@ fn a_shards_pool_is_sized_at_its_local_slots() {
     assert_eq!(shape.side_bytes(1000), shape.side_bytes(2000));
     assert_eq!(shape.side_bytes(100_002) - shape.side_bytes(100_000), 4);
     assert_eq!(sparkglm(&cfg).side_bytes(100_000), 0);
+}
+
+#[test]
+fn native_pool_growth_is_charged_even_when_target_latents_use_carveout() {
+    let cfg = config(11, KvCacheDtype::Fp8G128);
+    let target = sharded(&cfg, 0);
+    let joint = KvShape {
+        auxiliary_block_bytes: 25_600,
+        ..target
+    };
+    let budgeted = 10_000;
+    let (target_n, _) = plan(target, budgeted, GB10);
+    let (n, placement) = plan(joint, budgeted, GB10);
+    assert!(n > budgeted && n < target_n);
+    let system = joint.system_bytes(budgeted, &KvPlacement::default());
+    for agreed in [budgeted / 2, budgeted, (budgeted + n) / 2, n] {
+        assert!(joint.system_bytes(agreed, &placement) <= system);
+        assert!(carveout_footprint(joint, agreed, &placement) <= GB10);
+    }
+    let over = KvPlacement::plan(&joint.buffers(n + 1), GB10);
+    assert!(joint.system_bytes(n + 1, &over) > system);
+}
+
+#[test]
+fn qwen_carveout_growth_reserves_indexer_state_for_every_added_token() {
+    let mut cfg = config(12, KvCacheDtype::Bf16);
+    cfg.head_dim = 256;
+    let bare = KvShape {
+        config: &cfg,
+        v_aliases_k: false,
+        index: None,
+        tail_slots: None,
+        latent_shard: None,
+        auxiliary_block_bytes: 0,
+    };
+    let shape = bare.with_per_token_aux(768).unwrap();
+    let budgeted = 208_676;
+    let (n, placement) = plan(shape, budgeted, GB10);
+    assert!(n > budgeted);
+    let actual = |blocks, placement: &KvPlacement| {
+        bare.system_bytes(blocks, placement) + blocks * cfg.block_size * 768
+    };
+    let budget = actual(budgeted, &KvPlacement::default());
+    assert!(actual(n, &placement) <= budget);
+    assert!(carveout_footprint(shape, n, &placement) <= GB10);
+    let over = KvPlacement::plan(&shape.buffers(n + 1), GB10);
+    assert!(actual(n + 1, &over) > budget);
+    let (old_n, old_placement) = plan(bare, budgeted, GB10);
+    assert!(actual(old_n, &old_placement) > budget);
+    assert!(bare.with_per_token_aux(usize::MAX).is_err());
 }

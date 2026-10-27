@@ -78,8 +78,7 @@ fn setup_model(
         skip_activation_scales: false,
         skip_mtp: false,
         skip_layer_prefix: None,
-        skip_prefixes: Vec::new(),
-        pack_slab: false,
+        skip_vision: false,
     };
     use spark_runtime::weights::WeightLoader;
     let store = loader.load(model_dir, gpu.as_ref(), 1024 * 1024 * 1024)?;
@@ -322,6 +321,7 @@ fn coherence_test_capital_of_france() -> Result<()> {
         "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
+        false, // [behavior].verbatim_prompt
     )?;
 
     // Encode prompt with chat template
@@ -403,6 +403,7 @@ fn streaming_coherence_test() -> Result<()> {
         "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
+        false, // [behavior].verbatim_prompt
     )?;
 
     let messages = vec![(
@@ -494,6 +495,7 @@ fn speculative_decode_coherence() -> Result<()> {
         "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
+        false, // [behavior].verbatim_prompt
     )?;
 
     let messages = vec![(
@@ -574,6 +576,7 @@ fn prompt_logprobs_collection_during_prefill() -> Result<()> {
         "", // [behavior].jinja_template — none for these fixtures
         None,
         false, // --disable-template-overrides default
+        false, // [behavior].verbatim_prompt
     )?;
 
     let prompt = "The capital of France is Paris. The capital of Germany is";

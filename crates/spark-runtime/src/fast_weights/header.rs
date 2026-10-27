@@ -154,16 +154,26 @@ pub(super) fn parse_header(file: &mut File) -> Result<Vec<TensorMeta>> {
                     (WeightDtype::BF16, true)
                 }
             }
-            // Every other dtype maps exactly as on the buffered and RDMA paths:
-            // one table (`from_safetensors_str`), so the loaders cannot drift.
+            "U8" => (WeightDtype::UInt8, false),
+            // I8 is a 1-byte raw container; DeepSeek-V4-Flash-NVFP4 ships its MTP
+            // experts' 4-bit-packed weights as I8 (vs U8 for the main layers).
+            // Signedness is irrelevant for packed FP4 — the dequant kernel extracts
+            // nibbles by bit ops — so treat I8 as raw bytes (UInt8), matching the
+            // NVFP4 expert path.
+            "I8" => (WeightDtype::UInt8, false),
+            "F8_E4M3" => (WeightDtype::FP8E4M3, false),
+            "F8_E8M0" => (WeightDtype::FP8E8M0, false),
+            "I64" => (WeightDtype::Int64, false),
+            // CSF component streams (slab exception words; csf_32x2_v1 page
+            // origins, prefixes and records). Never stored: the copy loop
+            // hands every CSF part to `CsfAssembler`, which re-derives the
+            // element width from byte length against shape. `UInt8` is only
+            // the staging container here; U16/U32 anywhere else is still
+            // refused below.
             "U16" | "U32" if crate::weights::nvfp4_csf::csf_part(name).is_some() => {
                 (WeightDtype::UInt8, false)
             }
-            other => (
-                WeightDtype::from_safetensors_str(other)
-                    .with_context(|| format!("tensor {name}"))?,
-                false,
-            ),
+            other => bail!("Unsupported safetensors dtype '{other}' for tensor {name}"),
         };
         let shape: Vec<usize> = info["shape"]
             .as_array()

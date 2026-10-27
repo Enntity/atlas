@@ -25,7 +25,7 @@ use crate::model::{
     verify_pieces,
 };
 use crate::speculative::glm_repair_policy;
-use crate::weight_loader::qwen4_exp::GdnProjections;
+use crate::weight_loader::qwen4_exp::{GdnProjections, mxfp8_decode_requested};
 
 use super::while_on;
 
@@ -35,11 +35,22 @@ const GLM: &str = "glm5_next";
 /// The settings read in this crate: name, and this process's value from the
 /// feature's own parser. One entry per setting.
 pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
+    ("ATLAS_QWEN4EXP_SERVING_MODE", || {
+        use crate::weight_loader::qwen4_exp::mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
     // A rank that would only warn beside one that fails.
     (
         "ATLAS_STARTUP_PARITY=warn",
         || Ok(super::warn_only() as u64),
     ),
+    ("ATLAS_GLM_STRICT_NATIVE_MTP", || {
+        Ok(layers::glm_native::mode::strict_native_mtp() as u64)
+    }),
     // The head's command words.
     ("ATLAS_EP_PROTOCOL=v2", || {
         Ok(crate::model::ep_protocol_v2_requested() as u64)
@@ -48,7 +59,13 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_NO_TAIL_SPLIT", || {
         Ok(pc::tail_split_disabled() as u64)
     }),
+    ("ATLAS_TAIL_SPLIT_MIN_TOKENS", || {
+        Ok(pc::tail_split_min_tokens() as u64)
+    }),
     ("ATLAS_GLM_PREFILL_SP", || Ok(glm_sp::requested() as u64)),
+    ("ATLAS_GLM_PREFILL_PIPE2", || {
+        Ok(crate::model::glm_prefill_pipe::requested() as u64)
+    }),
     // Sequence-parallel prefill needs the BF16 highway, which needs the
     // DFlash lane.
     ("ATLAS_GLM_HC_BF16", || Ok(ops::hc_bf16_for(GLM) as u64)),
@@ -159,6 +176,46 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_SHARED_TP_SPLIT", || {
         Ok(moe::shared_tp_split_requested() as u64)
     }),
+    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
+        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
+    }),
+    // Same bytes either way; agreed so a pair never mixes the routing
+    // chains it was measured with.
+    ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
+        Ok(moe::route_fuse_requested()? as u64)
+    }),
+    ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
+        Ok(ops::kda_commit_ctas()? as u64)
+    }),
+    ("ATLAS_GLM_MLA_FUSE", || {
+        Ok(ops::glm_mla_fuse_requested()? as u64)
+    }),
+    // Which layer groups compute on the checkpoint's own formats; the shared
+    // expert's native TP split pairs halves across the ranks.
+    ("ATLAS_GLM_FP4L_NATIVE", || {
+        Ok(layers::glm_native::NativePolicy::from_env().bits())
+    }),
+    ("ATLAS_GLM_FP4L_FP8_PREFILL", || {
+        Ok(ops::Fp8bPrefill::from_env()? as u64)
+    }),
+    // The W8A8 block FP8 prefill GEMM: rounds its group sums differently
+    // from the in-tree kernel, so ranks that disagree serve a mix of both.
+    ("ATLAS_GLM_FP8B_CUTLASS", || {
+        Ok(ops::fp8b_cutlass_requested()? as u64)
+    }),
+    // The routed down rows' format (lossy E4M3 or BF16), so every rank's
+    // partial sums round alike.
+    ("ATLAS_GLM_MOE_DOWN_E4M3", || {
+        Ok(moe::down_e4m3_requested() as u64)
+    }),
+    // The 16-head sparse prefill's key-tile split, so every rank's heads sum
+    // in one order.
+    ("ATLAS_GLM_SPARSE_PIPE_WG2", || {
+        Ok(ops::glm_sparse_pipe_wg2_requested("glm5_next")? as u64)
+    }),
+    ("ATLAS_GLM_MXFP8_TILED", || {
+        Ok(ops::mxfp8_tiled_requested()? as u64)
+    }),
     ("ATLAS_MOE_SHARED_REDUCE_OVERLAP", || {
         Ok(moe::shared_reduce_overlap_requested() as u64)
     }),
@@ -254,6 +311,19 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_W4A16_TC", || {
         Ok(w4a16_gemv_tiers::tc_requested() as u64)
     }),
+    // Whether the shared expert's TP split and every verify op take the
+    // canonical row-invariant kernels (`layers::canonical_verify`).
+    ("ATLAS_GLM_CANONICAL_VERIFY", || {
+        Ok(layers::canonical_verify::enabled() as u64)
+    }),
+    ("ATLAS_GLM_SERVING_MODE", || {
+        use layers::glm_native::mode::{ServingMode, selected};
+        Ok(match selected()? {
+            None => 0,
+            Some(ServingMode::Strict) => 1,
+            Some(ServingMode::Spark) => 2,
+        })
+    }),
     // Whether a verify can roll back the PLE carry every rank replicates
     // (qwen4_exp): without its snapshots `commit_accepted_prefix` refuses a
     // partial accept, on that rank alone.
@@ -267,6 +337,16 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     }),
     ("ATLAS_QWEN4EXP_BF16_GDN", || {
         Ok((GdnProjections::from_env()? == GdnProjections::Nvfp4) as u64)
+    }),
+    // Whether an MXFP8 checkpoint's GDN decodes its own bytes or their BF16
+    // dequant: two summation orders in one out_proj all-reduce.
+    ("ATLAS_QWEN4EXP_MXFP8_DECODE", || {
+        Ok(mxfp8_decode_requested() as u64)
+    }),
+    // Whether an MXFP8 checkpoint prefills W8A8 or on the BF16 copies: two
+    // numerics feeding one prefill reduce.
+    ("ATLAS_QWEN4EXP_PREFILL_W8A8", || {
+        Ok(ops::qwen4exp_w8a8::enabled() as u64)
     }),
     // The MTP body a rank loads.
     ("ATLAS_GLM_MTP_DISTRIBUTED", || {
@@ -282,6 +362,11 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
             rank_split::ctx_requested()?,
             rank_split::topk_requested()?,
         ))
+    }),
+    // Changes drafts only (the convs run on the head of a split propose);
+    // agreed so a pair never drafts from a twin it was not measured with.
+    ("ATLAS_DFLASH_CONV_TWIN", || {
+        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
     }),
     // The draft head a qwen4_exp worker builds and the swaps of each batched
     // propose it serves (`--mtp-vocab` is agreed by the server).
@@ -382,11 +467,6 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_PREFILL_MOE_W2", || {
         Ok((moe::q38_requested() && moe::w2_requested()) as u64)
     }),
-    // Same bytes either way, but not the same memory: a rank without it
-    // keeps the routed K-major copy, and the two KV pools part.
-    ("ATLAS_QWEN4EXP_PREFILL_MOE_NODUP", || {
-        Ok((moe::q38_requested() && moe::nodup_requested()) as u64)
-    }),
     // The routed arm and the shared-reduce overlap (off while profiling)
     // decide whether `_SP_RS_PIPE` pipes the MoE reduce-scatter.
     ("ATLAS_MOE_PREFILL_FP8_DOWN", || {
@@ -460,29 +540,50 @@ pub(super) const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_QWEN4EXP_EXACT_VERIFY", || {
         Ok(qwen4exp_exact_verify::requested() as u64)
     }),
-    ("ATLAS_GLM_DENSE_TP_SPLIT", || {
-        Ok(layers::dense_ffn::dense_tp_split_requested()? as u64)
+    ("ATLAS_QWEN4EXP_EXACT_VERIFY_CHECK", || {
+        Ok(qwen4exp_exact_verify::check_requested() as u64)
     }),
-    ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
-        Ok(moe::route_fuse_requested()? as u64)
+    // The qwen4_exp verify width ceiling: the K the head dispatches and the
+    // worker mirrors.
+    ("ATLAS_QWEN4EXP_MTP_DEPTH", || {
+        Ok(qwen4exp_mtp_depth::requested() as u64)
     }),
-    ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
-        Ok(ops::kda_commit_ctas()? as u64)
+    // The dynamic MTP depth sizes every <= 8-wide slot's verify pools for
+    // `--num-drafts` (`speculative::deep_depth`): a worker without it would
+    // refuse the head's deep windows.
+    ("ATLAS_MTP_DYNAMIC_DEPTH", || {
+        Ok(crate::speculative::deep_depth::enabled() as u64)
     }),
-    ("ATLAS_GLM_MLA_FUSE", || {
-        Ok(ops::glm_mla_fuse_requested()? as u64)
+    // The widest batch whose slots' verify pools are sized for deep drafts:
+    // a worker sized narrower refuses the head's deep windows.
+    ("ATLAS_MTP_DEEP_MAX_SEQS", || {
+        while_on(
+            crate::speculative::deep_depth::enabled(),
+            crate::speculative::deep_depth::deep_max_seqs,
+        )
     }),
-    ("ATLAS_GLM_MXFP8_TILED", || {
-        Ok(ops::mxfp8_tiled_requested()? as u64)
+    // The qwen4_exp exact batching lane: the batched MoE all-reduce shape,
+    // the batched QSA-active step (instead of per-sequence decode), the
+    // batched multi-sequence verify under TP, and the check's serial steps.
+    ("ATLAS_QWEN4EXP_BATCH_FAST", || {
+        Ok(qwen4exp_batch_fast::requested() as u64)
     }),
-    ("ATLAS_GLM_CANONICAL_VERIFY", || {
-        Ok(layers::canonical_verify::enabled() as u64)
+    ("ATLAS_QWEN4EXP_BATCH_FAST_CHECK", || {
+        Ok(qwen4exp_batch_fast::check_requested() as u64)
     }),
-    ("ATLAS_DFLASH_CONV_TWIN", || {
-        Ok(ConvTwinKind::word(ConvTwinKind::requested()?))
+    // Per-row MoE / GDN arms change the collective count.
+    ("ATLAS_QWEN4EXP_BATCH_FAST_BISECT", || {
+        Ok(qwen4exp_batch_fast::bisect_requested() as u64)
     }),
+    ("ATLAS_SSM_SAVE_DUMP", || {
+        Ok(graph_flags::ssm_save_dump() as u64)
+    }),
+    ("ATLAS_LIGHTNING_VERIFY_LAYER_TRACE", || {
+        Ok(graph_flags::verify_layer_trace() as u64)
+    }),
+    ("ATLAS_MS_PROFILE", || Ok(graph_flags::ms_profile() as u64)),
+    ("ATLAS_DFLASH_DEBUG_NO_GRAPH", || {
+        Ok(graph_flags::dflash_debug_no_graph() as u64)
+    }),
+    ("ATLAS_K2_DIAG", || Ok(graph_flags::k2_diag() as u64)),
 ];
-
-#[path = "startup_parity_table/tail.rs"]
-mod tail;
-pub(super) use tail::SETTINGS_TAIL;

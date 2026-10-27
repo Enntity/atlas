@@ -84,6 +84,7 @@ fn verdict_logic_is_inside_the_boundary() {
         "crates/atlas-plugin/src/gate/scoring.rs",
         "crates/atlas-plugin/src/gate/closure.rs",
         "crates/atlas-plugin/src/gate/taxon.rs",
+        "crates/atlas-plugin/src/gate/taxon_paths.rs",
         "crates/atlas-plugin/src/gate/bench.rs",
     ] {
         let hit = super::coverage::invalidated_by([f]);

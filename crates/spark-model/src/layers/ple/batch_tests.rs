@@ -42,7 +42,6 @@ fn layer(gpu: &MockGpuBackend) -> PleLayer {
         32,
         32,
         None,
-        None,
         gpu,
     )
     .unwrap()

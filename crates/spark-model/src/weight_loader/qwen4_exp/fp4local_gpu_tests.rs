@@ -1,0 +1,220 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+
+//! GPU: the first four decoder layers of the REAL FP4-Local checkpoint load
+//! through the production path — the fast loader (CSF decode at upload), the
+//! MXFP8 funnel in `dense_auto`, and `Qwen4ExpWeightLoader::load_layers` with
+//! its per-layer MXFP8 source release. `#[ignore]`; on a GB10 with the
+//! checkpoint on disk and a qwen3.8-flash-next kernel build:
+//!
+//! ```text
+//! ATLAS_FP4L_CKPT=<model dir> ATLAS_QWEN4EXP_DEBUG_LAYERS=4 ATLAS_QWEN4EXP_NO_PLE=1 \
+//!   cargo test --release -p spark-model --lib fp4local_gpu -- --ignored --nocapture
+//! ```
+//!
+//! `ATLAS_QWEN4EXP_DEBUG_LAYERS=4` makes the loader drop every tensor of
+//! layers 4.. at upload (~9 GB resident instead of ~95), and the test refuses
+//! to run without it. PLE is off because its NVFP4 n-gram table is another
+//! agent's port; layer 1 is the PLE host.
+
+use std::path::{Path, PathBuf};
+
+use atlas_core::config::LayerType;
+use spark_runtime::fast_weights::FastSafetensorsLoader;
+use spark_runtime::gpu::GpuBackend;
+use spark_runtime::kv_cache::KvCacheDtype;
+use spark_runtime::weights::{WeightDtype, WeightLoader, nvfp4_csf};
+
+use super::*;
+use crate::weight_loader::ModelWeightLoader;
+
+const LAYERS: usize = 4;
+
+/// One tensor's raw bytes and shape, straight from the shard on disk.
+fn read(dir: &Path, name: &str) -> (Vec<u8>, Vec<usize>) {
+    let (_, shape, bytes) = crate::weight_map::test_checkpoint::read_checkpoint_tensor(dir, name)
+        .unwrap_or_else(|e| panic!("{e:#}"));
+    (bytes, shape)
+}
+
+fn d2h(g: &dyn GpuBackend, p: spark_runtime::gpu::DevicePtr, n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    g.copy_d2h(p, &mut v).unwrap();
+    v
+}
+
+#[test]
+#[ignore]
+fn fp4local_gpu_first_layers_load_exactly() {
+    let dir = PathBuf::from(std::env::var("ATLAS_FP4L_CKPT").expect("ATLAS_FP4L_CKPT"));
+    assert_eq!(
+        std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS").as_deref(),
+        Ok("4"),
+        "refusing to upload the whole checkpoint: set ATLAS_QWEN4EXP_DEBUG_LAYERS=4"
+    );
+    assert_eq!(std::env::var("ATLAS_QWEN4EXP_NO_PLE").as_deref(), Ok("1"));
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL=qwen3.8-flash-next");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+
+    let mut config = atlas_core::config::parse_config(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let mut loader = FastSafetensorsLoader::new();
+    loader.skip_mtp = true;
+    loader.skip_vision = true;
+    loader.skip_activation_scales = true;
+    loader.demand_paged_patterns = vec![".ple.ple_embedding.ngram_embedding.shard_".into()];
+    let t = std::time::Instant::now();
+    let store = loader.load(&dir, g, 0).unwrap();
+    eprintln!(
+        "uploaded {} tensors in {:.1} s",
+        store.len(),
+        t.elapsed().as_secs_f64()
+    );
+    spark_runtime::weights::auto_detect_weight_prefix(&store, &mut config);
+    config.num_hidden_layers = LAYERS;
+    config.layer_types.truncate(LAYERS);
+    config.max_seq_len = 4096;
+    config.max_batch_tokens = 2048;
+
+    // 1. CSF scales on the device are the host decode of the disk bytes.
+    for (l, e, p) in [(0, 0, "gate"), (3, 511, "down"), (2, 300, "up")] {
+        let stem = format!("model.language_model.layers.{l}.mlp.experts.{e}.{p}_proj.weight_scale");
+        let (f, fs) = read(&dir, &format!("{stem}.nvfp4_csf_fixed"));
+        let (x, _) = read(&dir, &format!("{stem}.nvfp4_csf_exceptions"));
+        let (want, shape) = nvfp4_csf::decode_nvfp4_csf(&f, &fs, &x).unwrap();
+        let t = store.get(&stem).unwrap();
+        assert_eq!(
+            (t.dtype, t.shape.as_slice()),
+            (WeightDtype::FP8E4M3, &shape[..]),
+            "{stem}"
+        );
+        assert_eq!(d2h(g, t.ptr, want.len()), want, "{stem}");
+    }
+
+    // 2. Every MXFP8 projection of these layers expands, through dense_auto,
+    //    to exactly the host expansion of its disk bytes.
+    let mut checked = 0;
+    for i in 0..LAYERS {
+        let lp = config.layer_prefix(i);
+        for c in format::layer_components(config.layer_types[i]) {
+            for stem in c.stems(&lp) {
+                let (w, ws) = read(&dir, &format!("{stem}.weight"));
+                let (s, _) = read(&dir, &format!("{stem}.weight_scale"));
+                let want: Vec<u8> = crate::weight_map::mxfp8_to_bf16_host(&w, &s, ws[0], ws[1])
+                    .unwrap()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let got =
+                    crate::weight_map::dense_auto(&store, &format!("{stem}.weight"), g).unwrap();
+                assert_eq!(d2h(g, got.weight, want.len()), want, "{stem}");
+                g.free(got.weight).unwrap();
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("{checked} MXFP8 projections: device BF16 == host expansion");
+
+    // 3. The layers build, and their MXFP8 sources are released afterwards.
+    let format = Qwen4ExpFormat::detect(&store, &config).unwrap();
+    assert!(format.mxfp8_backbone, "{format:?}");
+    let attn = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::FullAttention)
+        .count();
+    let t = std::time::Instant::now();
+    let layers = Qwen4ExpWeightLoader
+        .load_layers(&store, &config, g, &vec![KvCacheDtype::Bf16; attn])
+        .unwrap();
+    eprintln!(
+        "built {} layers in {:.1} s",
+        layers.len(),
+        t.elapsed().as_secs_f64()
+    );
+    assert_eq!(layers.len(), LAYERS);
+    for i in 0..LAYERS {
+        let lp = config.layer_prefix(i);
+        for c in format::layer_components(config.layer_types[i]) {
+            for stem in c.stems(&lp) {
+                for part in ["weight", "weight_scale"] {
+                    let n = format!("{stem}.{part}");
+                    assert!(store.was_reclaimed(&n), "{n} still resident");
+                }
+            }
+        }
+    }
+}
+
+/// The two FP4-Local components outside the decoder layers: the ViT (MXFP8
+/// attention, W4A16 NVFP4 MLP + merger) and the MTP draft module (native
+/// NVFP4 experts). Same environment as above; ~12 GB resident.
+#[test]
+#[ignore]
+fn fp4local_gpu_vision_and_mtp_load() {
+    let dir = PathBuf::from(std::env::var("ATLAS_FP4L_CKPT").expect("ATLAS_FP4L_CKPT"));
+    assert_eq!(
+        std::env::var("ATLAS_QWEN4EXP_DEBUG_LAYERS").as_deref(),
+        Ok("4")
+    );
+    let set = atlas_kernels::ptx_for_exact_target("qwen3.8-flash-next", "nvfp4")
+        .expect("build with ATLAS_TARGET_MODEL=qwen3.8-flash-next");
+    let gpu =
+        spark_runtime::cuda_backend::AtlasCudaBackend::new(0, &set.modules).expect("CUDA backend");
+    let g: &dyn GpuBackend = &gpu;
+    let mut config = atlas_core::config::parse_config(
+        &std::fs::read_to_string(dir.join("config.json")).unwrap(),
+    )
+    .unwrap();
+    let mut loader = FastSafetensorsLoader::new();
+    loader.skip_activation_scales = true;
+    loader.demand_paged_patterns = vec![".ple.ple_embedding.ngram_embedding.shard_".into()];
+    let store = loader.load(&dir, g, 0).unwrap();
+    spark_runtime::weights::auto_detect_weight_prefix(&store, &mut config);
+    config.num_hidden_layers = LAYERS;
+    config.layer_types.truncate(LAYERS);
+    config.max_seq_len = 4096;
+    config.max_batch_tokens = 2048;
+
+    // The W4A16 ViT linears expand to the host reference of the kernel's
+    // documented arithmetic: bf16_rne(e2m1 * f32(e4m3 * scale_2)). Not
+    // `atlas_core::numeric::nvfp4_dequant`, which multiplies in the other
+    // order ((e2m1 * e4m3) * scale_2) and so can round differently.
+    use atlas_core::numeric::FP4_E2M1;
+    for stem in [
+        "model.visual.blocks.0.mlp.linear_fc2",
+        "model.visual.merger.linear_fc1",
+    ] {
+        let (w, ws) = read(&dir, &format!("{stem}.weight"));
+        let (s, _) = read(&dir, &format!("{stem}.weight_scale"));
+        let (s2, _) = read(&dir, &format!("{stem}.weight_scale_2"));
+        let s2 = f32::from_le_bytes(s2[..4].try_into().unwrap());
+        let (n, k) = (ws[0], ws[1] * 2);
+        let want: Vec<u8> = (0..n * k)
+            .flat_map(|i| {
+                let (r, c) = (i / k, i % k);
+                let byte = w[r * k / 2 + c / 2];
+                let nib = if c % 2 == 1 { byte >> 4 } else { byte & 15 };
+                let scale = atlas_core::numeric::fp8_e4m3_to_f32(s[r * k / 16 + c / 16]) * s2;
+                atlas_core::numeric::f32_to_bf16(FP4_E2M1[nib as usize] * scale).to_le_bytes()
+            })
+            .collect();
+        let got = crate::weight_map::dequant_nvfp4_to_bf16(&store, stem, n, k, g).unwrap();
+        assert_eq!(d2h(g, got.weight, want.len()), want, "{stem}");
+        g.free(got.weight).unwrap();
+    }
+    let ve = Qwen4ExpWeightLoader
+        .load_vision_encoder(&store, &config, g)
+        .unwrap();
+    assert!(ve.is_some(), "vision tower must load");
+    assert!(store.was_reclaimed("model.visual.blocks.26.attn.qkv.weight"));
+    eprintln!("ViT: W4A16 expansion == host reference; tower built");
+
+    let mtp = load_qwen4exp_mtp_module(&store, &config, g, &[KvCacheDtype::Bf16]).unwrap();
+    assert!(mtp.is_some(), "MTP module must load");
+    eprintln!("MTP draft module built from native NVFP4 experts");
+}

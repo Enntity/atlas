@@ -160,10 +160,6 @@ impl CsfAssembler {
     ) -> Result<Option<DecodedScale>> {
         let (base, part) =
             csf_part(name).with_context(|| format!("{name} is not a CSF stream tensor"))?;
-        ensure!(
-            !self.decoded.contains_key(base),
-            "{base}: compressed scale already completed"
-        );
         let elem = part.elem_bytes();
         // The byte length against the header shape pins the dtype (U8 vs U16
         // vs U32) without trusting the dtype string: a stream with another

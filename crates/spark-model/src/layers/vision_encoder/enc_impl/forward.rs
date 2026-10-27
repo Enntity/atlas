@@ -28,19 +28,20 @@ impl VisionEncoder {
         }
         let mut images = Vec::new();
         for item in items {
-            for group in &item.groups {
+            for group in item.groups.iter() {
                 images.push((group.as_slice(), item.grid_h, item.grid_w));
             }
         }
         self.forward_batched(&images, gpu, stream)
     }
 
-    /// Merged rows `buf_out` can hold for one request: the bound on the
-    /// vision rows a prefill may splice and a rank may receive. The Qwen tower
-    /// packs every image into one `p_max` batch; native GLM encodes items
-    /// separately into a larger packed output.
+    /// Merged rows `buf_out` holds: the most rows ONE encode may write, so
+    /// the bound on the rows a prefill chunk may splice and a rank may
+    /// receive in one broadcast. Not a per-request bound: the chunked prefill
+    /// encodes each chunk's items separately (`vision_limits`). The Qwen tower
+    /// sizes it for one prefill chunk (`out_rows`); native GLM keeps its own.
     pub fn output_rows(&self) -> usize {
-        self.glm.as_ref().map_or(self.p_max, |glm| glm.out_rows)
+        self.glm.as_ref().map_or(self.out_rows, |glm| glm.out_rows)
     }
 
     /// Single-image forward (back-compat shim). For N=1 this issues the SAME
@@ -71,7 +72,7 @@ impl VisionEncoder {
     ///
     /// IN-BOUNDS INVARIANT: the deepstack high-water row is 4·Σmerged_p = Σp ≤
     /// p_max (all four mergers emit exactly merged_p rows each), and buf_out is
-    /// p_max rows → no realloc, no overrun.
+    /// out_rows ≥ p_max rows → no realloc, no overrun.
     ///
     /// Returns per-image `(post_h, post_w, merged_p)` in image order.
     pub fn forward_batched(
@@ -105,8 +106,27 @@ impl VisionEncoder {
             mp_total += mp;
         }
 
-        // Callers cap Σp ≤ p_max; defend here with a still-correct per-image
-        // fallback that packs buf_out the same way.
+        // Refuse before the first launch what would overrun a buffer: one
+        // image's patches fill every per-patch scratch buffer, and the packed
+        // rows fill `buf_out`. Rejecting late would leave earlier images'
+        // work queued behind an error the caller has already reported.
+        if let Some(i) = p_i.iter().position(|&p| p > self.p_max) {
+            anyhow::bail!(
+                "vision image {i} has {} patches, the encoder holds {}",
+                p_i[i],
+                self.p_max
+            );
+        }
+        anyhow::ensure!(
+            mp_total <= self.out_rows,
+            "vision encode of {n_img} images needs {mp_total} rows, the output window holds {}",
+            self.out_rows
+        );
+
+        // More patches than one batch: encode in passes of one image each
+        // (`forward_oversized_fallback`), packing buf_out the same way. The
+        // composition is unchanged from before the window grew: a set that
+        // fits one batch still runs as one batch.
         if p_total > self.p_max {
             return self.forward_oversized_fallback(images, &p_i, &mp_i, &mp_off, sms, gpu, stream);
         }
@@ -234,11 +254,13 @@ impl VisionEncoder {
             .collect())
     }
 
-    /// Fallback for Σp > p_max: encode each image alone (full single-image
-    /// kernel sequence) writing its final-merger rows into the PACKED buf_out
-    /// at mp_off[i]. NO deepstack write (LLM-unused; a packed deepstack region
-    /// could overrun under an oversized batch). The scheduler caps Σp ≤ p_max
-    /// so this is normally unreachable — a correctness guard only.
+    /// Σp > p_max: encode each image alone (the full single-image kernel
+    /// sequence) writing its final-merger rows into the PACKED buf_out at
+    /// mp_off[i], so every image gets exactly the rows it gets encoded on its
+    /// own. NO deepstack write (LLM-unused; a packed deepstack region could
+    /// overrun under an oversized batch). Reached by any prefill chunk whose
+    /// items exceed one batch: several full-size images, or a long video.
+    /// The caller checked each image ≤ p_max and Σmerged_p ≤ out_rows.
     #[allow(clippy::too_many_arguments)]
     fn forward_oversized_fallback(
         &self,
@@ -251,7 +273,7 @@ impl VisionEncoder {
         stream: u64,
     ) -> Result<Vec<(usize, usize, usize)>> {
         debug_assert!(
-            mp_off.last().map(|o| o + mp_i.last().unwrap()).unwrap_or(0) <= self.p_max,
+            mp_off.last().map(|o| o + mp_i.last().unwrap()).unwrap_or(0) <= self.out_rows,
             "oversized vision batch: Σmerged_p exceeds buf_out rows"
         );
         let pos_interp_on = std::env::var("ATLAS_VISION_POSINTERP")

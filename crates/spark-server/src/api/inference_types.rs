@@ -360,8 +360,8 @@ pub struct InferenceResponse {
     /// Number of prompt tokens served by the prefix cache (no prefill compute
     /// cost). Reported as `usage.prompt_tokens_details.cached_tokens`.
     pub cached_prompt_tokens: u32,
-    /// Speculative-decode draft tokens ACCEPTED for this request (MTP verify
-    /// path, `RequestAccept::accepted_total`). Reported to clients as
+    /// Accepted speculative draft tokens retained in this completion
+    /// (`RequestAccept::accepted_output_total`). Reported to clients as
     /// `usage.completion_tokens_details.accepted_prediction_tokens` — the
     /// OpenAI field's meaning (predicted tokens that matched generation),
     /// carried by Atlas's self-drafted MTP predictions. 0 when speculation is
@@ -372,6 +372,13 @@ pub struct InferenceResponse {
     /// i+1. Empty unless requested. The handler prepends the null entry
     /// for the first prompt token (no preceding context).
     pub prompt_logprobs: Vec<TokenLogprobs>,
+    /// #55: the server-side guard that cut this response, if any
+    /// (`ActiveSeq::guard_stop`, e.g. `inter_tool_prose_budget`). The
+    /// API surfaces it as a `guard_stop` extension field on the choice
+    /// — unknown fields are ignored by every SDK (cf. vLLM's
+    /// `stop_reason`), unlike a non-standard finish_reason, which typed
+    /// clients hard-fail on.
+    pub guard_stop: Option<&'static str>,
 }
 
 /// Events sent during streaming generation.

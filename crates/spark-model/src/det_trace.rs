@@ -37,14 +37,19 @@
 //! (absorbed queries), `x_attn_lat` (attention output before W_uv/`o_proj`);
 //! MoE `x_gate` (router logits).
 //!
+//! `ATLAS_GLM_DET_DUMP=<dir>` also writes every traced tensor's bytes to
+//! `<dir>/r<rank>_q<request>_c<chunk start>_L<layer>_<stage>_r<first row>_n<rows>.bin`,
+//! so runs whose bytes cannot match (another TP size, say) compare by value
+//! (`scripts/dev/det_dump_compare.py`).
+//!
+//! A DFlash verify block is traced too, as the chunk at its first row's
+//! position: per layer its MLA prefill taps and `v_out` (the layer's output
+//! rows), then `v_final` (normed hidden) and, where the whole vocab head runs
+//! here, `v_logits`.
+//!
 //! Every tap synchronizes the stream and copies the tensor to the host, so
 //! a traced prefill is several times slower and its stream timing differs.
-//! `ATLAS_GLM_DET_FINITE=1` adds NaN/infinity counts and the first bad element
-//! for known BF16/FP32 stages, with an additional host read. Integer stages
-//! remain hash-only. Unset, the taps return on one cached flag.
-
-#[path = "det_trace_finite.rs"]
-mod finite;
+//! Unset, the taps return on one cached flag and nothing else changes.
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -321,39 +326,40 @@ fn device_line(
     ptr: DevicePtr,
     rows: (usize, usize),
     row_bytes: usize,
-    element_bytes: Option<usize>,
 ) -> String {
     let bytes = rows.1 * row_bytes;
     let hash = device_hash(gpu, stream, ptr, bytes, SEGMENT);
-    let mut line = format_line(at, stage, rows, bytes, hash);
-    static FINITE: OnceLock<bool> = OnceLock::new();
-    if *FINITE.get_or_init(|| std::env::var("ATLAS_GLM_DET_FINITE").as_deref() == Ok("1"))
-        && let Some(width) = finite::width(stage, element_bytes)
-    {
-        let mut counts = finite::Counts::default();
-        let mut raw = vec![0u8; bytes.min(SEGMENT)];
-        let result = (|| -> anyhow::Result<()> {
-            gpu.synchronize(stream)?;
-            for offset in (0..bytes).step_by(SEGMENT) {
-                let n = (bytes - offset).min(SEGMENT);
-                gpu.copy_d2h(ptr.offset(offset), &mut raw[..n])?;
-                counts.update(&raw[..n], width);
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => line.push_str(&format!(
-                " fp{} nan={} inf={} values={} first_bad={:?}",
-                width * 8,
-                counts.nan,
-                counts.inf,
-                counts.values,
-                counts.first
-            )),
-            Err(error) => line.push_str(&format!(" finite_read_error={error:?}")),
-        }
+    format_line(at, stage, rows, bytes, hash)
+}
+
+/// `ATLAS_GLM_DET_DUMP`: the directory traced tensors are written to.
+fn dump_dir() -> Option<&'static std::path::Path> {
+    static DIR: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| std::env::var_os("ATLAS_GLM_DET_DUMP").map(Into::into))
+        .as_deref()
+}
+
+/// Write `bytes` at `ptr` (read after `stream`) as `stage` of `at`, rows from
+/// `row0`, into the dump directory. Best effort: a debugging aid.
+fn dump(
+    at: At,
+    gpu: &dyn GpuBackend,
+    stream: u64,
+    stage: &str,
+    ptr: DevicePtr,
+    rows: (usize, usize),
+    bytes: usize,
+) {
+    let Some(dir) = dump_dir() else { return };
+    let mut host = vec![0u8; bytes];
+    if gpu.synchronize(stream).is_err() || gpu.copy_d2h(ptr, &mut host).is_err() {
+        return;
     }
-    line
+    let name = format!(
+        "r{}_q{}_c{}_L{}_{stage}_r{}_n{}.bin",
+        at.rank, at.request, at.chunk_start, at.layer, rows.0, rows.1
+    );
+    let _ = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(name), host));
 }
 
 /// Taps reading after `stream` (see [`on_stream`]).
@@ -374,31 +380,6 @@ impl Taps<'_> {
     /// outside a traced chunk, so the verify and decode callers of shared
     /// layer code are silent, and nothing for an empty span.
     pub fn tap(&self, stage: &str, ptr: DevicePtr, rows: (usize, usize), row_bytes: usize) {
-        self.tap_inner(stage, ptr, rows, row_bytes, None);
-    }
-
-    /// Trace float storage whose representation varies with the caller's
-    /// configuration. `element_bytes` is 2 for BF16 or 4 for FP32; unsupported
-    /// widths keep only the byte hash. No numeric read occurs unless enabled.
-    pub fn tap_floats(
-        &self,
-        stage: &str,
-        ptr: DevicePtr,
-        rows: (usize, usize),
-        row_bytes: usize,
-        element_bytes: usize,
-    ) {
-        self.tap_inner(stage, ptr, rows, row_bytes, Some(element_bytes));
-    }
-
-    fn tap_inner(
-        &self,
-        stage: &str,
-        ptr: DevicePtr,
-        rows: (usize, usize),
-        row_bytes: usize,
-        element_bytes: Option<usize>,
-    ) {
         if rows.1 * row_bytes == 0 {
             return;
         }
@@ -423,8 +404,16 @@ impl Taps<'_> {
                 ptr,
                 rows,
                 row_bytes,
-                element_bytes,
             ));
+            dump(
+                at,
+                self.gpu,
+                self.stream,
+                stage,
+                ptr,
+                rows,
+                rows.1 * row_bytes,
+            );
         }
     }
 }

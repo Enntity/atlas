@@ -9,20 +9,18 @@ pub(super) fn dflash_seq_raw_argmax_policy(
     masked_requested: bool,
     lightning_product: bool,
     argmax_only_head: bool,
-    a: &mut crate::scheduler::types::ActiveSeq,
-    argmax_ids: &[u32],
+    a: &crate::scheduler::types::ActiveSeq,
 ) -> bool {
     if argmax_only_head {
         return true;
     }
-    // Per-row gate: the slow path advances `inside_tool_body` across the K
-    // picks, so a mid-block `</tool_call>` changes later rows' params —
-    // a block-start classification is wrong (#175, BFCL parallel_multiple_78).
     dflash_verify_uses_raw_argmax(raw_requested, masked_requested, lightning_product)
+        && a.temperature == 0.0
         && a.grammar_state.is_none()
         && !a.require_tool_call
-        && crate::scheduler::fast_greedy::fast_gate_over_rows(a, argmax_ids)
-            == crate::scheduler::fast_greedy::PenaltyGate::Neutral
+        && crate::scheduler::fast_greedy::classify_penalties(
+            &crate::scheduler::sample_step::verify_penalty_params(a),
+        ) == crate::scheduler::fast_greedy::PenaltyGate::Neutral
 }
 
 #[cfg(test)]
@@ -33,23 +31,26 @@ mod tests {
         let (mut a, _rx) = crate::scheduler::test_support::test_seq(vec![1, 2, 3], 10, None, 32);
         // Neutral penalties + no grammar + no tool-call EOS suppression:
         // the verify pick is provably the raw argmax — shortcut stays on.
-        assert!(gate(true, false, false, false, &mut a, &[]));
+        assert!(gate(true, false, false, false, &a));
         // The non-thinking preset ships presence_penalty=1.5 — a reduce-only
         // penalty that CAN flip the argmax against already-emitted tokens.
         a.presence_penalty = 1.5;
-        assert!(!gate(true, false, false, false, &mut a, &[]));
+        assert!(!gate(true, false, false, false, &a));
         a.presence_penalty = 0.0;
         a.repetition_penalty = 1.05;
-        assert!(!gate(true, false, false, false, &mut a, &[]));
+        assert!(!gate(true, false, false, false, &a));
         a.repetition_penalty = 1.0;
         a.dry_multiplier = 0.4;
-        assert!(!gate(true, false, false, false, &mut a, &[]));
+        assert!(!gate(true, false, false, false, &a));
         a.dry_multiplier = 0.0;
         a.require_tool_call = true;
-        assert!(!gate(true, false, false, false, &mut a, &[]));
+        assert!(!gate(true, false, false, false, &a));
         // Process-wide flag still dominates: raw off stays off per-seq.
         a.require_tool_call = false;
-        assert!(!gate(false, false, false, false, &mut a, &[]));
+        assert!(!gate(false, false, false, false, &a));
+        // A sampled request samples its verify rows (the pipeline's sampler).
+        a.temperature = 0.7;
+        assert!(!gate(true, false, false, false, &a));
     }
 
     #[test]
@@ -60,8 +61,8 @@ mod tests {
         // split) cannot feed the pipeline, whatever the request asks for.
         a.presence_penalty = 1.5;
         a.require_tool_call = true;
-        assert!(gate(true, false, false, true, &mut a, &[]));
-        assert!(gate(false, true, false, true, &mut a, &[]));
-        assert!(!gate(true, false, false, false, &mut a, &[]));
+        assert!(gate(true, false, false, true, &a));
+        assert!(gate(false, true, false, true, &a));
+        assert!(!gate(true, false, false, false, &a));
     }
 }

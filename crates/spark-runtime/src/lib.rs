@@ -13,6 +13,9 @@ pub mod cublaslt;
 pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(not(feature = "cuda"))]
+#[path = "cuda_backend_metal_stub.rs"]
+pub mod cuda_backend;
 #[cfg(feature = "cuda")]
 pub mod cutlass;
 #[cfg(not(feature = "cuda"))]
@@ -30,12 +33,14 @@ pub mod gpu;
 #[path = "gpu_args.rs"]
 mod gpu_args;
 mod gpu_pitched;
+pub mod host_sync_trace;
 pub mod kernel_args;
 pub mod kernel_audit;
 pub mod kv_cache;
 pub mod kv_dequant;
 pub mod kv_spill;
-#[cfg(all(feature = "metal", target_os = "macos"))]
+pub mod lane;
+#[cfg(feature = "metal")]
 pub mod metal_backend;
 pub mod op_cache;
 pub mod own_footprint;

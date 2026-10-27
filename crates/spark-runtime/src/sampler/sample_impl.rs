@@ -14,6 +14,27 @@ pub fn sample_with_params_history(
     sample_with_params_seeded(data, params, token_history, params.seed)
 }
 
+/// The tokens a row leaves out: a vocabulary-split verify head gathers only
+/// each rank's best logits, so the rest of a row is absent (NaN in the row).
+/// Every absent token comes after `(bound, bound_id)` in the sampler's order
+/// (logit descending, then the lower id), and `log_mass` is
+/// `ln Σ_absent exp(logit / temperature)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Absent {
+    pub bound: f32,
+    pub bound_id: u32,
+    pub log_mass: f32,
+}
+
+impl Absent {
+    /// Whether token `id` at `logit` precedes every absent token. On a scaled
+    /// row (logit / temperature, BF16 logits keep their order) `bound` is
+    /// scaled the same way.
+    fn beaten_by(&self, bound: f32, logit: f32, id: u32) -> bool {
+        logit > bound || (logit == bound && id <= self.bound_id)
+    }
+}
+
 /// Core sampling pipeline with explicit seed control.
 /// `seed` overrides the RNG for deterministic sampling. None = thread_rng.
 pub fn sample_with_params_seeded(
@@ -22,11 +43,59 @@ pub fn sample_with_params_seeded(
     token_history: &[u32],
     seed: Option<u64>,
 ) -> u32 {
+    // A whole row always decides the pick.
+    sample_core(data, params, token_history, seed).unwrap_or(0)
+}
+
+/// [`sample_with_params_seeded`] over a row of `vocab` tokens of which only
+/// `present` (id, logit after the pipeline) are known: the pick is the one
+/// the full row would give for the same draw, or `None` when the present
+/// tokens do not decide it: a top-k, min-p or top-p cut that could reach an
+/// absent token, or a draw over the whole vocabulary. The answer depends on
+/// the row alone and comes before the draw, so a caller that then samples the
+/// full row samples the same distribution. Penalties and bias must be
+/// neutral (the caller's pipeline applied them).
+pub fn sample_with_absent(
+    present: &[(u32, f32)],
+    vocab: usize,
+    params: &SamplingParams,
+    seed: Option<u64>,
+    absent: Absent,
+) -> Option<u32> {
+    let first = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+    if params.temperature <= 0.0 {
+        let &(id, v) = present.iter().min_by(|a, b| first(a, b))?;
+        return absent.beaten_by(absent.bound, v, id).then_some(id);
+    }
+    // The full row's top-n-sigma filter ran unless a mask made its sum -inf
+    // (absent tokens are finite there); by Cantelli it keeps at least the
+    // best `vocab·k²/(1+k²)` logits (k = top_n_sigma), so `draw` checks that
+    // every token the pick depends on is among those.
+    let sigma_kept = (params.top_n_sigma > 0.0
+        && !present.iter().any(|&(_, v)| v == f32::NEG_INFINITY))
+    .then(|| {
+        let k2 = (params.top_n_sigma as f64).powi(2);
+        (vocab as f64 * k2 / (1.0 + k2)).floor() as usize
+    });
+    let logits: Vec<(u32, f32)> = present
+        .iter()
+        .filter(|(_, v)| v.is_finite())
+        .map(|&(i, v)| (i, v / params.temperature))
+        .collect();
+    if logits.is_empty() {
+        return None;
+    }
+    draw(logits, params, seed, Some((absent, sigma_kept)))
+}
+
+fn sample_core(
+    data: &[u8],
+    params: &SamplingParams,
+    token_history: &[u32],
+    seed: Option<u64>,
+) -> Option<u32> {
     let n = data.len() / 4;
-    let top_k = params.top_k as usize;
-    let top_p = params.top_p;
     let top_n_sigma = params.top_n_sigma;
-    let min_p = params.min_p;
 
     // Read raw logits into a mutable vec for in-place modifications.
     // Penalties (repetition / presence / frequency / LZ / DRY) and
@@ -70,13 +139,7 @@ pub fn sample_with_params_seeded(
     // quantized logits tie often, so one rule is what lets a speculative
     // verify commit exactly the tokens this pick would.
     if params.temperature <= 0.0 {
-        // FIRST-index-wins: unifies the tie-break with the GPU argmax kernel
-        // (argmax_bf16, lowest-lane), every verify pick (CPU argmax_first_wins,
-        // fast-greedy row picks) and torch.argmax/vLLM greedy. Logits are BF16
-        // so exact ties are common; under the old LAST-wins rule the CPU host
-        // path and verify disagreed at ties and speculative decode emitted
-        // divergent tokens (lossy spec-off != gamma, tool-call args/order).
-        return argmax_first_wins_f32(&raw_logits);
+        return Some(argmax_first_wins_f32(&raw_logits));
     }
     let temperature = params.temperature;
 
@@ -98,7 +161,7 @@ pub fn sample_with_params_seeded(
     }
 
     // ── 2. Temperature scaling ──
-    let mut logits: Vec<(u32, f32)> = raw_logits
+    let logits: Vec<(u32, f32)> = raw_logits
         .iter()
         .enumerate()
         .filter(|(_, v)| v.is_finite()) // Skip -inf tokens from top-n-sigma
@@ -107,8 +170,30 @@ pub fn sample_with_params_seeded(
 
     if logits.is_empty() {
         // Fallback: if top-n-sigma filtered everything, use argmax of original
-        return argmax_first_wins_f32(&raw_logits);
+        return Some(argmax_first_wins_f32(&raw_logits));
     }
+    draw(logits, params, seed, None)
+}
+
+/// Steps 3 on of the sampler over the scaled, finite `logits`. With
+/// `absent` (and top-n-sigma's guaranteed keep, when its filter ran on the
+/// full row), `None` when the present tokens do not decide the pick.
+fn draw(
+    mut logits: Vec<(u32, f32)>,
+    params: &SamplingParams,
+    seed: Option<u64>,
+    absent: Option<(Absent, Option<usize>)>,
+) -> Option<u32> {
+    let (top_k, top_p, min_p) = (params.top_k as usize, params.top_p, params.min_p);
+    let sigma_kept = absent.and_then(|(_, kept)| kept);
+    let absent = absent.map(|(a, _)| a);
+    // Every absent token's scaled logit is at most `bound_scaled` (division
+    // by a positive temperature is monotone; it keeps distinct BF16 logits
+    // distinct, so the order is the raw one).
+    let bound_scaled = absent.map(|a| a.bound / params.temperature);
+    let beats_absent = |logit: f32, id: u32| {
+        absent.is_none_or(|a| a.beaten_by(bound_scaled.unwrap_or(a.bound), logit, id))
+    };
 
     // ── 3. Rank-dependent filtering (top-k / min-p / top-p) ──
     // These need descending order — but a full O(n·log n) sort of the whole
@@ -117,14 +202,38 @@ pub fn sample_with_params_seeded(
     // an O(n) quickselect to isolate the top-k, then sort only those k. Pure
     // temperature sampling (no top_k/top_p/min_p) needs no ordering at all —
     // the multinomial draw below is order-independent — so skip sorting.
-    let cmp_desc =
-        |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal);
+    //
+    // The order is total: value descending, then the lower index, so exact
+    // ties (frequent in BF16 logits) fall the same way on every run and on a
+    // split verify head's candidates as on the full row.
+    let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    // Whether absent tokens are still candidates (no top-k / min-p cut yet).
+    let mut open = absent.is_some();
     let sorted = if top_k > 0 && top_k < logits.len() {
         // Quickselect the top-k into [0, top_k) (O(n)), drop the rest, then
         // sort just the k survivors (O(k·log k)). Identical result to
         // full-sort-then-truncate; min-p/top-p below run over these k.
         logits.select_nth_unstable_by(top_k, cmp_desc);
         logits.truncate(top_k);
+        logits.sort_unstable_by(cmp_desc);
+        // The k present survivors are the row's top k when the last beats
+        // every absent token.
+        let (id, logit) = logits[top_k - 1];
+        if !beats_absent(logit, id) {
+            return None;
+        }
+        open = false;
+        true
+    } else if open {
+        // A top-k past the present tokens, or none with no min-p/top-p:
+        // absent tokens stay in the draw.
+        if top_k > 0 || (min_p <= 0.0 && top_p >= 1.0) {
+            return None;
+        }
         logits.sort_unstable_by(cmp_desc);
         true
     } else if min_p > 0.0 || top_p < 1.0 {
@@ -151,9 +260,12 @@ pub fn sample_with_params_seeded(
         .iter()
         .map(|&(idx, logit)| (idx, (logit - max_val).exp()))
         .collect();
+    // An absent token's probability is at most this.
+    let absent_prob = bound_scaled.map(|b| (b - max_val).exp());
 
     // ── 4b. Entropy: H = -Σ p·ln(p) over the post-softmax distribution ──
-    {
+    // (a row with absent tokens has no whole distribution to report)
+    if absent.is_none() {
         let sum: f32 = probs.iter().map(|p| p.1).sum();
         if sum > 0.0 {
             let inv = 1.0 / sum;
@@ -172,20 +284,43 @@ pub fn sample_with_params_seeded(
     if min_p > 0.0 {
         let max_prob = probs[0].1; // Already sorted descending
         let threshold = min_p * max_prob;
+        if open {
+            // Every absent token must fall below the floor.
+            if absent_prob.is_some_and(|p| p >= threshold) {
+                return None;
+            }
+            open = false;
+        }
         probs.retain(|p| p.1 >= threshold);
+    }
+    // The tokens the top-p cut and the draw see must all survive the full
+    // row's top-n-sigma filter.
+    if sigma_kept.is_some_and(|kept| open || probs.len() > kept) {
+        return None;
     }
 
     // ── 6. Top-p (nucleus) ──
     if top_p < 1.0 {
-        let sum: f32 = probs.iter().map(|p| p.1).sum();
+        let tail = match absent {
+            Some(a) if open => (a.log_mass - max_val).exp(),
+            _ => 0.0,
+        };
+        let sum: f32 = probs.iter().map(|p| p.1).sum::<f32>() + tail;
         let mut cumsum = 0.0f32;
         let mut cutoff = probs.len();
+        let mut cut = false;
         for (i, &(_, prob)) in probs.iter().enumerate() {
             cumsum += prob / sum;
             if cumsum >= top_p {
                 cutoff = i + 1;
+                cut = true;
                 break;
             }
+        }
+        // With absent tokens still in, the nucleus must close on a present
+        // token that beats every absent one (`probs` is a prefix of `logits`).
+        if open && !(cut && beats_absent(logits[cutoff - 1].1, logits[cutoff - 1].0)) {
+            return None;
         }
         probs.truncate(cutoff);
     }
@@ -205,185 +340,8 @@ pub fn sample_with_params_seeded(
     for &(idx, prob) in &probs {
         cumsum += prob;
         if cumsum >= threshold {
-            return idx;
+            return Some(idx);
         }
     }
-    probs.last().map_or(0, |p| p.0)
-}
-
-/// Greedy pick with `max_by(partial_cmp.unwrap_or(Equal))` semantics —
-/// LAST-index-wins (Rust's `max_by` returns the last of several equal
-/// maxima). Retained for reference/tests only: the production greedy bypass
-/// now uses `argmax_first_wins` (2026-10-11) because BF16 logits tie exactly
-/// and every other pick site — the GPU argmax kernel, the CPU verify argmax
-/// and all fast-path picks — resolves to the lowest index. The mismatch made
-/// spec decode emit divergent tokens at exact ties (lossy spec-off != gamma).
-///
-/// NaN is the reason for the guarded structure. `partial_cmp` with a NaN
-/// returns `None`, mapped to `Equal` — and under `max_by`'s last-wins rule an
-/// "equal" NaN DISPLACES the current maximum, so a NaN anywhere after the true
-/// max changes the historical result. That quirk cannot be reproduced by a
-/// max-then-find pass, so: pass 1 computes the max over 8 independent lanes
-/// (vectorisable, no index dependency) while also detecting NaN; if ANY NaN is
-/// present the original `max_by` expression runs verbatim (bit-identical by
-/// construction); otherwise the answer is the LAST index equal to the max,
-/// which is exactly what `max_by` returns on NaN-free input (including
-/// -0.0/+0.0 ties, where `partial_cmp` says Equal and `==` agrees).
-pub fn argmax_last_wins_f32(v: &[f32]) -> u32 {
-    const LANES: usize = 8;
-    let mut acc = [f32::NEG_INFINITY; LANES];
-    let mut any_nan = false;
-    let mut chunks = v.chunks_exact(LANES);
-    for c in &mut chunks {
-        for (a, &x) in acc.iter_mut().zip(c) {
-            any_nan |= x.is_nan();
-            if x > *a {
-                *a = x;
-            }
-        }
-    }
-    let mut best = f32::NEG_INFINITY;
-    for &a in acc.iter() {
-        if a > best {
-            best = a;
-        }
-    }
-    for &x in chunks.remainder() {
-        any_nan |= x.is_nan();
-        if x > best {
-            best = x;
-        }
-    }
-    if any_nan {
-        // Bit-identical fallback: the exact historical expression.
-        return v
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
-    }
-    v.iter()
-        .rposition(|&x| x == best)
-        .unwrap_or(0)
-        .try_into()
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod greedy_tests {
-    use super::argmax_last_wins_f32;
-
-    fn reference(v: &[f32]) -> u32 {
-        v.iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
-    }
-
-    fn agree(v: &[f32]) {
-        assert_eq!(argmax_last_wins_f32(v), reference(v), "diverged on {v:?}");
-    }
-
-    #[test]
-    fn matches_max_by_reference() {
-        agree(&[]);
-        agree(&[1.0]);
-        agree(&[1.0, 3.0, 2.0]);
-        // Ties resolve to the LAST index — the opposite of the verify path.
-        agree(&[1.0, 5.0, 5.0, 5.0, 2.0]);
-        agree(&[5.0, 1.0, 5.0]);
-        // Tie straddling the 8-lane boundary.
-        agree(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);
-        agree(&[-5.0, -1.0, -3.0]);
-        agree(&[-0.0, 0.0, -0.0]);
-        agree(&[f32::NEG_INFINITY, f32::NEG_INFINITY]);
-        agree(&[f32::INFINITY, 1.0, f32::INFINITY]);
-        // NaN cases route to the verbatim fallback => trivially identical,
-        // but assert anyway so the routing itself is covered.
-        agree(&[f32::NAN, 1.0, 2.0]);
-        agree(&[1.0, 2.0, f32::NAN]);
-        agree(&[f32::NAN]);
-    }
-
-    fn params_temp0() -> super::SamplingParams {
-        super::SamplingParams {
-            temperature: 0.0,
-            top_k: 0,
-            top_p: 1.0,
-            top_n_sigma: 0.0,
-            min_p: 0.0,
-            logit_bias: Vec::new(),
-            repetition_penalty: 1.0,
-            repetition_penalty_window: 0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            lz_penalty: 0.0,
-            dry_multiplier: 0.0,
-            dry_base: 1.75,
-            dry_allowed_length: 0,
-            dry_sequence_breakers: Vec::new(),
-            max_tokens: 16,
-            stop_token_ids: Vec::new(),
-            seed: Some(0),
-        }
-    }
-
-    fn f32_bytes(v: &[f32]) -> Vec<u8> {
-        v.iter().flat_map(|x| x.to_le_bytes()).collect()
-    }
-
-    #[test]
-    fn greedy_pick_is_first_index_wins_on_ties() {
-        // Production contract (2026-10-11): the CPU greedy bypass must return
-        // the LOWEST tied index — identical to the GPU argmax kernel, the CPU
-        // verify argmax and torch.argmax/vLLM greedy. BF16 logits tie exactly
-        // and the old last-wins rule made serial decode diverge from verify.
-        let v = [1.0f32, 5.0, 5.0, 5.0, 2.0];
-        assert_eq!(
-            super::sample_with_params_history(&f32_bytes(&v), &params_temp0(), &[]),
-            1
-        );
-        // Tie straddling the 8-lane boundary.
-        let v2 = [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 9.0];
-        assert_eq!(
-            super::sample_with_params_history(&f32_bytes(&v2), &params_temp0(), &[]),
-            7
-        );
-        // argmax_first_wins_f32 directly.
-        assert_eq!(super::argmax_first_wins_f32(&v), 1);
-    }
-
-    #[test]
-    fn greedy_pick_nan_is_deterministic() {
-        // first-wins: NaN never wins — a NaN AFTER the max must not displace
-        // it; all-NaN deterministically falls back to index 0.
-        let v = [1.0f32, 5.0, 5.0, f32::NAN];
-        assert_eq!(
-            super::sample_with_params_history(&f32_bytes(&v), &params_temp0(), &[]),
-            1
-        );
-        let v_nan = [f32::NAN, 2.0, 1.0];
-        assert_eq!(
-            super::sample_with_params_history(&f32_bytes(&v_nan), &params_temp0(), &[]),
-            1
-        );
-        let v_all_nan = [f32::NAN; 4];
-        assert_eq!(
-            super::sample_with_params_history(&f32_bytes(&v_all_nan), &params_temp0(), &[]),
-            0
-        );
-    }
-
-    #[test]
-    fn vocab_sized_last_wins() {
-        let mut v: Vec<f32> = (0..248_320)
-            .map(|i| (((i * 2654435761u64 as usize) % 100_003) as f32) / 1000.0 - 50.0)
-            .collect();
-        v[100_000] = 999.0;
-        v[200_000] = 999.0; // duplicate max — LAST must win here
-        assert_eq!(argmax_last_wins_f32(&v), reference(&v));
-        assert_eq!(argmax_last_wins_f32(&v), 200_000);
-    }
+    Some(probs.last().map_or(0, |p| p.0))
 }

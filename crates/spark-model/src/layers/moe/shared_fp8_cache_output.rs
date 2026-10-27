@@ -37,7 +37,7 @@ impl MoeLayer {
         );
         // Validate the ordinal before its diagnostic bit shift, including
         // ordinary and large-row calls that never enter the K5 oracle.
-        let (pn, pk, owner, capacity, cached, original) = match projection {
+        let (projection_n, projection_k, owner, capacity, cached, original) = match projection {
             0 => (
                 2048,
                 4096,
@@ -69,7 +69,7 @@ impl MoeLayer {
             "shared FP8 output row capacity exceeded"
         );
         anyhow::ensure!(
-            (n, k) == (pn, pk) && output == owner && cached == Some(weight),
+            (n, k) == (projection_n, projection_k) && output == owner && cached == Some(weight),
             "shared FP8 output geometry/owner/cached-weight binding"
         );
         let bf16_bytes = |width: u32| {
@@ -124,9 +124,7 @@ impl MoeLayer {
         // supports it; keep that existing precision/ABI without extending the
         // separately validated FP8 kernel envelope or fabricating oracle passes.
         if rows > 1024 {
-            // fp8_e4m3_to_bf16 compiles only into glm-5.3-flash: for any other
-            // model hitting this arm the lookup can never resolve.
-            if ops::bf16_gemm_cutlass_rows(rows) && ctx.config.model_type == "glm5_next" {
+            if ops::bf16_gemm_cutlass_rows(rows) {
                 // E4M3 widens exactly to BF16, so the tuned BF16 tensor-core
                 // GEMM computes the same products as the FP8 M64 kernel.
                 let count = n as usize * k as usize;

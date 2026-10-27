@@ -10,8 +10,9 @@
 //   (b) decode     qwen4exp_moe_rows_{plan,gate_up,silu_down} (today's verify
 //                  rows; bit-identical to serial decode's single-row kernels)
 //   (c) TC         qwen4exp_moe_c8_tc (ATLAS_QWEN4EXP_MOE_TC)
-//   (d) prefill    moe_prefill_q38's W2 chain (ATLAS_QWEN4EXP_PREFILL_MOE[_W2]):
-//                  A and SiLU*up as E4M3, W as e4m3(lut * scale * scale2)
+//   (d) prefill    moe_prefill_w4a4 (ATLAS_QWEN4EXP_PREFILL_MOE): the
+//                  reference's W4A4 -- A and SiLU*up as NVFP4 under the
+//                  checkpoint's input scales, W as stored
 // For every (row, slot) the expert's [2560] output (each path's BF16), and
 // each row's routed sum sum_s w_s y_s (float64 over the paths' outputs):
 // relative L2 error ||y - ref|| / ||ref|| and max |y - ref| over the layer's
@@ -31,7 +32,12 @@
 // C8, 40 rows a layer, all 48 layers): expert-output rel L2 vs float64
 // -- BF16 floor 1.66e-3, (b) 2.8-3.1e-3, (c) 3.1-3.6e-3, (d) 5.7-8.2e-2;
 // prefill's error is mostly W -> E4M3 (5.4-6.6e-2 alone); the decode clamp
-// fires only in layer 47 (0.002% of values) and costs 1.3e-2 there.
+// fires only in layer 47 (0.002% of values) and costs 1.3e-2 there. (d) was
+// then the E4M3 chain (moe_prefill_q38 W2).
+// 2026-10-19, NVFP4 checkpoint, the same dump, layers 1 / 24 / 47, expert
+// out rel L2: (d) E4M3 6.3e-2 / 7.8e-2 / 7.1e-2, (d) W4A4 1.10e-1 / 1.41e-1
+// / 1.30e-1 -- the reference's NVFP4 activations cost more than E4M3 ones
+// against exact W4A16 math; (c) TC 3.2-4.7e-3.
 #include "qwen4exp_moe_c8_bench.h"
 #include <map>
 #include <set>
@@ -86,13 +92,19 @@ static const double LUT[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2
 static double bf(unsigned short u) { unsigned w = (unsigned)u << 16; float f; memcpy(&f, &w, 4); return f; }
 static double bf_round(double x) { return bf(tobf((float)x)); }  // the floor any BF16 output has
 
-// One projection of one expert as served: [N, K/2] packed, [N, K/16] E4M3, scale2.
-struct HostProj { std::vector<unsigned char> p, s; float s2; unsigned n, k; };
+// One projection of one expert as served: [N, K/2] packed, [N, K/16] E4M3,
+// scale2, and its activation input_scale.
+struct HostProj { std::vector<unsigned char> p, s; float s2, is; unsigned n, k; };
+static float scalar(Ckpt& c, const std::string& name) {
+    auto v = c.get(name);
+    float f;
+    memcpy(&f, v.data(), 4);
+    return f;
+}
 struct Expert { HostProj g, u, d; };
 static HostProj load_proj(Ckpt& c, const std::string& base, unsigned n, unsigned k) {
-    HostProj h{c.get(base + ".weight"), c.get(base + ".weight_scale"), 0.f, n, k};
-    auto s2 = c.get(base + ".weight_scale_2");
-    memcpy(&h.s2, s2.data(), 4);
+    HostProj h{c.get(base + ".weight"), c.get(base + ".weight_scale"), scalar(c, base + ".weight_scale_2"),
+               scalar(c, base + ".input_scale"), n, k};
     if (h.p.size() != (size_t)n * k / 2 || h.s.size() != (size_t)n * k / 16) { fprintf(stderr, "%s shape\n", base.c_str()); exit(1); }
     return h;
 }

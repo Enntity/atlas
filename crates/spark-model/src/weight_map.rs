@@ -11,6 +11,8 @@
 pub mod exl3;
 #[path = "weight_map/expert.rs"]
 mod expert;
+#[path = "weight_map/fp8_block_load.rs"]
+mod fp8_block_load;
 #[path = "weight_map/fp8_dequant.rs"]
 mod fp8_dequant;
 #[path = "weight_map/fp8_lut.rs"]
@@ -50,12 +52,17 @@ mod quantized;
 mod ssm_qwen35;
 #[path = "weight_map/ssm_qwen35_more.rs"]
 mod ssm_qwen35_more;
-
 #[cfg(test)]
 #[path = "weight_map/tests.rs"]
 mod tests;
 
 pub use expert::*;
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use fp8_block_load::fp8_block_gemm_host;
+pub use fp8_block_load::{
+    FP8_BLOCK, Fp8BlockWeight, RawFp8Block, fp8_block_bytes, fp8_block_twin, raw_fp8_block,
+};
 pub(crate) use fp8_dequant::*;
 #[cfg(test)]
 #[path = "weight_map/test_checkpoint.rs"]
@@ -67,7 +74,7 @@ pub use model_a::*;
 pub use moe::*;
 #[cfg(test)]
 pub(crate) use mxfp8::mxfp8_to_bf16_host;
-pub use mxfp8::{Mxfp8Proj, Mxfp8Weight, dequant_mxfp8_to_bf16};
+pub use mxfp8::{Mxfp8Weight, dequant_mxfp8_to_bf16};
 pub use mxfp8_load::{
     RawMxfp8, mxfp8_cols_twin, mxfp8_geometry, mxfp8_row_range_twin, mxfp8_rows_twin, raw_mxfp8,
     release_raw_mxfp8,

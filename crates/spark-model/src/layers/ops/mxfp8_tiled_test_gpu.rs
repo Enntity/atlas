@@ -11,6 +11,7 @@
 //!   cargo test --release -p spark-model --lib mxfp8_tiled -- --ignored --nocapture
 
 use super::*;
+use anyhow::Context;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 
 const MAX_M: u32 = 32;
@@ -28,7 +29,15 @@ impl Rng {
 }
 
 fn backend() -> Result<&'static AtlasCudaBackend> {
-    crate::layers::glm_gpu_test_backend::backend()
+    static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
+    if GPU.get().is_none() {
+        let gpu =
+            AtlasCudaBackend::new(0, &atlas_kernels::ptx_modules()).context("CUDA backend")?;
+        let _ = GPU.set(gpu);
+    }
+    let gpu = GPU.get().expect("set above");
+    gpu.bind_to_thread()?;
+    Ok(gpu)
 }
 
 fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
@@ -40,7 +49,6 @@ fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
 fn raw(gpu: &dyn GpuBackend, p: DevicePtr, n: usize) -> Result<Vec<u8>> {
     let mut b = vec![0u8; n];
     gpu.copy_d2h(p, &mut b)?;
-    crate::layers::glm_gpu_test_backend::finite_bf16("MXFP8 projection", &b)?;
     Ok(b)
 }
 

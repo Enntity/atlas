@@ -268,10 +268,13 @@ pub(crate) fn resolve_tokenizer_runtime(
         Some("minimax_xml") => ("<minimax:tool_call>", "</minimax:tool_call>"),
         _ => ("<tool_call>", "</tool_call>"),
     };
-    let tool_call_start_token = tokenizer
-        .encode(tc_start_str)
-        .ok()
-        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    let single_token = |s: &str| {
+        tokenizer
+            .encode(s)
+            .ok()
+            .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None })
+    };
+    let tool_call_start_token = single_token(tc_start_str);
     if let Some(tid) = tool_call_start_token {
         tracing::info!("Tool call start token: {} ({})", tid, tc_start_str);
     } else {
@@ -280,25 +283,16 @@ pub(crate) fn resolve_tokenizer_runtime(
              require_tool_call / suppress / force-emit-after-think will be no-ops"
         );
     }
-    let tool_call_end_token = tokenizer
-        .encode(tc_end_str)
-        .ok()
-        .and_then(|ids| if ids.len() == 1 { Some(ids[0]) } else { None });
+    let tool_call_end_token = single_token(tc_end_str);
     if let Some(tid) = tool_call_end_token {
         tracing::info!("Tool call end token: {} ({})", tid, tc_end_str);
     }
-    // qwen3_coder XML parameter markers for the envelope-stuck guard, from
-    // THIS tokenizer (they were hard-coded to Qwen3.6 ids; Nemotron's differ).
-    let tool_markers =
-        crate::scheduler::tool_markers::ToolMarkers::from_tokenizer(tokenizer.inner());
-    match &tool_markers {
-        Some(m) => tracing::info!("Tool parameter marker classes: {}", m.summary()),
-        None => tracing::warn!(
-            "Tool parameter markers unresolved for this tokenizer: parameter-value \
-             tracking and the envelope-stuck cap are off (--tool-max-tokens still applies)"
-        ),
+    // GLM tool calls carry each value between single-token markers; the
+    // envelope-stuck guard exempts the tokens between them (large file writes).
+    if let (Some(open), Some(close)) = (single_token("<arg_value>"), single_token("</arg_value>")) {
+        crate::scheduler::set_tool_value_markers(open, close);
+        tracing::info!("Tool value markers: {open} (<arg_value>), {close} (</arg_value>)");
     }
-    crate::scheduler::tool_markers::set(tool_markers);
 
     let grammar_engine = {
         let stop_ids: Vec<i32> = eos_tokens.iter().map(|&id| id as i32).collect();

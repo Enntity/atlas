@@ -4,9 +4,11 @@
 // `moe_w4a16_fused_gate_up_t_k64` + `moe_silu_mul` and of
 // `moe_w4a16_grouped_gemm_ptrtable_t_k64` (moe_w4a16_grouped_gemm.cu, the
 // qwen3.6-35b-a3b file this target symlinks). Opt-in:
-// ATLAS_QWEN4EXP_PREFILL_MOE=1. The routed pair also reads the checkpoint's
-// N-major expert planes, byte-identically, without the K-major duplicate
-// (`moe_q38{,w}n_*`, ATLAS_QWEN4EXP_PREFILL_MOE_NODUP; NM in q38_tile).
+// ATLAS_QWEN4EXP_PREFILL_MOE=1 serves the shared expert (dense entries) and
+// the router weight from here. The routed entries are no longer dispatched --
+// the routed prefill is the reference's W4A4 (moe_prefill_w4a4.cu) -- and
+// stay as the dev benches' E4M3 baseline; they also read the checkpoint's
+// N-major expert planes, byte-identically (`moe_q38{,w}n_*`; NM in q38_tile).
 //
 // WHAT THE DEFAULT DOES. Per 64-row x 128-column tile and 64-wide K step, its
 // 128 threads (4 warps) stage A (BF16, gathered through sorted_token_ids) and
@@ -635,39 +637,6 @@ extern "C" __global__ void __launch_bounds__(256, Q38_MINB) NAME(               
 }
 Q38_DENSE_DOWN_ENTRY(moe_q38_dense_down, false)
 Q38_DENSE_DOWN_ENTRY(moe_q38w_dense_down, true)
-
-// ── router weight -> BF16 ──
-// The router GEMM ran `w4a16_gemm` (w4a16_gemm.cu: 64x64 tiles, K step 16,
-// no pipelining; 6.7 TFLOP/s at 16K tokens x 512 experts on GB10). Its B
-// values are `bf16((LUT[q] * float(scale)) * scale2)` and its products one
-// FP32 accumulator per output over m16n8k16 MMAs in increasing k -- exactly
-// what `dense_gemm_bf16_pipelined` computes over a BF16 [N, K] weight. This
-// writes that weight from the [N, K/2] packed / [N, K/16] scale planes (the
-// layout w4a16_gemm reads: row per output column `n`, low nibble = even k), so
-// the router logits, and the routing, are byte-identical.
-// Grid: (ceil(N * K / 2 / 256)), Block 256: one packed byte (two k) a thread.
-extern "C" __global__ void moe_q38_router_dequant(
-    const unsigned char* __restrict__ B_packed,   // [N, K/2]
-    const unsigned char* __restrict__ B_scale,    // [N, K/16] FP8 E4M3
-    const float scale2,
-    __nv_bfloat16* __restrict__ out,              // [N, K]
-    const unsigned int N,
-    const unsigned int K
-) {
-    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;   // packed byte
-    const unsigned int half_k = K / 2;
-    if (i >= N * half_k) return;
-    const unsigned int n = i / half_k;
-    const unsigned int kp = i - n * half_k;
-    const unsigned char packed = B_packed[i];
-    __nv_fp8_e4m3 f;
-    *(unsigned char*)&f = B_scale[(size_t)n * (K / Q38_GROUP) + (2 * kp) / Q38_GROUP];
-    const float lo = Q38_E2M1_LUT[packed & 0xF] * (float)f * scale2;
-    const float hi = Q38_E2M1_LUT[packed >> 4] * (float)f * scale2;
-    *reinterpret_cast<unsigned int*>(out + (size_t)n * K + 2 * kp) =
-          (unsigned int)__bfloat16_as_ushort(__float2bfloat16(lo))
-        | ((unsigned int)__bfloat16_as_ushort(__float2bfloat16(hi)) << 16);
-}
 
 // ── unpermute + top-k weighted reduce, local experts only ──
 // `moe_unpermute_reduce_indexed` (common/moe_permute.cu) sums all top-k routes

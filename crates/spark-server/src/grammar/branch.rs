@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Adapted from Jason McCartney / Enntity's SparkGLM union grammar work.
-//! Source commits and integration notes: `docs/porting/tool-json-union.json`.
-//!
 //! The branch decision of a tool-call-or-JSON union
 //! (`GrammarSpec::ToolCallOrJson`) at its first output token.
 //!

@@ -31,11 +31,9 @@ use spark_runtime::weights::WeightStore;
 
 use crate::weight_map::{DenseWeight, QuantizedWeight, dense_auto};
 
+#[path = "dflash_config.rs"]
 mod config;
-mod own_head;
-
 pub use config::*;
-pub(crate) use own_head::own_lm_head_present;
 
 /// DFlash2 2-tap grouped dynamic convolution weights.
 #[derive(Clone)]

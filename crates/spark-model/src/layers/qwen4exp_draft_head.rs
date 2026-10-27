@@ -121,7 +121,10 @@ impl DraftHead {
                 hidden,
                 gpu,
                 gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                gpu.kernel(
+                    "quantize_nvfp4",
+                    crate::weight_loader::qwen4_exp::mode::weight_quantizer()?,
+                )?,
                 stream,
             )
             .context("qwen4_exp MTP draft head: NVFP4 copy")?;
@@ -151,7 +154,7 @@ impl DraftHead {
                 KernelHandle(0)
             },
             w4a16_tiers: if want_nvfp4 {
-                W4a16BatchmTiers::resolve(gpu, false)
+                W4a16BatchmTiers::resolve(gpu)
             } else {
                 W4a16BatchmTiers::default()
             },

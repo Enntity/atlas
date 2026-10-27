@@ -5,6 +5,9 @@
 use xgrammar::{CompiledGrammar, GrammarMatcher, allocate_token_bitmask, reset_token_bitmask};
 
 use super::engine::GrammarError;
+use crate::literal_xml::LiteralXmlState;
+
+mod literal_dispatch;
 
 // ── GrammarState ───────────────────────────────────────────────────────
 
@@ -37,6 +40,10 @@ pub struct GrammarState {
     /// The run's verify-timing sink.
     timing: std::sync::Arc<crate::scheduler::mtp_timing::RunTiming>,
     matcher: GrammarMatcher,
+    /// Tokenizer bytes paired with the compiled matcher. The scheduler uses
+    /// this only when a candidate native opener is emitted, to distinguish a
+    /// literal XML mention in earlier reasoning from a real tool boundary.
+    tokenizer_info: xgrammar::tokenizer::TokenizerInfo,
     /// Bitmask buffer: `Box<[i32]>` of shape `(1, ceil(vocab_size / 32))`.
     bitmask_data: Box<[i32]>,
     vocab_size: usize,
@@ -66,9 +73,11 @@ pub struct GrammarState {
     /// disengaging the grammar as tool-call grammars do. Set via
     /// [`Self::strict_output`].
     strict: bool,
-    /// The strict grammar's response opens inside `<think>`, so the first
+    /// The response opens inside `<think>`, so the first
     /// sampled token is reasoning and must not be masked or consumed.
     opens_in_thinking: bool,
+    /// Native tool token forbidden during a deferred required-tool preamble.
+    first_token_suppress: Option<u32>,
     /// GLM's native tool opener, which ends reasoning without a `</think>`
     /// (`first_token_thinking::apply_native_tool_boundary`) and is itself the
     /// first output token. Set for a grammar with a tool branch beside its
@@ -78,6 +87,19 @@ pub struct GrammarState {
     /// A tool-call-or-JSON union's answer (JSON) branch first-token mask: the
     /// branch is chosen by mass at the first output token (`grammar::branch`).
     answer_start: Option<Box<[i32]>>,
+    /// Whether this is an automatic tool-call grammar whose root has a
+    /// free-text dispatch state. Required tool grammars and response-format
+    /// grammars stay on the exact token matcher path.
+    auto_literal_dispatch: bool,
+    /// Lexical state of the emitted free-text prefix. Quotes inside an actual
+    /// tool body must never make the body unconstrained.
+    literal_xml_state: LiteralXmlState,
+    /// One lexical state per xgrammar matcher history step. `accept_bytes`
+    /// records one rollback step for a whole decoded token.
+    literal_xml_history: Vec<LiteralXmlState>,
+    /// Vocabulary tokens that contain a possible markup delimiter. This keeps
+    /// the literal-candidate repair out of the full-vocabulary hot loop.
+    literal_lt_tokens: Box<[u32]>,
 }
 
 impl GrammarState {
@@ -132,6 +154,7 @@ impl GrammarState {
         Ok(Self {
             timing: std::sync::Arc::default(),
             matcher,
+            tokenizer_info: compiled.tokenizer_info().clone(),
             bitmask_data,
             vocab_size,
             stop_tokens: Box::new([]),
@@ -139,8 +162,13 @@ impl GrammarState {
             bitmask_fill_result: false,
             strict: false,
             opens_in_thinking: false,
+            first_token_suppress: None,
             native_opener: None,
             answer_start: None,
+            auto_literal_dispatch: false,
+            literal_xml_state: LiteralXmlState::default(),
+            literal_xml_history: Vec::new(),
+            literal_lt_tokens: Box::new([]),
         })
     }
 
@@ -153,15 +181,6 @@ impl GrammarState {
     #[must_use]
     pub fn with_stop_tokens(mut self, stop_tokens: &[u32]) -> Self {
         self.stop_tokens = stop_tokens.to_vec().into_boxed_slice();
-        self
-    }
-
-    /// Mark this as a `response_format` grammar (see the `strict` field).
-    /// `opens_in_thinking`: the prompt leaves the model inside `<think>`.
-    #[must_use]
-    pub fn strict_output(mut self, opens_in_thinking: bool) -> Self {
-        self.strict = true;
-        self.opens_in_thinking = opens_in_thinking;
         self
     }
 
@@ -210,16 +229,6 @@ impl GrammarState {
         self.strict
     }
 
-    /// Whether the first token sampled after prefill is grammar output. False
-    /// only for a strict grammar whose response opens inside `<think>`: that
-    /// token is reasoning, and the grammar starts after `</think>` as on every
-    /// other path. Tool grammars keep masking it (GLM can open a tool call
-    /// as its first token, which implicitly ends thinking); a strict union
-    /// with a tool branch consumes that opener instead (`opens_output`).
-    pub fn masks_first_token(&self) -> bool {
-        !(self.strict && self.opens_in_thinking)
-    }
-
     /// Fill the allowed-token bitmask for the next decode step.
     ///
     /// Returns `true` if the bitmask constrains at least one token (i.e., is not
@@ -257,6 +266,9 @@ impl GrammarState {
             .record(crate::scheduler::mtp_timing::Phase::GrammarFill, t_fill);
         self.bitmask_valid = true;
         self.bitmask_fill_result = filled;
+        if filled && self.auto_literal_dispatch && self.matcher.is_grammar_completed() {
+            self.restore_literal_candidates();
+        }
         filled
     }
 
@@ -276,49 +288,6 @@ impl GrammarState {
             return false;
         }
         (self.bitmask_data[word] & (1i32 << bit)) != 0
-    }
-
-    /// Accept a sampled token and advance the grammar state.
-    ///
-    /// Returns `true` if the token was accepted by the grammar.
-    /// Returns `false` if the token violates the grammar (should not happen
-    /// if the bitmask was applied correctly).
-    ///
-    /// Short-circuits with `true` once the matcher has reached its
-    /// terminated (accepting) state — feeding tokens past the stop into
-    /// xgrammar emits a `grammar_matcher.cc:493` warning ("matcher has
-    /// terminated, but is trying to accept new token") for every trailing
-    /// token in spec-decode draft runs (Discord 2026-05-08 universe06608).
-    /// Returning `true` keeps the spec-decode boundary heuristic in
-    /// `truncate_drafts_at_grammar_boundary` consistent — drafts past a
-    /// completed grammar are not "rejected by grammar"; they are simply
-    /// past the stop, which the EOS handler will terminate independently.
-    pub fn accept_token(&mut self, token_id: u32) -> bool {
-        // Any advance invalidates the per-position bitmask cache. Done
-        // unconditionally (even on the early-return paths that don't move the
-        // matcher) — over-invalidation only costs a refill, whereas a missed
-        // invalidation would serve a stale mask and desync the NPDA.
-        self.bitmask_valid = false;
-        if self.matcher.is_terminated() {
-            return true;
-        }
-        // Stop/EOS tokens (e.g. `<|im_end|>`, 248046) are control tokens that
-        // terminate the turn — they are never part of the grammar's content
-        // language. The model legitimately ends a turn with one (after a
-        // text-only reply, or after a complete tool call) while the
-        // structural-tag NPDA is still in a non-accepting state; feeding it to
-        // `matcher.accept_token` then returns false ("refusal"), which callers
-        // mis-read as a grammar desync and abort the response mid-stream
-        // (`emit_step`: "Ending response to prevent cascading grammar-mask
-        // corruption"). That truncates agentic turns and is the dominant cause
-        // of the opencode webserver_ok gap vs vLLM (which parses tools
-        // post-hoc and never constrains the stop token). Accept it
-        // unconditionally and let the EOS handler terminate. This cannot
-        // corrupt tool-call STRUCTURE — only non-stop tokens drive the matcher.
-        if self.stop_tokens.contains(&token_id) {
-            return true;
-        }
-        self.matcher.accept_token(token_id as i32)
     }
 
     /// The single grammar-forced next token, if the current state
@@ -422,12 +391,21 @@ impl GrammarState {
     pub fn rollback(&mut self, n: usize) {
         self.bitmask_valid = false;
         self.matcher.rollback(n as i32);
+        if self.auto_literal_dispatch {
+            let keep = self.literal_xml_history.len().saturating_sub(n);
+            self.literal_xml_history.truncate(keep);
+            self.literal_xml_state = self.literal_xml_history.last().copied().unwrap_or_default();
+        }
     }
 
     /// Reset the grammar state to the initial position.
     pub fn reset(&mut self) {
         self.bitmask_valid = false;
         self.matcher.reset();
+        if self.auto_literal_dispatch {
+            self.literal_xml_history.clear();
+            self.literal_xml_state = LiteralXmlState::default();
+        }
     }
 
     /// Apply the current bitmask to a slice of f32 logits in-place.
@@ -486,3 +464,6 @@ pub fn grammar_blocks_stop(gs: Option<&mut GrammarState>, eos_tokens: &[u32]) ->
 // now handled at the streaming-sanitizer + parser layer (envelope_open
 // markers in `LeakMarkers`, plus `<minimax:_call>` → `<tool_call>`
 // normalisation in `parse_tool_calls`).
+
+#[path = "state/first_token.rs"]
+mod first_token;

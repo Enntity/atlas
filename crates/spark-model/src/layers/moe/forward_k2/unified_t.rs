@@ -27,7 +27,7 @@ impl MoeLayer {
         h: u32,
         top_k: u32,
         is_ep: bool,
-        mixed_bf16_shared: bool,
+        unfused_shared: bool,
         include_shared: bool,
         ctx: &ForwardContext,
         stream: u64,
@@ -44,7 +44,7 @@ impl MoeLayer {
         // → the kernel skips it) and compute it in BF16 below instead. The
         // NVFP4 shared_*_t tables are load-time placeholders whose values
         // would be numerically wrong for this checkpoint.
-        let (sh_gate_t, sh_up_t, sh_down_t) = if mixed_bf16_shared || !include_shared {
+        let (sh_gate_t, sh_up_t, sh_down_t) = if unfused_shared || !include_shared {
             (&null_qw, &null_qw, &null_qw)
         } else {
             (
@@ -154,9 +154,9 @@ impl MoeLayer {
         // (3 GEMMs + silu_mul total, vs 4 launches per token in the
         // per-token fallback). Must run after silu_down_t, which owns the
         // shared scratch buffers for the non-mixed case.
-        if mixed_bf16_shared {
+        if unfused_shared {
             let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
-            self.run_separate_shared_expert(
+            self.run_unfused_shared_expert(
                 input,
                 2,
                 h,

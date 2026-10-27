@@ -237,24 +237,6 @@ impl TransformerModel {
             det.tap("logits", logits_ptr, row, self.config.vocab_size * 2);
         }
 
-        if std::env::var("ATLAS_LAYER_H_PREFILL").as_deref() == Ok("1") {
-            self.gpu.synchronize(stream)?;
-            let v_sz = self.config.vocab_size;
-            let mut lb = vec![0u8; v_sz * 2];
-            if self.gpu.copy_d2h(logits_ptr, &mut lb).is_ok() {
-                let mut top: Vec<(u32, f32)> = Vec::with_capacity(5);
-                for (i, c) in lb.chunks_exact(2).enumerate() {
-                    let v = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16);
-                    if v.is_finite() && (top.len() < 5 || v > top[4].1) {
-                        top.push((i as u32, v));
-                        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                        top.truncate(5);
-                    }
-                }
-                tracing::warn!("ATLAS_LAYER_HP LOGITS top5={top:?}");
-            }
-        }
-
         // Per-layer divergence dump: full logits vector + top-10 token IDs.
         if let Ok(dir) = std::env::var("ATLAS_NEMO_DUMP")
             && !dir.is_empty()
@@ -359,9 +341,11 @@ impl TransformerModel {
         } else if cap_applied {
             // Cap forced — never attach the full-length snapshot to a
             // truncated tree (would be unreachable + leak a pool slot).
-            if !self.tokens_have_vision_pad(cache_tokens) && !self.hss_window_slid(seq) {
+            if let Some(key) = self.pc_key(seq, cache_tokens)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    cache_tokens,
+                    &key,
                     cache_block_table,
                     cache_disk_block_ids,
                     bs,
@@ -420,14 +404,10 @@ impl TransformerModel {
                 }
             };
             if let Some(snap_id) = snap_result {
-                if self.tokens_have_vision_pad(tokens) || self.hss_window_slid(seq) {
-                    // Vision-pad: image-tainted snapshot + colliding token key.
-                    // HSS-slid: `block_table` no longer parallels the token
-                    // stream (see `hss_window_slid`). Either way we decline the
-                    // radix insert, and the snapshot is only reachable through
-                    // those nodes — so free it rather than leak a pool slot.
-                    self.ssm_snapshots.free(snap_id);
-                } else {
+                let key = self
+                    .pc_key(seq, tokens)
+                    .filter(|_| !self.hss_window_slid(seq));
+                if let Some(key) = key {
                     tracing::info!(
                         "Saved SSM snapshot {} for {} tokens ({} blocks) [chunk]",
                         snap_id,
@@ -454,7 +434,7 @@ impl TransformerModel {
                     self.ssm_snapshots
                         .save_hidden(snap_id, normed, self.gpu.as_ref(), stream)?;
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
-                        tokens,
+                        &key,
                         &seq.block_table,
                         &seq.disk_block_ids,
                         bs,
@@ -467,10 +447,22 @@ impl TransformerModel {
                     if let Some(old) = displaced {
                         self.ssm_snapshots.free(old);
                     }
+                    self.dflash_warm_save(seq, &key, stream)?;
+                } else {
+                    // A placeholder the content key does not cover (an
+                    // image-tainted snapshot under a colliding key), or HSS
+                    // slid (`block_table` no longer parallels the token
+                    // stream, see `hss_window_slid`): either way we decline
+                    // the radix insert, and the snapshot is only reachable
+                    // through those nodes — so free it rather than leak a
+                    // pool slot.
+                    self.ssm_snapshots.free(snap_id);
                 }
-            } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+            } else if let Some(key) = self.pc_key(seq, tokens)
+                && !self.hss_window_slid(seq)
+            {
                 let acquired = self.prefix_cache.insert(
-                    tokens,
+                    &key,
                     &seq.block_table,
                     &seq.disk_block_ids,
                     bs,
@@ -479,9 +471,11 @@ impl TransformerModel {
                 );
                 super::super::super::block_mgmt::cache_acquires_refs(&acquired, kv_cache);
             }
-        } else if !self.tokens_have_vision_pad(tokens) && !self.hss_window_slid(seq) {
+        } else if let Some(key) = self.pc_key(seq, tokens)
+            && !self.hss_window_slid(seq)
+        {
             let acquired = self.prefix_cache.insert(
-                tokens,
+                &key,
                 &seq.block_table,
                 &seq.disk_block_ids,
                 bs,

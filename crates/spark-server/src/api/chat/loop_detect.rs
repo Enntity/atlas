@@ -9,9 +9,8 @@
 // into the downstream sampling-bias logic.
 
 use crate::ir::{Message, Role};
-
 pub(super) struct LoopDetectOut {
-    /// True when the verdict was Suppress OR spinning detection
+    /// True when the repeated-call verdict was Suppress
     /// fired. Caller flips the `<tool_call>` token bias to avoid
     /// re-emitting tool calls for one turn.
     pub(super) suppress_tool_call: bool,
@@ -33,7 +32,11 @@ fn loop_suppress_disabled() -> bool {
     std::env::var("ATLAS_LOOP_NO_SUPPRESS").as_deref() == Ok("1")
 }
 
-pub(super) fn check_loops(messages: &[Message], tools_active: bool) -> LoopDetectOut {
+pub(super) fn check_loops(
+    messages: &[Message],
+    tools_active: bool,
+    repeat_run: usize,
+) -> LoopDetectOut {
     let mut suppress_tool_call = false;
     let mut tool_call_repeat_count: usize = 0;
 
@@ -131,6 +134,9 @@ pub(super) fn check_loops(messages: &[Message], tools_active: bool) -> LoopDetec
     // Spinning detection — independent signal: if the model has
     // produced ≥5 consecutive short, low-content responses,
     // something is structurally wrong even if no two are similar.
+    // #55: short prose turns are diagnostic only.
+    // Client-supplied history is not provenance and reply length does not
+    // establish that tool use is repeating or should be discouraged.
     let mut recent_short: usize = 0;
     for m in messages.iter().rev() {
         if m.role != Role::Assistant {
@@ -268,11 +274,27 @@ pub(super) fn check_loops(messages: &[Message], tools_active: bool) -> LoopDetec
     }
 
     if spinning {
-        tracing::warn!(
+        tracing::debug!(
             recent_short,
-            "Spinning detection fired — suppressing <tool_call>"
+            "Short prose history detected; tool availability unchanged"
         );
-        suppress_tool_call = !loop_suppress_disabled();
+    }
+
+    // An identical call answered by an identical result got a repeat
+    // notice and a deeper thinking turn (`prepare.rs`). Keep `<tool_call>`
+    // open and unbiased so the model can act on it: masked, it narrates the
+    // action it cannot take (omp, 2026-10-12: 756 tokens of one paragraph).
+    if repeat_run >= crate::hint_injector::REPEAT_NOTICE_MIN_RUN
+        && (suppress_tool_call || tool_call_repeat_count >= 2)
+    {
+        tracing::warn!(
+            repeat_run,
+            suppress_tool_call,
+            tool_call_repeat_count,
+            "Loop detector → identical repeat: repeat notice instead of <tool_call> mask/bias"
+        );
+        suppress_tool_call = false;
+        tool_call_repeat_count = 0;
     }
 
     LoopDetectOut {

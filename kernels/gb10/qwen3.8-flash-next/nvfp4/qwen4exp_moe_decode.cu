@@ -254,14 +254,14 @@ __device__ __forceinline__ void qx_t_walk(
     stage();
     #pragma unroll 1
     for (int g0 = 0; g0 < G - D; g0 += D) {
-        const unsigned char* pn = pp + (size_t)(g0 + D) * 8 * row;
+        const unsigned char* next_packed = pp + (size_t)(g0 + D) * 8 * row;
         const unsigned char* sn = sp + (size_t)(g0 + D) * row;
         #pragma unroll
         for (int d = 0; d < D; d++) {
             qx_t_prefetch<PF>(packed, scale, N, g0 + d + PF, G);
             qx_t_group<V, R>(g0 + d, w[d], s[d], s2, a, s_lut, acc);
             #pragma unroll
-            for (int j = 0; j < 8; j++) w[d][j] = __ldg((const W*)(pn + (size_t)(d * 8 + j) * row));
+            for (int j = 0; j < 8; j++) w[d][j] = __ldg((const W*)(next_packed + (size_t)(d * 8 + j) * row));
             s[d] = __ldg((const W*)(sn + (size_t)d * row));
         }
     }

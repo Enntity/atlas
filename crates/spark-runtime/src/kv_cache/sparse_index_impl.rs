@@ -36,7 +36,6 @@ impl PagedKvCache {
             })
             .transpose()?;
         let tail_entries = tails.as_ref().map_or(self.num_blocks, |t| t.capacity());
-        let tail_map = tails.as_ref().map_or(DevicePtr::NULL, |t| t.map);
         let values_stride = spec.values_block_bytes(self.config.block_size);
         let scales_stride = spec.scales_block_bytes(self.config.block_size);
         let tail_stride = spec.tail_block_bytes(self.config.block_size);
@@ -51,7 +50,7 @@ impl PagedKvCache {
             ) {
                 Ok(ptr) => ptr,
                 Err(error) => {
-                    free_allocations(gpu, allocations, tail_map);
+                    free_allocations(gpu, allocations);
                     return Err(error);
                 }
             };
@@ -66,7 +65,7 @@ impl PagedKvCache {
                     Ok(ptr) => ptr,
                     Err(error) => {
                         let _ = gpu.free(values);
-                        free_allocations(gpu, allocations, tail_map);
+                        free_allocations(gpu, allocations);
                         return Err(error);
                     }
                 }
@@ -82,7 +81,10 @@ impl PagedKvCache {
                     if !scales.is_null() {
                         let _ = gpu.free(scales);
                     }
-                    free_allocations(gpu, allocations, tail_map);
+                    free_allocations(gpu, allocations);
+                    if let Some(tails) = tails {
+                        let _ = gpu.free(tails.map);
+                    }
                     return Err(error);
                 }
             };
@@ -160,11 +162,7 @@ impl PagedKvCache {
     }
 }
 
-fn free_allocations(
-    gpu: &dyn GpuBackend,
-    allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)>,
-    tail_map: DevicePtr,
-) {
+fn free_allocations(gpu: &dyn GpuBackend, allocations: Vec<(DevicePtr, DevicePtr, DevicePtr)>) {
     for (values, scales, tail) in allocations {
         let _ = gpu.free(values);
         if !scales.is_null() {
@@ -172,11 +170,4 @@ fn free_allocations(
         }
         let _ = gpu.free(tail);
     }
-    if !tail_map.is_null() {
-        let _ = gpu.free(tail_map);
-    }
 }
-
-#[cfg(test)]
-#[path = "sparse_index_failure_tests.rs"]
-mod failure_tests;

@@ -128,14 +128,6 @@ fn env_on(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
 }
 
-/// Shared install/dispatch eligibility: every 32-row piece must have a tier.
-pub(super) fn nvfp4_tc_supported(m: u32) -> bool {
-    m > 0
-        && (0..m)
-            .step_by(32)
-            .all(|r0| crate::layers::w4a16_gemv_tiers::tc_kernel((m - r0).min(32)).0 != 0)
-}
-
 impl BlockDiffusionDraftHead {
     /// Install the twins the `ATLAS_DFLASH_*` levers request, after the
     /// Phase G FP8 install. main's NVFP4 install is skipped when MXFP8 serves
@@ -146,7 +138,7 @@ impl BlockDiffusionDraftHead {
         if mxfp8 && !nvfp4_tc {
             self.install_mxfp8_layers(gpu)?;
         } else {
-            self.try_install_nvfp4(gpu, nvfp4_tc)?;
+            self.try_install_nvfp4(gpu)?;
         }
         self.twins.nvfp4_tc =
             nvfp4_tc && matches!(self.quant, super::DflashQuantization::Nvfp4Weights);
@@ -224,7 +216,10 @@ impl BlockDiffusionDraftHead {
                 k,
                 gpu,
                 gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                gpu.kernel(
+                    "quantize_nvfp4",
+                    crate::layers::glm_native::mode::weight_quantizer()?,
+                )?,
                 gpu.default_stream(),
             )?),
             ConvTwinKind::Mxfp8 => {
@@ -269,7 +264,10 @@ impl BlockDiffusionDraftHead {
         let fc_in = self.target_layer_ids.len() * self.target_hidden_size;
         let fused_n = self.num_layers * 2 * self.num_kv_heads * self.head_dim;
         let absmax = gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?;
-        let quant = gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?;
+        let quant = gpu.kernel(
+            "quantize_nvfp4",
+            crate::layers::glm_native::mode::weight_quantizer()?,
+        )?;
         let stream = gpu.default_stream();
         let q4 = |w: &DenseWeight, n, k| {
             crate::weight_map::quantize_to_nvfp4(w, n, k, gpu, absmax, quant, stream)
@@ -324,7 +322,10 @@ impl BlockDiffusionDraftHead {
                 h,
                 gpu,
                 gpu.kernel("quantize_nvfp4", "nvfp4_global_absmax")?,
-                gpu.kernel("quantize_nvfp4", "quantize_bf16_to_nvfp4")?,
+                gpu.kernel(
+                    "quantize_nvfp4",
+                    crate::layers::glm_native::mode::weight_quantizer()?,
+                )?,
                 stream,
             )?);
             gpu.synchronize(stream)?;
@@ -399,23 +400,18 @@ impl BlockDiffusionDraftHead {
             w.weight.0 != 0,
             "DFlash MXFP8 twin of a dropped BF16 weight"
         );
-        let data = gpu.alloc(n * k)?;
-        let scales = gpu.alloc(n * k / ops::MXFP8_BLOCK)?;
+        let mx = Mxfp8Weight::alloc(gpu, n, k)?;
         ops::mxfp8_quantize(
             gpu,
             quant,
             w.weight,
-            data,
-            scales,
+            mx.data,
+            mx.scales,
             n,
             k,
             gpu.default_stream(),
         )?;
-        Ok(Mxfp8Weight {
-            data,
-            scales,
-            tiled: false,
-        })
+        Ok(mx)
     }
 
     /// `out[m, n] = input[m, k] · Wᵀ` from an NVFP4 twin on the tensor-core
@@ -436,7 +432,7 @@ impl BlockDiffusionDraftHead {
     ) -> Result<bool> {
         let tier = crate::layers::w4a16_gemv_tiers::tc_kernel;
         let pieces = || (0..m).step_by(32).map(move |r0| (r0, (m - r0).min(32)));
-        if !nvfp4_tc_supported(m) {
+        if m == 0 || !pieces().all(|(_, rows)| tier(rows).0 != 0) {
             return Ok(false);
         }
         for (r0, rows) in pieces() {

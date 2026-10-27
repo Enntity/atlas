@@ -32,7 +32,7 @@ impl Qwen4ExpMtpHead {
 
         // ── 1. Per-stream grouped norm of the incoming residual ──
         // Read out BEFORE step 3 overwrites `streams`.
-        self.stream_norms(ctx, streams, hc, stream)?;
+        self.stream_norms(ctx, streams, hc, self.normed_h, stream)?;
 
         // ── 2. Per-stream projection, shared weight ──
         for s in 0..hc {
@@ -284,7 +284,7 @@ impl Qwen4ExpMtpHead {
     }
 
     /// The per-stream norm of `rows` highway rows (`[rows, hidden]` FP32 at
-    /// `streams`, stream `r % hc_mult` of its token) into `normed_h`: one
+    /// `streams`, stream `r % hc_mult` of its token) into `out`: one
     /// `rms_norm_f32_grouped` launch where it is loaded, else one
     /// `rms_norm_f32` launch per row, as before. Same bytes either way.
     pub(super) fn stream_norms(
@@ -292,19 +292,35 @@ impl Qwen4ExpMtpHead {
         ctx: &ForwardContext,
         streams: DevicePtr,
         rows: usize,
+        out: DevicePtr,
         stream: u64,
     ) -> Result<()> {
         let h = ctx.config.hidden_size;
         let hc = ctx.config.hc_mult.max(1);
         let eps = ctx.config.rms_norm_eps as f32;
         let w = self.module.pre_fc_norm_hidden.weight;
+        // `ATLAS_QWEN4EXP_MTP_FLAT_NORM`: one norm over each token's whole
+        // `[hc_mult * hidden]` row, as vLLM (`qwen4exp_mtp_norm.rs`).
+        if super::qwen4exp_mtp_norm::flat_norm() {
+            return ops::rms_norm_f32(
+                ctx.gpu,
+                self.rms_norm_f32_k,
+                streams,
+                w,
+                out,
+                (rows / hc) as u32,
+                (hc * h) as u32,
+                eps,
+                stream,
+            );
+        }
         if self.rms_norm_f32_grouped_k.0 != 0 {
             return ops::rms_norm_f32_grouped(
                 ctx.gpu,
                 self.rms_norm_f32_grouped_k,
                 streams,
                 w,
-                self.normed_h,
+                out,
                 rows as u32,
                 h as u32,
                 eps,
@@ -318,7 +334,7 @@ impl Qwen4ExpMtpHead {
                 self.rms_norm_f32_k,
                 streams.offset(s * h * 4),
                 w.offset((s % hc) * h * 2),
-                self.normed_h.offset(s * h * 2),
+                out.offset(s * h * 2),
                 1,
                 h as u32,
                 eps,

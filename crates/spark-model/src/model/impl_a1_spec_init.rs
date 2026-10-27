@@ -54,19 +54,22 @@ pub(super) fn alloc_mtp_prefill_hidden(
     // not be killed, and the head must be a precision the batched prefill
     // can actually run at — an NVFP4/FP8 MTP head would allocate this and
     // never write it.
-    // Native GLM MTP repair uses the configured repair arena (32K by default)
-    // even when serving a larger context. `arena_context` supplies the same
-    // bound to this capture allocation and its stored capacity. Repair-off
-    // DFlash is not clamped here and skips this allocation below.
+    // The repaired GLM long-context lane indexes a bounded 32K arena even
+    // when the native lane serves a larger context; the capture below and
+    // every stored capacity must quote that same arena. `arena_context`
+    // is the SSOT for the bound, so the private-cache quote
+    // (`PrivateStoragePlan`) cannot disagree with this allocation.
     let mtp_arena_context = crate::speculative::glm_repair_policy::arena_context(
         &config.model_type,
         crate::speculative::glm_repair_policy::enabled()
             && crate::speculative::glm_repair_policy::long_context_enabled(),
+        crate::layers::glm_native::mode::strict_native_mtp(),
         max_seq_len,
     );
     // A DFlash head never prefills from this buffer (its context comes
     // from the multi-layer capture below), so it is not allocated.
     let mtp_prefill_hidden = if has_mtp
+        && !crate::layers::glm_native::mode::strict_native_mtp()
         && dflash_kgamma == 0
         && mtp_quant.supports_drafter_prefill()
         && crate::layers::mtp_drafter_prefill_enabled(levers)

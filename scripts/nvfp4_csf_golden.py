@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: AGPL-3.0-only AND Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0-only
 """
 Golden vectors for the NVFP4-CSF block-scale decoder
 (`crates/spark-runtime/src/weights/nvfp4_csf.rs`).
@@ -20,15 +20,13 @@ The Rust test reads the two inputs, decodes them, and must be byte-identical
 
 THE REFERENCE
 -------------
-`decode_nvfp4_csf_scale` below is adapted from vLLM PR 60646,
-`vllm/model_executor/model_loader/csf_scales.py` at commit
-00b5ad0712629374e6352e2b31de0460be0fdf17, as carried by
-`eugr/spark-vllm-docker:docker/patches/qwen3.8/vllm/14-pr60646.patch`.
-Changes to the reference: logging removed; torch imported inside the function.
-The reference remains Apache-2.0; the surrounding Atlas fixture generator is
-AGPL-3.0-only. See `third_party/csf_references/LICENSE` and `NOTICE` for the
-original license, notices and pinned source URLs. Jason McCartney / Enntity
-integrated this reference into the Atlas fixture generator.
+`decode_nvfp4_csf_scale` below is copied verbatim (minus logging, plus a local `import torch`) from vLLM
+PR 60646, `vllm/model_executor/model_loader/csf_scales.py`, as carried by
+`eugr/spark-vllm-docker:docker/patches/qwen3.8/vllm/14-pr60646.patch`
+(upstream commit 00b5ad0712629374e6352e2b31de0460be0fdf17).
+Copyright contributors to the vLLM project, Apache-2.0. It is deliberately the
+unmodified reference rather than a re-derivation, so the golden tests the Rust
+decoder against someone else's reading of the format.
 
 USAGE
 -----
@@ -73,8 +71,6 @@ CASES = [
 
 
 # ---- vLLM reference (Apache-2.0, see module docstring) -----------------------
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 def decode_nvfp4_csf_scale(fixed, exceptions):
     import torch
 

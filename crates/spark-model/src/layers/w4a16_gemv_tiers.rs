@@ -122,22 +122,13 @@ const TC_ROWS: [u32; 3] = [8, 16, 32];
 /// Under `ATLAS_GLM_CANONICAL_VERIFY` every tier is `w4a16_gemv_tc8`, which
 /// runs 9..32 rows as 8-row tiles of its own arithmetic
 /// (`layers::canonical_verify`), so a row's bits do not follow the width.
-pub fn tc_name(rows: u32, suffix: &str, canonical_target: bool) -> String {
-    let rows = if canonical_target && super::canonical_verify::requested() {
+pub fn tc_name(rows: u32, suffix: &str) -> String {
+    let rows = if super::canonical_verify::requested() {
         8
     } else {
         rows
     };
     format!("w4a16_gemv_tc{rows}{suffix}")
-}
-
-/// The loaded GLM kernel set provides the canonical 32-row sweep. A common
-/// or unrelated target must retain its original tier widths even when the
-/// process-wide canonical-verify setting is enabled. Probe only at startup.
-pub(super) fn canonical_target(gpu: &dyn GpuBackend) -> bool {
-    super::canonical_verify::requested()
-        && super::try_kernel(gpu, "kda", "kda_commit_records").0 != 0
-        && super::try_kernel(gpu, "dense_gemv_bf16_batchm", "dense_gemv_bf16_tc8_planes").0 != 0
 }
 
 /// The narrowest resolved tensor-core tier covering `m` rows, or a zero handle.
@@ -212,17 +203,12 @@ impl W4a16BatchmTiers {
         for (h, w) in handles.iter_mut().zip(W4A16_BATCHM_WIDTHS) {
             *h = super::try_kernel(gpu, "w4a16_gemv", &format!("w4a16_gemv_batch{w}"));
         }
-        if glm_series && tc_requested() {
-            let canonical_target = canonical_target(gpu);
+        if tc_requested() {
             TC.get_or_init(|| {
-                TC_ROWS.map(|rows| {
-                    super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "", canonical_target))
-                })
+                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "")))
             });
             TC_LD.get_or_init(|| {
-                TC_ROWS.map(|rows| {
-                    super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "_ld", canonical_target))
-                })
+                TC_ROWS.map(|rows| super::try_kernel(gpu, "w4a16_gemv", &tc_name(rows, "_ld")))
             });
         }
         Self { handles }

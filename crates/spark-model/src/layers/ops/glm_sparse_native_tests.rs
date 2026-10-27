@@ -29,13 +29,17 @@ fn config() -> ModelConfig {
 }
 
 #[test]
-fn native_sparse_opt_in_is_strict() {
+fn native_sparse_opt_in_and_library_path_are_strict() {
     for value in [None, Some("0")] {
-        assert!(!dispatch::parse(value).unwrap());
+        assert!(!loader::parse(value).unwrap());
     }
-    assert!(dispatch::parse(Some("1")).unwrap());
+    assert!(loader::parse(Some("1")).unwrap());
     for value in ["", "true", "yes", " 1", "2"] {
-        assert!(dispatch::parse(Some(value)).is_err());
+        assert!(loader::parse(Some(value)).is_err());
+    }
+    assert!(loader::validate_path(Some("/opt/atlas/native.so")).is_ok());
+    for path in [None, Some(""), Some("native.so"), Some("./native.so")] {
+        assert!(loader::validate_path(path).is_err());
     }
 }
 
@@ -100,5 +104,51 @@ fn native_sparse_context_limit_is_a_fallback_boundary() {
     assert!(plan::admit(4096, 32768, false, false, false).is_none());
 }
 
-#[path = "glm_sparse_native_dispatch_tests.rs"]
-mod dispatch_tests;
+#[test]
+fn native_sparse_exact_abi_call_and_native_failure_propagation() {
+    static SEEN: std::sync::Mutex<Option<plan::NativeArgs>> = std::sync::Mutex::new(None);
+    unsafe extern "C" fn success(args: *const plan::NativeArgs) -> i32 {
+        // SAFETY: execute supplies its live, validated host ABI struct.
+        *SEEN.lock().unwrap() = Some(unsafe { *args });
+        0
+    }
+    unsafe extern "C" fn failure(_: *const plan::NativeArgs) -> i32 {
+        719
+    }
+    let spans = std::array::from_fn(|i| Span {
+        ptr: (i as u64 + 1) * 0x100000000,
+        bytes: 1 << 29,
+    });
+    let plan = Plan::new(4096, 4100, 8794, 2048, 32, spans, 0x1234).unwrap();
+    execute(&plan, success).unwrap();
+    assert_eq!(SEEN.lock().unwrap().take(), Some(plan.abi));
+    assert_eq!(plan.abi.q, spans[0].ptr);
+    assert_eq!(plan.abi.metadata, spans[6].ptr);
+    assert_eq!(plan.abi.out, spans[9].ptr);
+    assert!(
+        execute(&plan, failure)
+            .unwrap_err()
+            .to_string()
+            .contains("719")
+    );
+}
+
+#[test]
+fn tp4_native_sparse_validates_actual_sixteen_head_arena() {
+    let mut c = config();
+    c.tp_world_size = 4;
+    c.ep_world_size = 4;
+    c.num_attention_heads = 16;
+    c.num_key_value_heads = 16;
+    c.linear_num_key_heads = 16;
+    c.linear_num_value_heads = 16;
+    for rows in [4100, 16384] {
+        c.max_batch_tokens = rows;
+        validate_startup(&c, rows, 32768, 16, 4, KvCacheDtype::Fp8G128, &[]).unwrap();
+    }
+    c.num_attention_heads = 32;
+    assert!(validate_geometry(&c).is_err());
+    c.num_attention_heads = 16;
+    c.ep_world_size = 2;
+    assert!(validate_geometry(&c).is_err());
+}

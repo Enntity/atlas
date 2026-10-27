@@ -19,7 +19,10 @@
 //! (the qwen4_exp pieces' `ATLAS_QWEN4EXP_DECODE_GRAPH_COLLECTIVES=1`)
 //! [`Recorder`]'s `all_reduce_async` first offers the call to the
 //! communicator's capturable one-shot, which enqueues it into the open
-//! capture; only a refusal splits. The GLM verify cache keeps it off.
+//! capture; only a refusal splits. The GLM verify cache keeps it off on the
+//! TP2 pair and turns it on beyond two ranks, where the chain's one-shot is
+//! the reduce its eager `all_reduce_async` would run, so each KDA run is one
+//! graph.
 //!
 //! The cache is generic over its key so the qwen4_exp decode and verify
 //! pieces (`model/decode_pieces.rs`) reuse it with a slot-vector key;
@@ -59,6 +62,12 @@ pub(crate) enum CommOp {
         bytes: usize,
         stream: u64,
     },
+    GatherAsync {
+        base: u64,
+        stride: i64,
+        bytes: usize,
+        stream: u64,
+    },
 }
 
 impl CommOp {
@@ -74,6 +83,18 @@ impl CommOp {
                 bytes,
                 stream,
             } => comm.peer_exchange_async(send, recv, bytes, stream),
+            Self::GatherAsync {
+                base,
+                stride,
+                bytes,
+                stream,
+            } => {
+                ensure!(
+                    comm.gather_async(base, stride, bytes, stream)?,
+                    "piecewise graph replay: the gather it recorded was refused"
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -181,6 +202,24 @@ impl CommBackend for Recorder<'_> {
     }
     fn supports_peer_exchange_async(&self) -> bool {
         self.inner.supports_peer_exchange_async()
+    }
+    /// Recorded when the communicator would serve it (its answer depends on
+    /// the size alone), declined as the eager call would be otherwise.
+    fn gather_async(&self, base: u64, stride: i64, bytes: usize, stream: u64) -> Result<bool> {
+        if !self.inner.supports_gather_async(bytes) {
+            return Ok(false);
+        }
+        let op = CommOp::GatherAsync {
+            base,
+            stride,
+            bytes,
+            stream,
+        };
+        self.on_stream(stream, op)?;
+        Ok(true)
+    }
+    fn supports_gather_async(&self, bytes: usize) -> bool {
+        self.inner.supports_gather_async(bytes)
     }
     fn supports_exchange_async(&self, bytes: usize) -> bool {
         self.inner.supports_exchange_async(bytes)
@@ -332,7 +371,7 @@ impl VerifyPieces {
     }
 
     /// [`Pieces::run_with`] with the TP communicator the GLM verify always
-    /// has.
+    /// has, capturing its collectives beyond two ranks (the chain).
     pub(crate) fn run(
         &self,
         key: PieceKey,
@@ -341,7 +380,8 @@ impl VerifyPieces {
         stream: u64,
         mut body: impl FnMut(&dyn CommBackend) -> Result<()>,
     ) -> Result<()> {
-        self.run_with(key, gpu, Some(comm), stream, |c| match c {
+        let collectives = self.capture_collectives || comm.world_size() > 2;
+        self.run_capturing(key, gpu, Some(comm), stream, collectives, |c| match c {
             Some(c) => body(c),
             None => bail!("piecewise verify graph: the communicator went missing"),
         })
@@ -378,6 +418,19 @@ impl<K: Eq + Hash + Debug> Pieces<K> {
         gpu: &dyn GpuBackend,
         comm: Option<&dyn CommBackend>,
         stream: u64,
+        body: impl FnMut(Option<&dyn CommBackend>) -> Result<()>,
+    ) -> Result<()> {
+        self.run_capturing(key, gpu, comm, stream, self.capture_collectives, body)
+    }
+
+    /// [`Self::run_with`], capturing collectives when `collectives`.
+    fn run_capturing(
+        &self,
+        key: K,
+        gpu: &dyn GpuBackend,
+        comm: Option<&dyn CommBackend>,
+        stream: u64,
+        collectives: bool,
         mut body: impl FnMut(Option<&dyn CommBackend>) -> Result<()>,
     ) -> Result<()> {
         {
@@ -404,7 +457,7 @@ impl<K: Eq + Hash + Debug> Pieces<K> {
         let captured = gpu.begin_capture(stream).and_then(|()| match comm {
             Some(comm) => {
                 let mut recorder = Recorder::new(comm, gpu, stream);
-                recorder.capture_collectives = self.capture_collectives;
+                recorder.capture_collectives = collectives;
                 match body(Some(&recorder)) {
                     Ok(()) => recorder.finish(),
                     Err(e) => {

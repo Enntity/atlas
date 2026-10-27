@@ -33,6 +33,17 @@ mod default_loops;
 /// is a pure host-side layout change). 48 GDN layers x 16 tables x 32
 /// entries x 8 B = 192 KB.
 pub const VERIFY_WY_TABLE_SEQS: usize = 32;
+
+/// The decode rows of a [`TransformerLayer::decode_rows_kv_only`] call:
+/// `n` rows of `hidden` / `residual` scratch, row `i` at KV row `seq_lens[i]`.
+#[derive(Clone, Copy)]
+pub struct KvRows<'a> {
+    pub hidden: DevicePtr,
+    pub residual: DevicePtr,
+    pub n: usize,
+    pub seq_lens: &'a [usize],
+    pub stream: u64,
+}
 /// Tables per GDN layer: h_state + Hi0..Hi14 (K=16 verify → 15
 /// intermediates). wy2..4 read only the first `k` slabs and wyN reads only
 /// slabs 0 (h) and 1 (Hi_0 base) — the extra slabs exist so the
@@ -76,6 +87,22 @@ pub trait TransformerLayer: Send + Sync {
         _stream: u64,
     ) -> Result<()> {
         anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
+    }
+
+    /// Packed multi-prompt prefill (`glm_packed`): `owners` tile arena rows
+    /// `[0, total)`, each a whole new prompt. Row-local work runs once over
+    /// every row; each prompt advances only its own state. Unsupported layers
+    /// refuse before any work.
+    fn prefill_glm_packed(
+        &self,
+        _hidden: DevicePtr,
+        _total: usize,
+        _owners: &mut [super::glm_packed::GlmPackedOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM packed prefill is unsupported for this layer")
     }
 
     /// True when this layer's PREFILL attends only over the tokens it is
@@ -876,6 +903,20 @@ pub trait TransformerLayer: Send + Sync {
             ctx,
             stream,
         )
+    }
+
+    /// Write the KV rows of `rows` (metadata in `ctx`) and nothing else: no
+    /// attention read, FFN or residual update. A one-layer drafter's KV row
+    /// depends on its own input row only, which is what the qwen4_exp MTP
+    /// absorb (`ATLAS_QWEN4EXP_MTP_ABSORB`) relies on. `Ok(false)` =
+    /// unsupported.
+    fn decode_rows_kv_only(
+        &self,
+        _rows: KvRows<'_>,
+        _kv_cache: &mut PagedKvCache,
+        _ctx: &ForwardContext,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Decode N sequences through this layer in a single batched call.

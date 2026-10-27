@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Segmented n-gram tables: shards scattered across one or MORE files, and
-//! the single-scalar FP8 dequant scale that RadixArk's Qwen3.8-Flash-Next
-//! conversion ships instead of a per-row scale file.
+//! Segmented n-gram tables: shards scattered across one or MORE files, the
+//! single-scalar FP8 dequant scale that RadixArk's Qwen3.8-Flash-Next
+//! conversion ships instead of a per-row scale file, and the NVFP4 global
+//! scale of the FP4-Local checkpoint.
 //!
 //! Split out of `ngram_cache.rs` to keep that file under the 500-LoC cap. A
 //! child module, so the cache's private fields are still reachable.
@@ -78,6 +79,9 @@ impl NgramRowCache {
                  a constant per-tensor scale would silently override it"
             );
         }
+        if self.nvfp4_global.is_some() {
+            bail!("NgramRowCache: the rows are NVFP4; an FP8 scale array would mis-decode them");
+        }
         let sbytes = self.slots * 4;
         let sblocks = sbytes.div_ceil(BLOCK);
         let arena = ExpertArena::new(1, sblocks as u32, BLOCK)
@@ -97,98 +101,27 @@ impl NgramRowCache {
         Ok(())
     }
 
-    /// Install SEGMENTED per-row block scales: `shards[i]` is shard `i`'s
-    /// backing file and the byte offset of its first scale row, at the same
-    /// `rows_per` shard split as the weight table (`open_segmented` must have
-    /// run first). Every fault then fetches the row's scale row into
-    /// `scales[slot * scale_stride..]`. Refuses if a scale source is already
-    /// installed — stacking two would silently pick one.
-    pub fn attach_segmented_block_scales(
-        &mut self,
-        shards: &[(std::path::PathBuf, u64)],
-        scale_stride: usize,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            self.scales.is_none(),
-            "NgramRowCache: a scale source is already installed"
-        );
-        anyhow::ensure!(
-            !shards.is_empty() && scale_stride > 0 && scale_stride <= BLOCK,
-            "NgramRowCache: bad segmented scale geometry (shards={}, stride={scale_stride})",
-            shards.len()
-        );
-        let seg = self
-            .segments
-            .as_ref()
-            .context("NgramRowCache: segmented scales need a segmented table")?;
-        let rows_per = seg.rows_per;
-        let (paths, shard_file) = plan_shard_files(shards);
-        let mut files = Vec::with_capacity(paths.len());
-        for path in &paths {
-            files.push(open_direct(path)?);
+    /// Mark the rows as packed NVFP4 (E2M1 codes, then their E4M3 block
+    /// scales, in the row itself) and record the tensor's global f32 scale,
+    /// which the NVFP4 gather multiplies in after the block scale.
+    ///
+    /// Exclusive with a scale ARRAY: an NVFP4 row has no per-slot f32 to
+    /// look up, and leaving one installed would let the FP8 gather be picked
+    /// for bytes it cannot decode.
+    pub fn set_nvfp4_global_scale(&mut self, scale: f32) -> Result<()> {
+        if self.scales.is_some() {
+            bail!("NgramRowCache: an FP8 scale array is installed; NVFP4 rows carry their own");
         }
-        let sbytes = self.slots * scale_stride;
-        let sblocks = sbytes.div_ceil(BLOCK);
-        // ATLAS_PLE_SCALES_RESIDENT=1: read every shard's scale tensor into
-        // one host arena (shard order, flat `id * stride` indexing); faults
-        // then memcpy scales instead of a second disk read. Hard error on a
-        // missing/short shard.
-        let resident_env = std::env::var("ATLAS_PLE_SCALES_RESIDENT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let resident = if resident_env {
-            let shard_bytes = rows_per as usize * scale_stride;
-            let mut arena = vec![0u8; shards.len() * shard_bytes];
-            std::thread::scope(|sc| {
-                let mut hs = Vec::new();
-                for (dst, (path, base)) in arena.chunks_mut(shard_bytes).zip(shards.iter()) {
-                    let (path, base) = (path.clone(), *base);
-                    hs.push(sc.spawn(move || -> Result<()> {
-                        use std::os::unix::fs::FileExt;
-                        std::fs::File::open(&path)
-                            .with_context(|| format!("scale shard {path:?}"))?
-                            .read_exact_at(dst, base)
-                            .with_context(|| format!("scale shard {path:?} short at {base}"))
-                    }));
-                }
-                for h in hs {
-                    h.join().expect("scale loader panic")?;
-                }
-                Ok::<(), anyhow::Error>(())
-            })?;
-            tracing::info!(
-                "PLE block scales resident: {:.1} GB ({} shards x {} rows x {} B)",
-                arena.len() as f64 / 1e9,
-                shards.len(),
-                rows_per,
-                scale_stride
-            );
-            Some(std::sync::Arc::new(arena))
-        } else {
-            None
-        };
-        self.scales = Some(ScaleCache {
-            arena: ExpertArena::new(1, sblocks as u32, BLOCK)
-                .context("NgramRowCache: block-scale arena")?,
-            stride: scale_stride,
-            src: ScaleSrc::Segmented(Segments {
-                bases: shards.iter().map(|(_, off)| *off).collect(),
-                rows_per,
-                files,
-                shard_file,
-            }),
-            resident,
-        });
+        if !(scale.is_finite() && scale > 0.0) {
+            bail!("NgramRowCache: NVFP4 global scale {scale} cannot dequantize anything");
+        }
+        self.nvfp4_global = Some(scale);
         Ok(())
     }
 
-    /// Device VA of the block-scale arena (`[slots, scale_stride]` u8), for
-    /// the NVFP4 gather kernel.
-    pub fn block_scale_dev_va(&self) -> Result<Option<u64>> {
-        match &self.scales {
-            Some(s) => Ok(Some(s.arena.slot_dev_va(0, 0)?)),
-            None => Ok(None),
-        }
+    /// The NVFP4 global scale, `Some` exactly when the rows are packed NVFP4.
+    pub fn nvfp4_global_scale(&self) -> Option<f32> {
+        self.nvfp4_global
     }
 }
 

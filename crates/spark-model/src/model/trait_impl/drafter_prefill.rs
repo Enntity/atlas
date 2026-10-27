@@ -93,6 +93,24 @@ impl TransformerModel {
         )
     }
 
+    /// [`Self::try_mtp_prefill_capture`] of a single-sequence chunk, and for
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL` the final highway rows this rank holds of
+    /// it ([`Self::note_mtp_prompt_rows`]): of a chunk split by the
+    /// sequence-parallel prefill (`sp`), rank 0's half at row 0.
+    pub(super) fn mtp_prefill_capture_rows(
+        &self,
+        seq: &mut SequenceState,
+        chunk_start: usize,
+        proc_count: usize,
+        sp: Option<crate::layers::glm_sp::SpRows>,
+        stream: u64,
+    ) -> Result<()> {
+        self.try_mtp_prefill_capture(seq, chunk_start, proc_count, stream)?;
+        let held = sp.map_or(proc_count, |s| if s.row0 == 0 { s.rows } else { 0 });
+        self.note_mtp_prompt_rows(seq, chunk_start, held, 0);
+        Ok(())
+    }
+
     /// [`Self::try_mtp_prefill_capture`] with an explicit SOURCE pointer.
     ///
     /// The mixed forward lays out `[decode rows | prefill rows]`, so its
@@ -109,7 +127,8 @@ impl TransformerModel {
         // Native-only sequences must not touch the single shared capture
         // buffer; doing so would make a plain fallback mutate the next repair
         // owner's input.
-        if self.mtp_prefill_hidden.is_null()
+        if self.native_glm_mtp
+            || self.mtp_prefill_hidden.is_null()
             || proc_count == 0
             || seq.disable_mtp
             || seq.proposer_state.is_none()
@@ -210,7 +229,7 @@ impl TransformerModel {
         // before touching the paired path, proposer state, or retained
         // capture so a request-local fallback cannot accidentally run a
         // drafter through an eager-prefill call.
-        if seq.disable_mtp {
+        if self.native_glm_mtp || seq.disable_mtp {
             return Ok(());
         }
         if !is_last || eager_drafter_disabled() || self.mtp_prefill_hidden.is_null() {
@@ -222,7 +241,34 @@ impl TransformerModel {
         if seq.proposer_state.is_none() {
             return Ok(());
         }
-        let ctx = ForwardContext {
+        let ctx = self.drafter_ctx();
+        self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
+        if crate::speculative::mtp_accept_debug() {
+            let rows =
+                proposer.drafter_rows(seq.proposer_state.as_mut().expect("checked above").as_mut());
+            let captured = self
+                .mtp_prefill_capture_len
+                .load(std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                "MTP drafter coverage: prompt_len={} captured={captured} drafter_rows={rows}",
+                seq.prompt_len,
+            );
+        }
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "MTP eager drafter prefill ENGAGED: the whole-prompt capture is consumed at \
+                 end-of-prefill, so every concurrent sequence (not only the last-prefilled) \
+                 can build drafter KV over its own prompt"
+            );
+        }
+        Ok(())
+    }
+
+    /// The drafter's context outside a propose: rank-local (`comm: None`),
+    /// no metadata, no capture.
+    fn drafter_ctx(&self) -> ForwardContext<'_> {
+        ForwardContext {
             ssm_batch: None,
             buffers: &self.buffers,
             gpu: self.gpu.as_ref(),
@@ -244,26 +290,49 @@ impl TransformerModel {
             host_token_ids: None,
             routed_lora_layers: None,
             midchunk_capture: None,
-        };
-        self.ensure_drafter_context(proposer.as_ref(), seq, &ctx, stream)?;
-        if crate::speculative::mtp_accept_debug() {
-            let rows =
-                proposer.drafter_rows(seq.proposer_state.as_mut().expect("checked above").as_mut());
-            let captured = self
-                .mtp_prefill_capture_len
-                .load(std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(
-                "MTP drafter coverage: prompt_len={} captured={captured} drafter_rows={rows}",
-                seq.prompt_len,
-            );
         }
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            tracing::info!(
-                "MTP eager drafter prefill ENGAGED: the whole-prompt capture is consumed at \
-                 end-of-prefill, so every concurrent sequence (not only the last-prefilled) \
-                 can build drafter KV over its own prompt"
-            );
+    }
+
+    /// `ATLAS_QWEN4EXP_MTP_PREFILL`: highway rows `hc_row ..` hold the final
+    /// streams of `seq`'s prompt positions `first_pos ..` (`rows` of them)
+    /// until the next forward (`DraftProposer::note_prompt_rows`).
+    pub(in crate::model) fn note_mtp_prompt_rows(
+        &self,
+        seq: &mut SequenceState,
+        first_pos: usize,
+        rows: usize,
+        hc_row: usize,
+    ) {
+        if let (Some(p), Some(st), false) = (
+            self.proposer.as_ref(),
+            seq.proposer_state.as_mut(),
+            seq.disable_mtp,
+        ) {
+            p.note_prompt_rows(st.as_mut(), first_pos, rows, hc_row);
+        }
+    }
+
+    /// After a prefill chunk of `seq` returns, its logits computed: the
+    /// drafter's context over the rows it noted (`DraftProposer::absorb_prompt`;
+    /// `prompt` = the whole prompt's tokens). A failure costs only drafts.
+    pub(in crate::model) fn try_mtp_prompt_absorb(
+        &self,
+        seq: &mut SequenceState,
+        prompt: &[u32],
+        stream: u64,
+    ) {
+        let (Some(p), Some(st), false) = (
+            self.proposer.clone(),
+            seq.proposer_state.as_mut(),
+            seq.disable_mtp,
+        ) else {
+            return;
+        };
+        if let Err(e) = p.absorb_prompt(st.as_mut(), prompt, &self.drafter_ctx(), stream) {
+            static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            crate::layers::qwen4exp_mtp::qwen4exp_mtp_absorb::warn_sparsely(&FAILED, || {
+                format!("MTP drafter prompt rows failed (drafting without them): {e:#}")
+            });
         }
         Ok(())
     }

@@ -48,6 +48,7 @@ impl Violation {
 /// error string listing EVERY violation (so the operator fixes them in one
 /// pass), or `Ok(())` when the invocation is self-consistent.
 pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
+    args.tool_guard.policy()?;
     let mut v: Vec<Violation> = Vec::new();
 
     // ── Enumerated-value typos (caught here so a typo fails fast, before the
@@ -270,23 +271,6 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
             "above 32 a decode batch runs padded to the next rung (48, 64, 96, 128), and \
              per-row buffers sized to the requested width are overrun by the padding rows.",
             format!("use --max-batch-size 32 or {up} (any value up to 32 is fine)."),
-        ));
-    }
-
-    // ── Reference mode locks thinking to the client's request. ──
-    if args.reference_mode && args.disable_thinking {
-        v.push(Violation::new(
-            "--reference-mode is set together with --disable-thinking.",
-            "reference mode serves the client's thinking flags unchanged; \
-             --disable-thinking forces reasoning off for every request.",
-            "drop --disable-thinking (the client decides thinking in reference mode).",
-        ));
-    }
-    if args.reference_mode && args.max_thinking_budget.is_some() {
-        v.push(Violation::new(
-            "--reference-mode is set together with --max-thinking-budget.",
-            "reference mode leaves the client's max_tokens as the only cap on reasoning.",
-            "drop --max-thinking-budget.",
         ));
     }
 

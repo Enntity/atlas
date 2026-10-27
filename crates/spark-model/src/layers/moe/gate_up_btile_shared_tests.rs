@@ -261,3 +261,36 @@ fn legacy_unsupported_shared_transforms_succeed_without_tiled_authority() {
         assert!(layer.shared_gate_up_receipt.is_none());
     }
 }
+
+/// Production's unified layout mints the shared gate/up receipt over the
+/// transposed NVFP4 twins and `ATLAS_GLM_TARGET_SHARED_FP8` adds an E4M3
+/// predecode: a native FP8 block shared expert takes precedence over both,
+/// freeing them (and the NVFP4 originals) instead of refusing to load.
+#[test]
+fn native_shared_expert_replaces_every_derived_shared_copy() {
+    use crate::layers::moe::shared_native::SharedNative;
+    use crate::weight_map::Fp8BlockWeight;
+    let gpu = Gpu::new();
+    let (_store, config, _local, mut layer) = binding_tests::setup(&gpu, 0);
+    install_native_shared(&mut layer, &gpu);
+    btile_shared_fixture(&mut layer, &gpu, &config).unwrap();
+    layer.shared_gate_fp8 = Some(gpu.alloc(64).unwrap());
+    assert!(layer.shared_gate_up_receipt.is_some() && layer.shared_gate_t.is_some());
+    let twin = |gpu: &Gpu| Fp8BlockWeight {
+        data: gpu.alloc(64).unwrap(),
+        scales: gpu.alloc(16).unwrap(),
+        tiled: false,
+    };
+    let native = SharedNative {
+        gate: twin(&gpu),
+        up: twin(&gpu),
+        down: twin(&gpu),
+        prefill: crate::layers::ops::Fp8bPrefill::W8a8,
+    };
+    layer.install_shared_native(&gpu, native).unwrap();
+    assert!(layer.has_shared_native());
+    assert!(layer.shared_gate_up_receipt.is_none());
+    assert!(layer.shared_gate_t.is_none() && layer.shared_up_t.is_none());
+    assert!(layer.shared_gate_fp8.is_none());
+    assert!(layer.weights.shared_expert.gate_proj.is_null());
+}

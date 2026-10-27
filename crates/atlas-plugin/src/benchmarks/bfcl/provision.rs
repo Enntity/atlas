@@ -27,6 +27,7 @@ pub const PLUGIN_ID: &str = "bfcl";
 
 const REQUIREMENTS: &str = include_str!("../../../assets/bfcl/requirements.txt");
 const PROVISION_PY: &str = include_str!("../../../assets/bfcl/provision.py");
+const PREFLIGHT_PY: &str = include_str!("../../../assets/bfcl/preflight.py");
 const SCORE_PY: &str = include_str!("../../../assets/bfcl/score.py");
 
 /// Minimum interpreter. bfcl-eval and the scorer both use `match` and modern
@@ -62,28 +63,23 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
     write_asset(&dir, "requirements.txt", REQUIREMENTS)?;
     write_asset(&dir, "provision.py", PROVISION_PY)?;
     write_asset(&dir, "score.py", SCORE_PY)?;
+    write_asset(&dir, "preflight.py", PREFLIGHT_PY)?;
 
     let dataset = dir.join("dataset.jsonl");
     let scorer = dir.join("score.py");
     let venv = dir.join("venv");
     let interpreter = python::venv_python(&venv);
     // The stamp covers every input that can change the materialized data: the
-    // pins and both scripts.
+    // pins and all three scripts.
     let stamp = Stamp::new(
         &dir,
         ".provisioned",
-        format!(
-            "v1 py>={}.{} req={} prov={} score={}",
-            MIN_PYTHON.0,
-            MIN_PYTHON.1,
-            REQUIREMENTS.len(),
-            PROVISION_PY.len(),
-            SCORE_PY.len()
-        ),
+        provisioning_key(&[REQUIREMENTS, PROVISION_PY, SCORE_PY, PREFLIGHT_PY]),
     );
 
     if stamp.is_current() && dataset.is_file() && interpreter.is_file() {
         handle.info("BFCL artifacts already provisioned");
+        scorer_preflight(&interpreter, &dir, handle).await?;
         let totals = read_totals(&dir)?;
         return Ok(Artifacts {
             dir,
@@ -103,6 +99,8 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
 
     handle.status("BFCL: downloading bfcl-eval (needs network)");
     python::pip_install(&interpreter, &dir.join("requirements.txt")).await?;
+
+    scorer_preflight(&interpreter, &dir, handle).await?;
 
     handle.status("BFCL: materializing the single-turn dataset");
     let out = python::run(
@@ -146,6 +144,37 @@ pub async fn ensure(store: &ArtifactStore, handle: &PluginHandle) -> Result<Arti
     })
 }
 
+fn provisioning_key(inputs: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    for input in inputs {
+        hash.update((input.len() as u64).to_le_bytes());
+        hash.update(input.as_bytes());
+    }
+    format!(
+        "v3 py>={}.{} sha256={:x}",
+        MIN_PYTHON.0,
+        MIN_PYTHON.1,
+        hash.finalize()
+    )
+}
+
+async fn scorer_preflight(interpreter: &Path, dir: &Path, handle: &PluginHandle) -> Result<()> {
+    handle.status("BFCL: verifying scorer dependencies and argument checks");
+    let script = dir.join("preflight.py");
+    let out = python::run(
+        interpreter,
+        &[script
+            .to_str()
+            .context("preflight path is not valid UTF-8")?],
+        Some(dir),
+    )
+    .await
+    .context("BFCL scorer preflight failed before inference")?;
+    handle.info(out.stdout.trim());
+    Ok(())
+}
+
 fn read_totals(dir: &Path) -> Result<std::collections::BTreeMap<String, usize>> {
     let text = std::fs::read_to_string(dir.join("dataset_summary.json")).context(
         "dataset_summary.json is missing — delete ~/.atlas/artifacts/bfcl to re-provision",
@@ -156,6 +185,18 @@ fn read_totals(dir: &Path) -> Result<std::collections::BTreeMap<String, usize>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_length_input_changes_invalidate_the_bfcl_cache() {
+        assert_ne!(
+            provisioning_key(&["pin==1", "script"]),
+            provisioning_key(&["pin==2", "script"])
+        );
+        assert_ne!(
+            provisioning_key(&["ab", "c"]),
+            provisioning_key(&["a", "bc"])
+        );
+    }
 
     #[test]
     fn the_committed_python_assets_are_non_empty_and_own_their_cli() {
