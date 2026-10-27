@@ -161,7 +161,7 @@ fn glm_text_spelled_call_markup_streams_like_blocking() {
         tokens.extend(spelled);
         let response = response(tokens.clone());
         let (reasoning, content) =
-            crate::api::chat_blocking::decode_response_text(&state, &response, true, tools);
+            crate::api::chat_blocking::decode_response_text(&state, &response, true, tools, false);
         let choice = crate::api::chat_blocking_choice::build_choice_message(
             &state,
             &request(),

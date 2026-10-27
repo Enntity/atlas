@@ -30,7 +30,7 @@ fn glm_tool_arguments_keep_generated_key_order() {
     let state = app(true);
     let response = response(tokens.clone());
     let (reasoning, content) =
-        crate::api::chat_blocking::decode_response_text(&state, &response, true, true);
+        crate::api::chat_blocking::decode_response_text(&state, &response, true, true, false);
     let choice = crate::api::chat_blocking_choice::build_choice_message(
         &state, &req, &response, reasoning, content, true, None, 0,
     );
@@ -39,7 +39,7 @@ fn glm_tool_arguments_keep_generated_key_order() {
         serde_json::to_string(&choice.tool_calls[0].arguments).unwrap(),
         expected
     );
-    let (_, _, deltas) = stream_for_request(app(true), true, tokens, req);
+    let (_, _, deltas) = stream_tokens_with_state(app(true), true, tokens, req);
     let streamed: String = deltas
         .iter()
         .filter_map(|delta| match delta {
