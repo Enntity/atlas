@@ -802,6 +802,7 @@ mod factory;
 mod gguf;
 mod methods;
 #[cfg(test)]
+#[path = "config/methods_config_tests.rs"]
 mod methods_tests;
 mod ngram;
 mod ngram_qwen4exp;
