@@ -20,11 +20,21 @@ use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
 use super::lifecycle::*;
-use super::{BlockDiffusionDraftHead, DflashKernels, DflashProposerState, DflashScratch};
+use super::{
+    BlockDiffusionDraftHead, CTX_ACC_POOL, DflashKernels, DflashProposerState, DflashScratch,
+};
 use crate::speculative::DraftProposer;
 use crate::weight_map::DenseWeight;
 
-fn owner(slot: usize, generation: u64) -> SequenceGeneration {
+pub(super) static POOL_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+pub(super) fn lock_and_drain_pool() -> parking_lot::MutexGuard<'static, ()> {
+    let guard = POOL_TEST_LOCK.lock();
+    CTX_ACC_POOL.lock().clear();
+    guard
+}
+
+pub(super) fn owner(slot: usize, generation: u64) -> SequenceGeneration {
     SequenceGeneration::new(slot, generation).unwrap()
 }
 
@@ -121,6 +131,13 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         batch_mlp_down: DevicePtr(0),
         batch_logits: DevicePtr(0),
         batch_grammar_bitmask: DevicePtr(0),
+        batch_grammar_masks_host_pinned: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+        batch_grammar_masks_pinned_bytes: 0,
+        batch_ctx_in: DevicePtr(0),
+        batch_ctx_fc: DevicePtr(0),
+        batch_ctx_fused: DevicePtr(0),
+        batch_ctx_rows: 0,
+        spark_shared_default: false,
         batch_tokens: DevicePtr(0),
         batch_markov_prev: DevicePtr(0),
         batch_markov_embed: DevicePtr(0),
@@ -149,6 +166,8 @@ pub(super) fn zero_head() -> BlockDiffusionDraftHead {
         quant: super::DflashQuantization::Bf16,
         twins: Default::default(),
         startup: super::DsparkStartupExecution::from_env_lenient(),
+        ctx_carry: parking_lot::Mutex::new(None),
+        drafter_cublas: false,
         rank_split: None,
     }
 }
@@ -221,7 +240,10 @@ fn zero_kv_cache() -> PagedKvCache {
 /// A live per-sequence state mirroring `owner_failure_reclaim_frees_state_
 /// resources_without_leaking`'s setup but driven through the REAL trait
 /// method (`<BlockDiffusionDraftHead as DraftProposer>::free_state`).
-fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashProposerState> {
+pub(super) fn live_state(
+    gpu: &MockGpuBackend,
+    own: SequenceGeneration,
+) -> Box<DflashProposerState> {
     Box::new(DflashProposerState {
         block_table: Vec::new(),
         seq_len: 12,
@@ -233,6 +255,9 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
         last_num_accepted: 1,
         skip_next_decode_append: false,
         max_ctx_len: 1024,
+        ctx_acc_rows: 1024,
+        ctx_prefill_origin: None,
+        ctx_prefill_base: 0,
         ctx_slot_bytes: 64,
         block_table_dev: Some(gpu.alloc(256).unwrap()),
         ctx_count_drafter: 12,
@@ -254,7 +279,10 @@ fn live_state(gpu: &MockGpuBackend, own: SequenceGeneration) -> Box<DflashPropos
 }
 
 /// Grab two real KV pool blocks into the state's block table.
-fn hold_two_blocks(state: &mut DflashProposerState, kv: &parking_lot::Mutex<PagedKvCache>) {
+pub(super) fn hold_two_blocks(
+    state: &mut DflashProposerState,
+    kv: &parking_lot::Mutex<PagedKvCache>,
+) {
     for _ in 0..2 {
         let block = kv.lock().try_alloc_block().expect("block available");
         state.block_table.push(block);
@@ -263,6 +291,7 @@ fn hold_two_blocks(state: &mut DflashProposerState, kv: &parking_lot::Mutex<Page
 
 #[test]
 fn real_free_state_success_path_reclaims_all_resources() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -294,6 +323,7 @@ fn real_free_state_success_path_reclaims_all_resources() {
 
 #[test]
 fn real_free_state_second_call_is_idempotent_success() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -311,6 +341,7 @@ fn real_free_state_second_call_is_idempotent_success() {
 
 #[test]
 fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -352,6 +383,7 @@ fn real_free_state_owner_mismatch_reclaims_then_propagates_error() {
 
 #[test]
 fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -378,6 +410,7 @@ fn real_free_state_different_live_owner_is_rejected_and_reclaimed() {
 
 #[test]
 fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -403,6 +436,7 @@ fn real_free_state_missing_owner_is_rejected_and_reclaimed() {
 
 #[test]
 fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -427,6 +461,7 @@ fn real_free_state_backend_free_failure_retains_pointer_for_retry() {
 
 #[test]
 fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let head = zero_head();
     let own = owner(3, 77);
@@ -455,6 +490,7 @@ fn real_free_state_block_table_free_failure_restores_handle_for_retry() {
 
 #[test]
 fn reclaim_seam_free_failure_retains_pointers() {
+    let _pool_guard = lock_and_drain_pool();
     let gpu = MockGpuBackend::new();
     let own = owner(3, 77);
     let mut dstate = live_state(&gpu, own);

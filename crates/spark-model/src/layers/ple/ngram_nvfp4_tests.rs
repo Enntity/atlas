@@ -325,3 +325,27 @@ fn nvfp4_gather_matches_the_golden_through_pack_and_cache() {
     assert_eq!((golden_checked, junk_checked), (11, 3));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn decodes_rows_with_block_and_global_scales() {
+    let mut rows = vec![0u8; 2 * packed_stride(32)];
+    rows[..8].fill(0x22);
+    rows[8..16].fill(0x77);
+    rows[16..18].copy_from_slice(&[0x38, 0x40]);
+    rows[packed_stride(32)..packed_stride(32) + 16].fill(0x99);
+    rows[packed_stride(32) + 16..packed_stride(32) + 18].fill(0x40);
+    let out = dequant_packed_bf16(&rows, 32, 0.25);
+    let at = |i: usize| f32::from_bits(u32::from(out[i]) << 16);
+    assert_eq!(out.len(), 64);
+    assert!((0..16).all(|i| at(i) == 0.25));
+    assert!((16..32).all(|i| at(i) == 3.0));
+    assert!((32..64).all(|i| at(i) == -0.25));
+}
+
+#[test]
+fn rejects_mismatched_rows_and_strides() {
+    assert!(check_packed_stride(18, 32, true).is_err());
+    assert!(check_packed_stride(16, 32, false).is_err());
+    assert!(check_packed_stride(32, 32, false).is_ok());
+    assert!(check_packed_stride(32, 30, false).is_err());
+}

@@ -32,8 +32,15 @@ impl BlockDiffusionDraftHead {
         gpu: &dyn GpuBackend,
         max_seq_len: usize,
         max_batch_size: usize,
+        target_model_type: &str,
         mut startup: DsparkStartupExecution,
     ) -> Result<Self> {
+        super::selector_platform::validate_requested_features(startup.diagnostics.draft_conf)?;
+        let spark_shared_default =
+            crate::model::uses_spark_shared_defaults_model_type(target_model_type);
+        let drafter_cublas = !spark_shared_default
+            && std::env::var("ATLAS_DFLASH_DRAFTER_CUBLAS").as_deref() == Ok("1")
+            && spark_runtime::cublaslt::available();
         let embed_tokens_shared = weights
             .embed_tokens
             .as_ref()
@@ -86,6 +93,13 @@ impl BlockDiffusionDraftHead {
         let head_dim = weights.config.head_dim;
         let vocab_size = target_vocab_size.min(weights.config.vocab_size);
         let gamma_val = gamma.unwrap_or(weights.config.block_size());
+        let own_lm_head = (!spark_shared_default).then_some(weights.lm_head).flatten();
+        let lm_head_nvfp4 = own_lm_head.or(lm_head_nvfp4);
+        let lm_head_shared = if own_lm_head.is_some() {
+            DevicePtr::NULL
+        } else {
+            lm_head_shared
+        };
 
         // Allocate the drafter's paged FP8 KV cache. One multi-layer cache,
         // sized for `max_seq_len + γ + 1` positions (prompt + γ drafts +
@@ -456,6 +470,28 @@ impl BlockDiffusionDraftHead {
         // applied to each seq's logits rows 0/1 in the staged tail (#102).
         let batch_grammar_bitmask =
             gpu.alloc(batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4)?;
+        let batch_grammar_masks_pinned_bytes =
+            batch_capacity * ops::grammar_bitmask_words(vocab_size as u32) * 4;
+        let batch_grammar_masks_host_pinned =
+            std::sync::atomic::AtomicPtr::new(if spark_shared_default {
+                std::ptr::null_mut()
+            } else {
+                gpu.alloc_host_pinned(batch_grammar_masks_pinned_bytes)?
+            });
+        let batch_ctx_rows = if spark_shared_default {
+            0
+        } else {
+            batch_capacity * super::batched_ctx::BATCH_CTX_ROWS_PER_SEQ
+        };
+        let (batch_ctx_in, batch_ctx_fc, batch_ctx_fused) = if batch_ctx_rows == 0 {
+            (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL)
+        } else {
+            (
+                gpu.alloc(batch_ctx_rows * batch_target_bytes / batch_capacity)?,
+                gpu.alloc(batch_ctx_rows * hidden_size * bf16)?,
+                gpu.alloc(batch_ctx_rows * num_layers * 2 * kv_dim * bf16)?,
+            )
+        };
         let batch_tokens = gpu.alloc(batch_capacity * draft_record_bytes)?;
         // `[capacity]` anchors, then `[capacity]` banned draft depths.
         let batch_markov_prev = gpu.alloc(batch_capacity * MARKOV_PREV_BYTES)?;
@@ -855,6 +891,13 @@ impl BlockDiffusionDraftHead {
             batch_mlp_down,
             batch_logits,
             batch_grammar_bitmask,
+            batch_grammar_masks_host_pinned,
+            batch_grammar_masks_pinned_bytes,
+            batch_ctx_in,
+            batch_ctx_fc,
+            batch_ctx_fused,
+            batch_ctx_rows,
+            spark_shared_default,
             batch_tokens,
             batch_markov_prev,
             batch_markov_embed,
@@ -883,6 +926,8 @@ impl BlockDiffusionDraftHead {
             quant: DflashQuantization::Bf16,
             twins: Default::default(),
             startup,
+            ctx_carry: parking_lot::Mutex::new(None),
+            drafter_cublas,
             rank_split: None,
         };
 

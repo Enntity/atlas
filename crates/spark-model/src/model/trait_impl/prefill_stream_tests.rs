@@ -3,8 +3,8 @@
 
 #[path = "prefill_stream_commit_order_tests.rs"]
 mod commit_order;
-#[path = "prefill_stream_test_fixture.rs"]
-mod fixture;
+use super::super::prefill_stream_test_fixture as fixture;
+use super::super::prefill_stream_test_fixture::*;
 use crate::model::kv_admission::kv_admission_refusal;
 use crate::traits::{Model, SequenceState};
 use fixture::*;

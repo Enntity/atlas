@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Check ownership with the real payload helper and checkpoint teardown.
+use super::mmq_layout::{free_expert_table, free_quantized_payload};
 use super::*;
 use atlas_core::scope::ModelResource;
 use spark_runtime::gpu::mock::MockGpuBackend;
@@ -45,7 +46,7 @@ fn payload(gpu: &MockGpuBackend, carveout: bool) -> (WeightStore, QuantizedWeigh
 fn mmq_payload_retirement_prevents_checkpoint_double_free() {
     let gpu = MockGpuBackend::new();
     let (mut store, mut weight) = payload(&gpu, false);
-    free_quantized_payload(&gpu, &store, &mut weight).unwrap();
+    free_quantized_payload(&gpu, &mut weight).unwrap();
     store.release(&gpu).unwrap();
     assert_eq!(gpu.invalid_free_count(), 0);
     assert_eq!(gpu.alloc_count(), 0);
@@ -56,7 +57,7 @@ fn mmq_retired_checkpoint_cannot_free_reused_slab_address() {
     let gpu = MockGpuBackend::with_carveout(4 * 65536);
     let (mut store, mut weight) = payload(&gpu, true);
     let original = weight.weight;
-    free_quantized_payload(&gpu, &store, &mut weight).unwrap();
+    free_quantized_payload(&gpu, &mut weight).unwrap();
     let slab = gpu.alloc_carveout(256).unwrap();
     assert_eq!(slab, original);
     gpu.copy_h2d(&[31; 256], slab).unwrap();
@@ -75,7 +76,7 @@ fn mmq_partial_payload_free_clears_each_pointer_before_the_next_attempt() {
     let (mut store, mut weight) = payload(&gpu, false);
     let original = weight.weight;
     gpu.fail_next_free();
-    assert!(free_quantized_payload(&gpu, &store, &mut weight).is_err());
+    assert!(free_quantized_payload(&gpu, &mut weight).is_err());
     assert!(
         weight.weight.is_null(),
         "a failed free belongs to backend cleanup, not another layer/store attempt"
@@ -85,7 +86,7 @@ fn mmq_partial_payload_free_clears_each_pointer_before_the_next_attempt() {
     // This mock's injected failure retains memory. Simulate backend cleanup
     // after the layer/store gave up ownership; neither may attempt it again.
     gpu.free(original).unwrap();
-    free_quantized_payload(&gpu, &store, &mut weight).unwrap();
+    free_quantized_payload(&gpu, &mut weight).unwrap();
     store.release(&gpu).unwrap();
     assert_eq!(gpu.invalid_free_count(), 0);
     assert_eq!(gpu.alloc_count(), 0);
@@ -111,11 +112,8 @@ fn mmq_repack_rejects_expert_tp_before_gpu_work() {
         &config,
     )
     .unwrap();
-    let store = WeightStore::from_map(HashMap::new());
     let before = (gpu.alloc_count(), gpu.launch_count(), gpu.sync_count());
-    let err = layer
-        .repack_nvfp4_mmq_unified(&gpu, &config, &store)
-        .unwrap_err();
+    let err = layer.repack_nvfp4_mmq_unified(&gpu, &config).unwrap_err();
     assert!(err.to_string().contains("expert TP"), "{err:#}");
     assert_eq!(
         before,
@@ -165,9 +163,7 @@ fn layer_fixture(gpu: &dyn GpuBackend) -> (MoeLayer, WeightStore, atlas_core::co
 fn mmq_full_repack_retires_all_checkpoint_sources() {
     let gpu = MockGpuBackend::new();
     let (mut layer, mut store, config) = layer_fixture(&gpu);
-    layer
-        .repack_nvfp4_mmq_unified(&gpu, &config, &store)
-        .unwrap();
+    layer.repack_nvfp4_mmq_unified(&gpu, &config).unwrap();
     assert!(layer.nvfp4_mmq_layout);
     assert_eq!(layer._nvfp4_mmq_owned.len(), 3);
     store.release(&gpu).unwrap();
@@ -180,11 +176,7 @@ fn mmq_later_repack_failure_keeps_earlier_retirements() {
     let (mut layer, mut store, config) = layer_fixture(&gpu);
     // One slab plus three table buffers completes gate, then up fails.
     gpu.fail_alloc_after(4);
-    assert!(
-        layer
-            .repack_nvfp4_mmq_unified(&gpu, &config, &store)
-            .is_err()
-    );
+    assert!(layer.repack_nvfp4_mmq_unified(&gpu, &config).is_err());
     assert!(store.was_reclaimed("gate.weight"));
     assert!(store.was_reclaimed("gate.weight_scale"));
     assert!(!store.was_reclaimed("up.weight"));

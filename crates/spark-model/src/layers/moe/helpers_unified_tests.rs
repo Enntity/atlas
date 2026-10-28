@@ -13,6 +13,8 @@ mod checkpoint_down;
 #[path = "helpers_unified_fault_tests.rs"]
 mod faults;
 use abi::assert_abi_and_tables;
+#[path = "helpers_unified_inplace_tests.rs"]
+mod inplace;
 
 fn make_weight(gpu: &RecordingGpu, n: usize, k: usize, gs: usize, seed: u8) -> QuantizedWeight {
     let weight = gpu.alloc(n * k / 2).unwrap();

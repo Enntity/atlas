@@ -22,7 +22,7 @@ fn mmq_cuda_repack_preserves_nibbles_scales_and_checkpoint_ownership() -> Result
         gpu.copy_h2d(&scales, store.get(&format!("{name}.weight_scale"))?.ptr)?;
         originals.push((packed, scales));
     }
-    layer.repack_nvfp4_mmq_unified(&gpu, &config, &store)?;
+    layer.repack_nvfp4_mmq_unified(&gpu, &config)?;
     assert_eq!(store.reclaimed_count(), 6);
     // This teardown used to free all six source allocations again. It must
     // succeed before we read the new slabs (which can reuse their addresses).

@@ -35,6 +35,30 @@ fn kernel_src(rel: &str) -> String {
     fs::read_to_string(kernel_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
+fn kernel_params(src: &str, name: &str) -> Vec<String> {
+    let start = src.find(&format!("{name}(")).expect("kernel signature");
+    let open = src[start..].find('(').unwrap() + start;
+    let mut depth = 0i32;
+    let mut close = None;
+    for (offset, ch) in src[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    src[open + 1..close.expect("closing parenthesis")]
+        .split(',')
+        .map(|param| param.trim().to_owned())
+        .collect()
+}
+
 fn kernel_define(src: &str, name: &str) -> usize {
     src.lines()
         .find_map(|line| {
@@ -150,4 +174,30 @@ fn kernel_signature_has_sixteen_params_with_device_anchor() {
         params[15], "unsigned int* __restrict__ scratch",
         "last parameter must be the scratch pointer: {params:?}"
     );
+}
+
+#[test]
+fn batched_selector_keeps_ten_param_per_sequence_body() {
+    for rel in [KERNEL_GB10, KERNEL_STRIX] {
+        let src = kernel_src(rel);
+        let params = kernel_params(&src, "dflash2_candidate_selector_batched");
+        assert_eq!(params.len(), 10);
+        assert_eq!(params[5], "const unsigned int* __restrict__ last_tokens");
+        assert_eq!(params[9], "unsigned int top_k");
+        let body = if rel == KERNEL_STRIX {
+            kernel_params(&src, "df2_selector_batched_body")
+        } else {
+            kernel_params(&src, "df2_batch_selector_body")
+        };
+        assert_eq!(body.len(), 10);
+        assert_eq!(body[5], "unsigned int last_token");
+    }
+}
+
+#[test]
+fn confidence_selector_uses_the_same_sixteen_param_entry() {
+    let src = kernel_src("gb10/glm-5.3-flash/nvfp4/glm_dflash2_selector_conf.cu");
+    assert!(src.contains("#define DF2_SEL_CONF 1"));
+    assert!(src.contains("#define dflash2_candidate_selector dflash2_candidate_selector_conf"));
+    assert!(src.contains("#include \"../../common/dflash2_candidate_selector.cu\""));
 }

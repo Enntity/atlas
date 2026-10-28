@@ -242,18 +242,14 @@ mod tests {
     #[test]
     fn carve_region_layout_and_overflow() {
         let cursor = AtomicUsize::new(0);
-        // Two equal regions pack adjacently, like per-sequence carves.
         assert_eq!(carve_region(&cursor, 64, 32), Some(0));
         assert_eq!(carve_region(&cursor, 64, 32), Some(32));
-        // Third overflows -> None (callers take the sync-copy fallback).
         assert_eq!(carve_region(&cursor, 64, 32), None);
         assert_eq!(carve_region(&cursor, 64, 1), None);
-        // Unaligned is fine — byte offsets, not slots.
         let cursor = AtomicUsize::new(0);
         assert_eq!(carve_region(&cursor, 10, 4), Some(0));
         assert_eq!(carve_region(&cursor, 10, 4), Some(4));
         assert_eq!(carve_region(&cursor, 10, 4), None);
-        // Zero bytes always carves at the cursor.
         assert_eq!(carve_region(&cursor, 10, 0), Some(8));
     }
 
@@ -301,5 +297,15 @@ mod tests {
         let src = src.split("#[cfg(test)]").next().unwrap();
         assert_eq!(src.matches("self.ctx_kv_project(").count(), 1);
         assert_eq!(src.matches("self.precompute_ctx_kv(").count(), 1); // serial fallback only
+    }
+
+    #[test]
+    fn serial_precompute_has_one_synchronous_position_fallback() {
+        let src = include_str!("precompute_ctx_kv.rs");
+        let start = src.find("fn precompute_ctx_kv(").unwrap();
+        let end = src.find("fn ctx_kv_project(").unwrap();
+        let serial = &src[start..end];
+        assert_eq!(serial.matches("gpu.copy_d2d(").count(), 0);
+        assert_eq!(serial.matches("gpu.copy_h2d(").count(), 1);
     }
 }

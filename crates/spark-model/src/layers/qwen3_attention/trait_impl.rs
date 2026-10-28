@@ -12,6 +12,7 @@ use crate::layers::FfnComponent;
 
 mod decode_inner;
 mod diag;
+mod moe_transpose;
 mod multi_seq;
 pub(crate) use multi_seq::{
     grouped_routed_decode_enabled, grouped_routed_decode_min, pairwise_moe_decode_enabled,
@@ -506,13 +507,7 @@ impl TransformerLayer for Qwen3AttentionLayer {
         gpu: &dyn GpuBackend,
         config: &atlas_core::config::ModelConfig,
     ) -> Result<()> {
-        if let FfnComponent::Moe(moe) = &mut self.ffn {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        if let Some(FfnComponent::Moe(moe)) = self.moe_ffn.as_mut() {
-            moe.transpose_for_prefill_hybrid(gpu, config)?;
-        }
-        Ok(())
+        moe_transpose::transpose_moe_for_prefill_hybrid_inner(self, gpu, config)
     }
 }
 

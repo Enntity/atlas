@@ -7,7 +7,8 @@ use crate::layers::fp8_calibration::Fp8KvCalibration;
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use crate::weight_map::{AttentionWeights, DenseWeight, QuantWeight, QuantizedWeight};
 
-use super::types_weights::{HcWeights, HeadGateActivation, MlaWeights};
+use super::types::HeadGateActivation;
+use super::types_weights::{HcWeights, MlaWeights};
 use spark_runtime::gpu::{DevicePtr, KernelHandle};
 use spark_runtime::kv_cache::KvCacheDtype;
 
@@ -115,6 +116,10 @@ pub struct Qwen3AttentionLayer {
     /// NVFP4 twins of the same projections (`ATLAS_GLM_MLA_NVFP4=1`, LOSSY
     /// opt-in: ~half the MXFP8 bytes) on the W4A16 tensor-core tier.
     pub(crate) mla_q4: Vec<(DevicePtr, crate::weight_map::QuantizedWeight)>,
+    /// Spark's native GLM MLA projection arm.
+    pub(crate) mla_native: super::mla_native::MlaNative,
+    /// Spark's checkpoint-native dense MXFP8 projection arm.
+    pub(crate) dense_mx: super::dense_mx::DenseMx,
     // ── Manifold-Constrained Hyper-Connections (mHC) — DeepSeek-V4 ──
     /// Per-block HC parameters. `Some` only for DeepSeek-V4 (`hc_mult > 0`),
     /// in which case the attn/ffn residual sites use `hc_pre`/`hc_post`

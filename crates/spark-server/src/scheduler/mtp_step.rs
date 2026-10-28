@@ -53,6 +53,7 @@ pub fn step_mtp(
         None => num_drafts,
     };
     let native_mtp = model.native_mtp_enabled();
+    let spark_defaults = model.uses_spark_shared_defaults();
     let glm_repaired_narrow = glm_repaired_narrow(num_drafts);
     let mut bootstrap_idxs: Vec<usize> = Vec::new();
     let mut verify_idxs: Vec<usize> = Vec::new();
@@ -113,7 +114,7 @@ pub fn step_mtp(
     // can carry as a decode row skips the bootstrap forward below
     // (`one_forward`). DFlash plans after Phase A, whose bootstrap stashes
     // drafts for Phase B (`late_dflash`).
-    let early_plan = (!dflash_verify_raw_argmax && !native_mtp).then(|| {
+    let early_plan = (!dflash_verify_raw_argmax && (spark_defaults || !native_mtp)).then(|| {
         one_forward::plan_verify(
             model,
             sched,
@@ -144,8 +145,7 @@ pub fn step_mtp(
     // target and n of the drafter. Falls back to the per-sequence loop below
     // whenever the envelope does not hold (`mtp_bootstrap_step`); kill switch
     // ATLAS_NO_MTP_BATCH_BOOTSTRAP.
-    if !spark_model::speculative::glm_repair_policy::enabled()
-        && !native_mtp
+    if !(spark_model::speculative::glm_repair_policy::enabled() || (spark_defaults && native_mtp))
         && can_batch_bootstrap(model, sched, bootstrap_idxs.len(), dflash_verify_raw_argmax)
     {
         for &i in &bootstrap_idxs {
@@ -333,7 +333,9 @@ pub fn step_mtp(
     );
     for &idx in &serial_idxs {
         let a = &mut active[idx];
-        crate::scheduler::copy_drafts::mtp::begin_verify(model, sched, a);
+        if spark_defaults {
+            crate::scheduler::copy_drafts::mtp::begin_verify(model, sched, a);
+        }
         // Confidences travel with the taken drafts and are cut with them.
         let (mut drafts, mut conf) = a.take_drafts();
         if drafts.is_empty() {
@@ -380,7 +382,7 @@ pub fn step_mtp(
         // ladder sent K=3 (`--dflash-gamma 4`) into MTP K=3 verify.
         if dflash_verify_raw_argmax
             || glm_repaired_narrow
-            || (native_mtp && drafts.len() >= 2)
+            || (spark_defaults && native_mtp && drafts.len() >= 2)
             || drafts.len() >= 4
         {
             step_verify_dflash(

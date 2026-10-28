@@ -33,6 +33,11 @@ mod fp8b;
 mod mxfp8;
 #[path = "ops/mxfp8_act.rs"]
 mod mxfp8_act;
+#[path = "ops/mxfp8_proj.rs"]
+mod mxfp8_proj;
+#[cfg(test)]
+#[path = "ops/mxfp8_proj32_tests.rs"]
+mod mxfp8_proj32_tests;
 #[path = "ops/mxfp8_w8a8.rs"]
 mod mxfp8_w8a8;
 #[path = "ops/rank_join.rs"]
@@ -362,6 +367,7 @@ pub use moe_nvfp4_mmq::*;
 pub use moe_prefill::*;
 pub use mxfp8::*;
 pub use mxfp8_act::*;
+pub use mxfp8_proj::*;
 pub use mxfp8_w8a8::*;
 pub use norm::*;
 pub use nvfp4_mmq::*;

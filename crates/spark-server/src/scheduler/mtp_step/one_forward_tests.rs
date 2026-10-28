@@ -488,3 +488,6 @@ mod logprob_tests;
 
 #[path = "bootstrap_score_tests.rs"]
 mod bootstrap_score_tests;
+
+#[path = "one_forward_grammar_tests.rs"]
+mod grammar;

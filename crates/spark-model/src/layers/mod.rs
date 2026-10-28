@@ -17,6 +17,7 @@ pub mod glm_sp;
 pub mod glm_sp_moe_seam;
 pub mod glm_sp_overlap;
 pub mod glm_sp_uneven;
+mod kernel_pick;
 pub mod moe;
 mod moe_grouped_decode;
 pub mod mtp_head;
@@ -47,8 +48,8 @@ pub use dflash_head::{
 };
 pub use glm5_kda::{Glm5KdaLayer, Glm5KdaWeights, Glm5Projection};
 pub(crate) use glm5_kda::{
-    kda_batched_ffn_enabled, kda_multi_seq_enabled, kda_side_proj_lt_enabled,
-    verify_fused_tp_hc_enabled,
+    kda_batched_ffn_enabled, kda_conv_planes_enabled, kda_multi_seq_enabled,
+    kda_side_proj_lt_enabled, verify_fused_tp_hc_enabled,
 };
 pub use glm5_mtp::{Glm5MtpHead, Glm5MtpProposerState};
 pub use moe::MoeLayer;
@@ -63,7 +64,7 @@ pub use qwen3_attention::Qwen3AttentionLayer;
 pub use qwen3_ssm::Qwen3SsmLayer;
 pub use qwen4exp_mtp::{Qwen4ExpMtpHead, Qwen4ExpMtpProposerState};
 pub(crate) use vision_encoder::{GlmVisionBlockWeights, GlmVisionMergerWeights, GlmVisionWeights};
-pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder};
+pub use vision_encoder::{MergerLayer, ViTBlock, VisionEncoder, VitWeight};
 pub mod vision_tower;
 pub use vision_tower::VisionTower;
 

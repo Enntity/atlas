@@ -5,56 +5,53 @@
 //! kernels; this test must not do so inside the asynchronous chain.
 
 use super::*;
+use anyhow::ensure;
 
 const EXPERTS: u32 = 288;
 const INTER: u32 = 2048;
 
-// Reuse immutable weight slabs across expert IDs to bound this test below
-// 1 GiB. All 288 routing slots and pointer-table accesses are still real.
-fn expand_tables(gpu: &dyn GpuBackend, t: [DevicePtr; 3]) -> Result<[DevicePtr; 3]> {
-    let mut out = [DevicePtr::NULL; 3];
-    for (i, bytes) in [8usize, 8, 4].into_iter().enumerate() {
-        let mut src = vec![0; E as usize * bytes];
-        gpu.copy_d2h(t[i], &mut src)?;
-        let expanded: Vec<u8> = (0..EXPERTS as usize)
-            .flat_map(|e| {
-                src[(e % E as usize) * bytes..(e % E as usize + 1) * bytes]
+fn expand_tables(gpu: &dyn GpuBackend, tables: [DevicePtr; 3]) -> Result<[DevicePtr; 3]> {
+    let mut expanded = [DevicePtr::NULL; 3];
+    for (index, bytes) in [8usize, 8, 4].into_iter().enumerate() {
+        let mut source = vec![0; E as usize * bytes];
+        gpu.copy_d2h(tables[index], &mut source)?;
+        let repeated: Vec<u8> = (0..EXPERTS as usize)
+            .flat_map(|expert| {
+                source[(expert % E as usize) * bytes..(expert % E as usize + 1) * bytes]
                     .iter()
                     .copied()
             })
             .collect();
-        out[i] = upload(gpu, &expanded)?;
+        expanded[index] = upload(gpu, &repeated)?;
     }
-    Ok(out)
+    Ok(expanded)
 }
 
 fn routing(rows: usize, seed: usize) -> Route {
-    // Mix a shared hot set (up to rows tokens per expert) and sparse slots
-    // throughout the whole 288-expert table. Each token has distinct top-8.
     let ids: Vec<[usize; TOPK]> = (0..rows)
-        .map(|t| {
-            std::array::from_fn(|k| {
-                if k < 4 {
-                    k
+        .map(|token| {
+            std::array::from_fn(|slot| {
+                if slot < 4 {
+                    slot
                 } else {
-                    4 + (t * 17 + k + seed) % 284
+                    4 + (token * 17 + slot + seed) % 284
                 }
             })
         })
         .collect();
     let mut offsets = vec![0i32; EXPERTS as usize + 1];
-    for id in ids.iter().flatten() {
-        offsets[id + 1] += 1;
+    for expert in ids.iter().flatten() {
+        offsets[expert + 1] += 1;
     }
-    for e in 0..EXPERTS as usize {
-        offsets[e + 1] += offsets[e];
+    for expert in 0..EXPERTS as usize {
+        offsets[expert + 1] += offsets[expert];
     }
     let mut fill = offsets.clone();
     let mut sorted = vec![0; rows * TOPK];
-    for (t, row) in ids.iter().enumerate() {
-        for &e in row {
-            sorted[fill[e] as usize] = t as i32;
-            fill[e] += 1;
+    for (token, row) in ids.iter().enumerate() {
+        for &expert in row {
+            sorted[fill[expert] as usize] = token as i32;
+            fill[expert] += 1;
         }
     }
     Route {
@@ -67,7 +64,8 @@ fn routing(rows: usize, seed: usize) -> Route {
 #[test]
 #[ignore = "needs a GB10 and a glm-5.3-flash kernel build"]
 fn persistent_moe_chain_needs_no_host_barriers() -> Result<()> {
-    let gpu: &dyn GpuBackend = backend()?;
+    let backend = backend()?;
+    let gpu: &dyn GpuBackend = &backend;
     let mut rng = Rng(0x5327_f00d);
     let gate = expand_tables(gpu, tables(gpu, &mut rng, INTER, H, 1.0 / 256.0)?)?;
     let up = expand_tables(gpu, tables(gpu, &mut rng, INTER, H, 1.0 / 128.0)?)?;
@@ -102,8 +100,6 @@ fn persistent_moe_chain_needs_no_host_barriers() -> Result<()> {
                 grid,
                 persist: KernelHandle(0),
             };
-            // One stream, no host readback or synchronization between builder,
-            // gate/up and down. Repeating also exercises scratch reuse.
             for _ in 0..16 {
                 let packed_bytes = rows as usize * H as usize / 2;
                 let a_scale = c.offset(packed_bytes);
@@ -131,8 +127,7 @@ fn persistent_moe_chain_needs_no_host_barriers() -> Result<()> {
                     a_scale,
                     gate,
                     up,
-                    q[0],
-                    q[1],
+                    [q[0], q[1], DevicePtr::NULL],
                     offsets,
                     sorted,
                     EXPERTS,
@@ -145,8 +140,6 @@ fn persistent_moe_chain_needs_no_host_barriers() -> Result<()> {
                 if barriers {
                     gpu.synchronize(0)?;
                 }
-                // c still contains gate/up inputs. Only stream dependency is
-                // allowed to protect them from this down projection's writes.
                 ops::moe_w4a4_grouped_gemm_prequant_k128w(
                     gpu,
                     kernel(pair[1]),
@@ -170,10 +163,10 @@ fn persistent_moe_chain_needs_no_host_barriers() -> Result<()> {
                 }
             }
             gpu.synchronize(0)?;
-            let mut out = vec![0; output_bytes];
-            gpu.copy_d2h(c, &mut out)?;
-            crate::layers::glm_gpu_test_backend::finite_bf16("asynchronous MoE down", &out)?;
-            Ok(out)
+            let mut output = vec![0; output_bytes];
+            gpu.copy_d2h(c, &mut output)?;
+            crate::layers::glm_gpu_test_backend::finite_bf16("asynchronous MoE down", &output)?;
+            Ok(output)
         };
         let reference = run(kernels[0], 0, true)?;
         for repetition in 0..4 {

@@ -43,7 +43,7 @@ fn a_common_kernel_change_reopens_every_target_on_that_hardware() {
 }
 
 #[test]
-fn a_model_specific_change_reopens_that_model_and_its_kernel_alias() {
+fn a_model_specific_change_reopens_only_that_model() {
     let root = repo_root();
     let v = &views(&root, &[pr(2, &[FLAGSHIP])])[0];
     assert_eq!(

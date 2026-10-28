@@ -26,6 +26,7 @@
 pub(crate) mod block_mgmt;
 mod block_table_upload;
 pub(crate) mod decode_pieces;
+mod dflash_ctx_window;
 mod draft_assist;
 pub(crate) mod qsa_commit_table;
 pub use draft_assist::DraftAssist;
@@ -117,6 +118,10 @@ mod warm_turn;
 pub mod nllb;
 
 pub use types::TransformerModel;
+
+pub(crate) fn uses_spark_shared_defaults_model_type(model_type: &str) -> bool {
+    matches!(model_type, "glm5_next" | "qwen4_exp")
+}
 
 #[cfg(test)]
 #[allow(clippy::duplicate_mod)]

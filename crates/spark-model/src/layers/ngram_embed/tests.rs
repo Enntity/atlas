@@ -208,7 +208,7 @@ fn ngram_gpu_matches_golden() {
                 // The NVMe-backed variant has its own parity test
                 // (`cached_table_matches_resident_table`); this manual
                 // op-sequence harness drives resident tables only.
-                NgramTable::Cached(_) | NgramTable::ResidentNvfp4 { .. } => {
+                NgramTable::Cached(_) => {
                     unreachable!("test builds resident tables")
                 }
             }

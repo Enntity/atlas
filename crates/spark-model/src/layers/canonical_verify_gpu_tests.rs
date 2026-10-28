@@ -19,12 +19,12 @@ use anyhow::Context;
 use spark_runtime::cuda_backend::AtlasCudaBackend;
 use spark_runtime::kernel_args::{KernelLaunch, div_ceil};
 
-pub(super) const WIDTHS: [u32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32];
+pub(crate) const WIDTHS: [u32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32];
 /// The widths the canonical kernels take: also the chain's owner verifies
 /// past one launch (56 and 64 rows, two launches).
-pub(super) const CANON_WIDTHS: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 56, 64];
+pub(crate) const CANON_WIDTHS: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 56, 64];
 
-pub(super) struct Rng(pub u64);
+pub(crate) struct Rng(pub u64);
 
 impl Rng {
     pub fn next(&mut self) -> u64 {
@@ -42,18 +42,18 @@ impl Rng {
     }
 }
 
-pub(super) fn bf16(x: f32) -> u16 {
+pub(crate) fn bf16(x: f32) -> u16 {
     let u = x.to_bits();
     ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
 }
 
-pub(super) fn from_bf16(h: u16) -> f32 {
+pub(crate) fn from_bf16(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
 /// One backend for the whole test process: the tier tables resolve their
 /// handles once (`OnceLock`), against the first backend that asks.
-pub(super) fn backend() -> Result<&'static AtlasCudaBackend> {
+pub(crate) fn backend() -> Result<&'static AtlasCudaBackend> {
     static GPU: std::sync::OnceLock<AtlasCudaBackend> = std::sync::OnceLock::new();
     if GPU.get().is_none() {
         let gpu =
@@ -66,20 +66,20 @@ pub(super) fn backend() -> Result<&'static AtlasCudaBackend> {
     Ok(gpu)
 }
 
-pub(super) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
+pub(crate) fn upload(gpu: &dyn GpuBackend, bytes: &[u8]) -> Result<DevicePtr> {
     let ptr = gpu.alloc(bytes.len())?;
     gpu.copy_h2d(bytes, ptr)?;
     Ok(ptr)
 }
 
-pub(super) fn rows_bytes(rows: &[Vec<u16>]) -> Vec<u8> {
+pub(crate) fn rows_bytes(rows: &[Vec<u16>]) -> Vec<u8> {
     rows.iter()
         .flatten()
         .flat_map(|h| h.to_le_bytes())
         .collect()
 }
 
-pub(super) fn download(gpu: &dyn GpuBackend, ptr: DevicePtr, elems: usize) -> Result<Vec<u16>> {
+pub(crate) fn download(gpu: &dyn GpuBackend, ptr: DevicePtr, elems: usize) -> Result<Vec<u16>> {
     let mut b = vec![0u8; elems * 2];
     gpu.copy_d2h(ptr, &mut b)?;
     Ok(b.chunks(2)
@@ -105,14 +105,14 @@ fn e4m3(b: u8) -> f64 {
 }
 
 /// A random NVFP4 `[n, k]` weight on the GPU and its FP64 dequantization.
-pub(super) struct W4 {
+pub(crate) struct W4 {
     pub q: QuantizedWeight,
     pub n: u32,
     pub k: u32,
     pub dense: Vec<f64>,
 }
 
-pub(super) fn w4(gpu: &dyn GpuBackend, rng: &mut Rng, n: u32, k: u32) -> Result<W4> {
+pub(crate) fn w4(gpu: &dyn GpuBackend, rng: &mut Rng, n: u32, k: u32) -> Result<W4> {
     let (nu, ku) = (n as usize, k as usize);
     let packed: Vec<u8> = (0..nu * ku / 2).map(|_| rng.next() as u8).collect();
     // Positive E4M3 group scales 2^-3 .. 2^1.
@@ -138,7 +138,7 @@ pub(super) fn w4(gpu: &dyn GpuBackend, rng: &mut Rng, n: u32, k: u32) -> Result<
 }
 
 /// A random BF16 `[n, k]` weight (values `scale`·U(-1,1)) and its values.
-pub(super) fn bf16_weight(
+pub(crate) fn bf16_weight(
     gpu: &dyn GpuBackend,
     rng: &mut Rng,
     n: u32,
@@ -156,13 +156,13 @@ pub(super) fn bf16_weight(
     ))
 }
 
-pub(super) fn random_row(rng: &mut Rng, k: u32) -> Vec<u16> {
+pub(crate) fn random_row(rng: &mut Rng, k: u32) -> Vec<u16> {
     (0..k).map(|_| bf16(rng.unit())).collect()
 }
 
 /// Activations spread over 2^-6 .. 2^6: sums that cancel, so FP32 summation
 /// order shows in the BF16 output far more often than with U(-1, 1).
-pub(super) fn wide_row(rng: &mut Rng, k: u32) -> Vec<u16> {
+pub(crate) fn wide_row(rng: &mut Rng, k: u32) -> Vec<u16> {
     (0..k)
         .map(|_| bf16(rng.unit() * (2f32).powi(rng.below(13) as i32 - 6)))
         .collect()
@@ -170,7 +170,7 @@ pub(super) fn wide_row(rng: &mut Rng, k: u32) -> Vec<u16> {
 
 /// Launch the W4A16 kernel `name` (a width-tuned tier) with the geometry
 /// its op function uses.
-pub(super) fn launch_w4(
+pub(crate) fn launch_w4(
     gpu: &dyn GpuBackend,
     name: &str,
     w: &W4,
@@ -201,7 +201,7 @@ pub(super) fn launch_w4(
 
 /// The probe's output bits at each width and slot: `run(rows)` launches over
 /// `rows` (the probe among them) and returns the `[rows.len(), n]` output.
-pub(super) fn probe_bits(
+pub(crate) fn probe_bits(
     rng: &mut Rng,
     probe: &[u16],
     k: u32,
@@ -231,7 +231,7 @@ pub(super) fn probe_bits(
 }
 
 /// How many (width, slot) results differ from the first, with a report.
-pub(super) fn differing(label: &str, results: &[(u32, u32, Vec<u16>)]) -> usize {
+pub(crate) fn differing(label: &str, results: &[(u32, u32, Vec<u16>)]) -> usize {
     let first = &results[0].2;
     let bad: Vec<_> = results
         .iter()
@@ -255,7 +255,7 @@ pub(super) fn differing(label: &str, results: &[(u32, u32, Vec<u16>)]) -> usize 
 }
 
 /// One upload/launch/download of `rows` through `launch`.
-pub(super) fn run_rows(
+pub(crate) fn run_rows(
     gpu: &dyn GpuBackend,
     rows: &[Vec<u16>],
     n: u32,
@@ -389,7 +389,7 @@ fn canonical_w4a16_rows_do_not_depend_on_the_width() -> Result<()> {
 }
 
 /// Launch a BF16 GEMV kernel by name with its op function's geometry.
-pub(super) fn launch_dense(
+pub(crate) fn launch_dense(
     gpu: &dyn GpuBackend,
     (module, name): (&str, &str),
     weight: &DenseWeight,
@@ -414,5 +414,9 @@ pub(super) fn launch_dense(
 mod accuracy;
 #[path = "canonical_verify_bench_tests.rs"]
 mod bench;
+#[path = "canonical_verify_chain_tests.rs"]
+mod chain;
+#[path = "canonical_verify_dense_chain_tests.rs"]
+mod dense_chain;
 #[path = "canonical_verify_dense_tests.rs"]
 mod dense_tests;

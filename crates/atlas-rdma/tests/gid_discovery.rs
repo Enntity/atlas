@@ -7,12 +7,15 @@
 // two DGX Sparks observed on 2026-09-28: one with the entry at index 3, one
 // with a hole at 3 and the entry at 4 after the peer rebooted.
 
-use atlas_rdma::gid::roce_v2_ipv4_index_in;
+use atlas_rdma::gid::{roce_v2_ipv4_gids_in, roce_v2_ipv4_index_for_in, roce_v2_ipv4_index_in};
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 const LINK_LOCAL: &str = "fe80:0000:0000:0000:4ebb:47ff:fe2e:6f1a";
 const IPV4: &str = "0000:0000:0000:0000:0000:ffff:0a64:c001";
+const LAN: &str = "0000:0000:0000:0000:0000:ffff:0a58:00c3";
+const FABRIC: &str = "0000:0000:0000:0000:0000:ffff:0a63:0202";
 const ZERO: &str = "0000:0000:0000:0000:0000:0000:0000:0000";
 
 /// A sysfs root holding `dev` port 1 with `entries` as `(gid, type)`; a
@@ -96,5 +99,40 @@ fn a_missing_device_is_an_error_naming_the_device() {
     let root = table("nodev", "rocep1s0f0", &[]);
     let err = roce_v2_ipv4_index_in(&root, "roceP2p1s0f0").unwrap_err();
     assert!(err.to_string().contains("roceP2p1s0f0"), "{err}");
+    cleanup(&root);
+}
+
+#[test]
+fn prefers_the_gid_on_the_link_address_over_the_lowest_index() {
+    let root = table(
+        "twosubnet",
+        "rocep1s0f0",
+        &[
+            (LINK_LOCAL, Some("IB/RoCE v1")),
+            (LINK_LOCAL, Some("RoCE v2")),
+            (LAN, Some("IB/RoCE v1")),
+            (LAN, Some("RoCE v2")),
+            (FABRIC, Some("IB/RoCE v1")),
+            (FABRIC, Some("RoCE v2")),
+        ],
+    );
+    let dev = "rocep1s0f0";
+    let lan = Ipv4Addr::new(10, 88, 0, 195);
+    let fabric = Ipv4Addr::new(10, 99, 2, 2);
+    assert_eq!(roce_v2_ipv4_index_in(&root, dev).unwrap(), 3);
+    assert_eq!(roce_v2_ipv4_index_for_in(&root, dev, None).unwrap(), 3);
+    assert_eq!(
+        roce_v2_ipv4_index_for_in(&root, dev, Some(fabric)).unwrap(),
+        5
+    );
+    assert_eq!(roce_v2_ipv4_index_for_in(&root, dev, Some(lan)).unwrap(), 3);
+    assert_eq!(
+        roce_v2_ipv4_index_for_in(&root, dev, Some(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
+        3
+    );
+    assert_eq!(
+        roce_v2_ipv4_gids_in(&root, dev).unwrap(),
+        [(3, lan), (5, fabric)]
+    );
     cleanup(&root);
 }

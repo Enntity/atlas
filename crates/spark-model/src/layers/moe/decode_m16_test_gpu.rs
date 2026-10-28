@@ -418,3 +418,44 @@ fn persistent_rows_do_not_depend_on_the_batch() -> Result<()> {
 
 #[path = "decode_m16_test_gpu/a16.rs"]
 mod a16;
+#[path = "decode_m16_chain_test_gpu.rs"]
+mod chain;
+
+fn check_down_output(out: &[u8], offsets: &[i32], slab_rows: usize) -> Result<()> {
+    let row_bytes = H as usize * 2;
+    ensure!(
+        out.len() == *offsets.last().unwrap() as usize * row_bytes,
+        "down output shape"
+    );
+    for (expert, span) in offsets.windows(2).enumerate() {
+        let bytes = &out[span[0] as usize * row_bytes..span[1] as usize * row_bytes];
+        if (span[1] - span[0]) as usize <= slab_rows {
+            crate::layers::glm_gpu_test_backend::finite_bf16("MoE supported down rows", bytes)
+                .with_context(|| format!("expert {expert}, slabs {slab_rows}"))?;
+        } else {
+            ensure!(
+                bytes.chunks_exact(2).all(|word| {
+                    f32::from_bits((u16::from_le_bytes([word[0], word[1]]) as u32) << 16).is_nan()
+                }),
+                "expert {expert} exceeds {slab_rows} rows without the NaN capacity backstop"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn down_finiteness_allows_only_the_capacity_backstop() {
+    let offsets = [0, 17, 18];
+    let mut out = vec![0u8; 18 * H as usize * 2];
+    assert!(check_down_output(&out, &offsets, 16).is_err());
+    for word in out[..17 * H as usize * 2].chunks_exact_mut(2) {
+        word.copy_from_slice(&0x7fc0u16.to_le_bytes());
+    }
+    assert!(check_down_output(&out, &offsets, 16).is_ok());
+    assert!(check_down_output(&out, &offsets, 32).is_err());
+    for bad in [0x7fc0u16, 0x7f80, 0xff80] {
+        out[17 * H as usize * 2..][..2].copy_from_slice(&bad.to_le_bytes());
+        assert!(check_down_output(&out, &offsets, 16).is_err());
+    }
+}

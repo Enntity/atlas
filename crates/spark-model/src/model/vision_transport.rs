@@ -46,6 +46,26 @@ pub(crate) struct VisionRowBounds {
     pub request: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VisionCapacityError {
+    pub rows: usize,
+    pub capacity: usize,
+    pub grids: usize,
+}
+
+impl std::fmt::Display for VisionCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "vision row count {} ({} image grids) exceeds encoder capacity {}; \
+             drop or downscale images from the request",
+            self.rows, self.grids, self.capacity
+        )
+    }
+}
+
+impl std::error::Error for VisionCapacityError {}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct VisionWireState {
     pub rows: usize,
@@ -114,20 +134,18 @@ pub(crate) fn validate_state(
         "vision state received but this rank has no vision encoder capacity"
     );
 
-    if state.deferred {
-        ensure!(
-            state.rows <= bounds.request,
-            "vision row count {} exceeds the per-request bound {}",
-            state.rows,
-            bounds.request
-        );
+    let capacity = if state.deferred {
+        bounds.request
     } else {
-        ensure!(
-            state.rows <= bounds.window,
-            "vision row count {} exceeds the encoder output window {}",
-            state.rows,
-            bounds.window
-        );
+        bounds.window
+    };
+    if state.rows > capacity {
+        return Err(VisionCapacityError {
+            rows: state.rows,
+            capacity,
+            grids: state.grid_count,
+        }
+        .into());
     }
     ensure!(
         state.grid_count > 0,
@@ -436,5 +454,28 @@ mod tests {
             request: 262_144,
         };
         assert!(parse_state_header(&[8, 1, 0, 0, 0, 8, 1], none).is_err());
+    }
+
+    #[test]
+    fn over_capacity_is_a_typed_error() {
+        let error = parse_state_header(
+            &[17, 2, 0, 0, 0, 17],
+            VisionRowBounds {
+                window: 16,
+                request: 16,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<VisionCapacityError>(),
+            Some(&VisionCapacityError {
+                rows: 17,
+                capacity: 16,
+                grids: 2,
+            })
+        );
+        let flat = anyhow::anyhow!("{error:#}");
+        assert!(!flat.is::<VisionCapacityError>());
+        assert!(error.context("prefill").is::<VisionCapacityError>());
     }
 }

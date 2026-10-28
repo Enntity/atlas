@@ -50,6 +50,16 @@ impl Qwen3AttentionLayer {
                     stream,
                 )?;
             }
+        } else if let Some(r) = self.try_mx8(
+            ctx,
+            self.o_weight.as_ref(),
+            attn_out,
+            o_out,
+            1,
+            true,
+            stream,
+        ) {
+            r?;
         } else if let Some(o_bf16) = self.o_dense_bf16.as_ref() {
             self.dense_gemv_or_mx(ctx.gpu, attn_out, o_bf16, o_out, h, nq * hd, stream)?;
         } else if let Some(q2) = self.o_weight.as_ref().and_then(|w| w.as_packed_q2()) {

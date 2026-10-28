@@ -124,6 +124,36 @@ fn gathers(
 }
 
 #[test]
+fn the_runtime_facts_lead_the_table() {
+    let settings = settings(&[]).unwrap();
+    assert_eq!(
+        settings[0],
+        (
+            "cuBLASLt runtime version (libcublasLt)",
+            spark_runtime::cublaslt::version() as u64
+        )
+    );
+}
+
+#[test]
+fn a_different_cublaslt_runtime_fails_naming_both_values() {
+    let ours = settings(&CALLER).unwrap();
+    let mut peer = values(&ours);
+    peer[0] += 1;
+    for (rank, other) in [(0, 1), (1, 0)] {
+        let why = pair(rank, &ours, peer.clone()).unwrap_err().to_string();
+        let want = format!(
+            "{}: rank {rank} has {}, rank {other} has {}",
+            ours[0].0,
+            ours[0].1,
+            ours[0].1 + 1
+        );
+        assert!(why.contains(&want), "{why}");
+        assert!(why.contains("cuBLASLt runtime version"), "{why}");
+    }
+}
+
+#[test]
 fn matching_ranks_agree() {
     let ours = settings(&CALLER).unwrap();
     for rank in 0..2 {

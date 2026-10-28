@@ -43,6 +43,7 @@ struct Recorder {
     capture: AtomicU64,
     target_failure: AtomicBool,
     capture_failure: AtomicBool,
+    wait_failure: AtomicBool,
     /// What the peer rank sends for each word it roots (min-votes read it)
     /// once `script` (words it sends first, in order) runs out.
     peer_word: AtomicU32,
@@ -83,6 +84,9 @@ impl GpuBackend for Gpu {
     }
     fn stream_wait_event(&self, stream: u64, event: u64) -> Result<()> {
         self.record.order.lock().push(Order::Wait(stream, event));
+        if self.record.wait_failure.swap(false, Ordering::Relaxed) {
+            anyhow::bail!("injected stream wait failure");
+        }
         Ok(())
     }
     fn default_stream(&self) -> u64 {
@@ -319,6 +323,9 @@ impl Fixture {
     /// (so both halves of a 24-token prompt fit the 8-token arena).
     pub fn with_tail_split(tp: usize, ep: usize, rank: usize) -> Self {
         Self::build(tp, ep, rank, true)
+    }
+    pub fn fail_next_wait(&self) {
+        self.record.wait_failure.store(true, Ordering::Relaxed);
     }
     fn build(tp: usize, ep: usize, rank: usize, split: bool) -> Self {
         let record = Arc::new(Recorder::default());

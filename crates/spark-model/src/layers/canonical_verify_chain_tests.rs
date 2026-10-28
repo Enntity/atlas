@@ -5,6 +5,7 @@
 //! Repeated residual FFNs reuse their scratch between dependent launches.
 
 use super::*;
+use anyhow::{Result, ensure};
 
 #[test]
 #[ignore = "requires GB10 GLM kernels, ATLAS_PDL=1 and ATLAS_GLM_DECODE_GEMV_BATCH=1"]
@@ -19,7 +20,7 @@ fn canonical_prefill_chain_needs_no_host_barriers() -> Result<()> {
         ops::gemv_touch(ops::Twin::W4Tc8).is_some(),
         "requires touch twins"
     );
-    W4a16BatchmTiers::resolve(gpu, true);
+    W4a16BatchmTiers::resolve(gpu);
     let gpu: &dyn GpuBackend = gpu;
     let (m, h, inter) = (26u32, 4096u32, 1024u32);
     let mut rng = Rng(0xcafe_26ab_4455_9911);

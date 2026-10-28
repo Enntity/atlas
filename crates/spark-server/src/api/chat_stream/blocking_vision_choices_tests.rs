@@ -12,11 +12,7 @@ use std::{sync::Arc, time::Duration};
 #[tokio::test]
 async fn every_blocking_choice_carries_its_own_vision_input() {
     let image = VisionItem::image(vec![0.25; 8], 2, 4);
-    let video = VisionItem {
-        groups: vec![vec![0.5; 4], vec![0.75; 4]],
-        grid_h: 2,
-        grid_w: 2,
-    };
+    let video = VisionItem::video(vec![vec![0.5; 4], vec![0.75; 4]], 2, 2);
     // Include text-only requests and ordered mixed media; n=1 must retain
     // its behavior while every independently scheduled n>1 choice sees it.
     for media in [vec![], vec![image.clone()], vec![video, image]] {
@@ -91,7 +87,7 @@ async fn every_blocking_choice_carries_its_own_vision_input() {
                 // Each scheduler call must complete before the next arrives.
                 // Consume its media, just as scheduler prefill does.
                 drop(image_pixels);
-                assert!(response_tx.send(Ok(response(vec![14]))).is_ok());
+                assert!(response_tx.send(Ok(response())).is_ok());
             }
             let outcome = tokio::time::timeout(Duration::from_secs(5), handler)
                 .await

@@ -4,6 +4,7 @@ use super::LIGHTNING_SERVED_GAMMA;
 use super::batch_execution::{paged_slot_mapping, resolve_lane_id};
 use super::batch_inputs::DsparkBatchInputError;
 use super::batch_inputs_tests::valid;
+use spark_runtime::gpu::KernelHandle;
 
 #[test]
 fn packed_queries_are_sequence_major_anchor_then_masks() {
@@ -223,4 +224,40 @@ fn production_seam_prepares_then_returns_native_rows_before_generic_serial_dispa
     }
     assert!(projection_source.contains("(total_rows - row).min(16)"));
     assert!(!projection_source.contains("w4a16_gemv_batch32"));
+}
+
+#[test]
+fn batched_selector_is_one_launch_with_fallback() {
+    let src = include_str!("batch_tail_dflash2.rs");
+    assert_eq!(
+        src.matches("ops::dflash2_candidate_selector_batched(")
+            .count(),
+        1
+    );
+    assert!(src.contains("dflash2_candidate_selector_batched.0 != 0"));
+    assert_eq!(src.matches("ops::dflash2_candidate_selector(").count(), 1);
+}
+
+#[test]
+fn nvfp4_lm_head_wave_kernel_table() {
+    let h4 = KernelHandle(1);
+    let h8 = KernelHandle(2);
+    let h16 = KernelHandle(3);
+    let f = |m| super::batched_ctx::nvfp4_lm_head_wave_kernel(m, h4, h8, h16);
+    assert_eq!(f(1).0, h4.0);
+    assert_eq!(f(4).0, h4.0);
+    assert_eq!(f(5).0, h8.0);
+    assert_eq!(f(8).0, h8.0);
+    assert_eq!(f(9).0, h16.0);
+    assert_eq!(f(128).0, h16.0);
+    assert_eq!(
+        super::batched_ctx::nvfp4_lm_head_wave_kernel(
+            128,
+            KernelHandle(0),
+            KernelHandle(0),
+            KernelHandle(0),
+        )
+        .0,
+        0
+    );
 }

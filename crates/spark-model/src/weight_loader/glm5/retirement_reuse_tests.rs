@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Recycled addresses must not turn derived buffers back into checkpoint owners.
 use super::*;
+use anyhow::{Result, ensure};
 use atlas_core::scope::ModelResource;
-use spark_runtime::gpu::{KernelHandle, mock::MockGpuBackend};
+use parking_lot::Mutex;
+use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle, mock::MockGpuBackend};
+use spark_runtime::weights::{WeightDtype, WeightTensor};
+use std::collections::HashMap;
+
+use super::retirement::LoadedDense;
 
 #[derive(Default)]
 struct ReusingGpu {

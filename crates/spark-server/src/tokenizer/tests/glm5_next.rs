@@ -19,6 +19,90 @@ fn render(messages: &[serde_json::Value]) -> String {
     .expect("GLM-5.3 checkpoint template renders")
 }
 
+fn render_with(
+    messages: &[serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    flags: crate::tokenizer::chat_render::RenderFlags<'_>,
+) -> String {
+    super::qwen_dense::render_fixture("glm-5.3-flash-fp4-local", messages, tools, flags)
+        .expect("GLM-5.3 checkpoint template renders")
+}
+
+#[test]
+fn glm5_tools_respect_resolved_thinking_before_generation() {
+    let tools = [json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    })];
+    let messages = [json!({"role": "user", "content": "What is the weather in Paris?"})];
+    for enabled in [false, true] {
+        let rendered = render_with(
+            &messages,
+            Some(&tools),
+            crate::tokenizer::chat_render::RenderFlags {
+                enable_thinking: enabled,
+                ..Default::default()
+            },
+        );
+        let suffix = if enabled {
+            "<|assistant|><think>"
+        } else {
+            "<|assistant|><think></think>"
+        };
+        assert!(rendered.ends_with(suffix), "resolved thinking={enabled}");
+        assert_eq!(rendered.contains("Reasoning Effort: Max"), enabled);
+        assert!(rendered.contains("<tools>"));
+        assert!(rendered.contains("get_weather"));
+    }
+}
+
+#[test]
+fn glm5_without_tools_opens_think_even_when_thinking_is_off() {
+    let messages = [json!({"role": "user", "content": "What is the weather in Paris?"})];
+    let off = render_with(
+        &messages,
+        None,
+        crate::tokenizer::chat_render::RenderFlags {
+            enable_thinking: false,
+            ..Default::default()
+        },
+    );
+    assert!(off.ends_with("<|assistant|><think>"));
+    assert!(off.contains("Reasoning Effort: Low"));
+    let on = render_with(
+        &messages,
+        None,
+        crate::tokenizer::chat_render::RenderFlags {
+            enable_thinking: true,
+            ..Default::default()
+        },
+    );
+    assert!(on.ends_with("<|assistant|><think>"));
+    assert!(on.contains("Reasoning Effort: Max"));
+}
+
+#[test]
+fn glm5_response_format_thinking_off_renders_the_empty_think_block() {
+    let messages = [json!({"role": "user", "content": "Name one bridge."})];
+    let flags = |enable_thinking| crate::tokenizer::chat_render::RenderFlags {
+        enable_thinking,
+        empty_think_off: true,
+        ..Default::default()
+    };
+    let off = render_with(&messages, None, flags(false));
+    assert!(off.ends_with("<|assistant|><think></think>"), "{off}");
+    assert!(!off.contains("Reasoning Effort: Low"));
+    assert_eq!(render_with(&messages, None, flags(true)), render(&messages));
+}
+
 #[test]
 fn glm5_rendered_prompt_keeps_two_image_markers_in_order() {
     let messages = [json!({

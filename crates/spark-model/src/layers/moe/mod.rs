@@ -225,8 +225,13 @@ mod inplace_transpose;
 mod m5_projection_oracle;
 mod m5_projections;
 mod mmq_layout;
+#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
+mod mmq_layout_tests;
 mod route_fuse;
 mod router_bn4;
+#[cfg(all(test, feature = "cuda"))]
+mod router_determinism_gpu_tests;
 mod sp_quant_gather;
 pub(crate) use init_optional::down_e4m3_requested;
 pub(crate) use route_fuse::route_fuse_requested;

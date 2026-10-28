@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Real installer eligibility; subprocesses isolate startup env and TC OnceLock.
-use super::super::{DflashQuantization, free_state_tests::zero_head};
+use super::{DflashQuantization, free_state_tests::zero_head};
 use crate::layers::w4a16_gemv_tiers::W4a16BatchmTiers;
 use spark_runtime::gpu::{KernelHandle, mock::MockGpuBackend};
 
@@ -37,7 +37,7 @@ fn integration_nvfp4_installs_for_the_actual_execution_route() {
         return;
     };
     let gpu = MockGpuBackend::new();
-    let _tiers = W4a16BatchmTiers::resolve(&gpu, true);
+    let _tiers = W4a16BatchmTiers::resolve(&gpu);
     for (gamma, scalar_present) in [
         (0, false),
         (4, true),

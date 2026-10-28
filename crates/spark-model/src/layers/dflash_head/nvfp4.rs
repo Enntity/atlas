@@ -12,6 +12,20 @@ use crate::weight_map::{
     DenseWeight, Fp8DenseWeight, Mxfp8Weight, QuantizedWeight, quantize_to_nvfp4,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrafterNvfp4Tier {
+    Batch4,
+    Batch8,
+}
+
+fn drafter_nvfp4_tier(rows: u32) -> Option<DrafterNvfp4Tier> {
+    match rows {
+        1..=4 => Some(DrafterNvfp4Tier::Batch4),
+        5..=8 => Some(DrafterNvfp4Tier::Batch8),
+        _ => None,
+    }
+}
+
 impl BlockDiffusionDraftHead {
     pub(super) fn try_install_nvfp4(&mut self, gpu: &dyn GpuBackend) -> Result<()> {
         if std::env::var("ATLAS_NO_DFLASH_DRAFTER_NVFP4").is_ok() {
@@ -150,6 +164,21 @@ impl BlockDiffusionDraftHead {
         {
             return Ok(());
         }
+        if !self.spark_shared_default
+            && matches!(self.quant, DflashQuantization::Nvfp4Weights)
+            && let Some(weight) = w_nvfp4
+            && let Some(tier) = drafter_nvfp4_tier(m)
+        {
+            let kernel = match tier {
+                DrafterNvfp4Tier::Batch4 => self.kernels.w4a16_gemv_batch4,
+                DrafterNvfp4Tier::Batch8 => self.kernels.w4a16_gemv_batch8,
+            };
+            if kernel.0 != 0 {
+                return ops::w4a16_gemv_batchm(
+                    gpu, kernel, src, weight, dst, m, n_out, k_in, stream,
+                );
+            }
+        }
         if matches!(self.quant, DflashQuantization::Nvfp4Weights)
             && m <= 4
             && let Some(w) = w_nvfp4
@@ -188,5 +217,20 @@ impl BlockDiffusionDraftHead {
             return Ok(());
         }
         self.drafter_dense_gemm(gpu, src, w_bf16, dst, m, n_out, k_in, stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drafter_nvfp4_tier_pick() {
+        assert_eq!(drafter_nvfp4_tier(1), Some(DrafterNvfp4Tier::Batch4));
+        assert_eq!(drafter_nvfp4_tier(4), Some(DrafterNvfp4Tier::Batch4));
+        assert_eq!(drafter_nvfp4_tier(5), Some(DrafterNvfp4Tier::Batch8));
+        assert_eq!(drafter_nvfp4_tier(8), Some(DrafterNvfp4Tier::Batch8));
+        assert_eq!(drafter_nvfp4_tier(9), None);
+        assert_eq!(drafter_nvfp4_tier(0), None);
     }
 }

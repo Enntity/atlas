@@ -1417,3 +1417,6 @@ fn nemotron_h_omni_wrong_inner_model_type_fails() {
     let err = parse_config(json).unwrap_err();
     assert!(err.to_string().contains("nemotron_h"), "{err}");
 }
+
+#[path = "tests/tests_b.rs"]
+mod tests_b;

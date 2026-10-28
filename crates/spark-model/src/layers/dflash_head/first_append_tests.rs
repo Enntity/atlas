@@ -149,6 +149,8 @@ pub(super) fn head(variant: FirstAppend) -> BlockDiffusionDraftHead {
     head.target_layer_ids = vec![0, 1];
     head.target_hidden_size = SLOT / 4;
     head.max_seq_len = WINDOW;
+    head.ctx_window = WINDOW;
+    head.spark_shared_default = true;
     head.startup.diagnostics.first_append = variant;
     head.startup.diagnostics.no_decode_append = false;
     head
@@ -254,6 +256,37 @@ fn only_the_propose_at_the_prefill_end_is_the_first() {
         );
         let legacy = variant == FirstAppend::Legacy;
         assert_eq!(d.ctx_len, PROMPT + legacy as usize, "{variant:?}");
+    }
+}
+
+#[test]
+fn acquire_ctx_acc_reserves_the_own_row_for_non_legacy_only() {
+    let _pool_guard = super::free_state_tests::lock_and_drain_pool();
+    for variant in ALL {
+        let gpu = MockGpuBackend::new();
+        let mut head = head(variant);
+        head.spark_shared_default = false;
+        let mut state = head.alloc_state(&gpu).unwrap();
+        assert_eq!(dstate(&mut state).ctx_hidden_acc, DevicePtr(0));
+        head.acquire_ctx_acc(&gpu, state.as_mut()).unwrap();
+        let d = dstate(&mut state);
+        let own = variant != FirstAppend::Legacy;
+        assert_eq!(d.max_ctx_len, WINDOW, "{variant:?}");
+        assert_eq!(
+            gpu.read_alloc(d.ctx_hidden_acc).unwrap().len(),
+            (WINDOW + own as usize) * SLOT,
+            "{variant:?}"
+        );
+        assert_eq!(
+            d.own_row,
+            own.then(|| d.ctx_hidden_acc.offset(WINDOW * SLOT)),
+            "{variant:?}"
+        );
+        assert_eq!(
+            (d.first_append_at, d.own_row_at, d.own_capture),
+            (None, None, false),
+            "{variant:?}"
+        );
     }
 }
 

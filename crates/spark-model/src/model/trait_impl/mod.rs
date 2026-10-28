@@ -37,6 +37,7 @@ mod exact_verify_check;
 pub(crate) mod finish_leaf;
 pub(crate) mod gdn_commit_fuse;
 mod graph_borrow;
+mod kda_commit;
 mod lm_head_batched;
 mod lm_head_dp4a;
 mod meta;
@@ -47,6 +48,11 @@ mod prefill_a;
 pub(in crate::model) mod prefill_b;
 mod prefill_c;
 mod prefill_d;
+#[cfg(test)]
+mod prefill_dflash_first_append_tests;
+#[cfg(test)]
+#[path = "prefill_stream_test_fixture.rs"]
+pub(crate) mod prefill_stream_test_fixture;
 mod sequence;
 mod speculative;
 pub(in crate::model) mod ssm_fault_in;
@@ -785,6 +791,9 @@ impl Model for TransformerModel {
     }
     fn native_mtp_enabled(&self) -> bool {
         self.native_glm_mtp_enabled()
+    }
+    fn uses_spark_shared_defaults(&self) -> bool {
+        super::uses_spark_shared_defaults_model_type(&self.config.model_type)
     }
     fn native_prefix_admission_blocks(
         &self,

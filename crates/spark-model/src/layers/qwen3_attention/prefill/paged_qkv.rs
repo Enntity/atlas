@@ -221,7 +221,7 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
         // Keep-packed Q2_0 (Tier-1c): transient-dequant to BF16 then dense GEMM.
-        if let Some(r) = self.try_q2_prefill(ctx, weight_opt, normed, out, n, stream) {
+        if let Some(r) = self.try_unpacked_prefill(ctx, weight_opt, normed, out, n, stream) {
             return r;
         }
 

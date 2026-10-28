@@ -6,7 +6,7 @@ use anyhow::Result;
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
 
 use super::super::{
-    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder,
+    GlmVisionEncoder, GlmVisionWeights, MergerLayer, PATCH_DIM, ViTBlock, VisionEncoder, VitWeight,
 };
 
 /// Encoder capacity, in patches, when nothing bounds the image.
@@ -102,6 +102,26 @@ impl VisionEncoder {
             ),
         }
         let merger_in_dim = spatial_merge_size * spatial_merge_size * hidden_size; // 4608
+        let vit_weights: Vec<VitWeight> = blocks
+            .iter()
+            .flat_map(|b| [b.qkv_w, b.proj_w, b.fc1_w, b.fc2_w])
+            .chain(deepstack.iter().flat_map(|m| [m.fc1_w, m.fc2_w]))
+            .chain([merger.fc1_w, merger.fc2_w])
+            .collect();
+        let has_nvfp4 = vit_weights
+            .iter()
+            .any(|w| matches!(w, VitWeight::Nvfp4 { .. }));
+        let has_mxfp8 = vit_weights.iter().any(|w| matches!(w, VitWeight::Mxfp8(_)));
+        let max_vit_dq_bytes = vit_weights
+            .iter()
+            .map(VitWeight::bf16_bytes)
+            .max()
+            .unwrap_or(0);
+        let buf_vit_dq = if max_vit_dq_bytes == 0 {
+            DevicePtr::NULL
+        } else {
+            gpu.alloc(max_vit_dq_bytes)?
+        };
 
         // num_grid_per_side is the side length of the square pos_embed grid
         // (e.g. 48 for Qwen3-VL with 2304 position embeddings). Non-square
@@ -223,6 +243,16 @@ impl VisionEncoder {
             k_merge: gpu.kernel("vision_encoder", "vision_spatial_merge")?,
             k_f32_bf16: gpu.kernel("vision_encoder", "vision_f32_to_bf16")?,
             k_copy: gpu.kernel("vision_encoder", "vision_bf16_copy")?,
+            k_nvfp4_dq: if has_nvfp4 {
+                gpu.kernel("dequant_nvfp4_bf16", "dequant_nvfp4_to_bf16")?
+            } else {
+                KernelHandle(0)
+            },
+            k_mx8_dq: if has_mxfp8 {
+                gpu.kernel("mxfp8_proj", "mxfp8_proj_dequant")?
+            } else {
+                KernelHandle(0)
+            },
             hidden_size,
             num_heads,
             head_dim,
@@ -248,6 +278,7 @@ impl VisionEncoder {
             buf_scores,
             buf_probs,
             buf_o_stage,
+            buf_vit_dq,
             pos_embed_host_f32,
             rope_inv_freq,
         })
@@ -275,9 +306,9 @@ impl VisionEncoder {
             merger: MergerLayer {
                 norm_w: DevicePtr::NULL,
                 norm_b: DevicePtr::NULL,
-                fc1_w: DevicePtr::NULL,
+                fc1_w: VitWeight::Bf16(DevicePtr::NULL),
                 fc1_b: DevicePtr::NULL,
-                fc2_w: DevicePtr::NULL,
+                fc2_w: VitWeight::Bf16(DevicePtr::NULL),
                 fc2_b: DevicePtr::NULL,
             },
             k_gemm: KernelHandle(0),
@@ -294,6 +325,8 @@ impl VisionEncoder {
             k_merge: KernelHandle(0),
             k_f32_bf16: KernelHandle(0),
             k_copy: KernelHandle(0),
+            k_nvfp4_dq: KernelHandle(0),
+            k_mx8_dq: KernelHandle(0),
             hidden_size: config.hidden_size,
             num_heads: config.num_heads,
             head_dim: config.hidden_size / config.num_heads,
@@ -319,6 +352,7 @@ impl VisionEncoder {
             buf_scores: DevicePtr::NULL,
             buf_probs: DevicePtr::NULL,
             buf_o_stage: DevicePtr::NULL,
+            buf_vit_dq: DevicePtr::NULL,
             pos_embed_host_f32: Vec::new(),
             rope_inv_freq: Vec::new(),
         })

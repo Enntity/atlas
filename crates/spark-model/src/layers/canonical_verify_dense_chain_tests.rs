@@ -5,6 +5,7 @@
 //! host barriers.
 
 use super::*;
+use anyhow::{Result, ensure};
 
 const STEPS: usize = 48;
 

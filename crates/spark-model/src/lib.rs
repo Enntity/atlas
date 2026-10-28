@@ -18,6 +18,8 @@
 #![allow(clippy::type_complexity)]
 
 pub mod det_trace;
+#[cfg(test)]
+mod det_trace_finite;
 pub mod engine;
 pub mod factory;
 pub mod forward;

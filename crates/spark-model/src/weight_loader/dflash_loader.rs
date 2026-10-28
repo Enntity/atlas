@@ -33,6 +33,7 @@ use crate::weight_map::{DenseWeight, dense_auto};
 
 #[path = "dflash_config.rs"]
 mod config;
+mod own_head;
 pub use config::*;
 
 /// DFlash2 2-tap grouped dynamic convolution weights.
@@ -65,6 +66,7 @@ pub struct DflashWeights {
     pub markov_w2: Option<DenseWeight>,
     pub markov_rank: usize,
     pub embed_tokens: Option<DenseWeight>,
+    pub lm_head: Option<crate::weight_map::QuantizedWeight>,
     pub candidate_selector: Option<DflashCandidateSelectorWeights>,
 }
 
@@ -135,6 +137,7 @@ pub fn store_has_dflash_weights(store: &WeightStore) -> bool {
 pub fn load_dflash_weights(
     drafter_store: &WeightStore,
     drafter_config: &DflashConfig,
+    target_model_type: &str,
     gpu: &dyn GpuBackend,
     _tp_size: usize,
 ) -> Result<Option<DflashWeights>> {
@@ -290,6 +293,17 @@ pub fn load_dflash_weights(
     } else {
         None
     };
+    let lm_head = if !crate::model::uses_spark_shared_defaults_model_type(target_model_type)
+        && own_head::own_lm_head_present(drafter_store, prefix, drafter_config.has_own_lm_head)?
+    {
+        Some(crate::weight_map::quantized(
+            drafter_store,
+            &format!("{prefix}lm_head"),
+            gpu,
+        )?)
+    } else {
+        None
+    };
 
     if let Ok(fc_meta) = drafter_store.get(&format!("{prefix}fc.weight"))
         && fc_meta.dtype == spark_runtime::weights::WeightDtype::UInt8
@@ -330,6 +344,7 @@ pub fn load_dflash_weights(
         markov_w2,
         markov_rank,
         embed_tokens,
+        lm_head,
         candidate_selector,
     }))
 }

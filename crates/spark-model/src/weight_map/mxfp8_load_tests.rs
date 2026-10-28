@@ -229,3 +229,25 @@ fn released_raw_bytes_are_refused_not_read() {
     // The geometry probe reads dtypes and shapes only, so it still answers.
     assert_eq!(mxfp8_geometry(&st, "p").unwrap(), Some((64, 64)));
 }
+
+#[test]
+fn row_range_twin_is_the_contiguous_row_slice() {
+    let (n, k) = (40, 64);
+    let gpu = MockGpuBackend::new();
+    let (raw, w, s) = tensor(&gpu, 0x33, n, k);
+    for (first, rows) in [(0, 19), (19, 19), (0, n), (39, 1)] {
+        let twin = mxfp8_row_range_twin(&gpu, raw, first, rows, 0).unwrap();
+        assert!(!twin.tiled);
+        assert_eq!(
+            read(&gpu, twin.data, rows * k),
+            w[first * k..(first + rows) * k]
+        );
+        assert_eq!(
+            read(&gpu, twin.scales, rows * k / 32),
+            s[first * k / 32..(first + rows) * k / 32]
+        );
+    }
+    for (first, rows) in [(0, 0), (21, 20), (usize::MAX, 2)] {
+        assert!(mxfp8_row_range_twin(&gpu, raw, first, rows, 0).is_err());
+    }
+}

@@ -4,6 +4,7 @@
 //! for finite inputs. Bans and confidence use the serial fallback in serving;
 //! the batch ABI has neither. Nonfinite-input policies are not asserted equal.
 use super::*;
+use anyhow::ensure;
 
 const ANCHORS: [u32; 3] = [0, 1, 8];
 

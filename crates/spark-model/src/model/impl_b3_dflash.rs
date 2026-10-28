@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 
+use super::dflash_ctx_window;
 use super::types::TransformerModel;
 
 impl TransformerModel {
@@ -177,6 +178,17 @@ impl TransformerModel {
             },
             None => return Ok(()),
         };
+        if !crate::model::uses_spark_shared_defaults_model_type(&self.config.model_type) {
+            return self.capture_dflash_prefill_generic(
+                &seq.tokens,
+                dstate,
+                slot_idx,
+                chunk_start,
+                proc_count,
+                row_base,
+                stream,
+            );
+        }
         let h = self.config.hidden_size;
         let bf16 = 2usize;
         let n_capture = self.dflash_capture_layers.len();
@@ -233,6 +245,80 @@ impl TransformerModel {
         )
     }
 
+    fn capture_dflash_prefill_generic(
+        &self,
+        prompt_tokens: &[u32],
+        dstate: &mut crate::layers::DflashProposerState,
+        slot_idx: usize,
+        chunk_start: usize,
+        proc_count: usize,
+        row_base: usize,
+        stream: u64,
+    ) -> Result<()> {
+        if dstate.max_ctx_len == 0 {
+            return Ok(());
+        }
+        if dstate.ctx_prefill_origin.is_none() {
+            if let Some(ref proposer) = self.proposer {
+                proposer.adopt_dflash_ctx(self.gpu.as_ref(), dstate, prompt_tokens, chunk_start);
+            }
+            dstate.ctx_prefill_origin = Some(chunk_start);
+            dstate.ctx_prefill_base = dstate.ctx_len;
+        }
+        if dstate.ctx_hidden_acc.0 == 0
+            && let Some(ref proposer) = self.proposer
+        {
+            proposer.acquire_ctx_acc(self.gpu.as_ref(), dstate)?;
+        }
+        let h = self.config.hidden_size;
+        let bf16 = 2usize;
+        let stride = self.dflash_capture_layers.len() * h * bf16;
+        let plan = dflash_ctx_window::plan_capture(
+            dstate.ctx_prefill_base,
+            dstate.ctx_prefill_origin.unwrap_or(chunk_start),
+            chunk_start,
+            proc_count,
+            dstate.ctx_acc_rows,
+            dstate.max_ctx_len,
+        );
+        if let Some(slide) = plan.slide {
+            if slide.move_rows > 0 {
+                self.gpu.copy_d2d_async(
+                    dstate
+                        .ctx_hidden_acc
+                        .offset(slide.drop_n * dstate.ctx_slot_bytes),
+                    dstate.ctx_hidden_acc,
+                    slide.move_rows * dstate.ctx_slot_bytes,
+                    stream,
+                )?;
+            }
+            let dropped = slide.drop_n.min(dstate.ctx_positions.len());
+            dstate.ctx_positions.drain(..dropped);
+            dstate.ctx_committed = 0;
+        }
+        dstate.ctx_prefill_base = plan.base;
+        dstate.ctx_prefill_origin = Some(plan.origin);
+        if let Some(own_row) = dstate.own_row
+            && let Some(row) = crate::layers::dflash_head::own_capture_row(proc_count, 0)
+        {
+            self.dflash_capture_rows(
+                row_base + row,
+                1,
+                own_row.offset(slot_idx * h * bf16),
+                stride,
+                stream,
+            )?;
+        }
+        let count = proc_count.saturating_sub(plan.skip);
+        if count > 0 {
+            let dst = dstate
+                .ctx_hidden_acc
+                .offset(plan.first_row * stride + slot_idx * h * bf16);
+            self.dflash_capture_rows(row_base + plan.skip, count, dst, stride, stream)?;
+        }
+        Ok(())
+    }
+
     /// After prefill completes, advance the seq's DFlash `ctx_len` to
     /// `chunk_start + proc_count` so the drafter sees all captured prompt
     /// positions on the first propose() call.
@@ -255,7 +341,38 @@ impl TransformerModel {
                 .as_any_mut()
                 .downcast_mut::<crate::layers::DflashProposerState>()
         {
-            dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
+            if crate::model::uses_spark_shared_defaults_model_type(&self.config.model_type) {
+                dstate.seed_prefill_ctx(seq.tokens.len(), chunk_start + proc_count, seq.seq_len);
+            } else if dstate.max_ctx_len > 0 {
+                dstate.first_append_at = Some(seq.seq_len);
+                let chunk_end = chunk_start + proc_count;
+                let base = dstate.ctx_prefill_base;
+                let origin = dstate.ctx_prefill_origin.unwrap_or(chunk_start);
+                dstate.ctx_len = base.saturating_add(chunk_end.saturating_sub(origin));
+                dstate.ctx_positions.truncate(base);
+                dstate
+                    .ctx_positions
+                    .extend((origin..chunk_end).map(|position| position as i32));
+                if dstate.ctx_len > dstate.max_ctx_len {
+                    let keep = dstate.max_ctx_len / 2;
+                    let physical = dstate.ctx_len.min(dstate.ctx_acc_rows);
+                    let drop_n = physical - keep;
+                    let slot = dstate.ctx_slot_bytes;
+                    self.gpu.copy_d2d_async(
+                        dstate.ctx_hidden_acc.offset(drop_n * slot),
+                        dstate.ctx_hidden_acc,
+                        keep * slot,
+                        self.gpu.default_stream(),
+                    )?;
+                    let drop_positions = drop_n.min(dstate.ctx_positions.len());
+                    dstate.ctx_positions.drain(..drop_positions);
+                    dstate.ctx_len = keep;
+                    dstate.ctx_committed = 0;
+                    tracing::info!(
+                        "DFlash ctx prefill watermark: slid ctx window (dropped {drop_n}, keep {keep})"
+                    );
+                }
+            }
         }
         Ok(())
     }

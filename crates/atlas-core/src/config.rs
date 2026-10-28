@@ -801,6 +801,8 @@ mod dispatch_nemotron;
 mod factory;
 mod gguf;
 mod methods;
+#[cfg(test)]
+mod methods_tests;
 mod ngram;
 mod ngram_qwen4exp;
 mod parsers;

@@ -41,7 +41,7 @@ impl Qwen3AttentionLayer {
         }
         // Keep-packed Q2_0 (Tier-1c): transient-dequant o_proj then dense GEMM.
         if let Some(r) =
-            self.try_q2_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
+            self.try_unpacked_prefill(ctx, self.o_weight.as_ref(), attn_out, o_out, n, stream)
         {
             r?;
             return Ok(o_out);

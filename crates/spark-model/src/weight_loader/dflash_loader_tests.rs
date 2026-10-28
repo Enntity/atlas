@@ -249,3 +249,90 @@ fn dflash_config_fallbacks_keep_v1_defaults() {
     assert_eq!(scaling.rope_type.as_deref(), Some("yarn"));
     assert_eq!(scaling.factor, Some(4.0));
 }
+
+#[test]
+fn parse_lilicorr_drafter_config() {
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/lilicorr_drafter_config.json"
+    ));
+    let config = parse_dflash_config(json).expect("parse LiLiCorr drafter config");
+    assert_eq!(config.has_own_lm_head, Some(true));
+    let sub = config.dflash_config.expect("dflash_config");
+    assert_eq!(sub.projector_type.as_deref(), Some("lilicorr"));
+    assert_eq!(sub.lilicorr_enabled, Some(true));
+    assert_eq!(sub.use_swa, Some(true));
+    assert_eq!(sub.swa_window_size, Some(8192));
+}
+
+#[test]
+fn lilicorr_config_takes_generic_dflash_admission_path() {
+    use crate::factory::{DflashBuildArgs, admit_lightning_dspark_build};
+    use atlas_core::config::ModelConfig;
+    use spark_runtime::kv_cache::KvCacheDtype;
+
+    let json = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test_data/lilicorr_drafter_config.json"
+    ));
+    let store = WeightStore::empty();
+    let args = DflashBuildArgs {
+        drafter_store: &store,
+        drafter_config: parse_dflash_config(json).expect("parse LiLiCorr config"),
+        gamma: Some(8),
+        window_size: Some(0),
+    };
+    let target = ModelConfig::qwen3_next_80b_nvfp4();
+    let admitted = admit_lightning_dspark_build(&args, &target, 1, 16, KvCacheDtype::Bf16)
+        .expect("generic admission must not error");
+    assert!(admitted.is_none());
+}
+
+#[test]
+fn own_lm_head_policy() {
+    use super::own_head::own_lm_head_present;
+    use spark_runtime::gpu::DevicePtr;
+    use spark_runtime::weights::{WeightDtype, WeightTensor};
+    use std::collections::HashMap;
+
+    let tensor = |dtype| WeightTensor {
+        ptr: DevicePtr::NULL,
+        shape: vec![2, 2],
+        dtype,
+    };
+    let mut weights = HashMap::new();
+    weights.insert("lm_head.weight".to_owned(), tensor(WeightDtype::UInt8));
+    weights.insert(
+        "lm_head.weight_scale".to_owned(),
+        tensor(WeightDtype::FP8E4M3),
+    );
+    weights.insert(
+        "lm_head.weight_scale_2".to_owned(),
+        tensor(WeightDtype::FP32),
+    );
+    let store = WeightStore::from_map(weights);
+    assert!(!own_lm_head_present(&store, "", None).unwrap());
+    assert!(!own_lm_head_present(&store, "", Some(false)).unwrap());
+    assert!(own_lm_head_present(&store, "", Some(true)).unwrap());
+    assert!(own_lm_head_present(&WeightStore::empty(), "", Some(true)).is_err());
+
+    let mut bad = HashMap::new();
+    bad.insert("lm_head.weight".to_owned(), tensor(WeightDtype::BF16));
+    bad.insert(
+        "lm_head.weight_scale".to_owned(),
+        tensor(WeightDtype::FP8E4M3),
+    );
+    bad.insert(
+        "lm_head.weight_scale_2".to_owned(),
+        tensor(WeightDtype::FP32),
+    );
+    assert!(own_lm_head_present(&WeightStore::from_map(bad), "", Some(true)).is_err());
+
+    let mut no_scale2 = HashMap::new();
+    no_scale2.insert("lm_head.weight".to_owned(), tensor(WeightDtype::UInt8));
+    no_scale2.insert(
+        "lm_head.weight_scale".to_owned(),
+        tensor(WeightDtype::FP8E4M3),
+    );
+    assert!(own_lm_head_present(&WeightStore::from_map(no_scale2), "", Some(true)).is_err());
+}

@@ -614,6 +614,41 @@ fn widening_still_pulls_the_probe_forward() {
     );
 }
 
+/// 2026-10-21, concurrency-sweep on nvidia/Qwen3.8-27B-NVFP4
+/// (run-1792544951131605812): all eight C=8 prefills landed before the first
+/// batched step, so the first in-regime step must not become the baseline.
+#[test]
+fn one_bootstrap_step_cannot_set_a_new_regime_baseline() {
+    let mut g = MtpGate::new(3);
+    run_mtp_until_probe(&mut g, 2, ms(50));
+    drive_serial(&mut g, WINDOW_STEPS, ms(40));
+    g.record_verify_step(ms(239), 8, 8);
+    for _ in 0..WINDOW_STEPS * 6 {
+        match g.next_step() {
+            GateStep::MeasureVerify => g.record_verify_step(ms(270), 19, 8),
+            GateStep::MeasureDecode => g.record_decode(ms(142), 8),
+        }
+    }
+    assert!(!g.in_serial_mode());
+    assert_eq!(g.take_fresh_decision(), None);
+}
+
+#[test]
+fn stale_current_baseline_cannot_count_a_losing_window() {
+    let mut g = MtpGate::new(1);
+    run_mtp_until_probe(&mut g, 2, ms(50));
+    for _ in 0..WINDOW_STEPS {
+        assert_eq!(g.next_step(), GateStep::MeasureDecode);
+        g.record_decode(ms(10), 4);
+    }
+    assert!(!g.serial.stale && g.mtp.stale);
+    assert_eq!(g.losing_windows, 0);
+    drive_mtp_w(&mut g, WINDOW_STEPS, 8, 4, ms(10));
+    assert!(!g.mtp.stale);
+    assert!(!g.in_serial_mode());
+    assert_eq!(g.take_fresh_decision(), None);
+}
+
 #[test]
 fn request_disable_mtp_overrides_all_spec_dispatch_modes() {
     for thinking in [false, true] {
@@ -626,4 +661,18 @@ fn request_disable_mtp_overrides_all_spec_dispatch_modes() {
             ));
         }
     }
+}
+
+#[test]
+fn scheduler_uses_model_specific_regime_policy() {
+    let mut spark = MtpGate::new_spark_shared(1);
+    spark.note_width(1);
+    spark.note_width(4);
+    assert!(spark.require_full_window);
+
+    let mut upstream = MtpGate::new(1);
+    upstream.note_width(1);
+    upstream.note_width(4);
+    assert!(!upstream.require_full_window);
+    assert!(upstream.mtp.stale && upstream.serial.stale);
 }

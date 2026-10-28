@@ -15,8 +15,12 @@
 //!
 //! Run on the GB10 (all tests are `#[ignore]`d):
 //!   cargo test --release -p spark-model --test dflash2_selector_exact -- --ignored --nocapture
+#[path = "dflash2_selector_exact/geometry.rs"]
+mod geometry;
 #[path = "arm2_common/support.rs"]
 mod support;
+#[path = "dflash2_selector_exact/timing.rs"]
+mod timing;
 
 use anyhow::Result;
 use spark_model::layers::ops;

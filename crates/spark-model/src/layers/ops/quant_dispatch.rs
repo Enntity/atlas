@@ -58,6 +58,9 @@ pub fn quant_gemv(
         QuantWeight::Exl3(_) => anyhow::bail!(
             "quant_gemv: EXL3 is not routed through the generic dispatcher yet (reconstruct + GEMM lands in M3)"
         ),
+        QuantWeight::Mxfp8(_) => anyhow::bail!(
+            "quant_gemv: MXFP8 projections require the dedicated MXFP8 projection dispatcher"
+        ),
     }
 }
 
@@ -100,6 +103,9 @@ pub fn quant_gemm(
         ),
         QuantWeight::Exl3(_) => anyhow::bail!(
             "quant_gemm: EXL3 is not routed through the generic dispatcher yet (reconstruct + GEMM lands in M3)"
+        ),
+        QuantWeight::Mxfp8(_) => anyhow::bail!(
+            "quant_gemm: MXFP8 projections require the dedicated MXFP8 projection dispatcher"
         ),
     }
 }

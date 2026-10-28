@@ -27,6 +27,8 @@ use crate::speculative::DraftProposer;
 use crate::traits::{ChunkedPrefillPageMetadata, Model, SequenceState};
 use crate::weight_map::{DenseWeight, MtpWeights, QuantizedWeight};
 
+mod lmhead_arms;
+
 /// Presence kill switch for the wide (9..=VERIFY_ROW_CAP row) batched LM head arm:
 /// `ATLAS_NO_LMHEAD_BATCHED_WIDE` restores the M64-tile `w4a16_gemm` fallback.
 /// Presence, not value — `=0` is NOT "off" (see `atlas_env_presence_check_trap`).

@@ -488,6 +488,8 @@ pub use placement::{KvBuffer, KvPlacement};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
 #[cfg(test)]
+mod sparse_index_failure_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

@@ -44,7 +44,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub(super) mod bootstrap;
 pub(super) mod chain;
 pub(super) mod cmd_ring;
+mod gid;
 mod oneshot;
+mod oneshot_launch;
 mod proxy;
 mod rails;
 mod topology;
@@ -380,6 +382,8 @@ struct Peer {
 
 #[cfg(test)]
 mod cmd_ring_nic_tests;
+#[cfg(test)]
+mod loopback_sm_stage_tests;
 
 #[cfg(test)]
 mod tests {

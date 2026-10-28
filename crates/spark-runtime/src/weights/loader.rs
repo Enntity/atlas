@@ -367,6 +367,8 @@ pub(crate) fn check_oom_guard(
     Ok(())
 }
 mod load_fns;
+#[cfg(test)]
+mod load_windows;
 // shard planning is exercised only by the cfg(windows) streaming loader and
 // by unit tests.
 #[cfg(any(target_os = "windows", test))]

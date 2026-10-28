@@ -6,9 +6,8 @@
 //! when it is freed.
 
 // The real model and recording layer of `prefill_stream_tests`.
-#[allow(clippy::duplicate_mod)]
-#[path = "prefill_stream_test_fixture.rs"]
-mod fixture;
+use crate::model::trait_impl::prefill_stream_test_fixture as fixture;
+use crate::model::trait_impl::prefill_stream_test_fixture::*;
 
 use super::{FinishCache, finish_cache, held_tokens};
 use crate::traits::Model;

@@ -596,5 +596,27 @@ pub fn slab_layout(lens: impl Iterator<Item = usize>) -> (Vec<usize>, usize) {
 mod teardown_tests;
 
 #[cfg(test)]
+mod tests {
+    #[test]
+    fn slab_layout_aligns_each_tensor_to_4k() {
+        let (offsets, total) = super::slab_layout([1, 4096, 4097, 5].into_iter());
+        assert_eq!(offsets, vec![4096, 8192, 12288, 20480]);
+        assert_eq!(total, 24576);
+    }
+
+    #[test]
+    fn slab_layout_empty_shard_is_zero() {
+        let (offsets, total) = super::slab_layout(std::iter::empty());
+        assert!(offsets.is_empty() && total == 0);
+    }
+
+    #[test]
+    fn slab_layout_offset_zero_is_reserved() {
+        let (offsets, _) = super::slab_layout([7].into_iter());
+        assert!(offsets[0] >= 4096, "no tensor may alias the slab base");
+    }
+}
+
+#[cfg(test)]
 #[path = "weights/csf_load_tests.rs"]
 pub(crate) mod csf_load_tests;

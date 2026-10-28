@@ -27,9 +27,6 @@ mod loaders_mtp;
 mod model_a;
 #[path = "weight_map/model_b.rs"]
 mod model_b;
-#[path = "weight_map/modelopt_local.rs"]
-pub mod modelopt_local;
-pub mod modelopt_plan;
 #[path = "weight_map/moe.rs"]
 mod moe;
 #[path = "weight_map/mxfp8.rs"]
@@ -74,7 +71,7 @@ pub use model_a::*;
 pub use moe::*;
 #[cfg(test)]
 pub(crate) use mxfp8::mxfp8_to_bf16_host;
-pub use mxfp8::{Mxfp8Weight, dequant_mxfp8_to_bf16};
+pub use mxfp8::{Mxfp8Proj, Mxfp8Weight, dequant_mxfp8_to_bf16};
 pub use mxfp8_load::{
     RawMxfp8, mxfp8_cols_twin, mxfp8_geometry, mxfp8_row_range_twin, mxfp8_rows_twin, raw_mxfp8,
     release_raw_mxfp8,

@@ -23,6 +23,8 @@ mod vision;
 
 #[cfg(test)]
 mod nvidia_dense_tests;
+#[cfg(test)]
+mod retirement_reuse_tests;
 
 use anyhow::Result;
 use atlas_core::config::ModelConfig;

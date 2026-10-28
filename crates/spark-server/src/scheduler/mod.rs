@@ -96,6 +96,8 @@ mod think_skip_tests;
 mod ttft_trace;
 mod types;
 #[cfg(test)]
+mod verify_bias_tests;
+#[cfg(test)]
 mod verify_commit_tests;
 mod verify_dflash_batch_step;
 mod verify_dflash_step;
@@ -309,7 +311,11 @@ pub fn run(
     // for the pure-MTP path (not ngram/self/dflash, which have their own
     // economics and proposers).
     let mut mtp_gate = if use_mtp && !sched.levers.mtp_gate_force {
-        Some(mtp_gate::MtpGate::new(num_drafts))
+        Some(if model.uses_spark_shared_defaults() {
+            mtp_gate::MtpGate::new_spark_shared(num_drafts)
+        } else {
+            mtp_gate::MtpGate::new(num_drafts)
+        })
     } else {
         if use_mtp && sched.levers.mtp_gate_force {
             tracing::warn!(

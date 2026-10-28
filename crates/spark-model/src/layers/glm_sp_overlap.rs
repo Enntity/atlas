@@ -52,7 +52,7 @@ fn parse_blocks(value: Option<&str>) -> Result<usize> {
     }
 }
 
-fn requested_blocks() -> usize {
+pub(crate) fn requested_blocks() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         parse_blocks(std::env::var("ATLAS_GLM_SP_GATHER_OVERLAP").ok().as_deref())

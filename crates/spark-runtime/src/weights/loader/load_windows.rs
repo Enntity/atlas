@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::*;
-
 /// Windows-only streaming shard load (Strix Halo UMA). Parses the safetensors
 /// header only, then reads each tensor's byte range with seek+read into a
 /// transient host buffer that is dropped after upload. Avoids `memmap2` on the

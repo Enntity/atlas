@@ -29,6 +29,23 @@ pub struct Mxfp8Weight {
     pub tiled: bool,
 }
 
+/// An MXFP8 projection with its geometry: `out = act @ W^T`, `W` `[n, k]`.
+#[derive(Debug, Clone, Copy)]
+pub struct Mxfp8Proj {
+    pub w: Mxfp8Weight,
+    /// Output features (weight rows).
+    pub n: u32,
+    /// Input features, a multiple of 32.
+    pub k: u32,
+}
+
+impl Mxfp8Proj {
+    /// Bytes of the BF16 expansion used by prefill GEMM.
+    pub fn bf16_bytes(&self) -> usize {
+        self.n as usize * self.k as usize * 2
+    }
+}
+
 /// E8M0 exponents whose scale keeps EVERY E4M3 value exact in BF16.
 ///
 /// E4M3 values are multiples of 2^-9 with at most 4 significant bits, up to

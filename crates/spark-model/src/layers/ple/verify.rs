@@ -202,10 +202,6 @@ impl PleLayer {
                 // produced garbage input embeddings.
                 DevicePtr(va)
             }
-            #[cfg(feature = "cuda")]
-            NgramTable::ResidentNvfp4 { .. } => {
-                anyhow::bail!("PLE: resident NVFP4 table is not supported by this gather path")
-            }
             NgramTable::Bf16(w) => {
                 // Fully resident table (small fixtures / tests): the "slot" IS
                 // the row id, so upload the ids truncated to u32.

@@ -14,6 +14,8 @@ use super::super::super::types::TransformerModel;
 use crate::layer::{AttnMetadataDev, ForwardContext};
 use crate::traits::SequenceState;
 
+mod profile_tail;
+
 impl TransformerModel {
     pub(super) fn prefill_b_forward_layers(
         &self,

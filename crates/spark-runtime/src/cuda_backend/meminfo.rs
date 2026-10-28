@@ -13,6 +13,7 @@
 /// device allocation; taking the max reported ~27 GB "free" with the carve-out
 /// full, so the KV budget overran it and Flash-Next could not boot.
 /// Unified = device total no more than ~10% above host MemTotal.
+#[allow(dead_code)]
 pub(crate) fn unified_free(
     free: usize,
     total: usize,
@@ -27,11 +28,13 @@ pub(crate) fn unified_free(
 
 /// Read MemAvailable from /proc/meminfo (Linux only).
 /// Returns None on non-Linux or if parsing fails.
+#[allow(dead_code)]
 pub(super) fn system_available_memory_bytes() -> Option<usize> {
     system_meminfo_bytes("MemAvailable:")
 }
 
 /// One `/proc/meminfo` field in bytes (Linux only).
+#[allow(dead_code)]
 pub(super) fn system_meminfo_bytes(field: &str) -> Option<usize> {
     let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in contents.lines() {

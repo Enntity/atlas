@@ -45,6 +45,32 @@ fn faults(n: u32, panic_at: Option<u32>) -> Vec<Fault> {
         .collect()
 }
 
+#[test]
+fn resident_scales_index_by_global_row_id() {
+    let stride = 2usize;
+    let file = File::open(std::env::current_exe().expect("test exe")).expect("open test exe");
+    let seg = crate::ngram_cache::Segments {
+        bases: vec![0, 100, 200],
+        rows_per: 4,
+        files: vec![file],
+        shard_file: vec![0, 0, 0],
+    };
+    let arena: Vec<u8> = (0..12u8).flat_map(|r| [r, r.wrapping_add(100)]).collect();
+    let source = super::ScaleSource::Segmented {
+        seg: &seg,
+        resident: Some(&arena),
+    };
+    for id in [0u64, 3, 4, 7, 8, 11] {
+        let scales = source
+            .scale_resident_slice(id, stride)
+            .expect("resident slice");
+        assert_eq!(
+            scales,
+            &arena[id as usize * stride..id as usize * stride + stride]
+        );
+    }
+}
+
 /// Run `f` on its own thread, so a pool hang fails the test instead of
 /// wedging the suite.
 fn within_deadline(f: impl FnOnce() + Send + 'static) {

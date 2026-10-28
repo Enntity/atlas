@@ -236,15 +236,15 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
             blocks.push(ViTBlock {
                 norm1_w: dense(store, &format!("{bp}.norm1.weight"))?.weight,
                 norm1_b: dense(store, &format!("{bp}.norm1.bias"))?.weight,
-                qkv_w: dense(store, &format!("{bp}.attn.qkv.weight"))?.weight,
+                qkv_w: super::qwen35::vision_weight(store, &format!("{bp}.attn.qkv"), gpu)?,
                 qkv_b: dense(store, &format!("{bp}.attn.qkv.bias"))?.weight,
-                proj_w: dense(store, &format!("{bp}.attn.proj.weight"))?.weight,
+                proj_w: super::qwen35::vision_weight(store, &format!("{bp}.attn.proj"), gpu)?,
                 proj_b: dense(store, &format!("{bp}.attn.proj.bias"))?.weight,
                 norm2_w: dense(store, &format!("{bp}.norm2.weight"))?.weight,
                 norm2_b: dense(store, &format!("{bp}.norm2.bias"))?.weight,
-                fc1_w: dense(store, &format!("{bp}.mlp.linear_fc1.weight"))?.weight,
+                fc1_w: super::qwen35::vision_weight(store, &format!("{bp}.mlp.linear_fc1"), gpu)?,
                 fc1_b: dense(store, &format!("{bp}.mlp.linear_fc1.bias"))?.weight,
-                fc2_w: dense(store, &format!("{bp}.mlp.linear_fc2.weight"))?.weight,
+                fc2_w: super::qwen35::vision_weight(store, &format!("{bp}.mlp.linear_fc2"), gpu)?,
                 fc2_b: dense(store, &format!("{bp}.mlp.linear_fc2.bias"))?.weight,
             });
         }
@@ -255,9 +255,9 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
             deepstack.push(MergerLayer {
                 norm_w: dense(store, &format!("{mp}.norm.weight"))?.weight,
                 norm_b: dense(store, &format!("{mp}.norm.bias"))?.weight,
-                fc1_w: dense(store, &format!("{mp}.linear_fc1.weight"))?.weight,
+                fc1_w: super::qwen35::vision_weight(store, &format!("{mp}.linear_fc1"), gpu)?,
                 fc1_b: dense(store, &format!("{mp}.linear_fc1.bias"))?.weight,
-                fc2_w: dense(store, &format!("{mp}.linear_fc2.weight"))?.weight,
+                fc2_w: super::qwen35::vision_weight(store, &format!("{mp}.linear_fc2"), gpu)?,
                 fc2_b: dense(store, &format!("{mp}.linear_fc2.bias"))?.weight,
             });
         }
@@ -266,9 +266,9 @@ impl ModelWeightLoader for Qwen3VLWeightLoader {
         let merger = MergerLayer {
             norm_w: dense(store, &format!("{mp}.norm.weight"))?.weight,
             norm_b: dense(store, &format!("{mp}.norm.bias"))?.weight,
-            fc1_w: dense(store, &format!("{mp}.linear_fc1.weight"))?.weight,
+            fc1_w: super::qwen35::vision_weight(store, &format!("{mp}.linear_fc1"), gpu)?,
             fc1_b: dense(store, &format!("{mp}.linear_fc1.bias"))?.weight,
-            fc2_w: dense(store, &format!("{mp}.linear_fc2.weight"))?.weight,
+            fc2_w: super::qwen35::vision_weight(store, &format!("{mp}.linear_fc2"), gpu)?,
             fc2_b: dense(store, &format!("{mp}.linear_fc2.bias"))?.weight,
         };
 

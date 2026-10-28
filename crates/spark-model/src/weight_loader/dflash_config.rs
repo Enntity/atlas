@@ -81,6 +81,9 @@ pub struct DflashConfig {
     pub sliding_window: Option<usize>,
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+    /// Some DFlash2 checkpoints carry their own packed NVFP4 vocabulary head.
+    #[serde(default)]
+    pub has_own_lm_head: Option<bool>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -178,6 +181,10 @@ pub struct DflashSubConfig {
     /// Candidate pool size evaluated by DFlash2 CandidateSelector (16).
     #[serde(default)]
     pub selector_top_k: Option<usize>,
+    #[serde(default)]
+    pub projector_type: Option<String>,
+    #[serde(default)]
+    pub lilicorr_enabled: Option<bool>,
 }
 
 impl DflashConfig {

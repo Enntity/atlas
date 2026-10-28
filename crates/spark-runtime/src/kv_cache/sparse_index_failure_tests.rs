@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use super::*;
+use crate::gpu::GpuBackend;
 use crate::gpu::mock::MockGpuBackend;
 use crate::kv_cache::{KvCacheDtype, SparseIndexCacheDtype, TailSlotPlan};
 use atlas_core::scope::ModelResource;

@@ -22,6 +22,7 @@ fn strict_grammar() -> crate::grammar::GrammarState {
         &[crate::scheduler::test_support::GRAMMAR_EOS],
         false,
         None,
+        None,
         &mut sink,
     )
     .unwrap()
@@ -51,10 +52,14 @@ fn non_strict_grammar_rides_the_batched_verify() {
     assert!(p.batch.contains(&2), "grammarless unchanged");
 
     // Kill switch: injected value flips only the non-strict member.
-    assert!(!super::super::grammar_rides_batch(&active[0], true));
-    assert!(super::super::grammar_rides_batch(&active[0], false));
-    assert!(!super::super::grammar_rides_batch(&active[1], false));
-    assert!(super::super::grammar_rides_batch(&active[2], true));
+    assert!(!super::super::grammar_rides_batch(&active[0], true, false));
+    assert!(super::super::grammar_rides_batch(&active[0], false, false));
+    assert!(!super::super::grammar_rides_batch(&active[1], false, false));
+    assert!(super::super::grammar_rides_batch(&active[2], true, false));
+    assert!(
+        !super::super::grammar_rides_batch(&active[0], false, true),
+        "Spark defaults keep grammar verifies serial"
+    );
 }
 
 /// A grammar bootstrap sequence (no drafts) lands in decode_rows under the

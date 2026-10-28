@@ -68,6 +68,10 @@ fn response() -> InferenceResponse {
     }
 }
 
+fn app(_glm: bool) -> Arc<AppState> {
+    Arc::new(test_app_state::app_state(tokenizer()))
+}
+
 #[tokio::test]
 async fn blocking_choices_each_receive_vision_and_share_admission() {
     let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
@@ -169,3 +173,6 @@ async fn blocking_choices_each_receive_vision_and_share_admission() {
         "the final choice did not release vision rows"
     );
 }
+
+#[path = "chat_stream/blocking_vision_choices_tests.rs"]
+mod blocking_vision_choices;

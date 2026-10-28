@@ -8,6 +8,108 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "vision_preprocess_tests/glm.rs"]
+mod glm;
+
+#[cfg(test)]
+mod base_capacity_tests {
+    use super::*;
+
+    const GU: u32 = 32;
+
+    fn merged_tokens(h: u32, w: u32) -> u32 {
+        (h / 16) * (w / 16) / 4
+    }
+
+    #[test]
+    fn test_target_size_no_upscale() {
+        let (h, w) = target_size_with_max_pixels(100, 150, GU, None);
+        assert!(h <= 1280 && w <= 1280);
+        assert_eq!(h % GU, 0);
+        assert_eq!(w % GU, 0);
+    }
+
+    #[test]
+    fn test_target_size_downscale() {
+        let (h, w) = target_size_with_max_pixels(2000, 3000, GU, None);
+        assert!(h.max(w) <= 1280);
+        assert_eq!(h % GU, 0);
+        assert_eq!(w % GU, 0);
+    }
+
+    #[test]
+    fn test_target_size_max_pixels() {
+        let (h, w) = target_size_with_max_pixels(1254, 1254, GU, Some(512 * 512));
+        assert_eq!((h, w), (512, 512));
+    }
+
+    #[test]
+    fn no_declared_bound_keeps_the_1280_fallback() {
+        let (h, w) = target_size_with_max_pixels(1344, 1344, GU, None);
+        assert_eq!((h, w), (1280, 1280));
+        assert_eq!(merged_tokens(h, w), 1600);
+    }
+
+    #[test]
+    fn declared_area_bound_raises_above_the_fallback() {
+        let (h, w) = target_size_with_max_pixels(2048, 2048, GU, Some(16_777_216));
+        assert_eq!((h, w), (2048, 2048));
+        assert!(h > 1280);
+    }
+
+    #[test]
+    fn declared_area_bound_still_downscales_when_exceeded() {
+        let (h, w) = target_size_with_max_pixels(8192, 8192, GU, Some(16_777_216));
+        assert!((h as u64) * (w as u64) <= 16_777_216);
+        assert!(h > 1280);
+    }
+
+    #[test]
+    fn operator_override_can_lower_below_the_fallback() {
+        let (h, w) = target_size_with_max_pixels(1344, 1344, GU, Some(256 * 256));
+        assert!((h as u64) * (w as u64) <= 256 * 256);
+        assert!(h < 1280);
+    }
+
+    #[test]
+    fn absolute_ceiling_bounds_a_pathological_aspect_ratio() {
+        let (_, w) = target_size_with_max_pixels(32, 1_000_000, GU, Some(16_777_216));
+        assert!(w <= ABS_MAX_DIM);
+    }
+
+    #[test]
+    fn never_upscales() {
+        assert_eq!(
+            target_size_with_max_pixels(64, 64, GU, Some(16_777_216)),
+            (64, 64)
+        );
+    }
+
+    #[test]
+    fn sides_are_always_grid_multiples() {
+        for (oh, ow, max_pixels) in [
+            (1080u32, 1920u32, None),
+            (1080, 1920, Some(16_777_216usize)),
+            (450, 300, None),
+            (33, 33, Some(65_536)),
+        ] {
+            let (h, w) = target_size_with_max_pixels(oh, ow, GU, max_pixels);
+            assert_eq!(h % GU, 0);
+            assert_eq!(w % GU, 0);
+            assert!(h >= GU && w >= GU);
+        }
+    }
+
+    #[test]
+    fn aspect_ratio_is_preserved_within_grid_rounding() {
+        let (h, w) = target_size_with_max_pixels(1080, 1920, GU, Some(16_777_216));
+        let want = 1920.0f32 / 1080.0;
+        let got = w as f32 / h as f32;
+        assert!((got - want).abs() < 0.05);
+    }
+}
+
 #[test]
 fn test_image_pad_count_2x2_merge() {
     // Standard Qwen3-VL: 2×2 spatial merger folds a patch block

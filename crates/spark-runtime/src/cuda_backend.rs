@@ -14,12 +14,15 @@ use std::sync::Arc;
 use atlas_core::registry::AtlasRegistry;
 
 mod display_carveout;
+#[cfg(test)]
+mod display_carveout_lease;
 mod fault_probe;
 mod gpu_copy;
 mod gpu_impl;
 pub use gpu_impl::{configure_pdl, pdl_enabled};
 mod gpu_impl_graph;
 mod host_staging;
+mod meminfo;
 #[cfg(unix)]
 mod nvml;
 pub mod tensormap;

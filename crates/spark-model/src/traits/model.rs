@@ -1056,6 +1056,13 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// True for the two Enntity model types whose default serving path is
+    /// owned by spark-shared. Shared upstream policy changes may branch on
+    /// this identity without changing the model's default behavior.
+    fn uses_spark_shared_defaults(&self) -> bool {
+        false
+    }
+
     /// Confirm one native follower can immediately acquire this live owner's
     /// target/predictor prefix. Returns target blocks shared with the owner;
     /// `private_blocks` includes every live continuation and the follower's

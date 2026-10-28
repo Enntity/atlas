@@ -80,6 +80,12 @@ pub(super) fn use_small_m_gemv(enabled: bool, handle_nonzero: bool, m: u32) -> b
     small_m_arm(enabled, handle_nonzero, false, m, 0) == SmallMArm::BatchM
 }
 
+pub(super) const DRAFTER_CUBLAS_MIN_M: u32 = 32;
+
+pub(super) fn use_drafter_cublas(lever_on: bool, m: u32) -> bool {
+    lever_on && m >= DRAFTER_CUBLAS_MIN_M
+}
+
 impl BlockDiffusionDraftHead {
     /// C[m,n] = A[m,k] · W[n,k]^T in BF16 through [`small_m_arm`]'s pick.
     /// `out_stride = n` on every arm.
@@ -137,6 +143,11 @@ impl BlockDiffusionDraftHead {
                     n,
                     k,
                     stream,
+                )
+            }
+            SmallMArm::Pipelined if use_drafter_cublas(self.drafter_cublas, m) => {
+                spark_runtime::cublaslt::bf16_gemm_act_weight_t(
+                    src.0, w.weight.0, dst.0, m, n, k, stream,
                 )
             }
             SmallMArm::Pipelined => ops::dense_gemm_bf16_pipelined(
@@ -203,6 +214,14 @@ mod tests {
         assert!(!use_small_m_gemv(true, true, 0));
         assert!(!use_small_m_gemv(true, false, 8));
         assert!(!use_small_m_gemv(false, true, 8));
+    }
+
+    #[test]
+    fn drafter_cublas_decision() {
+        assert!(!use_drafter_cublas(false, 128));
+        assert!(!use_drafter_cublas(true, 31));
+        assert!(use_drafter_cublas(true, 32));
+        assert!(use_drafter_cublas(true, 128));
     }
 
     #[test]

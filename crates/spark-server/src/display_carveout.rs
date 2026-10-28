@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use spark_runtime::gpu::carveout::{FD_ENV, SIZE_ENV};
 
+mod device;
 #[cfg(target_os = "linux")]
 mod rm;
 

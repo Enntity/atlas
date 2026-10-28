@@ -297,6 +297,7 @@ pub struct MtpGate {
     win_tokens: f64,
     win_wall: f64,
     win_steps: usize,
+    spark_compat: bool,
     /// A new batch width needs a full window before cadence can shorten it.
     /// Bootstrap/capture cost stays charged, but cannot become a one-step EWMA.
     require_full_window: bool,
@@ -338,6 +339,15 @@ impl MtpGate {
     /// `num_drafts` is retained for construction-site compatibility and
     /// logging; arbitration is measurement-driven and does not model K.
     pub fn new(num_drafts: usize) -> Self {
+        Self::new_with_policy(num_drafts, false)
+    }
+
+    /// Preserve the spark-shared regime behavior for glm5_next and qwen4_exp.
+    pub fn new_spark_shared(num_drafts: usize) -> Self {
+        Self::new_with_policy(num_drafts, true)
+    }
+
+    fn new_with_policy(num_drafts: usize, spark_compat: bool) -> Self {
         // Resolved once per gate rather than cached in two statics: the gate
         // belongs to the run, and `event_interval` reads these on every decode
         // step, which is too hot for a per-call getenv.
@@ -358,6 +368,7 @@ impl MtpGate {
             win_tokens: 0.0,
             win_wall: 0.0,
             win_steps: 0,
+            spark_compat,
             require_full_window: false,
             losing_windows: 0,
             tokens_since_event: 0,
@@ -468,7 +479,7 @@ impl MtpGate {
             self.win_tokens = 0.0;
             self.win_wall = 0.0;
             self.win_steps = 0;
-            self.require_full_window = true;
+            self.require_full_window = self.spark_compat;
             self.losing_windows = 0;
             // In the NEW regime's units (`event_interval` scales with it).
             self.tokens_since_event = self.tokens_since_event.max(self.event_interval());
@@ -509,7 +520,11 @@ impl MtpGate {
         if self.win_steps >= WINDOW_STEPS {
             self.close_window();
         } else if !self.probing
-            && !self.require_full_window
+            && (if self.spark_compat {
+                !self.require_full_window
+            } else {
+                !self.is_stale(self.mode)
+            })
             && self.tokens_since_event >= self.event_interval()
         {
             // Time to look at the other mode: finish the current window
@@ -570,13 +585,6 @@ impl MtpGate {
         let (Some(mtp), Some(serial)) = (self.mtp.tps, self.serial.tps) else {
             return; // need both baselines before any switch
         };
-        // Arbitration compares same-regime numbers only: if EITHER
-        // baseline predates the last regime change there is no pair to
-        // compare — wait for the full-window re-measure instead of letting
-        // a fresh other-mode number beat a stale current one. Switching
-        // onto a stale serial number dumps a long think into Serial for a
-        // full reprobe interval — the costly failure this gate exists to
-        // avoid.
         if self.mtp.stale || self.serial.stale {
             return;
         }

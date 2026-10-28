@@ -299,4 +299,23 @@ mod lookup_tests {
             assert_eq!(kernel.0 != 0, model == "glm5_next", "{model}");
         }
     }
+
+    #[test]
+    fn glm_still_requires_its_ep_kernel() {
+        use super::unpermute_ep_kernel;
+        use crate::layers::moe::gate_up_repack::recording::Gpu;
+
+        for ep_world_size in [1, 2] {
+            let mut config = atlas_core::config::ModelConfig::qwen3_next_80b_nvfp4();
+            config.model_type = "glm5_next".into();
+            config.ep_world_size = ep_world_size;
+            let gpu = Gpu::new();
+            assert_ne!(unpermute_ep_kernel(&gpu, &config).unwrap().0, 0);
+            *gpu.missing.lock().unwrap() = vec![
+                "moe_unpermute_reduce_indexed_ep".into(),
+                "moe_unpermute_reduce_indexed_ep_vec8".into(),
+            ];
+            assert!(unpermute_ep_kernel(&gpu, &config).is_err());
+        }
+    }
 }

@@ -23,10 +23,15 @@ use crate::model::TransformerModel;
 use crate::traits::Model;
 use crate::weight_loader::load_dflash_weights;
 
+#[path = "build/glm.rs"]
 mod glm;
+#[path = "build/kv_budget.rs"]
 mod kv_budget;
+#[path = "build/kv_carveout.rs"]
 mod kv_carveout;
+#[path = "build/kv_nvme.rs"]
 mod kv_nvme;
+#[path = "build/kv_summary.rs"]
 mod kv_summary;
 
 pub fn build_model(
@@ -178,7 +183,6 @@ pub fn build_model(
     }
     // FP4-Local: CSF expert scales and MXFP8 / vision-NVFP4 projections become
     // the plain NVFP4 / BF16 layout the loaders below read. No-op otherwise.
-    crate::weight_map::modelopt_local::materialize(&mut store, &config, gpu.as_ref())?;
 
     // ── LoRA adapter load (pre-arena, pre-KV-sizing) ──
     // MUST run before `BufferArena::new` and the `gpu.free_memory()`
@@ -1214,6 +1218,7 @@ pub fn build_model(
         let weights = load_dflash_weights(
             args.drafter_store,
             &args.drafter_config,
+            &model.config_ref().model_type,
             model.gpu_backend(),
             1, // tp_size for the drafter side: replicated, so always 1
         )?;
@@ -1263,6 +1268,7 @@ pub fn build_model(
                     model.gpu_backend(),
                     max_seq_len,
                     max_batch_size,
+                    &model.config_ref().model_type,
                     startup,
                 )?;
                 // ATLAS_GLM_DRAFT_TP: on the TP2 pair or the TP4 chain every

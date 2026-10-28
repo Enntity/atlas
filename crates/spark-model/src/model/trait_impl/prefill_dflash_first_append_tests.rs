@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Exercise real non-GLM prefill capture, its cursor, and the first append.
-use super::fixture::Fixture;
 use crate::layers::dflash_head::{DflashProposerState, FirstAppend, prefill_test_support};
+use crate::model::trait_impl::prefill_stream_test_fixture::Fixture;
 use crate::speculative::DraftProposer;
 use std::sync::Arc;
 

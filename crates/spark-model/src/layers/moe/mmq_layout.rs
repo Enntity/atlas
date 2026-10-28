@@ -413,7 +413,10 @@ impl MoeLayer {
     }
 }
 
-fn free_quantized_payload(gpu: &dyn GpuBackend, weight: &mut QuantizedWeight) -> Result<()> {
+pub(super) fn free_quantized_payload(
+    gpu: &dyn GpuBackend,
+    weight: &mut QuantizedWeight,
+) -> Result<()> {
     if !weight.weight.is_null() {
         gpu.free(weight.weight)?;
         gpu.free(weight.weight_scale)?;
@@ -423,7 +426,7 @@ fn free_quantized_payload(gpu: &dyn GpuBackend, weight: &mut QuantizedWeight) ->
     Ok(())
 }
 
-fn free_expert_table(gpu: &dyn GpuBackend, table: &ExpertPtrTable) -> Result<()> {
+pub(super) fn free_expert_table(gpu: &dyn GpuBackend, table: &ExpertPtrTable) -> Result<()> {
     gpu.free(table.packed_ptrs)?;
     gpu.free(table.scale_ptrs)?;
     gpu.free(table.scale2_vals)?;

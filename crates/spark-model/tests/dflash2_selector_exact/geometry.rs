@@ -5,6 +5,7 @@
 //! this tests rank tails, staged-row boundaries and greedy predecessor updates
 //! without depending on a particular CUDA reduction's rounding order.
 use super::*;
+use anyhow::ensure;
 
 #[path = "batched.rs"]
 mod batched;

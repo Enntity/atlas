@@ -6,9 +6,8 @@
 //! of `ATLAS_GLM_ZERO_ROWS`.
 
 // The real model and recording layer of `prefill_stream_tests`.
-#[allow(clippy::duplicate_mod)]
-#[path = "../prefill_stream_test_fixture.rs"]
-mod fixture;
+use crate::model::trait_impl::prefill_stream_test_fixture as fixture;
+use crate::model::trait_impl::prefill_stream_test_fixture::*;
 
 use crate::layer::EmptyLayerState;
 use crate::model::warm_turn::{TraceMode, WarmTurn, ZeroRows};

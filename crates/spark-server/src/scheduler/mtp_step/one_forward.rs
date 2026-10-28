@@ -33,6 +33,18 @@ fn decode_rows_disabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("ATLAS_NO_MTP_ONE_FORWARD").is_some())
 }
 
+fn grammar_serial_verify() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("ATLAS_GRAMMAR_SERIAL_VERIFY").is_some())
+}
+
+fn grammar_rides_batch(a: &ActiveSeq, serial_verify: bool, spark_defaults: bool) -> bool {
+    if spark_defaults && a.grammar_state.is_some() {
+        return false;
+    }
+    a.grammar_state.is_none() || (!a.strict_grammar() && !serial_verify)
+}
+
 /// The batched verify of one step.
 pub(super) struct VerifyPlan {
     /// Members in dispatch order (`active` indices).
@@ -79,7 +91,7 @@ pub(super) fn plan_verify(
     // DSpark is included unless ATLAS_NO_DFLASH_BATCH_VERIFY (presence). MTP
     // still uses !dflash via the model self-gate (`dflash_hidden_save`).
     let dspark_batch_ok = !dflash_verify_raw_argmax || !dspark_batch_verify_disabled();
-    if model.native_mtp_enabled()
+    if (model.uses_spark_shared_defaults() && model.native_mtp_enabled())
         || spark_model::speculative::glm_repair_policy::enabled()
         || !spark_model::speculative::mtp_multi_seq_mode()
         || !dspark_batch_ok
@@ -101,9 +113,14 @@ pub(super) fn plan_verify(
         let a = &active[idx];
         // Batched DFlash cannot report generated scores. Keep those requests
         // on the single-sequence scored path; native MTP batches can score.
-        if a.grammar_state.is_none()
-            && a.pending_drafts.len() >= min_drafts
-            && (!dflash_verify_raw_argmax || a.top_logprobs.is_none())
+        if grammar_rides_batch(
+            a,
+            grammar_serial_verify(),
+            model.uses_spark_shared_defaults(),
+        ) && a.pending_drafts.len() >= min_drafts
+            && (!dflash_verify_raw_argmax
+                || !model.uses_spark_shared_defaults()
+                || a.top_logprobs.is_none())
         {
             plan.batch.push(idx);
         } else {
@@ -119,7 +136,13 @@ pub(super) fn plan_verify(
         plan.decode_rows = bootstrap_idxs
             .iter()
             .copied()
-            .filter(|&i| active[i].grammar_state.is_none())
+            .filter(|&i| {
+                grammar_rides_batch(
+                    &active[i],
+                    grammar_serial_verify(),
+                    model.uses_spark_shared_defaults(),
+                )
+            })
             .collect();
         plan.batch.extend_from_slice(&plan.decode_rows);
     }
@@ -154,9 +177,15 @@ pub(super) fn plan_verify(
     // confidences are left as they were, as before: D-Cut then reads the
     // sequence as unmeasured).
     for &idx in &plan.batch {
-        if active[idx].pending_drafts.len() > ladder_nd {
+        if model.uses_spark_shared_defaults() {
+            if active[idx].pending_drafts.len() > ladder_nd {
+                active[idx].pending_drafts.truncate(ladder_nd);
+            }
+        } else {
             active[idx].pending_drafts.truncate(ladder_nd);
-            crate::scheduler::copy_drafts::cut_conf(&mut active[idx]);
+            if dflash_verify_raw_argmax {
+                crate::scheduler::copy_drafts::cut_conf(&mut active[idx]);
+            }
         }
     }
     let rows = ladder_nd + 1;
@@ -212,8 +241,11 @@ fn deep_truncate(
                 .mtp_acct
                 .depth_drafts(ceiling, sched.levers.depth())
                 .min(ladder_nd);
-            let cap =
-                crate::scheduler::copy_drafts::mtp::deep_cap(model, sched, a, lone, own, ceiling);
+            let cap = if model.uses_spark_shared_defaults() {
+                crate::scheduler::copy_drafts::mtp::deep_cap(model, sched, a, lone, own, ceiling)
+            } else {
+                own
+            };
             a.pending_drafts.len().min(cap)
         })
         .collect();

@@ -727,3 +727,4 @@ pub fn process_decode_logits(
 
 #[cfg(test)]
 mod auto_tool_eos_tests;
+mod post_think_eos;

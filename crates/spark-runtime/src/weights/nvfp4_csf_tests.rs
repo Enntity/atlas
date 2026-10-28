@@ -465,3 +465,34 @@ fn csf_decode_throughput() {
         bytes as f64 / (1u64 << 30) as f64 / s
     );
 }
+
+#[test]
+fn assembler_refuses_components_after_the_scale_is_complete() {
+    let g = golden().remove(0);
+    for deferred in [false, true] {
+        let mut a = CsfAssembler::new();
+        for (name, shape, bytes) in [
+            (
+                "x.weight_scale.nvfp4_csf_fixed",
+                g.fixed_shape.clone(),
+                g.fixed.as_slice(),
+            ),
+            (
+                "x.weight_scale.nvfp4_csf_exceptions",
+                vec![g.exceptions.len() / 4],
+                g.exceptions.as_slice(),
+            ),
+        ] {
+            if deferred {
+                a.defer(name, &shape, bytes.len()).unwrap();
+            } else {
+                a.offer(name, &shape, bytes).unwrap();
+            }
+        }
+        assert!(
+            a.offer("x.weight_scale.nvfp4_csf_fixed", &g.fixed_shape, &g.fixed)
+                .is_err()
+        );
+        assert!(a.offer("x.weight_scale.csf32_bases", &[1], &[0]).is_err());
+    }
+}

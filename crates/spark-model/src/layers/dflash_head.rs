@@ -356,6 +356,9 @@ pub struct DflashProposerState {
     /// Allocation cap for `ctx_hidden_acc` (in slot count). Mirrors the
     /// `max_seq_len` build arg so we can clamp without re-fetching it.
     pub max_ctx_len: usize,
+    pub ctx_acc_rows: usize,
+    pub ctx_prefill_origin: Option<usize>,
+    pub ctx_prefill_base: usize,
     /// Width (bytes) of one `ctx_hidden_acc` slot — `5 * target_hidden * bf16`.
     /// Stored to avoid re-deriving on every append.
     pub ctx_slot_bytes: usize,
@@ -515,6 +518,8 @@ impl ProposerState for DflashProposerState {
 /// at build time and slots them in alongside the drafter's own `fc`,
 /// `hidden_norm`, `norm`, and per-layer weights.
 #[allow(dead_code)]
+pub(crate) static CTX_ACC_POOL: Mutex<Vec<(usize, DevicePtr)>> = Mutex::new(Vec::new());
+
 pub struct BlockDiffusionDraftHead {
     // Drafter-architecture config (mirrors the drafter's HF config.json).
     pub num_layers: usize,
@@ -638,6 +643,20 @@ pub struct BlockDiffusionDraftHead {
     /// `batch_capacity × ceil(vocab/32)` i32 — per-sequence grammar masks
     /// packed for the staged tail's row-0/1 masking (#102).
     pub batch_grammar_bitmask: DevicePtr,
+    /// Optional pinned staging for grammar-mask H2D copies.
+    pub batch_grammar_masks_host_pinned: std::sync::atomic::AtomicPtr<u8>,
+    /// Capacity of the pinned grammar-mask staging region.
+    pub batch_grammar_masks_pinned_bytes: usize,
+    /// Staging rows for batched DFlash context projection.
+    pub batch_ctx_in: DevicePtr,
+    /// Projected context rows for batched DFlash context projection.
+    pub batch_ctx_fc: DevicePtr,
+    /// Fused K/V rows for batched DFlash context projection.
+    pub batch_ctx_fused: DevicePtr,
+    /// Row capacity of the batched context staging buffers.
+    pub batch_ctx_rows: usize,
+    /// Whether target-model DFlash defaults are Spark-owned.
+    pub spark_shared_default: bool,
     pub batch_tokens: DevicePtr,
     pub batch_markov_prev: DevicePtr,
     pub batch_markov_embed: DevicePtr,
@@ -750,6 +769,8 @@ pub struct BlockDiffusionDraftHead {
     /// process environment. Product heads derive it from the validated
     /// Lightning policy; generic heads keep legacy lenient semantics.
     pub startup: DsparkStartupExecution,
+    pub ctx_carry: Mutex<Option<carry::DflashCtxCarry>>,
+    pub drafter_cublas: bool,
 
     /// `ATLAS_GLM_DRAFT_TP`: the worker rank reads half of the MLP and head
     /// rows of a single-sequence propose (`rank_split`). `None` = off.
@@ -779,6 +800,7 @@ mod batch_execution;
 mod batch_execution_tests;
 mod batch_fallback;
 mod batch_forward;
+mod batch_grammar;
 #[cfg(test)]
 mod batch_inputs_tests;
 mod batch_plan;
@@ -786,6 +808,8 @@ mod batch_projection;
 mod batch_propose;
 mod batch_tail;
 mod batch_tail_dflash2;
+mod batched_ctx;
+mod carry;
 mod lifecycle;
 #[cfg(test)]
 mod row_contract_tests;
@@ -814,19 +838,26 @@ mod forward_block;
 mod forward_block_layer;
 mod forward_block_layer_paged;
 #[cfg(test)]
-mod free_state_tests;
+mod free_state_carry_tests;
+#[cfg(test)]
+pub(crate) mod free_state_tests;
 mod from_weights;
 mod from_weights_kernels;
 #[cfg(test)]
 mod lifecycle_tests;
 mod markov;
 mod nvfp4;
+#[cfg(test)]
+mod nvfp4_install_tests;
 mod parity_report;
 mod precompute_ctx_kv;
+#[cfg(test)]
+pub(crate) mod prefill_test_support;
 mod propose;
 pub mod rank_split;
 mod rank_split_batch;
 mod rank_split_forward;
+mod selector_platform;
 mod small_m_gemm;
 
 mod context_window;
@@ -840,6 +871,58 @@ impl BlockDiffusionDraftHead {
     /// in `extra_lanes`). `ATLAS_DFLASH_PROPOSE_LANES` overrides (default 1).
     pub fn lane_count(&self) -> usize {
         1 + self.extra_lanes.len()
+    }
+
+    fn can_pool_ctx_acc(&self) -> bool {
+        !self.spark_shared_default
+            && self.startup.diagnostics.first_append == FirstAppend::Legacy
+            && self.ctx_window_len() == self.ctx_window.min(self.max_seq_len)
+    }
+
+    fn recycle_ctx_acc(&self, gpu: &dyn GpuBackend, ptr: DevicePtr) {
+        const CTX_ACC_POOL_CAP: usize = 3;
+        if ptr.0 == 0 {
+            return;
+        }
+        let own = self.startup.diagnostics.first_append != FirstAppend::Legacy;
+        let bytes = (self.ctx_window_len() + usize::from(own))
+            .saturating_mul(self.target_layer_ids.len())
+            .saturating_mul(self.target_hidden_size)
+            .saturating_mul(2);
+        {
+            let mut pool = CTX_ACC_POOL.lock();
+            if self.can_pool_ctx_acc() && pool.len() < CTX_ACC_POOL_CAP {
+                pool.push((bytes, ptr));
+                return;
+            }
+        }
+        if let Err(error) = gpu.free(ptr) {
+            tracing::error!(
+                "DFlash ctx acc recycle: freeing {:#x} failed ({error}); buffer leaked to backend",
+                ptr.0
+            );
+        }
+    }
+
+    fn release_ctx_carry(&self, gpu: &dyn GpuBackend, entry: carry::DflashCtxCarry) {
+        if !entry.block_table.is_empty() {
+            self.kv_cache.lock().free_blocks(&entry.block_table);
+        }
+        for (_, handles) in entry.graphs {
+            for handle in handles {
+                if handle.0 != 0
+                    && let Err(error) = gpu.destroy_graph(handle)
+                {
+                    tracing::error!("DFlash ctx carry graph release failed: {error:#}");
+                }
+            }
+        }
+        self.recycle_ctx_acc(gpu, entry.ctx_hidden_acc);
+        if let Some(block_table) = entry.block_table_dev
+            && let Err(error) = gpu.free(block_table)
+        {
+            tracing::error!("DFlash ctx carry table release failed: {error:#}");
+        }
     }
 
     /// Resolve a lane's mutable propose resources: (stream, scratch,
@@ -1032,6 +1115,7 @@ impl BlockDiffusionDraftHead {
                 ..*ctx
             };
             let mut prepared = 0usize;
+            let mut pending_ctx = Vec::new();
             for i in 0..n {
                 if let Err(e) = self.prepare_drafts_state(
                     last_tokens[i],
@@ -1043,9 +1127,18 @@ impl BlockDiffusionDraftHead {
                     prepare_ctx,
                     stream,
                     target_hiddens[i],
+                    (!self.spark_shared_default).then_some(&mut pending_ctx),
                 ) {
                     if !generic_auth {
                         return Err(e);
+                    }
+                    if !pending_ctx.is_empty() {
+                        self.run_batched_ctx_stage(
+                            &pending_ctx,
+                            prepare_ctx,
+                            stream,
+                            &self.scratch,
+                        )?;
                     }
                     tracing::warn!(
                         "DFlash batched propose: prepare failed at sequence {i}/{n}; per-sequence fallback: {e:#}"
@@ -1068,6 +1161,9 @@ impl BlockDiffusionDraftHead {
                         .map(Some);
                 }
                 prepared = i + 1;
+            }
+            if !pending_ctx.is_empty() {
+                self.run_batched_ctx_stage(&pending_ctx, prepare_ctx, stream, &self.scratch)?;
             }
         }
         let staged = self.propose_batch_staged_dispatch(
@@ -1145,42 +1241,39 @@ impl DraftProposer for BlockDiffusionDraftHead {
     }
 
     fn alloc_state(&self, gpu: &dyn GpuBackend) -> Result<Box<dyn ProposerState>> {
-        // Per-seq ctx accumulator: `[max_ctx_len, 5 * target_hidden] BF16`.
-        // Sized once, re-used across the seq's lifetime; reset on
-        // `free_state`. It holds the drafter's context window, not the whole
-        // sequence: prefill capture keeps the prompt's last `max_ctx_len`
-        // rows and commits slide past it (`commit_ctx`). At 512K context a
-        // max_seq_len-sized accumulator would be 20 GiB per sequence on GLM.
+        // The Spark-owned path keeps its per-seq accumulator allocation
+        // policy. Other DFlash targets allocate lazily on first capture so a
+        // carried prefix can supply the buffer before a new one is needed.
         let bf16 = 2usize;
         let ctx_slot_bytes = self.target_layer_ids.len() * self.target_hidden_size * bf16;
         let max_ctx_len = self.ctx_window_len();
         let own = self.startup.diagnostics.first_append != FirstAppend::Legacy;
         let total = (max_ctx_len + own as usize) * ctx_slot_bytes;
-        let pooled = {
-            let mut pool = self.acc_pool.lock();
-            pool.iter()
-                .position(|&(bytes, _)| bytes == total)
-                .map(|i| pool.swap_remove(i).1)
-        };
-        let ctx_hidden_acc = match pooled {
-            Some(ptr) => ptr,
-            None => gpu.alloc(total)?,
-        };
-        // Initialize to zero so stale data doesn't leak between sequences.
-        // Transactional: a failed memset frees the accumulator instead of
-        // leaking it for the server's lifetime; a failed FREE during that
-        // cleanup is logged (the allocation is then backend-orphaned — the
-        // pointer is already unreachable from any live state).
-        if let Err(error) = gpu.memset(ctx_hidden_acc, 0, total) {
-            if let Err(free_error) = gpu.free(ctx_hidden_acc) {
-                tracing::error!(
-                    "DSpark alloc_state: freeing failed-memset accumulator {:#x} failed \
-                     ({free_error}); allocation orphaned on the backend",
-                    ctx_hidden_acc.0
-                );
+        let ctx_hidden_acc = if self.spark_shared_default {
+            let pooled = {
+                let mut pool = self.acc_pool.lock();
+                pool.iter()
+                    .position(|&(bytes, _)| bytes == total)
+                    .map(|i| pool.swap_remove(i).1)
+            };
+            let ptr = match pooled {
+                Some(ptr) => ptr,
+                None => gpu.alloc(total)?,
+            };
+            if let Err(error) = gpu.memset(ptr, 0, total) {
+                if let Err(free_error) = gpu.free(ptr) {
+                    tracing::error!(
+                        "DFlash alloc_state: freeing failed-memset accumulator {:#x} failed \
+                         ({free_error}); allocation orphaned on the backend",
+                        ptr.0
+                    );
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+            ptr
+        } else {
+            DevicePtr::NULL
+        };
         Ok(Box::new(DflashProposerState {
             block_table: Vec::with_capacity(64),
             seq_len: 0,
@@ -1192,6 +1285,9 @@ impl DraftProposer for BlockDiffusionDraftHead {
             last_num_accepted: 0,
             skip_next_decode_append: false,
             max_ctx_len,
+            ctx_acc_rows: max_ctx_len,
+            ctx_prefill_origin: None,
+            ctx_prefill_base: 0,
             ctx_slot_bytes,
             // Phase 2 Option B: lazily allocated on first propose when
             // Option B is on (the generic default; ATLAS_DFLASH_OPTION_B=0
@@ -1207,7 +1303,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
             first_append_at: None,
             own_capture: false,
             own_row_at: None,
-            own_row: own.then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
+            own_row: (own && ctx_hidden_acc.0 != 0)
+                .then(|| ctx_hidden_acc.offset(max_ctx_len * ctx_slot_bytes)),
             warm_ctx: self.startup.diagnostics.warm_ctx,
             ctx_floor: 0,
             ctx_run: None,
@@ -1221,6 +1318,43 @@ impl DraftProposer for BlockDiffusionDraftHead {
                 % self.lane_count(),
             lifecycle: None,
         }))
+    }
+
+    fn acquire_ctx_acc(&self, gpu: &dyn GpuBackend, state: &mut dyn ProposerState) -> Result<()> {
+        let dstate = state
+            .as_any_mut()
+            .downcast_mut::<DflashProposerState>()
+            .ok_or_else(|| anyhow::anyhow!("Invalid DFlash proposer state"))?;
+        if dstate.ctx_hidden_acc.0 != 0 || dstate.ctx_acc_rows == 0 {
+            return Ok(());
+        }
+        let own = self.startup.diagnostics.first_append != FirstAppend::Legacy;
+        let total = (dstate.ctx_acc_rows + usize::from(own)) * dstate.ctx_slot_bytes;
+        let pooled = if self.can_pool_ctx_acc() {
+            let mut pool = CTX_ACC_POOL.lock();
+            pool.iter()
+                .position(|(bytes, _)| *bytes == total)
+                .map(|i| pool.swap_remove(i).1)
+        } else {
+            None
+        };
+        let ptr = match pooled {
+            Some(ptr) => ptr,
+            None => gpu.alloc(total)?,
+        };
+        if let Err(error) = gpu.memset(ptr, 0, total) {
+            if let Err(free_error) = gpu.free(ptr) {
+                tracing::error!(
+                    "DFlash acquire_ctx_acc: freeing failed-memset accumulator {:#x} failed \
+                     ({free_error}); allocation orphaned on the backend",
+                    ptr.0
+                );
+            }
+            return Err(error);
+        }
+        dstate.ctx_hidden_acc = ptr;
+        dstate.own_row = own.then(|| ptr.offset(dstate.ctx_acc_rows * dstate.ctx_slot_bytes));
+        Ok(())
     }
 
     fn propose(
@@ -1373,6 +1507,135 @@ impl DraftProposer for BlockDiffusionDraftHead {
         Ok(())
     }
 
+    fn carry_dflash_ctx(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+        tokens: &[u32],
+    ) -> bool {
+        if self.spark_shared_default || !carry::ctx_carry_enabled() || !self.can_pool_ctx_acc() {
+            return false;
+        }
+        let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
+            return false;
+        };
+        if dstate.ctx_hidden_acc.0 == 0 || dstate.ctx_len == 0 {
+            return false;
+        }
+        let mut entry = carry::DflashCtxCarry {
+            ctx_hidden_acc: std::mem::replace(&mut dstate.ctx_hidden_acc, DevicePtr(0)),
+            ctx_len: dstate.ctx_len,
+            ctx_committed: dstate.ctx_committed,
+            ctx_positions: std::mem::take(&mut dstate.ctx_positions),
+            block_table: std::mem::take(&mut dstate.block_table),
+            block_table_dev: dstate.block_table_dev.take(),
+            ctx_count_drafter: dstate.ctx_count_drafter,
+            max_ctx_count_drafter: dstate.max_ctx_count_drafter,
+            tokens: tokens.to_vec(),
+            graphs: Vec::new(),
+            lane_id: dstate.lane_id,
+        };
+        if let Some(owner) = dstate.lifecycle.as_ref().map(|l| l.owner()) {
+            let mut graphs = self.propose_graphs.lock();
+            for key in graphs
+                .keys()
+                .filter(|key| key.owner() == owner)
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                if let Some(handles) = graphs.remove(&key) {
+                    entry.graphs.push((key, handles));
+                }
+            }
+        }
+        if let Some(old) = self.ctx_carry.lock().replace(entry) {
+            self.release_ctx_carry(gpu, old);
+        }
+        true
+    }
+
+    fn adopt_dflash_ctx(
+        &self,
+        gpu: &dyn GpuBackend,
+        state: &mut dyn ProposerState,
+        prompt: &[u32],
+        prefill_start: usize,
+    ) -> bool {
+        if self.spark_shared_default || !self.can_pool_ctx_acc() {
+            return false;
+        }
+        let Some(dstate) = state.as_any_mut().downcast_mut::<DflashProposerState>() else {
+            return false;
+        };
+        let Some(entry) = self.ctx_carry.lock().take() else {
+            return false;
+        };
+        let common = entry.common_prefix_len(prompt);
+        let cut = common.min(prefill_start);
+        let valid = entry
+            .ctx_positions
+            .iter()
+            .take_while(|&&p| p >= 0 && (p as usize) < cut)
+            .count();
+        if valid < carry::MIN_CARRY_TOKENS || valid == 0 {
+            self.release_ctx_carry(gpu, entry);
+            return false;
+        }
+
+        self.recycle_ctx_acc(gpu, dstate.ctx_hidden_acc);
+        dstate.ctx_hidden_acc = entry.ctx_hidden_acc;
+        dstate.block_table = entry.block_table;
+        dstate.block_table_dev = entry.block_table_dev;
+        dstate.max_ctx_count_drafter = entry.max_ctx_count_drafter;
+        dstate.ctx_committed = entry.ctx_committed.min(valid);
+        dstate.ctx_count_drafter = entry.ctx_count_drafter.min(valid);
+        dstate.ctx_len = entry.ctx_len.min(valid);
+        dstate.ctx_positions = entry.ctx_positions;
+        dstate.ctx_positions.truncate(valid);
+        dstate.prefill_done = true;
+        dstate.lane_id = entry.lane_id;
+
+        if let Some(new_owner) = dstate.lifecycle.as_ref().map(|l| l.owner()) {
+            let mut graphs = self.propose_graphs.lock();
+            for (old_key, handles) in entry.graphs {
+                match DflashGraphIdentity::new(
+                    new_owner,
+                    old_key.block_table_ptr(),
+                    old_key.ctx_ptr(),
+                    old_key.markov_ptr(),
+                    old_key.lane(),
+                ) {
+                    Ok(new_key) => {
+                        graphs.insert(new_key, handles);
+                    }
+                    Err(error) => {
+                        for handle in handles {
+                            if handle.0 != 0
+                                && let Err(destroy_error) = gpu.destroy_graph(handle)
+                            {
+                                tracing::error!(
+                                    "DFlash carry graph release failed ({destroy_error:#}); \
+                                     rekey failed ({error:#})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (_, handles) in entry.graphs {
+                for handle in handles {
+                    if handle.0 != 0
+                        && let Err(error) = gpu.destroy_graph(handle)
+                    {
+                        tracing::error!("DFlash ownerless carry graph release failed: {error:#}");
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn free_state(
         &self,
         gpu: &dyn GpuBackend,
@@ -1434,6 +1697,11 @@ impl DraftProposer for BlockDiffusionDraftHead {
         // non-null pointer so a double free_state is a no-op. A failed free
         // is logged and the pointer RETAINED so a cleanup retry can release
         // it (a silently cleared pointer would leak unrecoverably).
+        if dstate.ctx_hidden_acc.0 != 0 && self.can_pool_ctx_acc() {
+            self.recycle_ctx_acc(gpu, dstate.ctx_hidden_acc);
+            dstate.ctx_hidden_acc = DevicePtr(0);
+            dstate.own_row = None;
+        }
         if dstate.ctx_hidden_acc.0 != 0 {
             let bytes = (dstate.max_ctx_len + usize::from(dstate.own_row.is_some()))
                 * dstate.ctx_slot_bytes;
@@ -1480,6 +1748,8 @@ impl DraftProposer for BlockDiffusionDraftHead {
         dstate.ctx_positions.clear();
         dstate.seq_len = 0;
         dstate.ctx_len = 0;
+        dstate.ctx_prefill_origin = None;
+        dstate.ctx_prefill_base = 0;
         dstate.prefill_done = false;
         dstate.last_num_drafted = 0;
         dstate.last_num_accepted = 0;

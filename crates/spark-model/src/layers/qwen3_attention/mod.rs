@@ -41,12 +41,17 @@ mod op_dump;
 // compiles on Apple Silicon without dragging in `atlas_core::registry`.
 #[cfg(feature = "cuda")]
 pub mod innerq_driver;
+pub(crate) mod mx8;
 mod prefill;
 mod prefill_weights;
 mod prefill_weights_rowinv;
 mod trait_impl;
 mod types;
+mod types_layer;
 mod types_weights;
+
+#[cfg(all(test, feature = "cuda"))]
+mod fp8_gemv_parity_gpu_tests;
 
 #[cfg(feature = "cuda")]
 pub use innerq_driver::InnerQDriver;

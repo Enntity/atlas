@@ -12,6 +12,32 @@ use crate::speculative::DraftProposer;
 use spark_runtime::gpu::mock::MockGpuBackend;
 use spark_runtime::kv_cache::{KvCacheConfig, KvCacheDtype, PagedKvCache};
 
+fn fresh_state(gpu: &MockGpuBackend) -> Box<super::DflashProposerState> {
+    fresh_state_with_owner(gpu, Some(owner(4, 78)))
+}
+
+fn fresh_state_with_owner(
+    gpu: &MockGpuBackend,
+    owner_id: Option<super::SequenceGeneration>,
+) -> Box<super::DflashProposerState> {
+    let mut state = live_state(gpu, owner_id.unwrap_or_else(|| owner(4, 78)));
+    state.seq_len = 0;
+    state.last_num_drafted = 0;
+    state.last_draft_conf.clear();
+    state.prefill_done = false;
+    state.ctx_len = 0;
+    state.last_num_accepted = 0;
+    state.ctx_count_drafter = 0;
+    state.ctx_committed = 0;
+    state.ctx_positions.clear();
+    state.first_append_at = None;
+    state.own_capture = false;
+    state.own_row_at = None;
+    state.ctx_prefill_origin = None;
+    state.ctx_prefill_base = 0;
+    state
+}
+
 #[test]
 fn reclaim_seam_free_failure_retains_pointers() {
     let _pool_guard = lock_and_drain_pool();

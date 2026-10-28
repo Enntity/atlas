@@ -58,12 +58,12 @@ use table::SETTINGS;
 pub type Setting = (&'static str, u64);
 
 /// A setting that only matters while its switch is `on`.
-fn while_on(on: bool, value: fn() -> usize) -> Result<u64> {
+pub(super) fn while_on(on: bool, value: fn() -> usize) -> Result<u64> {
     Ok(if on { value() as u64 } else { 0 })
 }
 
 /// `ATLAS_STARTUP_PARITY=warn`: log what [`agree`] would fail on and boot.
-fn warn_only() -> bool {
+pub(super) fn warn_only() -> bool {
     std::env::var("ATLAS_STARTUP_PARITY").as_deref() == Ok("warn")
 }
 

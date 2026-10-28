@@ -1,22 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! Host-side decoders for the storage formats NVIDIA's ModelOpt "FP4-Local"
-//! packs use and Atlas kernels do not read directly:
-//!
-//! * **CSF NVFP4 block scales** (`weight_scale_encoding: "csf"`, codec
-//!   `byte-window4-fixed-stream-u24-exceptions/1`). Each E4M3 block-scale
-//!   matrix `[rows, cols]` ships as two tensors:
-//!   - `<name>.nvfp4_csf_fixed`, U8 `[rows / 16, 16 * (1 + cols / 2)]`: per
-//!     16-row slab, one base byte per row, then those rows' 4-bit codes, two
-//!     per byte, low nibble first. A scale byte is `base + code`.
-//!   - `<name>.nvfp4_csf_exceptions`, U32: words whose low 24 bits are a flat
-//!     `row * cols + col` position and whose high 8 bits replace the byte
-//!     there.
-//!
-//!   The decode is lossless: the bytes equal the uncompressed E4M3 scales, so
-//!   every NVFP4 kernel consumes them unchanged. Format as specified by
-//!   vLLM's `csf_scales.py` (Apache-2.0, vllm-project/vllm#60646); this is an
-//!   independent Rust implementation of that published layout.
+//! Host-side reference decoders for generic MXFP8 and NVFP4 row formats.
 //!
 //! * **MXFP8** (OCP microscaling): an E4M3 weight `[out, in]` with one E8M0
 //!   exponent per 32 inputs, `[out, in / 32]`. Expanded to BF16 EXACTLY: an
@@ -29,75 +13,10 @@
 //! Pure arithmetic, no CUDA, no environment lookups in the hot loops.
 
 use crate::numeric::{FP4_E2M1, FP8_E4M3_LUT};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 
-/// Rows per CSF slab; every slab stores 16 base bytes ahead of its codes.
-pub const CSF_SLAB_ROWS: usize = 16;
-/// Largest legal row base: a base above 240 cannot reach 255 with a nibble.
-pub const CSF_MAX_BASE: u8 = 240;
 /// Inputs per MXFP8 scale.
 pub const MXFP8_BLOCK: usize = 32;
-
-/// Shape `[rows, cols]` of the E4M3 scale matrix a CSF fixed stream encodes.
-pub fn csf_scale_shape(fixed_rows: usize, fixed_cols: usize) -> Result<(usize, usize)> {
-    ensure!(
-        fixed_cols.is_multiple_of(CSF_SLAB_ROWS) && fixed_cols >= CSF_SLAB_ROWS,
-        "CSF fixed stream width {fixed_cols} is not 16 * (1 + cols / 2)"
-    );
-    let cols = (fixed_cols / CSF_SLAB_ROWS - 1) * 2;
-    ensure!(cols > 0, "CSF fixed stream encodes zero columns");
-    Ok((fixed_rows * CSF_SLAB_ROWS, cols))
-}
-
-/// Rebuild a `[rows, cols]` E4M3 block-scale matrix (as raw bytes) from its
-/// CSF fixed stream `[fixed_rows, fixed_cols]` and little-endian U32
-/// exception words.
-pub fn decode_csf_scales(
-    fixed: &[u8],
-    fixed_rows: usize,
-    fixed_cols: usize,
-    exceptions: &[u8],
-) -> Result<Vec<u8>> {
-    let (rows, cols) = csf_scale_shape(fixed_rows, fixed_cols)?;
-    ensure!(
-        fixed.len() == fixed_rows * fixed_cols,
-        "CSF fixed stream is {} bytes, shape [{fixed_rows}, {fixed_cols}] needs {}",
-        fixed.len(),
-        fixed_rows * fixed_cols
-    );
-    ensure!(
-        exceptions.len().is_multiple_of(4),
-        "CSF exception stream is {} bytes, not whole U32 words",
-        exceptions.len()
-    );
-    let half = cols / 2;
-    let mut out = vec![0u8; rows * cols];
-    for (slab, src) in fixed.chunks_exact(fixed_cols).enumerate() {
-        let (bases, codes) = src.split_at(CSF_SLAB_ROWS);
-        for (i, &base) in bases.iter().enumerate() {
-            if base > CSF_MAX_BASE {
-                bail!("CSF row base {base} exceeds {CSF_MAX_BASE}");
-            }
-            let row = slab * CSF_SLAB_ROWS + i;
-            let packed = &codes[i * half..(i + 1) * half];
-            let dst = &mut out[row * cols..(row + 1) * cols];
-            for (pair, &byte) in dst.chunks_exact_mut(2).zip(packed) {
-                pair[0] = base + (byte & 0x0F);
-                pair[1] = base + (byte >> 4);
-            }
-        }
-    }
-    for word in exceptions.chunks_exact(4) {
-        let w = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
-        let pos = (w & 0x00FF_FFFF) as usize;
-        ensure!(
-            pos < out.len(),
-            "CSF exception position {pos} is outside the {rows}x{cols} scale matrix"
-        );
-        out[pos] = (w >> 24) as u8;
-    }
-    Ok(out)
-}
 
 /// The top 16 bits of an f32 whose low 16 bits are already zero (or whose
 /// rounding the caller has accepted). Round-to-nearest-even; NaN stays NaN.

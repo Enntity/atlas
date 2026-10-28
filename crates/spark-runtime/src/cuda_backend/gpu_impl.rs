@@ -47,6 +47,7 @@ use crate::gpu::{DevicePtr, GpuBackend, GraphHandle, HostPitched, KernelHandle};
 // OUTSIDE the block can move, and the PR's merge with main needed it).
 use super::host_staging::{d2h_trace_tick, h2d_enqueue, warn_pinned_transient_source};
 
+mod kernel_name;
 mod pdl;
 use pdl::pdl_kernel;
 pub use pdl::{configure_pdl, pdl_enabled};
@@ -217,7 +218,10 @@ impl GpuBackend for AtlasCudaBackend {
             super::fault_probe::note_failure("kernel launch", &e.to_string());
             // Name the kernel: under CUDA_LAUNCH_BLOCKING=1 this is the kernel
             // that faulted, and grid/block alone do not identify it.
-            anyhow::anyhow!("Kernel launch failed ({}): {e}", kernel_name(raw_func.0))
+            anyhow::anyhow!(
+                "Kernel launch failed ({}): {e}",
+                kernel_name::kernel_name(raw_func.0)
+            )
         })
     }
 
@@ -528,24 +532,4 @@ impl GpuBackend for AtlasCudaBackend {
     fn free_host_pinned(&self, ptr: *mut u8, _bytes: usize) -> Result<()> {
         self.free_host_pinned_cu(ptr, _bytes)
     }
-}
-
-/// The kernel's name for a launch-failure message; `?` where the driver
-/// cannot say (SCALE / HIP shim builds, or an old driver).
-fn kernel_name(func: *mut c_void) -> String {
-    #[cfg(not(atlas_scale))]
-    {
-        let mut name: *const std::ffi::c_char = std::ptr::null();
-        // SAFETY: `func` is a live CUfunction handle from the registry, and the
-        // driver writes a NUL-terminated string it owns (valid for the module's
-        // lifetime) into `name`, which is only read here.
-        let rc = unsafe { super::cuFuncGetName(&mut name, func) };
-        if rc == 0 && !name.is_null() {
-            return unsafe { std::ffi::CStr::from_ptr(name) }
-                .to_string_lossy()
-                .into_owned();
-        }
-    }
-    let _ = func;
-    "?".to_string()
 }

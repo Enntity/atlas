@@ -356,16 +356,6 @@ fn main() {
     }
 
     for (idx, target) in targets.iter().enumerate() {
-        if target.hw == "gb10" && target.model == "glm-5.3-flash" {
-            // The normal source include closure covers provenance; Cargo also
-            // needs to rerun when an imported device header changes.
-            println!(
-                "cargo:rerun-if-changed={}",
-                workspace_root
-                    .join("third_party/nvidia_sparse_mla_sm120")
-                    .display()
-            );
-        }
         let cu_files = collect_cu_files(
             target.common_kernel_dir.as_deref(),
             &target.overlay_dirs(),
