@@ -32,11 +32,14 @@ use anyhow::{Context, Result, ensure};
 use atlas_core::config::VisionConfig;
 use image::RgbImage;
 
+#[path = "container.rs"]
+mod container;
 mod gif_access;
 mod glm;
 mod patchify;
 mod types;
 
+use container::sniff_container;
 pub use types::{group_indices, sample_indices};
 
 use crate::vision_preprocess::{
@@ -133,26 +136,6 @@ pub fn decode_frames(
     let kind = sniff_container(&bytes, &mime);
     crate::video_decode_ffmpeg::decode_with_plan(&bytes, target_fps, ffmpeg)
         .with_context(|| format!("decoding {kind}"))
-}
-
-/// Best-effort container name for error messages. Cosmetic only — nothing
-/// branches on it — so an unrecognized blob is described as such rather than
-/// guessed at.
-fn sniff_container(bytes: &[u8], mime: &str) -> String {
-    let by_magic = if bytes.len() > 12 && &bytes[4..8] == b"ftyp" {
-        Some("an MP4/MOV container")
-    } else if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
-        Some("a Matroska/WebM container")
-    } else if bytes.starts_with(b"RIFF") {
-        Some("an AVI container")
-    } else {
-        None
-    };
-    match (by_magic, mime.is_empty()) {
-        (Some(k), _) => k.to_string(),
-        (None, false) => format!("a {mime} payload"),
-        (None, true) => "an unrecognized container".to_string(),
-    }
 }
 
 /// In-process GIF decode, bounded the same way the ffmpeg path is.

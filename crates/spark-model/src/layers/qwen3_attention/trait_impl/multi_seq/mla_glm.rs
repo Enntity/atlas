@@ -44,32 +44,8 @@ fn batch4_kernel(
 }
 
 #[cfg(test)]
-mod batch4_tests {
-    use super::*;
-
-    #[test]
-    fn batch4_is_opt_in_and_never_changes_other_widths() {
-        for rows in 1..=5 {
-            assert_eq!(
-                batch4_kernel(rows, false, false, KernelHandle(0))
-                    .unwrap()
-                    .0,
-                0
-            );
-            assert_eq!(
-                batch4_kernel(rows, true, true, KernelHandle(42)).unwrap().0,
-                if rows == 4 { 42 } else { 0 }
-            );
-        }
-    }
-
-    #[test]
-    fn batch4_requires_c4_and_a_live_exact_row_kernel() {
-        assert!(batch4_kernel(4, true, false, KernelHandle(42)).is_err());
-        assert!(batch4_kernel(3, true, false, KernelHandle(42)).is_err());
-        assert!(batch4_kernel(4, true, true, KernelHandle(0)).is_err());
-    }
-}
+#[path = "mla_glm_batch4_tests.rs"]
+mod batch4_tests;
 
 impl Qwen3AttentionLayer {
     pub(super) fn glm_mla_multi_seq_eligible(
@@ -489,13 +465,5 @@ impl Qwen3AttentionLayer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::enabled;
-
-    #[test]
-    fn glm_mla_multiseq_is_gated() {
-        if std::env::var_os("ATLAS_GLM_MLA_MULTI_SEQ").is_none() {
-            assert!(!enabled());
-        }
-    }
-}
+#[path = "mla_glm_local_tests.rs"]
+mod tests;

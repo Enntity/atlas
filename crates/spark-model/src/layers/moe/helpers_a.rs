@@ -9,8 +9,11 @@ mod btile_phase;
 
 #[path = "helpers_checkpoint_down.rs"]
 mod checkpoint_down;
+#[path = "helpers_a_free.rs"]
+mod free;
 #[path = "helpers_unified_phases.rs"]
 mod unified_phases;
+use free::free_original;
 pub(super) use unified_phases::SharedGateUpReceipt;
 #[cfg(test)]
 pub(super) use unified_phases::btile_shared_fixture;
@@ -493,12 +496,4 @@ impl MoeLayer {
         tracing::info!(freed, "CUTLASS grouped: released checkpoint routed scales");
         Ok(())
     }
-}
-
-/// Free one original weight and remember it for the store (see
-/// `transpose_for_prefill_unified`).
-fn free_original(gpu: &dyn GpuBackend, freed: &mut Vec<DevicePtr>, ptr: DevicePtr) -> Result<()> {
-    gpu.free(ptr)?;
-    freed.push(ptr);
-    Ok(())
 }

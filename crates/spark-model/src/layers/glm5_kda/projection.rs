@@ -11,25 +11,9 @@ use crate::weight_map::{DenseWeight, QuantizedWeight};
 mod fp8;
 #[path = "projection_mx.rs"]
 mod mx;
-
-/// Balanced `(first_row, rows)` chunks of at most the batch-M GEMV cap, so an
-/// owner-batched verify of `m > 8` rows reuses the exact short-batch kernels.
-fn verify_row_chunks(m: u32) -> impl Iterator<Item = (u32, u32)> {
-    // `ATLAS_GLM_LONG_BATCH_PROJ_ROWS=3` pins owner-exact 3-row chunks.
-    static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let cap = *CAP.get_or_init(|| {
-        std::env::var("ATLAS_GLM_LONG_BATCH_PROJ_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| (2..=ops::DENSE_GEMV_BATCHM_MAX_M).contains(v))
-            .unwrap_or(ops::DENSE_GEMV_BATCHM_MAX_M)
-    });
-    let chunks = m.div_ceil(cap);
-    (0..chunks).map(move |c| {
-        let start = c * m / chunks;
-        (start, (c + 1) * m / chunks - start)
-    })
-}
+#[path = "projection_rows.rs"]
+mod rows;
+use rows::verify_row_chunks;
 
 /// Memory-tight GLM KDA projection.
 ///
@@ -491,88 +475,9 @@ impl Glm5KdaLayer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn glm_kda_selects_nvfp4_gemv_for_decode_and_gemm_for_prefill() {
-        assert_eq!(
-            ProjectionPath::for_forward(true, true, 1000),
-            ProjectionPath::DecodeGemv
-        );
-        assert_eq!(
-            ProjectionPath::for_forward(false, true, 1000),
-            ProjectionPath::PrefillTransposedM128
-        );
-        assert_eq!(
-            ProjectionPath::for_forward(false, true, 128),
-            ProjectionPath::PrefillBase
-        );
-        assert_eq!(
-            ProjectionPath::for_forward(false, false, 1000),
-            ProjectionPath::PrefillBase
-        );
-    }
-
-    /// A packed prefill keeps one family at every row count.
-    #[test]
-    fn packed_prefill_pins_the_transposed_tiles() {
-        for tokens in [2, 50, 128, 129, 4096] {
-            assert_eq!(
-                ProjectionPath::for_forward_pinned(false, true, tokens, true),
-                ProjectionPath::PrefillTransposedM128,
-                "{tokens}"
-            );
-            assert_eq!(
-                ProjectionPath::for_forward_pinned(false, false, tokens, true),
-                ProjectionPath::PrefillBase
-            );
-        }
-        assert_eq!(
-            ProjectionPath::for_forward_pinned(true, true, 1, true),
-            ProjectionPath::DecodeGemv
-        );
-    }
-
-    #[test]
-    fn glm_kda_dense_takes_cutlass_only_for_short_k_in_whole_k16_steps() {
-        // f_b / g_b (K = dim = 128) on CUTLASS rows.
-        assert_eq!(DensePath::for_forward(8196, 128, true), DensePath::Cutlass);
-        assert_eq!(DensePath::for_forward(300, 64, true), DensePath::Cutlass);
-        // CUTLASS off or short rows (`bf16_gemm_cutlass_rows` false).
-        assert_eq!(
-            DensePath::for_forward(8196, 128, false),
-            DensePath::Pipelined
-        );
-        // beta / f_a / g_a (K = hidden) stay on the pipelined kernel.
-        assert_eq!(
-            DensePath::for_forward(8196, 4096, true),
-            DensePath::Pipelined
-        );
-        // A K residue groups differently in CUTLASS: not bit-identical.
-        for k in [40, 104, 120] {
-            assert_eq!(DensePath::for_forward(8196, k, true), DensePath::Pipelined);
-        }
-        assert_eq!(DensePath::for_forward(1, 128, true), DensePath::Gemv);
-    }
-}
+#[path = "projection_local_tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod verify_row_chunk_tests {
-    use super::verify_row_chunks;
-
-    #[test]
-    fn verify_row_chunks_cover_rows_within_the_kernel_cap() {
-        for m in 9..=96u32 {
-            let chunks: Vec<_> = verify_row_chunks(m).collect();
-            let mut next = 0;
-            for &(start, rows) in &chunks {
-                assert_eq!(start, next, "m={m} chunks must be contiguous");
-                assert!((2..=8).contains(&rows), "m={m} chunk of {rows} rows");
-                next += rows;
-            }
-            assert_eq!(next, m, "m={m} chunks must cover every row");
-        }
-        assert_eq!(verify_row_chunks(12).collect::<Vec<_>>(), [(0, 6), (6, 6)]);
-    }
-}
+#[path = "projection_verify_row_chunk_tests.rs"]
+mod verify_row_chunk_tests;

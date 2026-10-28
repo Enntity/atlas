@@ -43,6 +43,13 @@ use crate::layers::ple::PleLayer;
 use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
 use crate::weight_map::dense;
+#[cfg(feature = "cuda")]
+#[path = "ple_slots.rs"]
+mod slots;
+#[cfg(all(test, feature = "cuda"))]
+use slots::derived_slots;
+#[cfg(feature = "cuda")]
+use slots::{chunk_from_env, slots_from_env};
 
 const SPARK_PLE_FAULT_THREADS_DEFAULT: usize = 32;
 
@@ -62,47 +69,6 @@ pub(super) fn ple_decoder_layers(config: &ModelConfig) -> impl Iterator<Item = u
 /// the chunked pipeline resolves and releases a span at a time, so the
 /// default is DERIVED from the span width: `(scratch + warm_ahead) *
 /// ngram_heads`, rounded up to a power of two, floored at 65536. The
-/// `warm_ahead` term is the prefill prefetch window (`warm.rs`): without
-/// slack beside the span's pins, the worker's rows would have to evict
-/// each other — or the span's — before the gather reads them. The old
-/// `max_batch_tokens` derivation predates the span loop and would
-/// over-provision the arena 4x at a 32K --max-prefill-tokens.
-#[cfg(feature = "cuda")]
-fn derived_slots(scratch_tokens: usize, ngram_heads: usize) -> usize {
-    (scratch_tokens
-        .saturating_add(crate::layers::ple::warm_ahead_tokens(scratch_tokens))
-        .saturating_mul(ngram_heads)
-        .next_power_of_two())
-    .max(65536)
-}
-
-/// The forward pipeline's scratch width. The six `[span, hc*H]` buffers cost
-/// `scratch * 10240 * 14` bytes — ~1.18 GB at the 8192 default — whatever the
-/// forward width: the llama.cpp ubatch discipline, applied to the one
-/// subsystem whose scratch used to scale with `--max-prefill-tokens`.
-#[cfg(feature = "cuda")]
-fn chunk_from_env() -> usize {
-    std::env::var("ATLAS_PLE_CHUNK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(8192)
-}
-
-#[cfg(feature = "cuda")]
-fn slots_from_env(scratch_tokens: usize, ngram_heads: usize) -> (usize, &'static str) {
-    match std::env::var("ATLAS_PLE_CACHE_SLOTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        Some(n) if n > 0 => (n, "ATLAS_PLE_CACHE_SLOTS"),
-        _ => (
-            derived_slots(scratch_tokens, ngram_heads),
-            "(span + warm_ahead)*heads rounded up",
-        ),
-    }
-}
-
 /// First uploaded name that exists. EXL3 checkpoints use the nested
 /// `ngram_embedding.*` names; RadixArk NVFP4 still ships the old
 /// `ple_embedding.*` names. Missing both is the caller's error.
@@ -506,18 +472,5 @@ pub(super) fn load(
 }
 
 #[cfg(all(test, feature = "cuda"))]
-mod slots_tests {
-    use super::derived_slots;
-
-    /// The fixed 65536 this replaced assumed a 2048-token chunk; the default
-    /// serve config presents 8193, and a prefill pins tokens x heads rows.
-    /// Default warm lookahead is 2 spans (`ATLAS_PLE_WARM_AHEAD`), so the
-    /// derived count covers span + lookahead.
-    #[test]
-    fn derived_slots_cover_the_default_chunk() {
-        assert_eq!(derived_slots(8193, 16), 524_288); // (8193 + 16386) x 16, rounded up
-        assert_eq!(derived_slots(2048, 16), 131_072); // (2048 + 4096) x 16, exact
-        assert_eq!(derived_slots(4096, 16), 262_144); // (4096 + 8192) x 16, exact
-        assert!(derived_slots(20481, 16) >= 20481 * 16);
-    }
-}
+#[path = "ple_slots_tests.rs"]
+mod slots_tests;
