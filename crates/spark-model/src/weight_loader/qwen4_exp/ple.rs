@@ -44,6 +44,8 @@ use crate::layers::ple::{PleIdDims, PleWeights};
 #[cfg(feature = "cuda")]
 use crate::weight_map::dense;
 
+const SPARK_PLE_FAULT_THREADS_DEFAULT: usize = 32;
+
 /// The decoder layers that carry PLE. `ple_layer_ids` is ONE-indexed — the
 /// reference selects with `ple_layer_ids.index(layer_idx + 1)` — so `[2]`
 /// means decoder layer 1, `layers.1.ple`. Reading an id as a layer index
@@ -367,6 +369,7 @@ pub(super) fn load(
         )
     }
     .context("PLE: n-gram row cache")?;
+    cache.set_fault_threads_default(SPARK_PLE_FAULT_THREADS_DEFAULT);
     if let Some((period, idle)) = spark_storage::ngram_cache::keepalive_from_env() {
         cache
             .start_keepalive(period, idle)

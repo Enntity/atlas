@@ -28,11 +28,15 @@ use super::*;
 /// ```
 ///
 /// `1` restores the old strictly-serial behaviour for a bisect.
-pub(super) fn fault_threads() -> usize {
-    std::env::var("ATLAS_PLE_FAULT_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
+pub(super) fn fault_threads(default: usize) -> usize {
+    fault_threads_from(
+        default,
+        std::env::var("ATLAS_PLE_FAULT_THREADS").ok().as_deref(),
+    )
+}
+
+fn fault_threads_from(default: usize, value: Option<&str>) -> usize {
+    value.and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 /// One scheduled miss: read row `id` into `slot`. Produced by the decision
@@ -199,4 +203,16 @@ pub(super) fn fetch_row(
         sdst.copy_from_slice(&bounce.blocks(nblocks)[swithin..swithin + stride]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fault_threads_from;
+
+    #[test]
+    fn fault_threads_uses_table_default_unless_overridden() {
+        assert_eq!(fault_threads_from(32, None), 32);
+        assert_eq!(fault_threads_from(64, None), 64);
+        assert_eq!(fault_threads_from(32, Some("64")), 64);
+    }
 }

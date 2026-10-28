@@ -115,7 +115,9 @@ impl NgramRowCache {
             // The caller's thread works the batch too, so `fault_threads()`
             // stays the total depth. A failed build warns once and leaves
             // this batch and every later one on the scoped path below.
-            let workers = fault_threads().saturating_sub(1).max(1);
+            let workers = fault_threads(self.fault_threads_default)
+                .saturating_sub(1)
+                .max(1);
             self.fault_pool = fault_pool::FaultPool::build(self, workers);
         }
 
@@ -191,7 +193,7 @@ impl NgramRowCache {
         {
             return pool.run(faults, &ptrs);
         }
-        let want = fault_threads();
+        let want = fault_threads(self.fault_threads_default);
         if want <= 1 || faults.len() == 1 {
             let mut bounce = AlignedBlock::new();
             for f in faults {

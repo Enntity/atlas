@@ -99,6 +99,9 @@ pub struct NgramRowCache {
     keepalive: Option<keepalive::KeepAlive>,
     /// `ATLAS_PLE_FAULT_POOL=1` workers, built on the first multi-row fault.
     fault_pool: Option<fault_pool::FaultPool>,
+    /// Default fault concurrency for this table; `ATLAS_PLE_FAULT_THREADS`
+    /// overrides it. Spark Qwen4Exp restores its previous default of 32.
+    fault_threads_default: usize,
 }
 
 /// A table split across equal-sized shards at scattered file offsets, which
@@ -258,7 +261,14 @@ impl NgramRowCache {
             evictions: 0,
             keepalive: None,
             fault_pool: None,
+            fault_threads_default: 64,
         })
+    }
+
+    /// Set the table's fallback fault concurrency while preserving an
+    /// explicit `ATLAS_PLE_FAULT_THREADS` override.
+    pub fn set_fault_threads_default(&mut self, threads: usize) {
+        self.fault_threads_default = threads.max(1);
     }
 
     /// Start the NVMe keep-awake ticker (see `keepalive`): one 4 KiB read of
