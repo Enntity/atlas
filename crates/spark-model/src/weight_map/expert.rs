@@ -130,7 +130,6 @@ pub enum QuantWeight {
 
     /// EXL3 trellis (mul1 codebook). Reconstruct + GEMM lands in M3.
     Exl3(super::exl3::Exl3Weight),
-
 }
 
 impl QuantWeight {
