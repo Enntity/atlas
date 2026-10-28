@@ -46,8 +46,6 @@ impl Qwen3AttentionLayer {
         // ATLAS_QWEN4EXP_BATCH_FAST_BISECT: the sequential per-row arm.
         if fwd.levers.batch_bisect(ops::BISECT_ATTN_PROJ) {
             self.ms_qkv_seq_rows(c)?;
-        } else if self.ms_qkv_batch_mx8(c)? {
-            // Native MXFP8 projections use their exact batched kernel path.
         } else if self.ms_qkv_mx(c)? {
             // The checkpoint's MXFP8 Q/K/V (`dense_mx.rs`): one launch each
             // for every row, each row serial decode's bytes.

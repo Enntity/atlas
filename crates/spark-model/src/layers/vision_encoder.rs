@@ -45,54 +45,27 @@ pub const VIDEO_PAD_TOKEN_ID: u32 = IMAGE_PAD_TOKEN + 1;
 /// therefore check the length rather than assume it — see `patch_embed`.
 pub(crate) const PATCH_DIM: usize = 1536;
 
-#[derive(Debug, Clone, Copy)]
-pub enum VitWeight {
-    /// Unquantized BF16 weight.
-    Bf16(DevicePtr),
-    /// Native MXFP8 weight and geometry.
-    Mxfp8(crate::weight_map::Mxfp8Proj),
-    /// Native NVFP4 weight, scales, global scale, and geometry.
-    Nvfp4 {
-        packed: DevicePtr,
-        scales: DevicePtr,
-        global: f32,
-        n: u32,
-        k: u32,
-    },
-}
-
-impl VitWeight {
-    /// Size of the BF16 expansion scratch, or zero for a direct BF16 weight.
-    pub fn bf16_bytes(&self) -> usize {
-        match self {
-            Self::Bf16(_) => 0,
-            Self::Mxfp8(p) => p.n as usize * p.k as usize * 2,
-            Self::Nvfp4 { n, k, .. } => *n as usize * *k as usize * 2,
-        }
-    }
-}
-
 pub struct ViTBlock {
     pub norm1_w: DevicePtr,
     pub norm1_b: DevicePtr,
-    pub qkv_w: VitWeight,
+    pub qkv_w: DevicePtr,
     pub qkv_b: DevicePtr,
-    pub proj_w: VitWeight,
+    pub proj_w: DevicePtr,
     pub proj_b: DevicePtr,
     pub norm2_w: DevicePtr,
     pub norm2_b: DevicePtr,
-    pub fc1_w: VitWeight,
+    pub fc1_w: DevicePtr,
     pub fc1_b: DevicePtr,
-    pub fc2_w: VitWeight,
+    pub fc2_w: DevicePtr,
     pub fc2_b: DevicePtr,
 }
 
 pub struct MergerLayer {
     pub norm_w: DevicePtr,
     pub norm_b: DevicePtr,
-    pub fc1_w: VitWeight,
+    pub fc1_w: DevicePtr,
     pub fc1_b: DevicePtr,
-    pub fc2_w: VitWeight,
+    pub fc2_w: DevicePtr,
     pub fc2_b: DevicePtr,
 }
 
@@ -120,8 +93,6 @@ pub struct VisionEncoder {
     k_merge: KernelHandle, // vision_spatial_merge (2×2)
     k_f32_bf16: KernelHandle, // vision_f32_to_bf16
     k_copy: KernelHandle, // vision_bf16_copy
-    k_nvfp4_dq: KernelHandle,
-    k_mx8_dq: KernelHandle,
     // config
     pub hidden_size: usize,        // 1152
     pub num_heads: usize,          // 16
@@ -153,7 +124,6 @@ pub struct VisionEncoder {
     pub buf_scores: DevicePtr, // [attn_max × attn_max] f32  — per-head raw QKᵀ
     pub buf_probs: DevicePtr, // [attn_max × attn_max] bf16 — per-head softmax probs
     pub buf_o_stage: DevicePtr, // [p_max × head_dim] bf16 — per-head GEMM2 output staging
-    pub buf_vit_dq: DevicePtr,
     // host-side prep state
     pos_embed_host_f32: Vec<f32>, // [num_position_embeddings × hidden_size] row-major
     rope_inv_freq: Vec<f32>,      // [head_dim / 4] frequencies

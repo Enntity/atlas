@@ -131,8 +131,6 @@ pub enum QuantWeight {
     /// EXL3 trellis (mul1 codebook). Reconstruct + GEMM lands in M3.
     Exl3(super::exl3::Exl3Weight),
 
-    /// MXFP8 as stored in checkpoints (E4M3 values and E8M0 scales).
-    Mxfp8(super::Mxfp8Proj),
 }
 
 impl QuantWeight {
@@ -149,7 +147,6 @@ impl QuantWeight {
             Self::Dense(w) => w.weight.is_null(),
             Self::PackedQ2(w) => w.is_null(),
             Self::Exl3(w) => w.is_null(),
-            Self::Mxfp8(w) => w.w.data.is_null(),
         }
     }
 
@@ -165,13 +162,6 @@ impl QuantWeight {
     pub fn as_exl3(&self) -> Option<&super::exl3::Exl3Weight> {
         match self {
             Self::Exl3(w) => Some(w),
-            _ => None,
-        }
-    }
-
-    pub fn as_mxfp8(&self) -> Option<&super::Mxfp8Proj> {
-        match self {
-            Self::Mxfp8(weight) => Some(weight),
             _ => None,
         }
     }
@@ -228,12 +218,6 @@ impl From<PackedQ2Weight> for QuantWeight {
 impl From<super::exl3::Exl3Weight> for QuantWeight {
     fn from(w: super::exl3::Exl3Weight) -> Self {
         Self::Exl3(w)
-    }
-}
-
-impl From<super::Mxfp8Proj> for QuantWeight {
-    fn from(w: super::Mxfp8Proj) -> Self {
-        Self::Mxfp8(w)
     }
 }
 

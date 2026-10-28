@@ -65,11 +65,10 @@ impl VisionEncoder {
             .arg_u32(ms)
             .launch(stream)?;
         // fc1 GEMM → buf_merge_fc1
-        let fc1_w = self.vit_weight_ptr(gpu, &m.fc1_w, stream)?;
         self.vit_gemm_bias(
             gpu,
             self.buf_merge_in,
-            fc1_w,
+            m.fc1_w,
             m.fc1_b,
             self.buf_merge_fc1,
             merged_p,
@@ -85,11 +84,10 @@ impl VisionEncoder {
             .arg_u32(merged_p * merged_in)
             .launch(stream)?;
         // fc2 GEMM → out_slice
-        let fc2_w = self.vit_weight_ptr(gpu, &m.fc2_w, stream)?;
         self.vit_gemm_bias(
             gpu,
             self.buf_merge_fc1,
-            fc2_w,
+            m.fc2_w,
             m.fc2_b,
             out_slice,
             merged_p,

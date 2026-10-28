@@ -194,7 +194,7 @@ __device__ __forceinline__ void qhc_collapse(
 
     // ── stage normed = x * rms * (1 + w) once ──
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
+        smem_normed[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
     }
     __syncthreads();
 
@@ -386,7 +386,7 @@ extern "C" __global__ void hc_pre_stage(
         __syncthreads();
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
-        out[i] = x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]);
+        out[i] = x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]);
     }
 }
 
@@ -890,109 +890,7 @@ extern "C" __global__ void hc_pre_stage_bf16(
     }
     for (unsigned int i = tid; i < hc_dim; i += blockDim.x) {
         out[i] = __float2bfloat16(
-            x[i] * smem_rms[i / H] * (1.0f + hc_norm_w[i]));
-    }
-}
-
-// ── hc_post + hc_pre_stage_bf16 in one pass (ATLAS_QWEN4EXP_PREFILL_HC_SEAM)
-//
-// Inside a prefill layer the sublayer's `hc_post` is followed at once by the
-// next site's `hc_pre_stage_bf16` over the same token rows: the post writes
-// the 40 KB/token FP32 highway and the stage reads all of it straight back
-// for its per-stream RMS and `normed`. At 16K tokens that read is 657 MB per
-// seam, 96 seams a prefill. This kernel keeps the post values in registers
-// and never reads them back.
-//
-// BIT-IDENTICAL (--fmad=false): every highway float is `hc_post`'s
-// `r + x * inj`; per stream, thread `tid` accumulates `v * v` over
-// d = tid, tid + 1024, ... in that order exactly as `hc_pre_stage_bf16` does
-// at block 1024 (streams interleaved, which no accumulator can see), then the
-// same 16/8/4/2/1 shuffle-down tree and the same in-order sum of the 32 warp
-// partials; `normed` is `(v * rms) * (1 + w)` rounded to BF16 as there.
-//
-// In place on the highway: each element is read and then written by one
-// thread. Grid: (T, 1, 1), Block: (1024, 1, 1). Host checks: H <= 4 * 1024,
-// hc <= QHC_MAX_MULT.
-#define QHC_PS_DPT 4u
-
-extern "C" __global__ void __launch_bounds__(QHC_WBLOCK, 1) hc_post_stage_bf16(
-    const __nv_bfloat16* __restrict__ block_out, // [T, H]
-    float* streams,                              // [T, hc, H]: residual in, post out
-    const float* __restrict__ inj,               // [T, hc]
-    const float* __restrict__ hc_norm_w, // [hc*H]
-    __nv_bfloat16* __restrict__ normed_out,      // [T, hc*H] BF16
-    const unsigned int hidden_size,
-    const unsigned int hc,
-    const float eps
-) {
-    const unsigned int t = blockIdx.x;
-    const unsigned int tid = threadIdx.x;
-    const unsigned int lane = tid & 31u;
-    const unsigned int warp = tid >> 5;
-    const unsigned int H = hidden_size;
-    const unsigned int hc_dim = hc * H;
-    const __nv_bfloat16* xb = block_out + (size_t)t * H;
-    float* x = streams + (size_t)t * hc_dim;
-    __nv_bfloat16* out = normed_out + (size_t)t * hc_dim;
-
-    __shared__ float smem_rms[QHC_MAX_MULT];
-    __shared__ float smem_red[QHC_MAX_MULT][QHC_WBLOCK / 32];
-
-    float wv[QHC_MAX_MULT];
-    #pragma unroll
-    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) wv[s2] = s2 < hc ? inj[(size_t)t * hc + s2] : 0.0f;
-
-    float v[QHC_PS_DPT][QHC_MAX_MULT];
-    float acc[QHC_MAX_MULT];
-    #pragma unroll
-    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) acc[s2] = 0.0f;
-    #pragma unroll
-    for (unsigned int k = 0; k < QHC_PS_DPT; ++k) {
-        const unsigned int d = tid + k * QHC_WBLOCK;
-        if (d < H) {
-            const float xd = (float)xb[d];
-            #pragma unroll
-            for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
-                if (s2 < hc) {
-                    const float val = x[(size_t)s2 * H + d] + xd * wv[s2];
-                    x[(size_t)s2 * H + d] = val;
-                    v[k][s2] = val;
-                    acc[s2] += val * val;
-                }
-            }
-        }
-    }
-    #pragma unroll
-    for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
-        if (s2 < hc) {
-            float a = acc[s2];
-            #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                a += __shfl_down_sync(0xFFFFFFFFu, a, off);
-            }
-            if (lane == 0) smem_red[s2][warp] = a;
-        }
-    }
-    __syncthreads();
-    if (tid < hc) {
-        float tot = 0.0f;
-        for (unsigned int w2 = 0; w2 < QHC_WBLOCK / 32; ++w2) tot += smem_red[tid][w2];
-        smem_rms[tid] = rsqrtf(tot / (float)H + eps);
-    }
-    __syncthreads();
-    #pragma unroll
-    for (unsigned int k = 0; k < QHC_PS_DPT; ++k) {
-        const unsigned int d = tid + k * QHC_WBLOCK;
-        if (d < H) {
-            #pragma unroll
-            for (unsigned int s2 = 0; s2 < QHC_MAX_MULT; ++s2) {
-                if (s2 < hc) {
-                    const unsigned int i = s2 * H + d;
-                    out[i] = __float2bfloat16(
-                        v[k][s2] * smem_rms[s2] * (1.0f + hc_norm_w[i]));
-                }
-            }
-        }
+            x[i] * smem_rms[i / H] * (1.0f + (float)hc_norm_w[i]));
     }
 }
 
