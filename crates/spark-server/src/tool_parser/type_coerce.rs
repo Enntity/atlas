@@ -9,13 +9,25 @@ use super::{ToolCall, ToolDefinition};
 /// `properties` object. Never panics and never drops fields — unrecognised
 /// or unparseable values are left as-is.
 pub fn coerce_all(calls: &mut [ToolCall], tools: &[ToolDefinition]) {
+    coerce_all_with_poolside_nulls(calls, tools, false);
+}
+
+pub fn coerce_poolside_all(calls: &mut [ToolCall], tools: &[ToolDefinition]) {
+    coerce_all_with_poolside_nulls(calls, tools, true);
+}
+
+fn coerce_all_with_poolside_nulls(
+    calls: &mut [ToolCall],
+    tools: &[ToolDefinition],
+    poolside_nulls: bool,
+) {
     for call in calls.iter_mut() {
         let def = tools.iter().find(|t| t.function.name == call.function.name);
-        coerce_call_args(call, def);
+        coerce_call_args(call, def, poolside_nulls);
     }
 }
 
-fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
+fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>, poolside_nulls: bool) {
     let Some(schema) = tool_def.and_then(|t| t.function.parameters.as_ref()) else {
         return;
     };
@@ -51,7 +63,7 @@ fn coerce_call_args(call: &mut ToolCall, tool_def: Option<&ToolDefinition>) {
         // Poolside emits JSON null as the same raw text as a string "null".
         // Only the schema can disambiguate them. Keep strings untouched when
         // they are permitted, or when a union contains an unknown schema.
-        if matches!(val, serde_json::Value::String(s) if s == "null") {
+        if poolside_nulls && matches!(val, serde_json::Value::String(s) if s == "null") {
             if permits_unambiguous_null(prop) {
                 *val = serde_json::Value::Null;
                 changed = true;
@@ -284,8 +296,8 @@ mod nullable_tests {
             std::slice::from_mut(&mut buffered_call),
             &tools,
         );
-        coerce_all(std::slice::from_mut(&mut buffered_call), &tools);
-        coerce_all(std::slice::from_mut(&mut call), &tools);
+        coerce_poolside_all(std::slice::from_mut(&mut buffered_call), &tools);
+        coerce_poolside_all(std::slice::from_mut(&mut call), &tools);
         assert_eq!(buffered_call.function.arguments, call.function.arguments);
         serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap()["value"]
             .clone()

@@ -109,7 +109,7 @@ fn coerce_null_string() {
     let mut calls = vec![make_call("fn", r#"{"cursor":"null"}"#)];
     coerce_all(&mut calls, &tools);
     let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-    assert!(args["cursor"].is_null());
+    assert_eq!(args["cursor"], "null");
 }
 
 #[test]

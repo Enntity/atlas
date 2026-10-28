@@ -46,3 +46,20 @@ pub(super) fn read_is_qwen3vl_video(model_dir: &std::path::Path) -> Option<bool>
     }
     None
 }
+
+pub(super) fn use_qwen3vl_video_prompt(model_type: &str, detected: bool) -> bool {
+    detected && !matches!(model_type, "glm5_next" | "qwen4_exp")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_qwen3vl_video_prompt;
+
+    #[test]
+    fn qwen3vl_video_prompt_is_gated_for_spark_models() {
+        assert!(!use_qwen3vl_video_prompt("glm5_next", true));
+        assert!(!use_qwen3vl_video_prompt("qwen4_exp", true));
+        assert!(use_qwen3vl_video_prompt("qwen3_5_moe", true));
+        assert!(!use_qwen3vl_video_prompt("qwen3_5_moe", false));
+    }
+}

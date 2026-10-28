@@ -96,7 +96,11 @@ pub(super) fn build_choice_message(
                 .as_ref()
                 .is_some_and(|p| p.wants_typed_arguments())
             {
-                tool_parser::coerce_all(&mut tool_calls_i, &tools_ref);
+                if promote_bare_names {
+                    tool_parser::coerce_poolside_all(&mut tool_calls_i, &tools_ref);
+                } else {
+                    tool_parser::coerce_all(&mut tool_calls_i, &tools_ref);
+                }
             }
             if let Some(cwd) = cwd_hint {
                 tool_parser::normalize_paths(&mut tool_calls_i, cwd);

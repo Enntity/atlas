@@ -511,7 +511,7 @@ pub use poolside_v1::*;
 pub use qwen3_coder::*;
 pub use qwen3_xml::*;
 pub use streaming::*;
-pub use type_coerce::coerce_all;
+pub use type_coerce::{coerce_all, coerce_poolside_all};
 pub use validation::*;
 
 #[cfg(test)]

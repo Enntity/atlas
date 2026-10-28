@@ -106,7 +106,16 @@ pub(super) fn handle_complete_tool_call(
         );
     }
     if ctx.wants_typed_arguments {
-        tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+        if ctx
+            .state
+            .tool_call_parser
+            .as_ref()
+            .is_some_and(|p| p.promotes_bare_call_names())
+        {
+            tool_parser::coerce_poolside_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+        } else {
+            tool_parser::coerce_all(std::slice::from_mut(tc), &ctx.tool_defs_for_backfill);
+        }
     }
     if let Some(ref cwd) = ctx.cwd_for_normalize {
         tool_parser::normalize_paths(std::slice::from_mut(tc), cwd);
@@ -348,7 +357,19 @@ pub(super) fn handle_tool_call_delta(
             &ctx.tool_defs_for_backfill,
         );
         if ctx.wants_typed_arguments {
-            tool_parser::coerce_all(std::slice::from_mut(&mut tc), &ctx.tool_defs_for_backfill);
+            if ctx
+                .state
+                .tool_call_parser
+                .as_ref()
+                .is_some_and(|p| p.promotes_bare_call_names())
+            {
+                tool_parser::coerce_poolside_all(
+                    std::slice::from_mut(&mut tc),
+                    &ctx.tool_defs_for_backfill,
+                );
+            } else {
+                tool_parser::coerce_all(std::slice::from_mut(&mut tc), &ctx.tool_defs_for_backfill);
+            }
         }
         if let Some(ref cwd) = ctx.cwd_for_normalize {
             tool_parser::normalize_paths(std::slice::from_mut(&mut tc), cwd);

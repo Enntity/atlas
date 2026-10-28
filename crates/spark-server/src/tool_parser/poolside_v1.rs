@@ -176,7 +176,7 @@ mod tests {
         }]))
         .unwrap();
 
-        crate::tool_parser::coerce_all(&mut calls, &tools);
+        crate::tool_parser::coerce_poolside_all(&mut calls, &tools);
 
         let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(
