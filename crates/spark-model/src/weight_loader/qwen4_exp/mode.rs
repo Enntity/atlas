@@ -2,7 +2,8 @@
 //! Qwen TP2 modes share native target precision and target-verified MTP.
 //! Ported from Enntity/atlas `weight_loader/qwen4_exp/mode.rs` (AGPL-3.0-only),
 //! adapted for this stack: the switches its native-precision paths need
-//! (`ATLAS_QWEN4EXP_MXFP8_DECODE`, `_PREFILL_W8A8`, `_MXFP8_SHARED`) are
+//! (`ATLAS_QWEN4EXP_MXFP8_DECODE`, `_PREFILL_W8A8`, `_MXFP8_SHARED`,
+//! `_PREFILL_W4A4`) are
 //! opt-in here, so a mode requires each at `1`.
 use anyhow::{Result, bail, ensure};
 use atlas_core::config::ModelConfig;
@@ -22,6 +23,7 @@ pub const REQUIRED_FLAGS: &[(&str, &str)] = &[
     ("ATLAS_QWEN4EXP_FP8_GDN", "0"),
     ("ATLAS_QWEN4EXP_PREFILL_W8A8", "1"),
     ("ATLAS_QWEN4EXP_MXFP8_SHARED", "1"),
+    ("ATLAS_QWEN4EXP_PREFILL_W4A4", "1"),
     ("ATLAS_QWEN4EXP_PREFILL_MOE", "1"),
     ("ATLAS_QWEN4EXP_PREFILL_MOE_BF16", "0"),
     ("ATLAS_QWEN4EXP_PREFILL_BF16_PROJ", "0"),
