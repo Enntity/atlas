@@ -365,10 +365,7 @@ fn handle_token_inner(state: &mut StreamState, ctx: &StreamCtx, tok: u32) -> Del
                         state.reasoning_xml_scan_state,
                         &["<tool_call>", "<function=", "<parameter=", "<invoke "],
                     )
-                    .and_then(|(at, len)| {
-                        let marker = state.reasoning_xml_scan_buf[at..at + len].to_string();
-                        Some((at, marker))
-                    });
+                    .map(|(at, len)| (at, state.reasoning_xml_scan_buf[at..at + len].to_string()));
                     if let Some((at, op)) = opener {
                         // Snapshot the log tail BEFORE consuming the match,
                         // so the WARN still shows the opener in context.
