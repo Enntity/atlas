@@ -13,6 +13,7 @@ use std::{sync::Arc, time::Duration};
 async fn every_blocking_choice_carries_its_own_vision_input() {
     let image = VisionItem::image(vec![0.25; 8], 2, 4);
     let video = VisionItem {
+        held: spark_model::vision_budget::HeldRows::default(),
         groups: vec![vec![0.5; 4], vec![0.75; 4]],
         grid_h: 2,
         grid_w: 2,
