@@ -456,7 +456,9 @@ fn the_fp4_local_config_parses_to_the_same_architecture() {
     let count = |algo: &str, enc: &str| {
         q.quantized_layers
             .values()
-            .filter(|s| s.quant_algo == algo && s.weight_scale_encoding.as_deref() == Some(enc))
+            .filter(|s| {
+                s.quant_algo == algo && s.weight_scale_encoding.as_deref().unwrap_or("") == enc
+            })
             .count()
     };
     // 36 GDN x 5 + 12 attention x 5 (q/k/v/o + indexer) + 48 shared x 3 + 27 ViT x 2.
