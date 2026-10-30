@@ -37,6 +37,27 @@ impl MoeLayer {
         stream: u64,
         defer_shared_hc: bool,
     ) -> Result<()> {
+        // ATLAS_GLM_FP4L_DECODE_A16: a prompt chunk with verify rows runs
+        // each half on its own lane; decode and verify rows take W4A16 (BF16
+        // activations), as the reference's non-prompt rows.
+        if self.forward_prefill_mixed(input, num_tokens, ctx, stream, defer_shared_hc)? {
+            return Ok(());
+        }
+        let _a16 = super::decode_a16::A16Scope::enter(self.a16_stream_fits(
+            num_tokens as u32,
+            ctx.config.hidden_size as u32,
+            ctx.config.routed_inter_local() as u32,
+        ));
+        if super::decode_a16::A16Scope::lane() == super::decode_a16::Activations::A16Grouped
+            && ctx
+                .gpu
+                .op_cache()
+                .first_shape("moe:decode_a16_grouped", num_tokens as u32, 0, 0)
+        {
+            tracing::info!(
+                "ATLAS_GLM_FP4L_DECODE_A16: rows={num_tokens} on the grouped W4A16 path (the stream twins do not take them)"
+            );
+        }
         self.btile_input_guard(input, num_tokens, ctx, stream)?;
         anyhow::ensure!(
             !self.btile_storage.is_published() || self.nvfp4_prequant_moe,
@@ -247,13 +268,16 @@ impl MoeLayer {
         // (decode / verify), each rank computes half the shared expert's
         // intermediate columns and blends that partial before the EP
         // all-reduce, which sums the halves; each rank reads half the weights.
+        let split_eligible = has_shared
+            && is_ep_prefill
+            && sp.is_none()
+            && !overlap_shared_reduce
+            && !defer_shared_hc;
+        // ATLAS_GLM_FP4L_SHARED_FP8: the native split on the FP8 block twins.
+        let native_split = split_eligible && self.shared_native_split_ready(ctx, n, shared_inter);
         let split = mx_split
-            || (has_shared
-                && is_ep_prefill
-                && sp.is_none()
-                && !overlap_shared_reduce
-                && !defer_shared_hc
-                && self.shared_split_ready(ctx, n));
+            || native_split
+            || (split_eligible && self.shared_native.is_none() && self.shared_split_ready(ctx, n));
         // Under SP with the reduce-scatter pipe, the shared expert of this
         // rank's rows runs while that exchange is on the wire
         // (`forward_prefill_finish`, `defer_shared_to_rs`).
@@ -262,6 +286,8 @@ impl MoeLayer {
         if mx_split {
             // Every row (an SP chunk's too): the slice's partial of each.
             self.run_shared_expert_prefill(input, n, h, shared_inter, stream, stream, false, ctx)?;
+        } else if native_split {
+            self.run_shared_native_split(input, n, h, shared_inter, ctx, stream)?;
         } else if split {
             self.run_shared_split(input, n, h, shared_inter, ctx, stream)?;
         } else if has_shared && !overlap_shared_reduce && !defer_shared {

@@ -234,6 +234,10 @@ mod forward_prefill_w4a4;
 pub(crate) use forward_prefill_w4a4::requested as w4a4_requested;
 mod w4a4_scales;
 pub(crate) use w4a4_scales::W4a4Scales;
+mod decode_a16;
+pub(crate) use decode_a16::{DecodeRows, PromptRows, requested as decode_a16_requested};
+mod input_scales;
+pub(crate) use input_scales::{InputScales, requested as input_scales_requested};
 mod forward_rows;
 mod forward_rows_t;
 mod forward_token_major;
@@ -255,6 +259,7 @@ mod shared_fp8_cache_output;
 #[cfg(test)]
 mod shared_fp8_cache_test_gpu;
 mod shared_fp8_origin;
+pub(crate) mod shared_native;
 pub(crate) use gate_up_m16::validate_m16_gate_up_graphs;
 pub(crate) use shared_fp8_cache::SharedFp8Reserve;
 pub(crate) use shared_fp8_cache::validate_shared_fp8_cache_factory_reserve;
