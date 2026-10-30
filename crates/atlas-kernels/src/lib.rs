@@ -389,6 +389,13 @@ pub struct ModelBehavior {
     /// Atlas's `<tool_call>` logit bias and loop-detector mask on tool-armed
     /// requests. Default `true`; `false` leaves the opener to the model.
     pub tool_call_steering: bool,
+    /// The template gets the client's `reasoning_effort` spelling verbatim
+    /// (`minimal`, `xhigh`, `max`), as vLLM hands it. Default `false`: the
+    /// cross-template tier (`low`/`medium`/`high`/`xhigh`).
+    pub verbatim_reasoning_effort: bool,
+    /// Identical tool rounds get a repeat notice and keep `<tool_call>` open
+    /// instead of the loop mask (`hint_injector::repeat_notice`). Default off.
+    pub tool_repeat_notice: bool,
 }
 
 /// The server's thinking ceiling for a `max_thinking_budget`: 0 means none,
@@ -465,6 +472,8 @@ impl Default for ModelBehavior {
             verbatim_prompt: false,
             eos_ends_thinking: false,
             tool_call_steering: true,
+            verbatim_reasoning_effort: false,
+            tool_repeat_notice: false,
         }
     }
 }

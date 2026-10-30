@@ -48,7 +48,31 @@ pub(super) fn emit_span_row(
     rows: usize,
 ) {
     let position = think_commit::span_row_position(a.seq.seq_len, rows, row);
+    let prior = a.output_tokens.len();
     emit_token_at_position(a, tok, logprobs, sched, position);
+    // The final row is the target bonus. Earlier rows are accepted drafts.
+    if row + 1 < rows {
+        accepted_output(a, tok, prior);
+    }
+}
+
+/// Self-speculation emits its accepted drafts without a committed span index.
+pub(super) fn emit_accepted_token(
+    a: &mut ActiveSeq,
+    tok: u32,
+    sched: &crate::scheduler::sched_ctx::SchedCtx,
+) {
+    let prior = a.output_tokens.len();
+    emit_token(a, tok, None, sched);
+    accepted_output(a, tok, prior);
+}
+
+fn accepted_output(a: &mut ActiveSeq, tok: u32, prior: usize) {
+    // Emission may suppress/pop the token, or append synthetic grammar closes.
+    // Count only this draft, only if it remains at its original output position.
+    if a.output_tokens.get(prior) == Some(&tok) {
+        a.mtp_acct.record_accepted_output(prior);
+    }
 }
 
 /// Emit one already-verified row after its whole target prefix was committed.
@@ -609,7 +633,18 @@ fn compile_spec(
     // Exempt the model's stop/EOS tokens from grammar refusal so a legitimate
     // end-of-turn token cannot desync the NPDA and truncate the response
     // (see GrammarState::accept_token).
-    let state = state.with_stop_tokens(eos_tokens);
+    let state = state
+        .with_stop_tokens(eos_tokens)
+        .with_auto_literal_dispatch(
+            engine.literal_dispatch()
+                && matches!(
+                    spec,
+                    GrammarSpec::ToolCall {
+                        use_triggers: true,
+                        ..
+                    }
+                ),
+        );
     // A union picks its branch by mass at its first token (`grammar::branch`).
     let GrammarSpec::ToolCallOrJson { schema, .. } = spec else {
         return Ok(Some(state));
@@ -712,6 +747,13 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
     let Some(m) = super::tool_markers::get() else {
         return;
     };
+    if let Some(inside) = m.native_value_transition(a.inside_parameter_body, tok) {
+        // A value opening or closing is forward progress.
+        a.inside_parameter_body = inside;
+        a.param_body_chars_emitted = 0;
+        a.tool_body_streak_tokens = 0;
+        return;
+    }
     // CC6 (2026-06-07): count ONLY envelope tokens — tokens of a
     // `<parameter=…>` VALUE (the file content of a `write` call) are exempt,
     // so a legitimately large single-file Write streams without tripping the
@@ -731,6 +773,14 @@ pub fn update_tool_param_state(a: &mut ActiveSeq, tok: u32, quiet: bool) {
         }
         a.guard_stop = Some("tool_envelope_stuck");
         a.finished = true;
+    }
+    if m.has_native_values() {
+        // Native markers own value tracking; the `<parameter=` scan below
+        // would match unrelated tokens in this vocabulary.
+        if a.inside_parameter_body {
+            a.param_body_chars_emitted = a.param_body_chars_emitted.saturating_add(1);
+        }
+        return;
     }
 
     if a.inside_parameter_body {
