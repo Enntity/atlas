@@ -218,17 +218,6 @@ pub(super) fn seq_spec_eligible(
     )
 }
 
-/// A verify head that writes only argmax ids (`Model::verify_logits_argmax_only`,
-/// GLM's vocab-split head) cannot mask a verify row, so a sequence whose tool
-/// grammar constrains its next pick decodes serially, where the mask applies.
-/// Without this the forced call's rows were the raw argmax and the grammar
-/// disengaged on the first refused token. (SparkGLM 0.2.0 masks the split
-/// head's full rows instead, `verify_split_full_rows`, which needs the
-/// spark-model split-row support.)
-pub(super) fn masked_rows_unavailable(a: &super::ActiveSeq, argmax_only_head: bool) -> bool {
-    argmax_only_head && a.tool_grammar_constrains()
-}
-
 /// What the gate wants the scheduler to run for the NEXT step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStep {

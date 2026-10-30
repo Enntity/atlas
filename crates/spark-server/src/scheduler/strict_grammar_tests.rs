@@ -207,11 +207,13 @@ fn a_schema_too_large_to_compile_is_a_400_not_a_crash() {
     assert!(sent.is::<crate::api::InvalidRequestError>());
 }
 
-/// GLM's argmax-only verify head cannot mask a row: a sequence whose tool
-/// grammar constrains its next pick decodes serially; free dispatch text, a
-/// strict grammar (masked by `strict_spec`) and other heads keep speculating.
+/// GLM's split verify head masks a forced call's rows: the sequence picks
+/// from the whole rows through the grammar (no raw argmax a refused token
+/// would disengage), and a strict greedy sequence keeps `strict_spec`'s
+/// device masks on the raw lane.
 #[test]
-fn an_argmax_only_head_decodes_constraining_tool_grammars_serially() {
+fn a_split_verify_head_masks_a_forced_calls_rows() {
+    use crate::scheduler::cancel_test_model::{SCRIPT, Script, TestModel, VerifyScript};
     let tools: Vec<crate::tool_parser::ToolDefinition> =
         serde_json::from_value(serde_json::json!([{
             "type": "function",
@@ -219,29 +221,56 @@ fn an_argmax_only_head_decodes_constraining_tool_grammars_serially() {
                 "properties": {"location": {"type": "string"}}, "required": ["location"]}}
         }]))
         .unwrap();
-    let poolside = |use_triggers| {
-        let mut engine = engine().unwrap();
-        let compiled = engine
-            .compile_poolside_v1_tool_grammar(&tools, use_triggers, "</arg_value>")
-            .unwrap();
-        GrammarState::new(&compiled, engine.vocab_size()).unwrap()
+    let mut engine = engine().unwrap();
+    let compiled = engine
+        .compile_poolside_v1_tool_grammar(&tools, false, "</arg_value>")
+        .unwrap();
+    let forced = GrammarState::new(&compiled, engine.vocab_size()).unwrap();
+    // A pad token no grammar allows tops every row.
+    let mut row: Vec<f32> = (0..2048).map(|t| (t % 13) as f32 / 4.0).collect();
+    row[1500] = 12.0;
+    SCRIPT.with(|s| {
+        *s.borrow_mut() = Some(Script {
+            rows: vec![row; 2],
+            cursor: 0,
+        })
+    });
+    let verify = std::sync::Arc::new(VerifyScript::default());
+    let model = TestModel {
+        tokens: vec![],
+        host_logits: false,
+        cancel_after_sampling: None,
+        cancel_after_row_commit: None,
+        verify: Some(verify.clone()),
     };
     let (mut a, _rx) = test_seq(vec![1, 2, 3], 20, None, 8);
-    assert!(!mtp_gate::masked_rows_unavailable(&a, true), "no grammar");
-    a.grammar_state = Some(poolside(true));
-    assert!(
-        !mtp_gate::masked_rows_unavailable(&a, true),
-        "auto dispatch text"
-    );
-    a.grammar_state = Some(poolside(false));
-    assert!(mtp_gate::masked_rows_unavailable(&a, true), "forced call");
-    assert!(
-        !mtp_gate::masked_rows_unavailable(&a, false),
-        "a full-logits head"
-    );
+    a.min_tokens = 0;
+    a.grammar_state = Some(forced);
+    let raw = [1500, 1500];
+    let split = crate::scheduler::helpers::dflash_seq_uses_split_rows;
+    assert!(split(true, false, &model, &mut a, &raw));
+    let gs = a.grammar_state.as_mut().unwrap();
+    gs.fill_bitmask();
+    assert!(!gs.is_token_allowed(1500));
+    let sched = SchedCtx::for_test();
+    let ctx = sched.verify_logits_ctx(None, None, None, None);
+    let picks = crate::scheduler::verify_pipeline_helper::split_verify_picks(
+        &model,
+        &raw,
+        &[1500],
+        &mut a,
+        &ctx,
+    )
+    .unwrap();
+    assert_eq!(picks.len(), 1, "the span ends at its rejected draft");
+    let gs = a.grammar_state.as_mut().unwrap();
+    gs.fill_bitmask();
+    assert!(gs.is_token_allowed(picks[0]), "pick {}", picks[0]);
+    assert!(verify.log.lock().unwrap().iter().any(|e| e == "full 2"));
+    // Strict and greedy: the raw lane, masked on the device.
     a.grammar_state = Some(strict());
-    assert!(
-        !mtp_gate::masked_rows_unavailable(&a, true),
-        "strict_spec masks"
-    );
+    assert!(!split(true, false, &model, &mut a, &raw));
+    a.temperature = 0.7;
+    assert!(split(true, false, &model, &mut a, &raw));
+    SCRIPT.with(|s| *s.borrow_mut() = None);
 }
