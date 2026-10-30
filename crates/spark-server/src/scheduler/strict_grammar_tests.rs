@@ -207,45 +207,6 @@ fn a_schema_too_large_to_compile_is_a_400_not_a_crash() {
     assert!(sent.is::<crate::api::InvalidRequestError>());
 }
 
-/// GLM's argmax-only verify head cannot mask a row: a sequence whose tool
-/// grammar constrains its next pick decodes serially; free dispatch text, a
-/// strict grammar (masked by `strict_spec`) and other heads keep speculating.
-#[test]
-fn an_argmax_only_head_decodes_constraining_tool_grammars_serially() {
-    let tools: Vec<crate::tool_parser::ToolDefinition> =
-        serde_json::from_value(serde_json::json!([{
-            "type": "function",
-            "function": {"name": "get_weather", "parameters": {"type": "object",
-                "properties": {"location": {"type": "string"}}, "required": ["location"]}}
-        }]))
-        .unwrap();
-    let poolside = |use_triggers| {
-        let mut engine = engine().unwrap();
-        let compiled = engine
-            .compile_poolside_v1_tool_grammar(&tools, use_triggers, "</arg_value>")
-            .unwrap();
-        GrammarState::new(&compiled, engine.vocab_size()).unwrap()
-    };
-    let (mut a, _rx) = test_seq(vec![1, 2, 3], 20, None, 8);
-    assert!(!mtp_gate::masked_rows_unavailable(&a, true), "no grammar");
-    a.grammar_state = Some(poolside(true));
-    assert!(
-        !mtp_gate::masked_rows_unavailable(&a, true),
-        "auto dispatch text"
-    );
-    a.grammar_state = Some(poolside(false));
-    assert!(mtp_gate::masked_rows_unavailable(&a, true), "forced call");
-    assert!(
-        !mtp_gate::masked_rows_unavailable(&a, false),
-        "a full-logits head"
-    );
-    a.grammar_state = Some(strict());
-    assert!(
-        !mtp_gate::masked_rows_unavailable(&a, true),
-        "strict_spec masks"
-    );
-}
-
 /// GLM's split verify head masks a forced call's rows: the sequence picks
 /// from the whole rows through the grammar (no raw argmax a refused token
 /// would disengage), and a strict greedy sequence keeps `strict_spec`'s
