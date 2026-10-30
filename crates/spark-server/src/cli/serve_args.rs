@@ -160,6 +160,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 32768)]
     pub max_seq_len: usize,
 
+    /// Opt-in static YaRN extension for Qwen3.8-Flash-Next (2 or 4).
+    /// Does not change checkpoint files or reserve KV for every scheduler slot.
+    #[arg(long)]
+    pub qwen_yarn_factor: Option<u8>,
+
     /// KV cache block size (tokens per block).
     #[arg(long, default_value_t = 16)]
     pub block_size: usize,
@@ -628,6 +633,16 @@ pub struct ServeArgs {
     /// without Marconi snapshots). Block table reuse still avoids allocation.
     #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
     pub enable_prefix_caching: bool,
+
+    /// Make prefix-cache hits on hybrid-SSM models give the same output as
+    /// caching off **with this flag** at temperature 0 (#158). Both arms use
+    /// a fixed 1024-token prefill grid, so a warm turn re-prefills up to one
+    /// grid step past its last cut, and exact-mode outputs differ from
+    /// default-mode outputs. Costs throughput on long agentic replays
+    /// (+3–11% wall at G = 1024 on GB10 Flash-Next, same box). `ATLAS_PREFILL_GRID=N`
+    /// overrides the grid size.
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true")]
+    pub exact_prefix_cache: bool,
 
     /// Dump every /v1/chat/completions, /v1/responses, and
     /// /v1/messages (Anthropic) request — plus the corresponding
