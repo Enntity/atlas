@@ -527,6 +527,12 @@ pub struct ModelConfig {
     /// per MoE layer).
     #[serde(default)]
     pub use_routing_bias: bool,
+    /// The MoE router's logits stay FP32 into top-k (`moe_router_dtype:
+    /// "float32"`, GLM-5): BF16 operands, FP32 accumulation and an unrounded
+    /// FP32 logit, as the reference's `GateLinear(out_dtype=float32)`.
+    /// False: the router stores BF16 logits.
+    #[serde(default)]
+    pub router_logits_f32: bool,
     /// QK normalization granularity. "" = none (Qwen3-Next default).
     /// "per_layer" = each attention layer has its own learned q_layernorm /
     /// k_layernorm weight of shape `[head_dim]`, applied after Q/K projection
@@ -558,6 +564,14 @@ pub struct ModelConfig {
     /// is what the drafter's `fc` projection expects.
     #[serde(default)]
     pub dflash_capture_layers: Vec<usize>,
+
+    /// Prompt positions a bidirectional DFlash drafter's context window keeps
+    /// (the served window, capped at `max_seq_len`); `None` when DFlash is
+    /// off or its window is not that (a causal head). Every rank sets it from
+    /// the same arguments, so it can gate decisions both ranks must agree on
+    /// (sequence-parallel prefill keeps the window on rank 0).
+    #[serde(default)]
+    pub dflash_ctx_window: Option<usize>,
 
     /// LoRA adapter rank ceiling (`--max-lora-rank`). `0` = LoRA disabled.
     /// Set programmatically before model build (never parsed from the HF
