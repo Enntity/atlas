@@ -179,6 +179,13 @@ impl GrammarState {
         self
     }
 
+    /// Whether the grammar masks the next pick: neither terminated nor in an
+    /// automatic grammar's free dispatch text (a forced call, or a call body
+    /// an automatic grammar entered).
+    pub fn constrains_now(&self) -> bool {
+        !self.matcher.is_terminated() && !self.matcher.is_grammar_completed()
+    }
+
     /// Mark this as a `response_format` grammar (see the `strict` field).
     /// `opens_in_thinking`: the prompt leaves the model inside `<think>`.
     #[must_use]

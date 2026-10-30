@@ -502,6 +502,15 @@ impl ActiveSeq {
             .is_some_and(GrammarState::is_strict)
     }
 
+    /// A tool grammar masks this sequence's next pick (see
+    /// `GrammarState::constrains_now`). A strict grammar does not count: its
+    /// verify rows are masked by `strict_spec`.
+    pub(super) fn tool_grammar_constrains(&self) -> bool {
+        self.grammar_state
+            .as_ref()
+            .is_some_and(|g| !g.is_strict() && g.constrains_now())
+    }
+
     /// A tool-call-or-JSON union's first output token is next: it is picked
     /// on host logits (`GrammarState::choose_branch`), never in a verify row.
     pub(super) fn grammar_branch_pending(&self) -> bool {

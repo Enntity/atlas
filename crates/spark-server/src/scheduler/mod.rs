@@ -1027,6 +1027,9 @@ pub fn run(
                             dflash_resume_guard,
                             dflash_verify_raw_argmax,
                             strict_spec,
+                        ) && !mtp_gate::masked_rows_unavailable(
+                            a,
+                            model.verify_logits_argmax_only(),
                         )
                     })
                 )
