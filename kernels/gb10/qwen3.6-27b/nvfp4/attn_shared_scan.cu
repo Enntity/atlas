@@ -58,12 +58,13 @@
 // Host-checked (`shared_scan.rs`): head_dim 256, block_size a power of two in
 // 16..=256, num_q_heads a multiple of num_kv_heads with ratio <= 48.
 //
+// Neither kernel is on a PDL list (`cuda_backend/gpu_impl/pdl.rs`), so neither
+// waits on PDL entry; a PDL-launched successor still waits for the reduce.
+//
 // attn_shared_scan         Grid: (num_kv_heads*SS_MAX_SB, ceil(num_seqs/SS_ROWS_MAX))  Block: 96
 // attn_shared_scan_reduce  Grid: (num_q_heads, num_seqs)             Block: 256
 
 #include <cuda_bf16.h>
-
-#include "../../common/atlas_pdl.cuh"
 
 #define SS_HD 256u
 #define SS_STEP 16u    // positions a step: the V product's K extent
@@ -120,7 +121,6 @@ extern "C" __global__ void __launch_bounds__(SS_THREADS) attn_shared_scan(
     const float inv_sqrt_d,
     const unsigned int q_stride // elements between rows of Q
 ) {
-    atlas_pdl_enter();
     __shared__ unsigned int sQ[SS_QMAX * SS_ROW_WORDS];
     __shared__ unsigned int sK[SS_STEP * SS_ROW_WORDS];
     __shared__ unsigned int sV[SS_HD * SS_VT_WORDS];
@@ -414,7 +414,6 @@ extern "C" __global__ void __launch_bounds__(SS_HD) attn_shared_scan_reduce(
     const int* __restrict__ seq_lens,
     const unsigned int num_q_heads
 ) {
-    atlas_pdl_enter();
     const unsigned int q_head = blockIdx.x;
     const unsigned int row = blockIdx.y;
     const unsigned int d = threadIdx.x;
