@@ -195,6 +195,11 @@ pub(super) fn render_template(
         prompt_tokens
     };
 
+    let mut prompt_tokens = prompt_tokens;
+    if state.honor_thinking_off {
+        let (start, end) = (state.think_start_token_id, state.think_end_token_id);
+        close_open_think_when_off(&mut prompt_tokens, start, end, enable_thinking);
+    }
     let (enable_thinking, thinking_budget) = reconcile_prompt_thinking(
         &prompt_tokens,
         state.think_start_token_id,
@@ -212,7 +217,7 @@ pub(super) fn render_template(
 }
 #[path = "template/reconcile.rs"]
 mod reconcile;
-use reconcile::reconcile_prompt_thinking;
+use reconcile::{close_open_think_when_off, reconcile_prompt_thinking};
 
 #[cfg(test)]
 #[path = "template_thinking_tests.rs"]
