@@ -12,6 +12,8 @@ mod think_end;
 pub use glm_owner::{step_verify_glm_long_batched, step_verify_glm_long_with};
 pub(super) use think_end::accept_with_forced_think_end;
 
+pub(super) use glm_owner::step_verify_glm_long_strict;
+
 /// Width-generic γ-token verify with accept-prefix. `draft_conf` is the
 /// drafter's confidence in `drafts` (`ActiveSeq::take_drafts`; empty when
 /// not measured).
