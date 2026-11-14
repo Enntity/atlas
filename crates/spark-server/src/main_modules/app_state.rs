@@ -131,9 +131,6 @@ pub struct AppState {
     /// thinking is forced OFF regardless of the request body or the
     /// model's MODEL.toml default. Wired from `--disable-thinking`.
     pub disable_thinking: bool,
-    /// `--honor-thinking-off`: close a reasoning block the template opens
-    /// for a request whose thinking resolved off. See `chat::template`.
-    pub honor_thinking_off: bool,
     /// `--reference-mode`: no server-side change to sampling or prompt text.
     /// See `main_modules::reference_mode`.
     pub reference_mode: bool,

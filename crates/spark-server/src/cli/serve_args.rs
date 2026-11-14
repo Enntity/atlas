@@ -460,14 +460,6 @@ pub struct ServeArgs {
     #[arg(long, visible_alias = "stupify", default_value_t = false)]
     pub disable_thinking: bool,
 
-    /// Give a request that turns thinking off no reasoning even when the
-    /// chat template opens a reasoning block regardless (GLM-5.3): the
-    /// block is closed before generation, as the template writes a turn
-    /// that had none. Without this flag such a template reasons anyway,
-    /// with no budget, which is what the reference server does.
-    #[arg(long, default_value_t = false)]
-    pub honor_thinking_off: bool,
-
     /// Serve exactly what the client asked for: the client's sampling
     /// parameters and nothing else, rendered through the checkpoint's own
     /// chat template. For benchmark runs whose rules lock sampling and

@@ -199,14 +199,6 @@ fn ep_size_cannot_exceed_world_size() {
 }
 
 #[test]
-fn reference_mode_refuses_honor_thinking_off() {
-    for alone in ["--honor-thinking-off", "--reference-mode"] {
-        assert!(validate_serve_args(&parse(&[alone])).is_ok());
-    }
-    assert!(validate_serve_args(&parse(&["--reference-mode", "--honor-thinking-off"])).is_err());
-}
-
-#[test]
 fn disable_thinking_conflicts_with_budget() {
     assert!(
         validate_serve_args(&parse(&[
