@@ -199,11 +199,19 @@ fn ep_size_cannot_exceed_world_size() {
 }
 
 #[test]
-fn reference_mode_refuses_honor_thinking_off() {
-    for alone in ["--honor-thinking-off", "--reference-mode"] {
-        assert!(validate_serve_args(&parse(&[alone])).is_ok());
+fn thinking_off_budget_needs_a_token_and_no_reference_mode() {
+    for ok in [
+        &["--thinking-off-budget", "256"][..],
+        &["--reference-mode"][..],
+    ] {
+        assert!(validate_serve_args(&parse(ok)).is_ok());
     }
-    assert!(validate_serve_args(&parse(&["--reference-mode", "--honor-thinking-off"])).is_err());
+    for bad in [
+        &["--thinking-off-budget", "0"][..],
+        &["--reference-mode", "--thinking-off-budget", "256"][..],
+    ] {
+        assert!(validate_serve_args(&parse(bad)).is_err());
+    }
 }
 
 #[test]
