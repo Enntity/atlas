@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use super::reconcile_prompt_thinking;
+use super::{close_open_think_when_off, reconcile_prompt_thinking};
 use crate::tokenizer::ChatTokenizer;
 use serde_json::json;
 use tokenizers::{
@@ -214,4 +214,71 @@ fn a_closed_empty_think_block_turns_reasoning_off() {
             (false, None)
         );
     }
+}
+
+#[test]
+fn honoring_thinking_off_closes_the_block_the_template_left_open() {
+    let mut prompt = vec![9, 3, START];
+    assert!(close_open_think_when_off(
+        &mut prompt,
+        Some(START),
+        Some(END),
+        false
+    ));
+    assert_eq!(prompt, [9, 3, START, END]);
+    // The closed pair then reads as thinking off, with no forced budget.
+    assert_eq!(
+        reconcile_prompt_thinking(&prompt, Some(START), Some(END), false, None, 128),
+        (false, None)
+    );
+}
+
+#[test]
+fn honoring_thinking_off_leaves_every_other_prompt_alone() {
+    // Thinking on, a block already closed, no block in the tail, a block
+    // opened long before the tail, or a model with no end token.
+    let far = [&[START][..], &[9; 8][..]].concat();
+    type Case<'a> = (&'a [u32], bool, Option<u32>, Option<u32>);
+    let cases: [Case; 6] = [
+        (&[9, 3, START], true, Some(START), Some(END)),
+        (&[9, START, END], false, Some(START), Some(END)),
+        (&[9, 10], false, Some(START), Some(END)),
+        (&far, false, Some(START), Some(END)),
+        (&[9, 3, START], false, Some(START), None),
+        (&[9, 3, START], false, None, Some(END)),
+    ];
+    for (tokens, enabled, start, end) in cases {
+        let mut prompt = tokens.to_vec();
+        assert!(!close_open_think_when_off(&mut prompt, start, end, enabled));
+        assert_eq!(prompt, tokens);
+    }
+}
+
+/// The real GLM template: a thinking-off render still ends on an open
+/// `<think>`, and honoring it ends the prompt as the template itself writes
+/// a turn that had no reasoning (`<think></think>`).
+#[test]
+fn glm_thinking_off_render_closes_to_the_templates_empty_block() {
+    let (_dir, tokenizer) = glm_tokenizer();
+    let messages = [json!({"role": "user", "content": "go"})];
+    let mut prompt = tokenizer
+        .apply_chat_template_openai_with_effort(&messages, None, false, false, Some("none"), None)
+        .unwrap();
+    assert_eq!(prompt.last(), Some(&START));
+    assert!(close_open_think_when_off(
+        &mut prompt,
+        Some(START),
+        Some(END),
+        false
+    ));
+    assert!(prompt.ends_with(&[START, END]));
+    let history = [
+        json!({"role": "user", "content": "go"}),
+        json!({"role": "assistant", "content": "done"}),
+    ];
+    let rendered = tokenizer
+        .apply_chat_template_openai_with_effort(&history, None, false, false, None, None)
+        .unwrap();
+    let block = rendered.windows(2).any(|pair| pair == [START, END]);
+    assert!(block, "the template closes a reasoning-free turn this way");
 }

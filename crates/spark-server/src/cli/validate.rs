@@ -283,6 +283,14 @@ pub fn validate_serve_args(args: &ServeArgs) -> Result<(), String> {
             "drop --disable-thinking (the client decides thinking in reference mode).",
         ));
     }
+    if args.reference_mode && args.honor_thinking_off {
+        v.push(Violation::new(
+            "--reference-mode is set together with --honor-thinking-off.",
+            "reference mode renders the checkpoint's template unchanged; \
+             --honor-thinking-off closes the reasoning block that template opens.",
+            "drop --honor-thinking-off.",
+        ));
+    }
     if args.reference_mode && args.max_thinking_budget.is_some() {
         v.push(Violation::new(
             "--reference-mode is set together with --max-thinking-budget.",
