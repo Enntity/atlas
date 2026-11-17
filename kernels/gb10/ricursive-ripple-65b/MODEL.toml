@@ -106,13 +106,16 @@ hidden_size = 5120
 
 # DFlash2 drafter (`ricursiveAI/Ripple-65B-Preview-DFlash2`): 5 layers (4
 # sliding 4096 + 1 full NoPE), conv kernel 4, selector top-k 32, taps the
-# target's post-block states at layers 1/20/39/58/77 (zero-based). gamma 32
-# is SGLang's verified block (--speculative-num-draft-tokens 32): 1 anchor +
-# 31 drafts. Serve with --dflash-window-size 16384 (the full draft layer's
-# training context); `window_size` here is documentation only.
+# target's post-block states at layers 1/20/39/58/77 (zero-based). gamma 16
+# is the drafter's trained block_size. SGLang's verified block is 32
+# (--speculative-num-draft-tokens 32), but here 32 leaves the drafter on
+# BF16 (its NVFP4 tier stops at 16) and doubles the verify rows; 16 measured
+# faster on one GB10 and on the TP2 pair (PR body). Serve with
+# --dflash-window-size 16384 (the full draft layer's training context);
+# `window_size` here is documentation only.
 [dflash]
 draft_model = "ricursiveAI/Ripple-65B-Preview-DFlash2"
-gamma = 32
+gamma = 16
 window_size = 16384
 mask_token_id = 100278
 target_layer_ids = [1, 20, 39, 58, 77]
