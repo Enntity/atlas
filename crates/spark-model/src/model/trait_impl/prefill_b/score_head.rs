@@ -1,38 +1,66 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! The head of a score pass (`score.rs`): final norm on each branch's last
-//! row, then the option logits — gathered FP32 dot products from a BF16 LM
-//! head when one is kept, else the full-vocabulary head — and a softmax over
-//! each branch's options.
+//! The head of a score pass (`score.rs`): final norm on each selected branch
+//! row, then option logits and a softmax over each branch's options.
 
 use anyhow::Result;
 use spark_runtime::gpu::DevicePtr;
 
 use super::super::super::types::TransformerModel;
 use super::score_plan::ScorePlan;
+use crate::traits::{ScoreBranchProbs, ScoreInput};
+
+pub(super) fn validate_readouts(reqs: &[ScoreInput<'_>]) -> Result<()> {
+    for req in reqs {
+        let Some(readouts) = req.readouts else {
+            continue;
+        };
+        anyhow::ensure!(
+            readouts.len() == req.branches.len(),
+            "score: one readout list per branch"
+        );
+        for (branch, offsets) in req.branches.iter().zip(readouts) {
+            anyhow::ensure!(
+                (1..=4).contains(&offsets.len()),
+                "score: need 1..=4 readouts per branch"
+            );
+            anyhow::ensure!(
+                offsets.iter().all(|&offset| offset < branch.len()),
+                "score: readout offset is outside its branch"
+            );
+        }
+    }
+    Ok(())
+}
 
 impl TransformerModel {
-    /// Final norm on each branch's last row, LM head, softmax over options.
+    /// Final norm on selected branch rows, LM head, softmax over options.
     pub(super) fn score_head(
         &self,
         plan: &ScorePlan,
         options: &[Vec<u32>],
         stream: u64,
-    ) -> Result<Vec<Vec<f32>>> {
+    ) -> Result<Vec<ScoreBranchProbs>> {
         let h = self.config.hidden_size;
         let v = self.config.vocab_size;
         let bf16 = 2usize;
         let hidden = self.buffers.hidden_states();
         let normed = self.buffers.norm_output();
-        let mut last_rows = Vec::with_capacity(options.len());
+        let mut selected_rows = Vec::with_capacity(options.len());
+        let mut branches = Vec::with_capacity(options.len());
         let mut end = 0usize;
         for i in 0..plan.streams() {
-            end += plan.rows(i);
             if i >= plan.heads {
-                last_rows.push(end - 1);
+                let rows = match plan.readout_rows[i].as_deref() {
+                    Some(rows) => rows.to_vec(),
+                    None => vec![plan.rows(i) - 1],
+                };
+                selected_rows.extend(rows.iter().map(|&row| end + row));
+                branches.extend(std::iter::repeat_n(i - plan.heads, rows.len()));
             }
+            end += plan.rows(i);
         }
-        for (j, &row) in last_rows.iter().enumerate() {
+        for (j, &row) in selected_rows.iter().enumerate() {
             self.final_norm_rows(
                 hidden.offset(row * h * bf16),
                 normed.offset(j * h * bf16),
@@ -40,26 +68,42 @@ impl TransformerModel {
                 stream,
             )?;
         }
-        if self.lm_head_nvfp4.is_none() && self.lm_head_fp8.is_none() {
-            return self.score_head_gathered(normed, options, stream);
-        }
-        // The logits arena holds a bounded number of rows; run the LM head
-        // in groups of that many and keep only each branch's option logits.
-        let group = self.buffers.sizes().logits / (v * bf16);
-        anyhow::ensure!(group > 0, "score: the logits arena holds no full row");
-        let mut out = Vec::with_capacity(options.len());
-        let mut row = vec![0u8; v * bf16];
-        for g in (0..last_rows.len()).step_by(group) {
-            let k = group.min(last_rows.len() - g);
-            let dst = self.buffers.logits();
-            self.lm_head_batched(normed.offset(g * h * bf16), k as u32, dst, stream)?;
-            self.gpu.synchronize(stream)?;
-            for j in 0..k {
-                self.gpu.copy_d2h(dst.offset(j * v * bf16), &mut row)?;
-                out.push(softmax_options(&row, &options[g + j]));
+        let flat = if self.lm_head_nvfp4.is_none() && self.lm_head_fp8.is_none() {
+            self.score_head_gathered(normed, options, &branches, stream)?
+        } else {
+            // The logits arena holds a bounded number of rows; run the LM head
+            // in groups of that many and keep only each branch's option logits.
+            let group = self.buffers.sizes().logits / (v * bf16);
+            anyhow::ensure!(group > 0, "score: the logits arena holds no full row");
+            let mut out = Vec::with_capacity(selected_rows.len());
+            let mut row = vec![0u8; v * bf16];
+            for g in (0..selected_rows.len()).step_by(group) {
+                let k = group.min(selected_rows.len() - g);
+                let dst = self.buffers.logits();
+                self.lm_head_batched(normed.offset(g * h * bf16), k as u32, dst, stream)?;
+                self.gpu.synchronize(stream)?;
+                for j in 0..k {
+                    self.gpu.copy_d2h(dst.offset(j * v * bf16), &mut row)?;
+                    out.push(softmax_options(&row, &options[branches[g + j]]));
+                }
             }
+            out
+        };
+        let mut per_branch = vec![Vec::new(); options.len()];
+        for (branch, probs) in branches.into_iter().zip(flat) {
+            per_branch[branch].push(probs);
         }
-        Ok(out)
+        Ok(per_branch
+            .into_iter()
+            .enumerate()
+            .map(|(branch, mut probs)| {
+                if plan.readout_rows[plan.heads + branch].is_some() {
+                    ScoreBranchProbs::Readouts(probs)
+                } else {
+                    ScoreBranchProbs::Last(probs.pop().expect("every branch has a selected row"))
+                }
+            })
+            .collect())
     }
 }
 
@@ -71,10 +115,11 @@ impl TransformerModel {
         &self,
         normed: DevicePtr,
         options: &[Vec<u32>],
+        branches: &[usize],
         stream: u64,
     ) -> Result<Vec<Vec<f32>>> {
         let h = self.config.hidden_size;
-        let mut rows = vec![0u8; options.len() * h * 2];
+        let mut rows = vec![0u8; branches.len() * h * 2];
         self.gpu.synchronize(stream)?;
         self.gpu.copy_d2h(normed, &mut rows)?;
         let head = self.lm_head_weight.weight;
@@ -87,8 +132,9 @@ impl TransformerModel {
             *cache = (head.0, std::collections::HashMap::new());
         }
         let mut buf = vec![0u8; h * 2];
-        let mut out = Vec::with_capacity(options.len());
-        for (j, opts) in options.iter().enumerate() {
+        let mut out = Vec::with_capacity(branches.len());
+        for (j, &branch) in branches.iter().enumerate() {
+            let opts = &options[branch];
             let x = bf16_to_f32(&rows[j * h * 2..(j + 1) * h * 2]);
             let mut logits = Vec::with_capacity(opts.len());
             for &t in opts {
