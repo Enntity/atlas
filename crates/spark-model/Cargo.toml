@@ -32,6 +32,12 @@ metal-example = ["metal", "dep:tokenizers", "dep:memmap2", "dep:safetensors"]
 # driver symbols — cuGraph*/cuStream*/cuMem* — that aren't available on the
 # CI runner). Build on a real GPU host with `--features gpu-examples`.
 gpu-examples = ["dep:safetensors"]
+# libjpeg-turbo JPEG decode for the score-image path (see the `turbojpeg`
+# dependency below). NOT in `default`: the sys crate builds the C library
+# from source (cmake + nasm), which a plain CI runner can't. Build on a
+# GPU host with `--features jpeg-turbo`; without it JPEG decodes with the
+# `image` crate's pure-Rust decoder (zune-jpeg).
+jpeg-turbo = ["dep:turbojpeg"]
 # The NCCL and RDMA CommBackend, for the `comm_pair_bench` example (pair or chain).
 nccl = ["cuda", "spark-comm/nccl"]
 
@@ -58,7 +64,7 @@ base64 = "0.22"
 # decodable in pure Rust with no system dependency, so the whole temporal
 # pipeline can be proven before committing to an H.264 decoder.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
-turbojpeg = "1.5.1"
+turbojpeg = { version = "1.5.1", optional = true }
 parking_lot = { workspace = true }
 
 # Used by the `metal_qwen35_inference` example only — gated by

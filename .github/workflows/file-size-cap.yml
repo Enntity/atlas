@@ -497,6 +497,19 @@ jobs:
             "crates/spark-model/src/layers/nemotron_moe/union_verify_gpu_tests.rs"
             "crates/spark-model/src/layers/ops/moe_grouped_a/grouped_prefill.rs"
             "crates/spark-model/src/weight_loader/nemotron.rs"
+            # ── #397 (score images) carry-overs — tracked in #400 ──
+            # 623 LoC — the FP8 pack store with the NVMe tier and read-ahead;
+            # the tier is a cohesive extraction (`score_store/tier.rs`).
+            "crates/spark-model/src/model/trait_impl/prefill_b/score_store.rs"
+            # 546 LoC (419 before) — the image-pass merge bookkeeping (image
+            # packs joined into shared passes); extract the image-pack merge.
+            "crates/spark-server/src/scheduler/score.rs"
+            # 531 LoC (399 before) — GPU kernel microtest grew with the
+            # score-path cases; move those to a sibling test module.
+            "crates/spark-model/src/layers/ops/dense_bf16mma_lowp_test_gpu.rs"
+            # 506 LoC (479 before) — image rows in the score pass; thin
+            # margin, extract the image-pass branch with the store split.
+            "crates/spark-model/src/model/trait_impl/prefill_b/score.rs"
           )
 
           violations=0

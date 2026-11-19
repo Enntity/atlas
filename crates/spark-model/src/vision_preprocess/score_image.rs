@@ -44,30 +44,41 @@ fn decode_score_image_rgb(bytes: &[u8], format: &str) -> Result<(RgbImage, u32, 
         .into_decoder()
         .context("image could not be decoded")?;
     let (width, height) = decoder.dimensions();
-    let pixels = u64::from(width) * u64::from(height);
     check_source_pixels(width, height)?;
     ensure!(
         decoder.total_bytes() <= DECODE_MAX_ALLOC,
         "decoded image allocation exceeds the decoder limit"
     );
+    #[cfg(not(feature = "jpeg-turbo"))]
+    let img = pil_rgb(DynamicImage::from_decoder(decoder).context("image could not be decoded")?);
+    #[cfg(feature = "jpeg-turbo")]
     let img = if actual == ImageFormat::Jpeg {
-        let rgb_bytes = pixels * 3;
-        ensure!(
-            rgb_bytes <= DECODE_MAX_ALLOC,
-            "decoded image allocation exceeds the decoder limit"
-        );
-        let decoded = turbojpeg::decompress(bytes, turbojpeg::PixelFormat::RGB)
-            .context("image could not be decoded")?;
-        ensure!(
-            decoded.width == width as usize && decoded.height == height as usize,
-            "JPEG decoder dimensions changed during decode"
-        );
-        RgbImage::from_raw(width, height, decoded.pixels)
-            .context("JPEG decoder returned an invalid RGB buffer")?
+        decode_jpeg_turbo(bytes, width, height)?
     } else {
         pil_rgb(DynamicImage::from_decoder(decoder).context("image could not be decoded")?)
     };
     Ok((img, width, height))
+}
+
+// The decoder the score receipts were measured with (libjpeg-turbo, built from
+// source by the sys crate). Opt-in via `jpeg-turbo`: a plain CI runner can't
+// build the C library, so default builds decode JPEG with the `image` crate
+// above instead (slightly different IDCT, same semantics).
+#[cfg(feature = "jpeg-turbo")]
+fn decode_jpeg_turbo(bytes: &[u8], width: u32, height: u32) -> Result<RgbImage> {
+    let rgb_bytes = u64::from(width) * u64::from(height) * 3;
+    ensure!(
+        rgb_bytes <= DECODE_MAX_ALLOC,
+        "decoded image allocation exceeds the decoder limit"
+    );
+    let decoded = turbojpeg::decompress(bytes, turbojpeg::PixelFormat::RGB)
+        .context("image could not be decoded")?;
+    ensure!(
+        decoded.width == width as usize && decoded.height == height as usize,
+        "JPEG decoder dimensions changed during decode"
+    );
+    RgbImage::from_raw(width, height, decoded.pixels)
+        .context("JPEG decoder returned an invalid RGB buffer")
 }
 
 fn pil_rgb(image: DynamicImage) -> RgbImage {
