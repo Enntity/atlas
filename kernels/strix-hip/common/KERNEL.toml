@@ -32,6 +32,18 @@ extra_nvcc_flags = ["--fmad=false"]
 [shadow_exempt]
 w4a16 = ["w4a16_dequant"]
 moe_w4a16 = ["moe_w4a16_grouped_gemm"]
+# rms_norm.cu is a symlink to gb10/common/rms_norm.cu, which now carries the
+# image-scoring engine's optional prefill kernels (Enntity/atlas 68baafe3c,
+# SparkQwen #43/#44): the warp-per-head gated-norm twins and the any-block
+# marker are try_shipped_kernel lookups, so this shadow may omit them. The
+# twins are defined through one function-like macro whose parameter scans as
+# an entry point (`NAME`); no shadow instantiates that macro.
+norm = [
+    "gated_rms_norm_prefill_warp",
+    "gated_rms_norm_prefill_warp_sigmoid",
+    "rms_norm_rows_any_block",
+    "NAME",
+]
 
 # File stem → module name overrides.
 # Any .cu file not listed here uses its file stem as the module name.

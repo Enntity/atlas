@@ -81,6 +81,16 @@ norm = [
     "gated_rms_norm_sigmoid",
     "gated_rms_norm_f32_input_sigmoid",
     "gated_rms_norm_prefill_sigmoid",
+    # The image-scoring engine's prefill fusions (Enntity/atlas 68baafe3c):
+    # the warp-per-head gated-norm twins and the any-block marker are optional
+    # (try_shipped_kernel), so a shadow without them keeps the 1024-thread and
+    # CTA-per-head launches, same bits. The twins are defined through one
+    # function-like macro whose parameter scans as an entry point (`NAME`);
+    # no shadow instantiates that macro.
+    "gated_rms_norm_prefill_warp",
+    "gated_rms_norm_prefill_warp_sigmoid",
+    "rms_norm_rows_any_block",
+    "NAME",
 ]
 
 # File stem → module name overrides.
