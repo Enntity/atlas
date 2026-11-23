@@ -60,15 +60,25 @@ pub(super) struct StreamCtx {
     pub(super) max_tool_calls_per_response: usize,
     pub(super) min_tokens: usize,
     pub(super) req_return_token_ids: bool,
+    /// The request asked for streamed tool calls (`stream_tool_arguments`).
+    pub(super) req_stream_tool_arguments: bool,
     pub(super) req_ctx: Option<crate::rate_limiter::RequestContext>,
     pub(super) dump_seq: Option<u64>,
 }
 
 impl StreamCtx {
-    /// `--tool-guard stream`: Poolside v1 string arguments go out as they are
-    /// written. Rewriting paths against a working directory changes argument
-    /// text at the end of a call, so those requests stay held, as under retry.
+    /// `--tool-guard stream` and the request asked for it: tool calls go out
+    /// as they are written. A request that did not ask is held as under `on`,
+    /// so a client that does not read `content_filter` never gets a call the
+    /// guard blocks.
+    pub(super) fn streams_tool_calls(&self) -> bool {
+        self.state.tool_guard.stream && self.req_stream_tool_arguments
+    }
+
+    /// Poolside v1 string arguments go out as they are written. Rewriting
+    /// paths against a working directory changes argument text at the end of
+    /// a call, so those requests stay held, as under retry.
     pub(super) fn streams_poolside_strings(&self) -> bool {
-        self.state.tool_guard.stream && !self.tool_retry_enabled && self.cwd_for_normalize.is_none()
+        self.streams_tool_calls() && !self.tool_retry_enabled && self.cwd_for_normalize.is_none()
     }
 }
