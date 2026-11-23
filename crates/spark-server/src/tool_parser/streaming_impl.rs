@@ -36,6 +36,9 @@ impl StreamingToolDetector {
             literal_xml_state: crate::literal_xml::LiteralXmlState::default(),
             native_openers: 0,
             native_envelope: false,
+            stream_poolside_strings: false,
+            poolside_value: Default::default(),
+            poolside_sent: String::new(),
         }
     }
 
@@ -90,6 +93,8 @@ impl StreamingToolDetector {
         self.emitted_keys.clear();
         self.incremental_emitted = false;
         self.native_envelope = false;
+        self.poolside_value = Default::default();
+        self.poolside_sent.clear();
     }
 
     /// Feed a text delta. Returns events to emit (content or tool calls).
@@ -142,7 +147,9 @@ impl StreamingToolDetector {
                         // `}` for XML, or the JSON tail). Compute it BEFORE the
                         // buffer is truncated, since `stream_ready_fragments`
                         // reads `self.buffer[..end]`.
-                        if !self.buffer_args && self.incremental_emitted {
+                        if !self.buffer_args
+                            && (self.incremental_emitted || self.streams_poolside_args())
+                        {
                             let frags = self.stream_ready_fragments(end, true);
                             outputs.extend(frags);
                             outputs.push(DetectorOutput::ToolCallEnd { idx });
@@ -272,7 +279,9 @@ impl StreamingToolDetector {
                 // (`<parameter=key>value</parameter>`) must be converted to JSON before
                 // emission. The name header is emitted immediately so clients get instant
                 // feedback that a tool call started.
-                if !(self.promote_bare_names && self.complete_poolside_calls)
+                if !(self.promote_bare_names
+                    && self.complete_poolside_calls
+                    && !self.streams_poolside_args())
                     && self.current_tc_name.is_none()
                     && let Some(name) =
                         extract_streaming_name(&self.buffer, self.promote_bare_names)

@@ -18,7 +18,7 @@ type DeltaVec = Vec<StreamDelta>;
 
 /// Whether this stream holds a tool call's deltas until the call validates:
 /// under the tool guard (unless it streams), under tool retry, and for
-/// Poolside v1, whose detector buffers a call's
+/// Poolside v1 where its detector buffers a call's
 /// arguments until `</tool_call>` anyway. Holding its header too means the
 /// client never sees a call start that the blocking path would not return:
 /// an unregistered name (rejected at validation) or an envelope the response
@@ -29,7 +29,7 @@ fn holds_tool_deltas(state: &StreamState, ctx: &StreamCtx) -> bool {
         || state
             .detector
             .as_ref()
-            .is_some_and(|d| d.promotes_bare_names())
+            .is_some_and(|d| d.promotes_bare_names() && !d.streams_poolside_args())
 }
 
 /// Tier 5c (2026-05-26): emit `delta` to either the client stream OR a

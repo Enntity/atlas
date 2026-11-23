@@ -38,7 +38,7 @@ fn setup(glm: bool) -> (StreamCtx, StreamState) {
     let (ctx, state, _) = stream_for_app(a, true, vec![]);
     (ctx, state)
 }
-fn finish(s: &mut StreamState, c: &StreamCtx) -> Vec<ir::StreamDelta> {
+pub(super) fn finish(s: &mut StreamState, c: &StreamCtx) -> Vec<ir::StreamDelta> {
     handle_done(s, c, "stop".into(), 21, 1.0, 1.0, 0, 0, 0)
 }
 fn assert_blocked(out: &[ir::StreamDelta]) {
@@ -57,7 +57,7 @@ fn assert_blocked(out: &[ir::StreamDelta]) {
     );
     assert!(out.iter().any(|d| matches!(d, ir::StreamDelta::Finish { reason: ir::FinishReason::ContentFilter, token_ids, .. } if token_ids.is_empty())), "{out:?}");
 }
-fn dispatch(s: &mut StreamState, c: &StreamCtx, text: &str) -> Vec<ir::StreamDelta> {
+pub(super) fn dispatch(s: &mut StreamState, c: &StreamCtx, text: &str) -> Vec<ir::StreamDelta> {
     let events = s.detector.as_mut().unwrap().process(text);
     let mut out = vec![];
     for event in events {
@@ -466,9 +466,9 @@ fn a_streaming_guard_blocks_an_oversized_call_mid_stream() {
 }
 
 #[test]
-fn a_streaming_guard_still_holds_poolside_calls() {
-    // Poolside's detector holds a call until `</tool_call>` whatever the
-    // guard says, so nothing of a blocked call reached the client.
+fn a_streaming_guard_holds_poolside_calls_its_detector_holds() {
+    // Where the Poolside detector holds a call until `</tool_call>` (it was
+    // not asked to stream), nothing of a blocked call reached the client.
     let (c, mut s) = streaming_guard(true);
     let mut out = started_call(&mut s, &c, r#"{"url": "http://169.254.169.254/"}"#);
     assert!(out.is_empty(), "{out:?}");

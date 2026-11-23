@@ -93,6 +93,7 @@ mod streaming;
 mod streaming_emit;
 mod streaming_flush;
 mod streaming_impl;
+mod streaming_poolside;
 mod type_coerce;
 pub(crate) mod validation;
 

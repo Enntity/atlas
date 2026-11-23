@@ -63,3 +63,12 @@ pub(super) struct StreamCtx {
     pub(super) req_ctx: Option<crate::rate_limiter::RequestContext>,
     pub(super) dump_seq: Option<u64>,
 }
+
+impl StreamCtx {
+    /// `--tool-guard stream`: Poolside v1 string arguments go out as they are
+    /// written. Rewriting paths against a working directory changes argument
+    /// text at the end of a call, so those requests stay held, as under retry.
+    pub(super) fn streams_poolside_strings(&self) -> bool {
+        self.state.tool_guard.stream && !self.tool_retry_enabled && self.cwd_for_normalize.is_none()
+    }
+}

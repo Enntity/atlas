@@ -32,6 +32,8 @@ mod glm_boundary_case_tests;
 mod glm_literal_xml_tests;
 #[path = "glm_tool_args_tests.rs"]
 mod glm_tool_args_tests;
+#[path = "poolside_stream_args_tests.rs"]
+mod poolside_stream_args_tests;
 #[path = "qwen_literal_xml_tests.rs"]
 mod qwen_literal_xml_tests;
 #[path = "reasoning_done_tests.rs"]
@@ -288,6 +290,7 @@ fn stream_for_request(
                 .as_ref()
                 .is_some_and(|p| p.name() == "poolside_v1"),
         );
+        detector.set_stream_poolside_strings(ctx.streams_poolside_strings());
     }
     let mut deltas = vec![];
     for token in tokens {

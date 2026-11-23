@@ -275,6 +275,7 @@ pub(crate) async fn run_chat_stream(
                 .as_ref()
                 .is_some_and(|p| p.promotes_bare_call_names()),
         );
+        detector.set_stream_poolside_strings(ctx.streams_poolside_strings());
     }
 
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {

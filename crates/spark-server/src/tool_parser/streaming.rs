@@ -64,6 +64,13 @@ pub struct StreamingToolDetector {
     /// The open envelope began with a native opener token. It is a call even
     /// under an undeclared name, so it goes to validation instead of prose.
     pub(super) native_envelope: bool,
+    /// Poolside v1: send string arguments as they are written
+    /// (`streaming_poolside.rs`). Off unless the API turns it on.
+    pub(super) stream_poolside_strings: bool,
+    /// Per-call state of that streaming: the value the scan is inside, and
+    /// the argument fragments already sent.
+    pub(super) poolside_value: super::streaming_poolside::PoolsideValue,
+    pub(super) poolside_sent: String,
 }
 
 pub enum DetectorOutput {
