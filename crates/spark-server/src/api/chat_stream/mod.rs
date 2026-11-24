@@ -99,6 +99,7 @@ pub(crate) async fn run_chat_stream(
     timeout_at: Option<std::time::Instant>,
     stop_strings: Vec<String>,
     req_return_token_ids: bool,
+    req_stream_tool_arguments: bool,
     req_ctx: Option<crate::rate_limiter::RequestContext>,
     dump_seq: Option<u64>,
     active_guard: crate::metrics::ActiveRequestGuard,
@@ -247,6 +248,7 @@ pub(crate) async fn run_chat_stream(
         max_tool_calls_per_response,
         min_tokens,
         req_return_token_ids,
+        req_stream_tool_arguments,
         req_ctx,
         dump_seq,
         tool_retry_enabled: false,
@@ -275,6 +277,7 @@ pub(crate) async fn run_chat_stream(
                 .as_ref()
                 .is_some_and(|p| p.promotes_bare_call_names()),
         );
+        detector.set_stream_poolside_strings(ctx.streams_poolside_strings());
     }
 
     let token_stream = ReceiverStream::new(token_rx).flat_map(move |event| {

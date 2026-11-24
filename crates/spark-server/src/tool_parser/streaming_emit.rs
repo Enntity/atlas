@@ -71,6 +71,9 @@ impl StreamingToolDetector {
         // Poolside values can themselves contain Hermes/XML markers. Buffer
         // them for parse_poolside_v1_call instead of scanning nested values
         // as argument envelopes for a different format.
+        if self.streams_poolside_args() {
+            return self.poolside_fragments(limit.min(self.buffer.len()), final_close);
+        }
         if self.promote_bare_names {
             return Vec::new();
         }

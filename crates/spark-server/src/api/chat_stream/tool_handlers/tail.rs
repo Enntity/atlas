@@ -50,6 +50,41 @@ pub(crate) fn advance_name_run(name_run: &mut Option<(String, u32)>, name: &str)
 /// are still caught earlier by the F11 within-response dedup.
 pub(crate) const MAX_CONSEC_SAME_NAME_CALLS: u32 = 8;
 
+/// A Poolside v1 call whose arguments streamed (`--tool-guard stream`) is
+/// validated here, at its end: the held path's hard failures (a name that is
+/// not a tool of the request, arguments that are not a JSON object) end the
+/// response as a blocked call, since the client already has part of it.
+fn streamed_poolside_call_fails(
+    state: &mut StreamState,
+    ctx: &StreamCtx,
+    name: &str,
+    args_json: &str,
+) -> bool {
+    if !state
+        .detector
+        .as_ref()
+        .is_some_and(|d| d.streams_poolside_args())
+    {
+        return false;
+    }
+    let call = tool_parser::ToolCall {
+        id: String::new(),
+        call_type: "function".into(),
+        function: tool_parser::FunctionCall {
+            name: name.into(),
+            arguments: args_json.into(),
+        },
+    };
+    let Err(tool_parser::ToolCallIssue::Hard(error)) =
+        tool_parser::assess_tool_call(&call, &ctx.tool_defs_for_backfill)
+    else {
+        return false;
+    };
+    tracing::warn!(tool = %name, "streamed tool call failed validation: {error}");
+    super::super::tool_security::reject(state, atlas_tool_guard::BlockReason::InvalidArguments);
+    true
+}
+
 pub(crate) fn handle_tool_call_end(
     state: &mut StreamState,
     ctx: &StreamCtx,
@@ -60,7 +95,11 @@ pub(crate) fn handle_tool_call_end(
         return;
     }
     if let Some((name, args_json)) = state.streaming_tool_args.remove(&idx) {
-        if super::super::tool_security::check(state, ctx, &args_json) {
+        let streamed = !state.buffered_tool_chunks.contains_key(&idx);
+        if super::super::tool_security::check(state, ctx, &args_json)
+            || streamed_poolside_call_fails(state, ctx, &name, &args_json)
+        {
+            state.guard_cut_streamed_call |= streamed;
             return;
         }
         if !ctx.state.tool_guard.enabled {
