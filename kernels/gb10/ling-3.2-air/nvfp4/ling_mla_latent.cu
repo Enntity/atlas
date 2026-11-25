@@ -21,6 +21,8 @@
 // tile with the paged prefill kernel, and merge tiles by their softmax state.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <math_constants.h>
 
 #define LING_HEADS 32u
@@ -85,10 +87,123 @@ extern "C" __global__ void __launch_bounds__(512) ling_q_absorb(
     }
 }
 
+// ---- NVFP4 absorption (Spark decode precision) -------------------------------
+//
+// With decode precision NVFP4, 0.1.0 read kv_b_proj as NVFP4 for each new
+// token. The absorbed form reads both halves every step instead, so they are
+// kept as NVFP4 too, quantized by `quantize_bf16_to_nvfp4` (groups of 16 along
+// the reduction, E4M3 group scales, one FP32 scale per matrix): the key half
+// transposed to [32 * 512][128], the value half as stored, [32 * 128][512].
+// Each output row is one warp's dot product, reduced in a fixed lane order.
+
+__device__ __constant__ float LING_E2M1[16] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
+                                               -0.f, -0.5f, -1.f, -1.5f, -2.f, -3.f, -4.f, -6.f};
+
+__device__ __forceinline__ float ling_e4m3(unsigned char b) {
+    return __half2float(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3));
+}
+
+// kv_b key rows h*256 + d -> [h*512 + c][d]. grid (32 * 512 / 256), block 256.
+extern "C" __global__ void ling_kb_transpose(const __nv_bfloat16* __restrict__ kv_b,
+                                             __nv_bfloat16* __restrict__ out) {
+    const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;  // h * 512 + c
+    const unsigned h = row / LING_LATENT, c = row % LING_LATENT;
+    for (unsigned d = 0; d < LING_NOPE; ++d)
+        out[row * LING_NOPE + d] = kv_b[(h * LING_KVB + d) * LING_LATENT + c];
+}
+
+// grid (32 * 512 / 128, ceil(rows / 8)), block 128: thread t owns latent
+// output row h * 512 + c and reduces its 128 query channels in order.
+extern "C" __global__ void __launch_bounds__(128) ling_q_absorb_nvfp4(
+    const __nv_bfloat16* __restrict__ q_full,    // [rows][32][192], rope rotated
+    const unsigned char* __restrict__ packed,    // [32 * 512][64]
+    const unsigned char* __restrict__ scales,    // [32 * 512][8]
+    const float scale2,
+    __nv_bfloat16* __restrict__ q_abs,           // [rows][32][576]
+    const unsigned rows) {
+    const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;  // h * 512 + c
+    const unsigned h = row / LING_LATENT, c = row % LING_LATENT, r0 = blockIdx.y * ABSORB_ROWS;
+    const unsigned n = min(ABSORB_ROWS, rows - r0);
+    __shared__ float q[ABSORB_ROWS][LING_NOPE];
+    __shared__ float lut[16];  // per-thread nibbles: constant memory would serialize
+    if (threadIdx.x < 16) lut[threadIdx.x] = LING_E2M1[threadIdx.x];
+    for (unsigned i = threadIdx.x; i < n * LING_NOPE; i += blockDim.x)
+        q[i / LING_NOPE][i % LING_NOPE] =
+            __bfloat162float(q_full[((r0 + i / LING_NOPE) * LING_HEADS + h) * LING_QK + i % LING_NOPE]);
+    const uint4* src = reinterpret_cast<const uint4*>(packed + static_cast<size_t>(row) * 64);
+    const uint4 w4[4] = {src[0], src[1], src[2], src[3]};
+    const uint2 sc = *reinterpret_cast<const uint2*>(scales + static_cast<size_t>(row) * 8);
+    __syncthreads();
+    float w[LING_NOPE];
+#pragma unroll
+    for (unsigned g = 0; g < 8; ++g) {
+        const float s = ling_e4m3(static_cast<unsigned char>((g < 4 ? sc.x : sc.y) >> (8 * (g % 4)))) * scale2;
+        const unsigned words[2] = {g % 2 ? w4[g / 2].z : w4[g / 2].x, g % 2 ? w4[g / 2].w : w4[g / 2].y};
+#pragma unroll
+        for (unsigned j = 0; j < 16; ++j) w[g * 16 + j] = lut[(words[j / 8] >> (4 * (j % 8))) & 0xf] * s;
+    }
+    for (unsigned r = 0; r < n; ++r) {
+        float acc = 0.f;
+#pragma unroll
+        for (unsigned d = 0; d < LING_NOPE; ++d) acc += q[r][d] * w[d];
+        __nv_bfloat16* out = q_abs + ((r0 + r) * LING_HEADS + h) * LING_ROW;
+        out[c] = __float2bfloat16(acc);
+        if (c < LING_ROPE) out[LING_LATENT + c] = q_full[((r0 + r) * LING_HEADS + h) * LING_QK + LING_NOPE + c];
+    }
+}
+
+// grid (32 heads, ceil(rows / 8)), block 128: thread v owns value output row
+// h * 128 + v and reduces its 512 latent channels in order, 64 at a time.
+extern "C" __global__ void __launch_bounds__(128) ling_v_up_nvfp4(
+    const __nv_bfloat16* __restrict__ latent,    // [rows][32][512]
+    const unsigned char* __restrict__ packed,    // [32 * 128][256]
+    const unsigned char* __restrict__ scales,    // [32 * 128][32]
+    const float scale2,
+    __nv_bfloat16* __restrict__ out,             // [rows][32 * 128]
+    const unsigned rows) {
+    const unsigned h = blockIdx.x, v = threadIdx.x, r0 = blockIdx.y * ABSORB_ROWS, row = h * LING_V + v;
+    const unsigned n = min(ABSORB_ROWS, rows - r0);
+    __shared__ float lat[ABSORB_ROWS][LING_LATENT];
+    __shared__ float lut[16];  // per-thread nibbles: constant memory would serialize
+    if (threadIdx.x < 16) lut[threadIdx.x] = LING_E2M1[threadIdx.x];
+    for (unsigned i = threadIdx.x; i < n * LING_LATENT; i += blockDim.x)
+        lat[i / LING_LATENT][i % LING_LATENT] =
+            __bfloat162float(latent[((r0 + i / LING_LATENT) * LING_HEADS + h) * LING_LATENT + i % LING_LATENT]);
+    const uint4* src = reinterpret_cast<const uint4*>(packed + static_cast<size_t>(row) * 256);
+    const uint4* ssrc = reinterpret_cast<const uint4*>(scales + static_cast<size_t>(row) * 32);
+    __syncthreads();
+    float acc[ABSORB_ROWS];
+#pragma unroll
+    for (unsigned r = 0; r < ABSORB_ROWS; ++r) acc[r] = 0.f;
+    for (unsigned part = 0; part < 4; ++part) {           // 128 channels: 8 groups of 16
+        const uint4 w4[4] = {src[part * 4], src[part * 4 + 1], src[part * 4 + 2], src[part * 4 + 3]};
+        const uint2 sc = reinterpret_cast<const uint2*>(ssrc)[part];
+        float w[128];
+#pragma unroll
+        for (unsigned g = 0; g < 8; ++g) {
+            const float s = ling_e4m3(static_cast<unsigned char>((g < 4 ? sc.x : sc.y) >> (8 * (g % 4)))) * scale2;
+            const unsigned words[2] = {g % 2 ? w4[g / 2].z : w4[g / 2].x, g % 2 ? w4[g / 2].w : w4[g / 2].y};
+#pragma unroll
+            for (unsigned j = 0; j < 16; ++j) w[g * 16 + j] = lut[(words[j / 8] >> (4 * (j % 8))) & 0xf] * s;
+        }
+#pragma unroll
+        for (unsigned r = 0; r < ABSORB_ROWS; ++r) {
+            if (r >= n) break;
+            float a = acc[r];
+#pragma unroll
+            for (unsigned j = 0; j < 128; ++j) a += w[j] * lat[r][part * 128 + j];
+            acc[r] = a;
+        }
+    }
+#pragma unroll
+    for (unsigned r = 0; r < ABSORB_ROWS; ++r)
+        if (r < n) out[(r0 + r) * LING_HEADS * LING_V + row] = __float2bfloat16(acc[r]);
+}
+
 // ---- Absorbed paged decode ----------------------------------------------------
 
 #define DEC_SPLITS 64u
-#define DEC_MIN_CHUNK 256u
+#define DEC_MIN_CHUNK 64u
 #define DEC_TILE 32u
 // Shared row stride: 576 values + 8 of padding (1,168 bytes, an odd number of
 // 16-byte units) so ldmatrix rows fall in different banks.
