@@ -8,6 +8,7 @@ mod exl3;
 mod gemma4;
 mod glm5_next;
 mod inkling2;
+mod inkling2_loopcd;
 mod inkling2_vision;
 pub use inkling2_vision::{INKLING2_IMAGE_TOKEN, INKLING2_IMAGE_TOKEN_ID};
 mod laguna;
@@ -25,8 +26,12 @@ pub(crate) use deepseek_v4::parse_deepseek_v4;
 pub use exl3::Exl3QuantConfig;
 pub(crate) use gemma4::parse_gemma4_params;
 pub(crate) use glm5_next::parse_glm5_next;
-pub use inkling2::Inkling2Config;
 pub(crate) use inkling2::parse_inkling2_loop;
+pub use inkling2::{Inkling2Config, enable_inkling2_loopcd};
+pub use inkling2_loopcd::{
+    LOOPCD_FIRST_CONTROL_TOKEN, LOOPCD_MAX_STRENGTH, LOOPCD_THINKING_TOKEN, LoopCdMode,
+    loopcd_thinking_after,
+};
 pub(crate) use laguna::parse_laguna;
 pub(crate) use longcat::parse_longcat_ngram;
 pub use lora::{PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig, parse_peft_adapter_config};

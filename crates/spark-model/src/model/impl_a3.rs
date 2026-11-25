@@ -158,6 +158,27 @@ impl TransformerModel {
         logits_dst: DevicePtr,
         stream: u64,
     ) -> Result<DevicePtr> {
+        let logits = self.lm_head_batched_capped(hidden, num_tokens, logits_dst, stream)?;
+        self.loopcd_guide(
+            hidden,
+            logits,
+            num_tokens as usize,
+            |x, y| {
+                self.lm_head_batched_capped(x, num_tokens, y, stream)
+                    .map(drop)
+            },
+            stream,
+        )?;
+        Ok(logits)
+    }
+
+    fn lm_head_batched_capped(
+        &self,
+        hidden: DevicePtr,
+        num_tokens: u32,
+        logits_dst: DevicePtr,
+        stream: u64,
+    ) -> Result<DevicePtr> {
         let h = self.config.hidden_size as u32;
         let v = self.config.vocab_size as u32;
         // Caller picks the destination so co-dispatched prefill streams can each
@@ -392,12 +413,32 @@ impl TransformerModel {
     }
 
     pub(super) fn lm_head(&self, hidden: DevicePtr, stream: u64) -> Result<DevicePtr> {
+        let logits = self.lm_head_capped(hidden, None, stream)?;
+        self.loopcd_guide(
+            hidden,
+            logits,
+            1,
+            |x, y| self.lm_head_capped(x, Some(y), stream).map(drop),
+            stream,
+        )?;
+        Ok(logits)
+    }
+
+    /// The single-row head into the model's logits, or `dst` (BF16 logits).
+    fn lm_head_capped(
+        &self,
+        hidden: DevicePtr,
+        dst: Option<DevicePtr>,
+        stream: u64,
+    ) -> Result<DevicePtr> {
         let h = self.config.hidden_size as u32;
         let v = self.config.vocab_size as u32;
         // Pick the output buffer: FP32 scratch when use_fp32_logits is on,
         // shared BF16 buffer otherwise. The sampler must use the matching
         // dtype — see `decode_logits_dtype()`.
-        let (logits, fp32) = if self.use_fp32_logits {
+        let (logits, fp32) = if let Some(dst) = dst {
+            (dst, false)
+        } else if self.use_fp32_logits {
             (self.logits_fp32_buf, true)
         } else {
             (self.buffers.logits(), false)

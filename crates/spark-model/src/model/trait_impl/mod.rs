@@ -232,6 +232,7 @@ impl Model for TransformerModel {
         self.gdn_fuse_flush_all()?;
         self.stamp_overlay_route(seq.adapter_slot);
         self.stamp_decode_moe_single(seq.adapter_slot);
+        self.loopcd_stamp_seq(seq, &[token])?;
         let logits = self.decode_dispatch(token, seq, _stream)?;
         // The decode left this token's hidden stack in the shared DFlash
         // capture row; a sequence with a row of its own keeps it there.
@@ -253,6 +254,7 @@ impl Model for TransformerModel {
         self.gdn_fuse_flush_all()?;
         self.stamp_overlay_route_batch(seqs);
         self.stamp_decode_moe_batch(seqs);
+        self.loopcd_stamp_batch(tokens, &vec![1; seqs.len()], seqs)?;
         let r = self.decode_batch_dispatch(tokens, seqs, stream);
         if r.is_err() {
             // A mid-capture refuse (MoE LoRA router/mixed/non-active) in the
@@ -487,6 +489,7 @@ impl Model for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        self.loopcd_stamp_seq(seq, tokens)?;
         let r = self.decode_verify_dispatch(tokens, seq, stream);
         if r.is_err() {
             // Same brick guard as decode_batch: a refuse mid-verify-capture
@@ -657,6 +660,7 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 2]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        self.loopcd_stamp_seq(seq, tokens)?;
         if self.native_glm_mtp_enabled() {
             let allow = self.take_verify_row_masks(2)?;
             let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
@@ -677,6 +681,7 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 3]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        self.loopcd_stamp_seq(seq, tokens)?;
         self.decode_verify_graphed_k3_dispatch(tokens, seq, _stream)
     }
     fn decode_verify_graphed_k4(
@@ -687,6 +692,7 @@ impl Model for TransformerModel {
     ) -> Result<[u32; 4]> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        self.loopcd_stamp_seq(seq, tokens)?;
         self.decode_verify_graphed_k4_dispatch(tokens, seq, _stream)
     }
     fn can_batch_glm_long_verify_rows(&self, owners: usize, rows: usize) -> bool {
@@ -784,6 +790,7 @@ impl Model for TransformerModel {
         for (seq, &k) in seqs.iter_mut().zip(ks) {
             self.mark_gdn_deferred_commit(seq, k)?;
         }
+        self.loopcd_stamp_batch(tokens, ks, seqs)?;
         // Over a TP pair the worker runs the same forward (`ep_verify_batch`).
         self.ep_broadcast_verify_batch(tokens, ks, seqs)?;
         self.decode_verify_batched_dispatch(tokens, ks, seqs, _stream)
@@ -885,6 +892,7 @@ impl Model for TransformerModel {
         };
         let seq_len = seq.seq_len;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        self.loopcd_stamp_seq(seq, tokens)?;
         let rows = self.decode_verify_graphed_kgamma_dispatch(tokens, seq, _stream, allow)?;
         if let Some(serial) = serial {
             self.exact_verify_compare(serial, seq_len)?;
@@ -899,6 +907,7 @@ impl Model for TransformerModel {
     ) -> Result<Vec<u32>> {
         self.ssm_pool.require_verify_rollback_supported()?;
         self.mark_gdn_deferred_commit(seq, tokens.len())?;
+        self.loopcd_stamp_seq(seq, tokens)?;
         self.decode_and_verify_fused_dispatch(tokens, seq, _stream)
     }
     fn save_hidden_for_catchup(&self, token_idx: usize, pos: usize) -> Result<()> {

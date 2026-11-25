@@ -835,9 +835,10 @@ pub use gguf::{GgufConfigInputs, GgufMeta, config_from_gguf};
 pub use ngram::{NgramDims, ngram_ids, shift_right_ignore_eos, shift_right_ignore_eos_fill};
 pub use ngram_qwen4exp::Qwen4ExpNgram;
 pub use parsers::{
-    Exl3QuantConfig, Inkling2Config, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig,
-    RICURSIVE_FFN_CLAMP, parse_mistral_params, parse_peft_adapter_config,
-    parse_quantization_config,
+    Exl3QuantConfig, Inkling2Config, LOOPCD_FIRST_CONTROL_TOKEN, LOOPCD_MAX_STRENGTH,
+    LOOPCD_THINKING_TOKEN, LoopCdMode, PEFT_SUPPORTED_TARGET_MODULES, PeftAdapterConfig,
+    RICURSIVE_FFN_CLAMP, enable_inkling2_loopcd, loopcd_thinking_after, parse_mistral_params,
+    parse_peft_adapter_config, parse_quantization_config,
 };
 pub use parsers::{INKLING2_IMAGE_TOKEN, INKLING2_IMAGE_TOKEN_ID};
 pub(crate) use parsers::{

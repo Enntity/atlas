@@ -225,17 +225,21 @@ pub fn build_model(
         let inkling_dflash2 =
             config.model_type == "inkling2_loop" && args.drafter_config.is_dflash2();
         if args.drafter_config.is_inkling2_dspark() || inkling_dflash2 {
+            // LoopCD's reference visits run after the model's last; taps name the model's
+            let visits = config
+                .inkling2
+                .as_ref()
+                .map_or(config.num_hidden_layers, |i| i.model_visits());
             anyhow::ensure!(
                 config.model_type == "inkling2_loop"
                     && sub
                         .target_layer_ids
                         .iter()
-                        .all(|&t| (1..=config.num_hidden_layers).contains(&t))
-                    && (!inkling_dflash2
-                        || sub.target_layer_ids.last() == Some(&config.num_hidden_layers)),
+                        .all(|&t| (1..=visits).contains(&t))
+                    && (!inkling_dflash2 || sub.target_layer_ids.last() == Some(&visits)),
                 "Inkling 2 drafter taps {:?} need an Inkling 2 target of {} visits{}",
                 sub.target_layer_ids,
-                config.num_hidden_layers,
+                visits,
                 if inkling_dflash2 {
                     ", the last the final-norm output"
                 } else {
@@ -1395,6 +1399,7 @@ pub fn build_model(
         ssm_checkpoint_interval,
         ssm_pools,
     )?;
+    model.attach_loopcd()?;
     model.set_dflash_warm_store(dflash_warm_store);
     if let Some(arena) = pipe_arena {
         model.set_prefill_pipe(arena)?;

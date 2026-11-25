@@ -20,7 +20,7 @@ use crate::layer::TransformerLayer;
 use crate::layers::inkling2::glue::GlueKernels;
 use crate::layers::inkling2::layer::{Inkling2Layer, Params};
 use crate::layers::inkling2::ops::Inkling2Kernels;
-use crate::layers::inkling2::schedule::{max_blocks, schedule};
+use crate::layers::inkling2::schedule::{loopcd_stash, max_blocks, schedule};
 use crate::layers::inkling2::shared::{Dims, Shared};
 use crate::layers::inkling2::weights::{self as iw, GlobalWeights};
 use crate::weight_map::{DenseWeight, MtpWeights, dense};
@@ -38,8 +38,9 @@ fn header(store: &WeightStore) -> Result<plan::Header> {
         .collect()
 }
 
-fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize, max_seqs: usize) -> Dims {
+fn dims(config: &ModelConfig, max_rows: usize, max_seqs: usize) -> Dims {
     let ink = config.inkling2.as_ref().expect("inkling2 config");
+    let visits = schedule(ink);
     Dims {
         hidden: config.hidden_size,
         q_dim: config.num_attention_heads * config.head_dim,
@@ -52,11 +53,12 @@ fn dims(config: &ModelConfig, stack_blocks: usize, max_rows: usize, max_seqs: us
         inter: config.moe_intermediate_size,
         // blocks of at least 8 tokens over the longest context
         max_blocks_per_seq: config.max_position_embeddings.div_ceil(8),
-        stack_blocks,
+        stack_blocks: max_blocks(&visits),
         max_rows,
         max_seqs,
         visits: config.num_hidden_layers,
         conv_k: ink.sconv_kernel_size,
+        loopcd_stash: loopcd_stash(&visits),
     }
 }
 
@@ -149,7 +151,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
             route_scale: config.routed_scaling_factor as f32,
         };
         // the real row capacity arrives with attach_layer_buffers
-        let d = dims(config, max_blocks(&visits), 1, 1);
+        let d = dims(config, 1, 1);
         tracing::info!(
             "Inkling2: {} physical layers, {} visits, block stack {}",
             physical.len(),
@@ -174,6 +176,7 @@ impl ModelWeightLoader for Inkling2WeightLoader {
                     bound_states: Default::default(),
                     fused_proj: false,
                     fused_mixed: false,
+                    loopcd_rows: Default::default(),
                 }) as Box<dyn TransformerLayer>
             })
             .collect())
@@ -188,10 +191,9 @@ impl ModelWeightLoader for Inkling2WeightLoader {
         max_tokens: usize,
         max_seqs: usize,
     ) -> Result<()> {
-        let ink = config.inkling2.as_ref().context("inkling2 config")?;
+        config.inkling2.as_ref().context("inkling2 config")?;
         let d = dims(
             config,
-            max_blocks(&schedule(ink)),
             max_tokens.max(1),
             // batched decode pads its rows up the graph ladder
             spark_runtime::buffers::padded_batch_rung(max_seqs.max(1)),

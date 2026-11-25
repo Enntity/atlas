@@ -83,3 +83,41 @@ fn mini_passes_and_loop_layers() {
         .collect();
     assert_eq!(full, [5, 11, 17, 23, 29, 35, 41, 47]);
 }
+
+#[test]
+fn loopcd_reruns_the_coda_from_the_first_pass() {
+    let mut config = parse_config(CONFIG).unwrap();
+    atlas_core::config::enable_inkling2_loopcd(&mut config, atlas_core::config::LoopCdMode::On)
+        .unwrap();
+    let s = schedule(config.inkling2.as_ref().unwrap());
+    assert_eq!(s.len(), 54);
+    assert!(s[47].last && s.iter().filter(|v| v.last).count() == 1);
+    assert_eq!(s[18].loopcd, LoopCdRole::SaveFirstPass);
+    assert_eq!((s[18].blocks_before, s[18].message_blocks), (1, 1));
+    assert_eq!(
+        s.iter()
+            .filter(|v| v.loopcd == LoopCdRole::SaveFirstPass)
+            .count(),
+        1
+    );
+    for i in 0..6 {
+        let (model, reference) = (s[42 + i], s[48 + i]);
+        assert_eq!(
+            reference.loopcd,
+            LoopCdRole::Reference {
+                enter: i == 0,
+                leave: i == 5
+            }
+        );
+        // the same physical layer at the same stack depth
+        assert_eq!(
+            (reference.physical, reference.full, reference.boundary),
+            (model.physical, model.full, model.boundary)
+        );
+        assert_eq!(reference.blocks_before, model.blocks_before);
+        assert_eq!((reference.pass, reference.message_blocks), (0, 0));
+    }
+    assert_eq!(max_blocks(&s), 4);
+    // off: the plain schedule, no LoopCD roles
+    assert!(mini().iter().all(|v| v.loopcd == LoopCdRole::None));
+}

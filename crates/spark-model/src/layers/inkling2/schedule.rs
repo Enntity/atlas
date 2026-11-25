@@ -38,11 +38,27 @@ pub(crate) struct Visit {
     pub restart: bool,
     /// Blocks of the previous pass the messages read (later passes only).
     pub message_blocks: usize,
+    /// LoopCD: this visit's role in the reference coda pass.
+    pub loopcd: LoopCdRole,
+}
+
+/// What a visit does for LoopCD's reference coda pass (`inkling2_loopcd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LoopCdRole {
+    #[default]
+    None,
+    /// The second pass's restart: first stash the first pass (its output
+    /// and the blocks it pushed, `message_blocks + 1` from `blocks_before`).
+    SaveFirstPass,
+    /// A reference coda visit; the first sets the final output aside and
+    /// restores the first pass, the last writes the reference rows and puts
+    /// the final output back.
+    Reference { enter: bool, leave: bool },
 }
 
 pub(crate) fn schedule(ink: &Inkling2Config) -> Vec<Visit> {
     let block = ink.attn_res_block_size;
-    let visits = ink.num_visits();
+    let visits = ink.model_visits();
     let mut out = Vec::with_capacity(visits);
     let mut blocks = 0usize;
     let mut prelude_blocks = 0usize;
@@ -72,6 +88,11 @@ pub(crate) fn schedule(ink: &Inkling2Config) -> Vec<Visit> {
             save_prelude: v + 1 == ink.core_start,
             restart,
             message_blocks: if pass > 0 { message_blocks } else { 0 },
+            loopcd: if restart && pass == 1 && ink.reference_visits() > 0 {
+                LoopCdRole::SaveFirstPass
+            } else {
+                LoopCdRole::None
+            },
         });
         if boundary {
             blocks += 1;
@@ -80,7 +101,33 @@ pub(crate) fn schedule(ink: &Inkling2Config) -> Vec<Visit> {
             prelude_blocks = blocks;
         }
     }
+    reference_visits(ink, &mut out);
     out
+}
+
+/// LoopCD's reference coda: the model's coda visits again, from the first
+/// pass's state, which holds as many blocks as the last pass's.
+fn reference_visits(ink: &atlas_core::config::Inkling2Config, out: &mut Vec<Visit>) {
+    let n = ink.reference_visits();
+    let coda = out.len() - (ink.physical_layers - ink.core_end);
+    for i in 0..n {
+        let mut v = out[coda + i];
+        v.last = false;
+        v.loopcd = LoopCdRole::Reference {
+            enter: i == 0,
+            leave: i + 1 == n,
+        };
+        out.push(v);
+    }
+}
+
+/// Where LoopCD's first-pass stash sits on the block stack: `(first block,
+/// blocks)`, `(0, 0)` with LoopCD off.
+pub(crate) fn loopcd_stash(visits: &[Visit]) -> (usize, usize) {
+    visits
+        .iter()
+        .find(|v| v.loopcd == LoopCdRole::SaveFirstPass)
+        .map_or((0, 0), |v| (v.blocks_before, v.message_blocks + 1))
 }
 
 /// Most blocks B ever holds (sizes the shared stack).
