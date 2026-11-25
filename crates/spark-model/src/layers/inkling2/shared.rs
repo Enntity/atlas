@@ -35,6 +35,9 @@ pub(crate) struct Dims {
     pub visits: usize,
     /// Short-conv width (a visit's conv state keeps `conv_k - 1` columns).
     pub conv_k: usize,
+    /// LoopCD's first-pass stash on the stack, `(first block, blocks)`;
+    /// `(0, 0)` = LoopCD off (`schedule::loopcd_stash`).
+    pub loopcd_stash: (usize, usize),
 }
 
 impl Dims {
@@ -122,6 +125,13 @@ pub(crate) struct Shared {
     pub proj_tables: DevicePtr,
     /// The conv state of every graph-padding row (written, never read)
     pub pad_conv: DevicePtr,
+    // LoopCD (`loopcd.rs`), empty when off: the first pass's output and
+    // blocks, the final output while the reference coda runs, and the
+    // reference rows it leaves (BF16, row-indexed like the forward's hidden)
+    pub ref_h: DevicePtr,
+    pub ref_blocks: DevicePtr,
+    pub keep_final: DevicePtr,
+    pub loopcd_ref: DevicePtr,
 }
 
 /// Carves one allocation into 256-byte aligned pieces.
@@ -146,6 +156,7 @@ impl Arena {
 impl Shared {
     fn carve(a: &mut Arena, d: &Dims) -> Self {
         let (h, r, f, b) = (d.hidden, d.max_rows, 4usize, 2usize);
+        let lrows = if d.loopcd_stash.1 > 0 { r * h * b } else { 0 };
         Self {
             blocks: a.take(d.stack_blocks * r * h * b),
             prelude_h: a.take(r * h * b),
@@ -204,6 +215,10 @@ impl Shared {
             state_tables: a.take(d.visits * d.max_seqs * 8),
             proj_tables: a.take(d.visits * super::glue::BATCHM_MAX_ROWS * super::proj::TABLE_BYTES),
             pad_conv: a.take(d.conv_state_bytes()),
+            ref_h: a.take(lrows),
+            ref_blocks: a.take(d.loopcd_stash.1 * r * h * b),
+            keep_final: a.take(lrows),
+            loopcd_ref: a.take(lrows),
         }
     }
 

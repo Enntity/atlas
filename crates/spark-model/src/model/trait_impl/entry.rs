@@ -37,6 +37,7 @@ impl TransformerModel {
         // Full prefill computes on default; its eager consumer must follow it.
         let stream = self.gpu.default_stream();
         self.stamp_overlay_route(seq.adapter_slot);
+        self.loopcd_stamp_prompt(tokens, tokens.len())?;
 
         (|| {
             let logits = self.prefill_dispatch(tokens, seq, stream)?;
@@ -64,6 +65,7 @@ impl TransformerModel {
             stream
         };
         self.stamp_overlay_route(seq.adapter_slot);
+        self.loopcd_stamp_prompt(tokens, chunk_start + chunk_len)?;
         // Chunk 0 keys a vision prompt for the prefix cache (`vision_cache`);
         // a retried chunk 0 keeps the key its lookup used.
         if chunk_start == 0 && !seq.prefix_lookup_applied {
@@ -102,6 +104,7 @@ impl TransformerModel {
             stream
         };
         self.stamp_overlay_route(seq.adapter_slot);
+        self.loopcd_stamp_prompt(tokens, tokens.len())?;
 
         (|| {
             let logits = self.prefill_twophase_dispatch(tokens, seq, chunk_size, stream)?;

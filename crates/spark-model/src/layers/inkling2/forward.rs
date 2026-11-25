@@ -61,6 +61,7 @@ impl Inkling2Layer {
 
         // `hidden` arrives normed: the embedding table is (`load_embedding`),
         // and image rows never pass through `embed_norm`.
+        self.loopcd_enter(gpu, hidden, n, stream)?;
         let states = self.bind_states(gpu, conv_states, ctx.graph_capture, stream)?;
         for (j, state) in batch.journals.iter().zip(conv_states) {
             gpu.copy_d2d_async(*state, *j, self.conv_state_bytes(), stream)?;
@@ -400,7 +401,9 @@ impl Inkling2Layer {
         if v.save_prelude {
             gpu.copy_d2d_async(hidden, s.prelude_h, rb, stream)?;
         }
-        if v.last {
+        // the final block residual: the model's rows, or LoopCD's reference
+        let leaves = self.loopcd_leaves();
+        if v.last || leaves {
             self.block_res(
                 gpu,
                 n,
@@ -413,7 +416,11 @@ impl Inkling2Layer {
                 s.final_out,
                 stream,
             )?;
-            gm.cast_bf16(gpu, s.final_out, hidden, n * h, stream)?;
+            let out = if leaves { s.loopcd_ref } else { hidden };
+            gm.cast_bf16(gpu, s.final_out, out, n * h, stream)?;
+        }
+        if leaves {
+            self.loopcd_leave(gpu, hidden, n, stream)?;
         }
         Ok(())
     }

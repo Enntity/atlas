@@ -85,7 +85,28 @@ impl TransformerModel {
         bf16: usize,
         stream: u64,
     ) -> Result<DevicePtr> {
-        let logits = self.lm_head_project_batched_raw(normed, padded_n, h, bf16, stream)?;
+        let logits = self.buffers.logits();
+        self.lm_head_project_capped(normed, padded_n, h, bf16, logits, stream)?;
+        self.loopcd_guide(
+            normed,
+            logits,
+            padded_n,
+            |x, y| self.lm_head_project_capped(x, padded_n, h, bf16, y, stream),
+            stream,
+        )?;
+        Ok(logits)
+    }
+
+    fn lm_head_project_capped(
+        &self,
+        normed: DevicePtr,
+        padded_n: usize,
+        h: usize,
+        bf16: usize,
+        logits: DevicePtr,
+        stream: u64,
+    ) -> Result<()> {
+        self.lm_head_project_batched_raw(normed, padded_n, h, bf16, logits, stream)?;
         // The single-row head and the verify head (`lm_head_batched`) cap
         // their logits; the batched decode rows must too, or a softcapped
         // model (Gemma, Inkling 2) samples its C>=2 rows from uncapped logits.
@@ -98,7 +119,7 @@ impl TransformerModel {
                 stream,
             )?;
         }
-        Ok(logits)
+        Ok(())
     }
 
     fn lm_head_project_batched_raw(
@@ -107,9 +128,9 @@ impl TransformerModel {
         padded_n: usize,
         h: usize,
         bf16: usize,
+        logits: DevicePtr,
         stream: u64,
     ) -> Result<DevicePtr> {
-        let logits = self.buffers.logits();
         let v = self.config.vocab_size;
         // qwen3_5's batch lever (`exact_verify.rs`): each row the single-row
         // decode head's bytes (`dense_gemv_bf16` arithmetic, 8 rows a pass

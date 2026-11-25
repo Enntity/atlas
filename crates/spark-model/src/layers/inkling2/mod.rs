@@ -11,6 +11,7 @@ mod forward;
 mod gate_ops;
 pub(crate) mod glue;
 pub(crate) mod layer;
+mod loopcd;
 mod moe_ops;
 mod moe_prefill_hip;
 pub(crate) mod ops;

@@ -36,6 +36,14 @@ pub const DEFAULT_KV_CACHE_DTYPE: &str = "fp8";
 pub struct ServeArgs {
     #[command(flatten)]
     pub tool_guard: super::tool_guard_args::ToolGuardArgs,
+    /// LoopCD for looped Inkling 2 checkpoints (arXiv 2610.02185): the first
+    /// loop pass also runs the coda, and the served logits move away from
+    /// what it predicts, most where the model is least sure. Costs decode
+    /// speed and KV (one more full-attention visit of every nine). `on`
+    /// guides every token; `skip-thinking` leaves thinking messages and
+    /// control-token probabilities alone. Off by default.
+    #[arg(long, default_value = "off", value_parser = ["off", "on", "skip-thinking"])]
+    pub loopcd: String,
     /// HuggingFace model ID (e.g. "nvidia/Qwen3-Next-80B-A3B-Instruct-NVFP4")
     /// or a local directory path containing config.json.
     /// Optional: omit both this and `--model-from-path` to boot into the

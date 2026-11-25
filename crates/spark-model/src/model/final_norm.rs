@@ -84,7 +84,8 @@ impl TransformerModel {
             h as u32,
             self.config.rms_norm_eps as f32,
             stream,
-        )
+        )?;
+        self.loopcd_norm(input, output, rows, stream)
     }
 }
 

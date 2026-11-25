@@ -151,3 +151,33 @@ fn mini_declares_its_vision_tower() {
     assert_eq!(v.rms_norm_eps, 1e-5);
     assert_eq!(v.image_pad_token_id, 200_054);
 }
+
+#[test]
+fn loopcd_appends_the_reference_coda_visits() {
+    use crate::config::{LoopCdMode, enable_inkling2_loopcd};
+    let plain = parse_config(MINI).unwrap();
+    let mut off = plain.clone();
+    enable_inkling2_loopcd(&mut off, LoopCdMode::Off).unwrap();
+    assert_eq!(off.inkling2, plain.inkling2, "--loopcd off changes nothing");
+    assert_eq!(off.num_hidden_layers, 48);
+    assert_eq!(off.sliding_attention_layers, plain.sliding_attention_layers);
+
+    let mut config = plain.clone();
+    enable_inkling2_loopcd(&mut config, LoopCdMode::On).unwrap();
+    let ink = config.inkling2.as_ref().unwrap();
+    assert_eq!((ink.model_visits(), ink.reference_visits()), (48, 6));
+    assert_eq!(config.num_hidden_layers, 54);
+    assert_eq!(config.layer_types, vec![LayerType::FullAttention; 54]);
+    let physical: Vec<usize> = (42..54).map(|v| ink.visit_physical(v)).collect();
+    assert_eq!(physical, [18, 19, 20, 21, 22, 23, 18, 19, 20, 21, 22, 23]);
+    assert!((48..54).all(|v| ink.visit_pass(v) == 0));
+    // the reference visit of physical 23 is full attention, the rest sliding
+    let full: Vec<usize> = (0..54)
+        .filter(|v| !config.sliding_attention_layers.contains(v))
+        .collect();
+    assert_eq!(full, [5, 11, 17, 23, 29, 35, 41, 47, 53]);
+    assert!(enable_inkling2_loopcd(&mut config, LoopCdMode::On).is_err());
+
+    let mut other = crate::config::ModelConfig::qwen3_next_80b_nvfp4();
+    assert!(enable_inkling2_loopcd(&mut other, LoopCdMode::SkipThinking).is_err());
+}

@@ -86,6 +86,9 @@ pub(crate) struct Inkling2Layer {
     /// Whether one decode row's input projections, NVFP4 ones among them, run
     /// as one launch (`proj.rs`)
     pub fused_mixed: bool,
+    /// LoopCD's last reference visit: the hidden buffer of the forward that
+    /// last wrote `Shared::loopcd_ref` (`loopcd.rs`), shared with the head.
+    pub loopcd_rows: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Inkling2Layer {

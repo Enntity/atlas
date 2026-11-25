@@ -21,6 +21,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
 use super::super::{LayerType, ModelConfig, finalize_config};
+pub use super::inkling2_loopcd::LoopCdMode;
 
 /// Inkling-specific architecture numbers the shared `ModelConfig` has no field
 /// for. Visit indices are positions in the unrolled sequence the engine runs.
@@ -44,6 +45,8 @@ pub struct Inkling2Config {
     pub attn_res_block_size: usize,
     pub mlp_gate_softcap: f32,
     pub mlp_up_softcap: f32,
+    /// LoopCD (`inkling2_loopcd`): off unless the server asks for it.
+    pub loopcd: LoopCdMode,
 }
 
 impl Inkling2Config {
@@ -51,9 +54,23 @@ impl Inkling2Config {
         self.core_end - self.core_start
     }
 
-    /// Number of visits in the unrolled sequence.
-    pub fn num_visits(&self) -> usize {
+    /// Visits of the model itself: prelude, core x passes, coda.
+    pub fn model_visits(&self) -> usize {
         self.physical_layers + (self.num_passes - 1) * self.core_len()
+    }
+
+    /// LoopCD's reference coda visits, run after the model's (0 when off).
+    pub fn reference_visits(&self) -> usize {
+        if self.loopcd == LoopCdMode::Off {
+            0
+        } else {
+            self.physical_layers - self.core_end
+        }
+    }
+
+    /// Number of visits in the unrolled sequence the engine runs.
+    pub fn num_visits(&self) -> usize {
+        self.model_visits() + self.reference_visits()
     }
 
     /// Physical layer whose weights visit `v` runs.
@@ -63,8 +80,10 @@ impl Inkling2Config {
             v
         } else if v < core_visits_end {
             self.core_start + (v - self.core_start) % self.core_len()
-        } else {
+        } else if v < self.model_visits() {
             v - core_visits_end + self.core_end
+        } else {
+            v - self.model_visits() + self.core_end
         }
     }
 
@@ -77,6 +96,38 @@ impl Inkling2Config {
             0
         }
     }
+}
+
+/// Batched decode/verify only treat FullAttention as attention (as for
+/// Gemma-4 and Ricursive): label every visit full and list the sliding ones.
+fn set_visit_layers(config: &mut ModelConfig, ink: &Inkling2Config) {
+    let visits = ink.num_visits();
+    config.num_hidden_layers = visits;
+    config.layer_types = vec![LayerType::FullAttention; visits];
+    config.sliding_attention_layers = (0..visits)
+        .filter(|&v| ink.local_physical.contains(&ink.visit_physical(v)))
+        .collect();
+}
+
+/// Serve LoopCD ([`LoopCdMode`]): the reference coda visits join the
+/// unrolled sequence, each with its own KV and conv state. `Off` changes
+/// nothing; any other mode needs an Inkling 2 checkpoint.
+pub fn enable_inkling2_loopcd(config: &mut ModelConfig, mode: LoopCdMode) -> Result<()> {
+    if mode == LoopCdMode::Off {
+        return Ok(());
+    }
+    let mut ink = config
+        .inkling2
+        .clone()
+        .context("--loopcd needs an Inkling 2 (inkling2_loop) checkpoint")?;
+    ensure!(
+        ink.loopcd == LoopCdMode::Off,
+        "inkling2 LoopCD is already on"
+    );
+    ink.loopcd = mode;
+    set_visit_layers(config, &ink);
+    config.inkling2 = Some(ink);
+    Ok(())
 }
 
 fn get<'a>(raw: &'a Value, key: &str) -> Result<&'a Value> {
@@ -139,6 +190,7 @@ pub(crate) fn parse_inkling2_loop(raw: &Value) -> Result<ModelConfig> {
         attn_res_block_size: usize_of(text, "n_layers_per_attn_res_block")?,
         mlp_gate_softcap: f64_of(text, "mlp_gate_softcap")? as f32,
         mlp_up_softcap: f64_of(text, "mlp_up_softcap")? as f32,
+        loopcd: LoopCdMode::Off,
     };
 
     // The variants below are different models; refuse them instead of running
@@ -227,12 +279,7 @@ pub(crate) fn parse_inkling2_loop(raw: &Value) -> Result<ModelConfig> {
     let mut config: ModelConfig =
         serde_json::from_value(normalized).context("Failed to parse inkling2 config")?;
 
-    // Batched decode/verify only treat FullAttention as attention (as for
-    // Gemma-4 and Ricursive): label every visit full and list the sliding ones.
-    config.layer_types = vec![LayerType::FullAttention; visits];
-    config.sliding_attention_layers = (0..visits)
-        .filter(|&v| ink.local_physical.contains(&ink.visit_physical(v)))
-        .collect();
+    set_visit_layers(&mut config, &ink);
     config.partial_rotary_factor = 0.0;
     config.rotary_dim = 0;
     config.attn_gated = true;

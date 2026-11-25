@@ -129,6 +129,10 @@ pub(crate) fn load_model(
     // 1. Load model config (supports HF config.json and Mistral params.json)
     spark_runtime::progress::phase(2, "config");
     let (mut config, config_json) = serve_phases::load_model_config(&model_dir)?;
+    atlas_core::config::enable_inkling2_loopcd(
+        &mut config,
+        atlas_core::config::LoopCdMode::parse(&args.loopcd)?,
+    )?;
     atlas_core::qwen_yarn::configure_context(&mut config, args.qwen_yarn_factor, args.max_seq_len)?;
     if config.model_type == "qwen4_exp" && config.yarn_factor > 0.0 {
         tracing::info!(

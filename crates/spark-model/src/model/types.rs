@@ -549,6 +549,8 @@ pub struct TransformerModel {
     /// (byte-identical to a no-overlay build). Built in `set_lora_weights`
     /// (Stage 2) from the resident pool's Stage-1 raw uploads.
     pub(super) overlays: Option<crate::lora::TokenOverlaySet>,
+    /// LoopCD's guided head (`loopcd.rs`); `None` = off, every hook a no-op.
+    pub(super) loopcd: Option<Box<super::loopcd::LoopCdHead>>,
     /// Feature-2 token overlay kernels, resolved once at construction via
     /// `try_kernel` (null-on-miss ⇒ overlay silently unused on an older image).
     pub(super) overlay_kernels: crate::layers::ops::token_overlay::OverlayKernels,
