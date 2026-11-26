@@ -16,7 +16,6 @@ mod adaptive_rung;
 mod adaptive_spec;
 mod admission;
 mod beam_prefill;
-mod busy_chunk;
 #[cfg(test)]
 mod cancel_test_model;
 mod confidence;
@@ -721,8 +720,7 @@ pub fn run(
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
         let in_flight_before = active.len() + prefilling.len();
-        // ATLAS_PREFILL_BUSY_TOKENS: shorter chunks while sequences decode
-        let chunk_tokens = busy_chunk::cap(max_prefill_tokens, !active.is_empty());
+        let decoding_before = !active.is_empty();
         ttft_trace::begin_tick();
         start_new_requests(
             &*model,
@@ -731,7 +729,7 @@ pub fn run(
             pc_plants,
             chunked,
             always_mixed,
-            chunk_tokens,
+            max_prefill_tokens,
             max_batch_tokens,
             &eos_tokens,
             prefill_stream,
@@ -774,27 +772,31 @@ pub fn run(
                 .map_or(num_drafts, |max| num_drafts.min(max)),
             dflash_verify_raw_argmax: use_mtp && dflash_verify_raw_argmax,
         };
-        // Under EP a new prompt's first chunk ran inline just above. End
-        // the tick before its second chunk: decoders get their step, and
-        // prompts that arrived during the first chunk are admitted at the
-        // next boundary (two back-to-back 8K chunks held both ~6 s).
+        // A new prompt's first chunk ran inline just above. Under EP, or
+        // while sequences were decoding, end the tick before its second
+        // chunk: decoders get their step, and prompts that arrived during
+        // the first chunk are admitted at the next boundary (two
+        // back-to-back 8K chunks held both ~6 s under EP; on Inkling 2 Mini
+        // a stream beside a 32K-token prompt waited 3.47 s for two 8K
+        // chunks, 2.09 s for one).
         // (ATLAS_GLM_WARM_CHUNK_RUN: not when that chunk computed nothing.
         // ATLAS_GLM_PREFILL_YIELD_MS: nor when it queued its first chunk for
         // the continue phase, which then ran nothing yet.)
-        let head_just_started = (model.is_ep() || phase_continue_prefills::decode_share::enabled())
+        let head_just_started = (model.is_ep()
+            || decoding_before
+            || phase_continue_prefills::decode_share::enabled())
             && prefill_queue_was_empty
             && prefilling.first().is_some_and(|p| {
                 !phase_continue_prefills::follows_first_chunk(p)
                     && !phase_continue_prefills::layer_yield::queued(&sched.levers, &*model, p)
             });
-        let continue_chunk = busy_chunk::cap(max_prefill_tokens, !active.is_empty());
         let did_mixed_step = !head_just_started
             && continue_in_progress_prefills(
                 &*model,
                 &*policy,
                 &mut active,
                 &mut prefilling,
-                continue_chunk,
+                max_prefill_tokens,
                 max_batch_tokens,
                 always_mixed,
                 prefill_stream,
