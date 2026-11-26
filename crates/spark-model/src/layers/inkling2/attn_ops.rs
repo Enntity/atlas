@@ -159,6 +159,10 @@ pub(crate) struct PrefillAttn {
     pub k_cache: DevicePtr,
     pub v_cache: DevicePtr,
     pub out: DevicePtr,
+    /// The output gate's inputs and the gated output, which
+    /// `inkling2_flash_prefill` writes instead of `out` ([`prefill_attn`])
+    pub gate: DevicePtr,
+    pub gated: DevicePtr,
     pub block_table: DevicePtr,
     pub rel: DevicePtr,
     pub rel_proj: DevicePtr,
@@ -182,16 +186,24 @@ pub(crate) struct PrefillAttn {
 /// tiles; a verify block of a few rows keeps the per-head kernel, whose grid
 /// covers the GPU at that size).
 const FLASH_MIN_ROWS: usize = 64;
+/// Rows of the per-head kernel's bias table (`Shared::rel_table`): the runs
+/// below [`FLASH_MIN_ROWS`], the only ones that take it.
+pub(crate) const REL_TABLE_ROWS: usize = FLASH_MIN_ROWS - 1;
 /// `inkling2_flash_prefill.cu` FP_GROUP: query heads per KV head; FP_D_REL.
 const FLASH_GROUP: usize = 3;
 const FLASH_D_REL: usize = 16;
+/// `inkling2_flash_prefill.cu` FP_SMEM: double-buffered K/V tiles, then each
+/// of the 12 warps' fp32 bias tile (16 rows x a 52-float pitch).
+const FLASH_SMEM: u32 = 2 * 2 * 32 * 136 * 2 + 12 * 16 * 52 * 4;
 
+/// Whether the output left gated (`a.gated`, the flash kernel) or ungated in
+/// `a.out` for the caller's gate.
 pub(crate) fn prefill_attn(
     gpu: &dyn GpuBackend,
     k: &Inkling2Kernels,
     a: &PrefillAttn,
     stream: u64,
-) -> Result<()> {
+) -> Result<bool> {
     ensure!(
         a.head_dim == 128 && a.d_rel <= MAX_D_REL && a.rel_extent <= MAX_REL_EXTENT,
         "inkling2 prefill attention limits"
@@ -210,14 +222,17 @@ pub(crate) fn prefill_attn(
         && a.d_rel == FLASH_D_REL
     {
         // a prefill chunk: one CTA per (KV head, 64 tokens) shares each K/V tile
-        // with the group's query heads, computing the bias where it adds it
-        return KernelLaunch::new(gpu, k.flash_prefill)
+        // with the group's query heads, computing the bias where it adds it and
+        // gating its output
+        KernelLaunch::new(gpu, k.flash_prefill)
             .grid([kv_heads, q_len.div_ceil(64), 1])
             .block([384, 1, 1])
+            .shared_mem(FLASH_SMEM)
             .arg_ptr(a.q)
             .arg_ptr(a.k_cache)
             .arg_ptr(a.v_cache)
-            .arg_ptr(a.out)
+            .arg_ptr(a.gated)
+            .arg_ptr(a.gate)
             .arg_ptr(a.block_table)
             .arg_ptr(a.rel)
             .arg_ptr(a.rel_proj_t)
@@ -230,7 +245,8 @@ pub(crate) fn prefill_attn(
             .arg_u32(u32_of(a.sliding_window, "window")?)
             .arg_u32(extent)
             .arg_f32((a.head_dim as f32).powf(-0.5))
-            .launch(stream);
+            .launch(stream)?;
+        return Ok(true);
     }
     if cfg!(atlas_scale) {
         // AMD: the bias is computed inside the prefill body (no table); 16 coefficients a head.
@@ -239,7 +255,7 @@ pub(crate) fn prefill_attn(
             "inkling2 AMD prefill attention takes d_rel 16, not {}",
             a.d_rel
         );
-        return KernelLaunch::new(gpu, k.prefill_attn)
+        KernelLaunch::new(gpu, k.prefill_attn)
             .grid([heads, q_len.div_ceil(32), 1])
             .block([128, 1, 1])
             .arg_ptr(a.q)
@@ -261,8 +277,14 @@ pub(crate) fn prefill_attn(
             .arg_ptr(a.rel)
             .arg_u32(extent)
             .arg_ptr(a.rel_proj_t)
-            .launch(stream);
+            .launch(stream)?;
+        return Ok(false);
     }
+    ensure!(
+        a.q_len <= REL_TABLE_ROWS,
+        "inkling2 per-head prefill attention: {} rows over the bias table's {REL_TABLE_ROWS}",
+        a.q_len
+    );
     KernelLaunch::new(gpu, k.rel_bias_table)
         .grid([
             extent.div_ceil(256),
@@ -297,7 +319,8 @@ pub(crate) fn prefill_attn(
         .arg_ptr(a.sinks)
         .arg_ptr(a.bias)
         .arg_u32(extent)
-        .launch(stream)
+        .launch(stream)?;
+    Ok(false)
 }
 
 #[cfg(test)]
