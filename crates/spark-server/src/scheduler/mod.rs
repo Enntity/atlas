@@ -16,6 +16,7 @@ mod adaptive_rung;
 mod adaptive_spec;
 mod admission;
 mod beam_prefill;
+mod busy_chunk;
 #[cfg(test)]
 mod cancel_test_model;
 mod confidence;
@@ -720,6 +721,8 @@ pub fn run(
         let t_loop = std::time::Instant::now();
         let prefill_queue_was_empty = prefilling.is_empty();
         let in_flight_before = active.len() + prefilling.len();
+        // ATLAS_PREFILL_BUSY_TOKENS: shorter chunks while sequences decode
+        let chunk_tokens = busy_chunk::cap(max_prefill_tokens, !active.is_empty());
         ttft_trace::begin_tick();
         start_new_requests(
             &*model,
@@ -728,7 +731,7 @@ pub fn run(
             pc_plants,
             chunked,
             always_mixed,
-            max_prefill_tokens,
+            chunk_tokens,
             max_batch_tokens,
             &eos_tokens,
             prefill_stream,
@@ -784,13 +787,14 @@ pub fn run(
                 !phase_continue_prefills::follows_first_chunk(p)
                     && !phase_continue_prefills::layer_yield::queued(&sched.levers, &*model, p)
             });
+        let continue_chunk = busy_chunk::cap(max_prefill_tokens, !active.is_empty());
         let did_mixed_step = !head_just_started
             && continue_in_progress_prefills(
                 &*model,
                 &*policy,
                 &mut active,
                 &mut prefilling,
-                max_prefill_tokens,
+                continue_chunk,
                 max_batch_tokens,
                 always_mixed,
                 prefill_stream,
