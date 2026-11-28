@@ -334,3 +334,22 @@ fn the_next_turn_supersedes_a_tail_whose_last_block_it_never_shares() {
     assert!(!cache.window_mapped(turn1[2]) && !cache.window_mapped(turn1[5]));
     assert!(cache.window_mapped(y) && cache.window_mapped(turn2[10]));
 }
+
+#[test]
+fn a_merge_never_spans_rows_that_are_gone() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed_over(32, 64, 24, 4, &gpu);
+    let b: Vec<u32> = (0..2).map(|_| cache.alloc_block().unwrap()).collect();
+    let x: Vec<u32> = (0..4).map(|_| cache.alloc_block().unwrap()).collect();
+    cache.window_hold(&b, &gpu, 0).unwrap();
+    cache.window_hold(&x[2..], &gpu, 0).unwrap();
+    // a pin with one whole block, then a near pin along it whose window
+    // starts past two blocks nothing holds
+    assert!(cache.window_pin(&b, 0, 1, PinRank::Prompt));
+    let path = [b[0], x[0], x[1], x[2], x[3]];
+    assert!(cache.window_pin(&path, 3, 5, PinRank::Prompt));
+    // the first pin is superseded instead, and nothing was lent for x[0..2]
+    assert_eq!(cache.window_pins(), 2);
+    assert!(!cache.window_mapped(x[0]) && !cache.window_mapped(x[1]));
+    assert_eq!(cache.ref_count(x[2]), 2);
+}

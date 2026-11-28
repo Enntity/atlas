@@ -459,6 +459,15 @@ impl PagedKvCache {
                 p.rank = PinRank::Superseded;
             }
         }
+        // a merge spans only rows still mapped; otherwise the near pins are
+        // superseded like the rest
+        if path[first..start].iter().any(|&b| w.mapped(b).is_none()) {
+            for &i in &merged {
+                w.pins[i].rank = PinRank::Superseded;
+            }
+            merged.clear();
+            (first, whole) = (start, full.min(end));
+        }
         let blocks = &path[first..];
         for &block in blocks {
             let local = w.local_of[block as usize];
