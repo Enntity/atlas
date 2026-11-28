@@ -8,6 +8,17 @@ const WINDOW: usize = 1024;
 
 /// Four attention layers, the odd ones sliding-window, 16-token blocks.
 fn windowed(blocks: usize, local: usize, pins: usize, gpu: &MockGpuBackend) -> PagedKvCache {
+    windowed_over(WINDOW, blocks, local, pins, gpu)
+}
+
+/// [`windowed`] with a `window`-key window.
+fn windowed_over(
+    window: usize,
+    blocks: usize,
+    local: usize,
+    pins: usize,
+    gpu: &MockGpuBackend,
+) -> PagedKvCache {
     let config = KvCacheConfig {
         num_layers: 4,
         dtype: KvCacheDtype::Bf16,
@@ -15,7 +26,7 @@ fn windowed(blocks: usize, local: usize, pins: usize, gpu: &MockGpuBackend) -> P
     };
     let plan = WindowPlan {
         layers: vec![1, 3],
-        window: WINDOW,
+        window,
         blocks: local,
         pins,
     };
@@ -215,16 +226,17 @@ fn a_resumed_window_goes_to_the_back_of_the_pin_queue() {
 #[test]
 fn a_deeper_pin_on_the_same_path_sends_the_shallower_one_out_first() {
     let gpu = MockGpuBackend::new();
-    let mut cache = windowed(64, 12, 3, &gpu);
+    // a 32-key window: a pin spans 4 blocks
+    let mut cache = windowed_over(32, 64, 24, 3, &gpu);
     // two sequences: `x` and `y`, each with its own blocks
-    let x: Vec<u32> = (0..4).map(|_| cache.alloc_block().unwrap()).collect();
+    let x: Vec<u32> = (0..12).map(|_| cache.alloc_block().unwrap()).collect();
     let y: Vec<u32> = (0..2).map(|_| cache.alloc_block().unwrap()).collect();
     cache.window_hold(&x, &gpu, 0).unwrap();
     cache.window_hold(&y, &gpu, 0).unwrap();
-    // y pins, x pins at blocks 0..2, then x pins deeper along its own path
+    // y pins, x pins at blocks 0..2, then x pins far deeper along its own path
     assert!(cache.window_pin(&y, 0, PinRank::Prompt));
     assert!(cache.window_pin(&x[..2], 0, PinRank::Prompt));
-    assert!(cache.window_pin(&x, 2, PinRank::Prompt));
+    assert!(cache.window_pin(&x, 10, PinRank::Prompt));
     // the fourth pin evicts x's shallow one, not y's older pin
     let z = cache.alloc_block().unwrap();
     cache.window_hold(&[z], &gpu, 0).unwrap();
@@ -232,7 +244,36 @@ fn a_deeper_pin_on_the_same_path_sends_the_shallower_one_out_first() {
     cache.window_release(&x, &gpu, 0).unwrap();
     cache.window_release(&y, &gpu, 0).unwrap();
     assert!(!cache.window_mapped(x[0]) && !cache.window_mapped(x[1]));
-    assert!(cache.window_mapped(x[2]) && cache.window_mapped(y[0]));
+    assert!(cache.window_mapped(x[10]) && cache.window_mapped(y[0]));
+}
+
+#[test]
+fn a_pin_a_tile_deeper_on_the_same_path_merges_with_the_shallower_one() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed_over(32, 64, 24, 2, &gpu);
+    let x: Vec<u32> = (0..7).map(|_| cache.alloc_block().unwrap()).collect();
+    let y: Vec<u32> = (0..2).map(|_| cache.alloc_block().unwrap()).collect();
+    cache.window_hold(&x, &gpu, 0).unwrap();
+    cache.window_hold(&y, &gpu, 0).unwrap();
+    // a prompt's checkpoint a block short of its tail, then the tail, whose
+    // window starts a key tile later: one pin over both windows
+    assert!(cache.window_pin(&x[..6], 2, PinRank::Prompt));
+    assert!(cache.window_pin(&x, 4, PinRank::Prompt));
+    assert_eq!(cache.window_pins(), 1);
+    assert!(cache.window_pin(&y, 0, PinRank::Prompt));
+    cache.window_release(&x, &gpu, 0).unwrap();
+    cache.window_release(&y, &gpu, 0).unwrap();
+    // both resume points keep their rows, and the refs balance
+    assert!((2..7).all(|i| cache.window_mapped(x[i])));
+    assert!(!cache.window_mapped(x[0]) && !cache.window_mapped(x[1]));
+    assert_eq!(cache.ref_count(x[2]), 2);
+    // a resume at the shallower point refreshes the merged pin
+    cache.window_touch(&x[2..6]);
+    let z = cache.alloc_block().unwrap();
+    cache.window_hold(&[z], &gpu, 0).unwrap();
+    assert!(cache.window_pin(&[z], 0, PinRank::Prompt));
+    cache.window_release(&[z], &gpu, 0).unwrap();
+    assert!(cache.window_mapped(x[2]) && !cache.window_mapped(y[0]));
 }
 
 #[test]

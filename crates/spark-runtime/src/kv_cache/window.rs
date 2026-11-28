@@ -16,7 +16,9 @@
 //! ref on each block so the mapping cannot outlive the rows it names. Pins
 //! go first when the pool runs short, oldest first within a rank: pins a
 //! deeper pin along the same blocks superseded, then windows in generated
-//! text, then windows in a prompt. A conversation's next turn resumes from
+//! text, then windows in a prompt. Pins along the same blocks within a key
+//! tile or so of each other (a prompt's checkpoint a block short of its tail,
+//! and the tail) merge into one pin over both windows instead. A conversation's next turn resumes from
 //! its newest prompt snapshot (history rarely repeats the reasoning that
 //! generated text holds), so while the pool is short each conversation keeps
 //! that window. Local block 0 is the null block: map
@@ -182,10 +184,14 @@ impl WindowPool {
         true
     }
 
-    /// Move the pin of window `blocks` to the back of the queue, ranked at
-    /// least `rank`; false when no pin holds it.
+    /// Move the pin holding window `blocks` to the back of the queue, ranked
+    /// at least `rank`; false when no pin holds it.
     fn touch(&mut self, blocks: &[u32], rank: PinRank) -> bool {
-        let Some(i) = self.pins.iter().position(|p| p.blocks == blocks) else {
+        let holds = |p: &Pin| {
+            let at = p.blocks.iter().position(|&b| Some(&b) == blocks.first());
+            at.is_some_and(|i| p.blocks[i..].starts_with(blocks))
+        };
+        let Some(i) = self.pins.iter().position(holds) else {
             return false;
         };
         if let Some(mut pin) = self.pins.remove(i) {
@@ -423,25 +429,44 @@ impl PagedKvCache {
         if w.touch(blocks, rank) {
             return true;
         }
-        for p in w
-            .pins
-            .iter_mut()
-            .filter(|p| p.rank == rank && p.start <= start)
-        {
-            if path.get(p.start..p.start + p.blocks.len()) == Some(p.blocks.as_slice()) {
+        // same-rank pins along `path`: near ones merge into this pin, the
+        // rest are superseded by it
+        let reach = WindowPlan::span_blocks(w.plan.window, self.config.block_size, 0)
+            + WindowPlan::KEY_TILE.div_ceil(self.config.block_size)
+            + 1;
+        let end = path.len();
+        let mut first = start;
+        let mut merged = Vec::new();
+        for (i, p) in w.pins.iter_mut().enumerate() {
+            let along = p.rank == rank
+                && p.start <= start
+                && path.get(p.start..p.start + p.blocks.len()) == Some(p.blocks.as_slice());
+            if along && end - p.start <= reach {
+                first = first.min(p.start);
+                merged.push(i);
+            } else if along {
                 p.rank = PinRank::Superseded;
             }
         }
+        let blocks = &path[first..];
         for &block in blocks {
             let local = w.local_of[block as usize];
             w.refs[local as usize] += 1;
         }
+        let mut evicted = Vec::new();
+        for i in merged.into_iter().rev() {
+            if let Some(pin) = w.pins.remove(i) {
+                for &block in &pin.blocks {
+                    w.release(block);
+                }
+                evicted.extend(pin.blocks);
+            }
+        }
         w.pins.push_back(Pin {
-            start,
+            start: first,
             blocks: blocks.to_vec(),
             rank,
         });
-        let mut evicted = Vec::new();
         while w.pins.len() > w.plan.pins {
             evicted.extend(w.evict_pin().unwrap_or_default());
         }
@@ -454,7 +479,7 @@ impl PagedKvCache {
         true
     }
 
-    /// A resume read the window pinned as `blocks`: it ranks as a prompt's
+    /// A resume read window `blocks` of a pin: the pin ranks as a prompt's
     /// and is the newest of its rank.
     pub fn window_touch(&mut self, blocks: &[u32]) {
         if let Some(w) = self.window.as_mut() {
