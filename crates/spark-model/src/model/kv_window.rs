@@ -18,14 +18,15 @@ use std::ops::Range;
 use anyhow::{Result, ensure};
 use parking_lot::Mutex;
 use spark_runtime::gpu::GpuBackend;
-use spark_runtime::kv_cache::{PagedKvCache, WindowPlan};
+use spark_runtime::kv_cache::{PagedKvCache, PinRank, WindowPlan};
 
 use crate::traits::SequenceState;
 
 /// The cache's window geometry, and snapshot pins waiting for the lock.
 pub(crate) struct KvWindow {
     plan: Option<(WindowPlan, usize)>,
-    pins: Mutex<Vec<Vec<u32>>>,
+    /// A snapshot's block table, its window's first block and its rank.
+    pins: Mutex<Vec<(Vec<u32>, usize, PinRank)>>,
 }
 
 impl KvWindow {
@@ -41,7 +42,7 @@ impl KvWindow {
     }
 
     /// Queue a pin of the window a snapshot of `seq` at its current length
-    /// resumes from.
+    /// resumes from, ranked by whether that length is inside the prompt.
     pub(crate) fn queue_pin(&self, seq: &SequenceState) {
         let Some((plan, bs)) = &self.plan else {
             return;
@@ -49,13 +50,20 @@ impl KvWindow {
         let end = seq.seq_len.div_ceil(*bs).min(seq.block_table.len());
         let start = plan.first_block(seq.seq_len, *bs).min(end);
         if start < end {
-            self.pins.lock().push(seq.block_table[start..end].to_vec());
+            let rank = if seq.seq_len <= seq.prompt_len {
+                PinRank::Prompt
+            } else {
+                PinRank::Generated
+            };
+            self.pins
+                .lock()
+                .push((seq.block_table[..end].to_vec(), start, rank));
         }
     }
 
     fn apply_pins(&self, kv: &mut PagedKvCache) {
-        for blocks in self.pins.lock().drain(..) {
-            kv.window_pin(&blocks);
+        for (path, start, rank) in self.pins.lock().drain(..) {
+            kv.window_pin(&path, start, rank);
         }
     }
 

@@ -86,7 +86,7 @@ fn pins_take_an_eighth_of_the_budget_and_the_rest_buys_primary_blocks() {
     let budget: usize = 64 << 30;
     let mut p = plan(&config, &kv, NONE, 8, 4104).unwrap();
     let base = p.blocks;
-    let blocks = primary_blocks(&mut p, &kv, budget, 0).unwrap();
+    let blocks = primary_blocks(&mut p, &kv, budget, 0, 8).unwrap();
     assert_eq!(p.pins, budget / 8 / pin_bytes);
     assert_eq!(
         p.blocks,
@@ -95,13 +95,29 @@ fn pins_take_an_eighth_of_the_budget_and_the_rest_buys_primary_blocks() {
     let primary = p.primary_block_bytes(&kv) + 4;
     assert_eq!(blocks, (budget - p.blocks * local) / primary);
     // sizing again from the sized plan gives the same answer
-    assert_eq!(primary_blocks(&mut p, &kv, budget, 0).unwrap(), blocks);
+    assert_eq!(primary_blocks(&mut p, &kv, budget, 0, 8).unwrap(), blocks);
 }
 
 #[test]
 fn a_small_budget_still_pins_eight_windows_or_refuses() {
     let (config, kv) = inkling();
     let mut p = plan(&config, &kv, NONE, 8, 4104).unwrap();
-    assert!(primary_blocks(&mut p, &kv, 1 << 30, 0).is_err());
+    assert!(primary_blocks(&mut p, &kv, 1 << 30, 0, 8).is_err());
     assert_eq!(p.pins, 8);
+}
+
+#[test]
+fn every_concurrent_request_can_keep_a_snapshot_window() {
+    let (config, kv) = inkling();
+    let local = plan(&config, &kv, NONE, 64, 8192)
+        .unwrap()
+        .local_block_bytes(&kv);
+    let pin_bytes = WindowPlan::span_blocks(1024, 16, 0) * local;
+    // an eighth of this budget pins fewer windows than 64 requests resume from
+    let budget: usize = 64 << 30;
+    assert!(budget / 8 / pin_bytes < 64);
+    let mut p = plan(&config, &kv, NONE, 64, 8192).unwrap();
+    let blocks = primary_blocks(&mut p, &kv, budget, 0, 64).unwrap();
+    assert_eq!(p.pins, 64);
+    assert_eq!(primary_blocks(&mut p, &kv, budget, 0, 64).unwrap(), blocks);
 }

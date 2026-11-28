@@ -283,3 +283,56 @@ fn prefill_blocks_are_reserved_with_their_window() {
     scan(&src, &mut offenders);
     assert!(offenders.is_empty(), "{offenders:?}");
 }
+
+#[test]
+fn a_sequence_keeps_its_deepest_snapshot_window_over_its_shallower_ones() {
+    let gpu = MockGpuBackend::new();
+    let mut kv = cache(&gpu, 64, 2);
+    let window = KvWindow::new(&kv);
+    let (mut a, mut b) = (seq_with(&mut kv, 256), seq_with(&mut kv, 64));
+    (a.prompt_len, b.prompt_len) = (256, 64);
+    window.sync(&mut b, 0, 63 / BS, &mut kv, &gpu, 0).unwrap();
+    b.seq_len = 64;
+    window.queue_pin(&b);
+    // a's prefill snapshots at 128, then at its tail, 256
+    window.sync(&mut a, 0, 255 / BS, &mut kv, &gpu, 0).unwrap();
+    for len in [128, 256] {
+        a.seq_len = len;
+        window.queue_pin(&a);
+    }
+    window.truncate(&mut a, 0, &mut kv, &gpu, 0).unwrap();
+    window.truncate(&mut b, 0, &mut kv, &gpu, 0).unwrap();
+    // two pins: a's shallow window went, b's older one stayed
+    assert_eq!(kv.window_pins(), 2);
+    let a_mapped: Vec<usize> = (0..16)
+        .filter(|&i| kv.window_mapped(a.block_table[i]))
+        .collect();
+    assert_eq!(a_mapped, (12..16).collect::<Vec<_>>());
+    assert!(b.block_table.iter().all(|&blk| kv.window_mapped(blk)));
+}
+
+#[test]
+fn an_answer_snapshot_window_goes_before_the_prompt_window() {
+    let gpu = MockGpuBackend::new();
+    let mut kv = cache(&gpu, 64, 2);
+    let window = KvWindow::new(&kv);
+    let (mut a, mut b) = (seq_with(&mut kv, 256), seq_with(&mut kv, 64));
+    (a.prompt_len, b.prompt_len) = (128, 64);
+    window.sync(&mut a, 0, 255 / BS, &mut kv, &gpu, 0).unwrap();
+    window.sync(&mut b, 0, 63 / BS, &mut kv, &gpu, 0).unwrap();
+    // a's prompt tail at 128 and its answer's leaf at 256, then b's tail
+    for len in [128, 256] {
+        a.seq_len = len;
+        window.queue_pin(&a);
+    }
+    b.seq_len = 64;
+    window.queue_pin(&b);
+    window.truncate(&mut a, 0, &mut kv, &gpu, 0).unwrap();
+    window.truncate(&mut b, 0, &mut kv, &gpu, 0).unwrap();
+    // the next turn resumes from a's prompt tail: that window stays
+    let a_mapped: Vec<usize> = (0..16)
+        .filter(|&i| kv.window_mapped(a.block_table[i]))
+        .collect();
+    assert_eq!(a_mapped, (4..8).collect::<Vec<_>>());
+    assert!(b.block_table.iter().all(|&blk| kv.window_mapped(blk)));
+}

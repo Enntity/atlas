@@ -490,7 +490,7 @@ pub use latent_shard::{ExchangeLane, LatentShard, LatentShardSpec, LatentViewPla
 pub use placement::{KvBuffer, KvPlacement};
 pub use sparse_index::{SparseIndexCacheConfig, SparseIndexCacheDtype};
 pub use tail_slots::{NO_TAIL, TailSlotPlan};
-pub use window::{NO_WINDOW, WindowPlan};
+pub use window::{NO_WINDOW, PinRank, WindowPlan};
 #[cfg(test)]
 mod tests;
 

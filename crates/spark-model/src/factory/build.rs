@@ -1150,9 +1150,13 @@ pub fn build_model(
             }
             let n = match (joint_glm_plan, &mut window_plan) {
                 (Some(plan), _) => plan.num_blocks_for_budget(kv_budget),
-                (None, Some(window)) => {
-                    kv_window::primary_blocks(window, &kv_config, kv_budget, aux_bytes_per_token)?
-                }
+                (None, Some(window)) => kv_window::primary_blocks(
+                    window,
+                    &kv_config,
+                    kv_budget,
+                    aux_bytes_per_token,
+                    max_batch_size,
+                )?,
                 (None, None) => {
                     kv_budget::blocks_with_aux(&kv_config, kv_budget, aux_bytes_per_token)?
                 }

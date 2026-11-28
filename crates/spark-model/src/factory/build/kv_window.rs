@@ -8,9 +8,12 @@
 //! window map (`layers::inkling2`), so it is the one that takes it. The pool
 //! holds every live sequence's window and one step's rows, one forward's
 //! batch of new rows, and pinned snapshot windows: up to an eighth of the KV
-//! budget (at least [`MIN_PINS`]). A long prompt snapshots every few thousand
-//! tokens, and a resume needs its snapshot's window, so pins are what keep
-//! resume points across interleaved sessions.
+//! budget, and at least one per concurrent request (and [`MIN_PINS`]). A long
+//! prompt snapshots every few thousand tokens, and a resume needs its
+//! snapshot's window, so pins are what keep resume points across interleaved
+//! sessions; a conversation's deepest window outlasts its shallower ones
+//! (`spark_runtime::kv_cache::window`), so one pin each keeps every live
+//! conversation resumable.
 
 use anyhow::{Result, ensure};
 use atlas_core::config::ModelConfig;
@@ -76,19 +79,21 @@ pub(super) fn plan(
     })
 }
 
-/// Pin `plan`'s share of `budget` bytes, then the primary blocks the rest
-/// buys beside its window pools, with `aux_per_token` bytes riding on each
+/// Pin `plan`'s share of `budget` bytes (a window for each of `seqs`
+/// concurrent requests at least), then the primary blocks the rest buys
+/// beside its window pools, with `aux_per_token` bytes riding on each
 /// primary token.
 pub(super) fn primary_blocks(
     plan: &mut WindowPlan,
     kv: &KvCacheConfig,
     budget: usize,
     aux_per_token: usize,
+    seqs: usize,
 ) -> Result<usize> {
     let pin_blocks = WindowPlan::span_blocks(plan.window, kv.block_size, 0);
     let pin_bytes = pin_blocks * plan.local_block_bytes(kv);
     plan.blocks -= plan.pins * pin_blocks;
-    plan.pins = (budget / PIN_SHARE / pin_bytes).max(MIN_PINS);
+    plan.pins = (budget / PIN_SHARE / pin_bytes).max(seqs).max(MIN_PINS);
     plan.blocks += plan.pins * pin_blocks;
     let window_bytes = plan.blocks * plan.local_block_bytes(kv);
     ensure!(

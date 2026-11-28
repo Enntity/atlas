@@ -14,7 +14,12 @@
 //! forward reads or writes ([`PagedKvCache::window_hold`]); a snapshot pins
 //! the window it resumes from ([`PagedKvCache::window_pin`]), with a primary
 //! ref on each block so the mapping cannot outlive the rows it names. Pins
-//! go first when the pool runs short. Local block 0 is the null block: map
+//! go first when the pool runs short, oldest first within a rank: pins a
+//! deeper pin along the same blocks superseded, then windows in generated
+//! text, then windows in a prompt. A conversation's next turn resumes from
+//! its newest prompt snapshot (history rarely repeats the reasoning that
+//! generated text holds), so while the pool is short each conversation keeps
+//! that window. Local block 0 is the null block: map
 //! entries the kernels never read, and graph padding rows, point there.
 //!
 //! Every reader reaches the rows through the map at the same logical
@@ -34,6 +39,24 @@ pub use plan::WindowPlan;
 /// Map entry of a primary block that holds no window rows.
 pub const NO_WINDOW: u32 = u32::MAX;
 
+/// A pinned snapshot window: its primary blocks, from logical block `start`.
+struct Pin {
+    start: usize,
+    blocks: Vec<u32>,
+    rank: PinRank,
+}
+
+/// Eviction order of pins: the lowest rank goes first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PinRank {
+    /// A deeper pin along the same blocks replaced it.
+    Superseded,
+    /// A snapshot in generated text.
+    Generated,
+    /// A snapshot in a prompt, or one a resume has read.
+    Prompt,
+}
+
 /// One window layer's local pools.
 struct WindowLayer {
     layer: usize,
@@ -52,7 +75,7 @@ pub(super) struct WindowPool {
     refs: Vec<u32>,
     free: Vec<u32>,
     dirty: Vec<u32>,
-    pins: VecDeque<Vec<u32>>,
+    pins: VecDeque<Pin>,
     /// Per stream, an event recorded after its last release: a local block
     /// lent on another stream waits for it, since the releasing stream's
     /// queued forwards may still read the block.
@@ -159,13 +182,29 @@ impl WindowPool {
         true
     }
 
-    /// Drop the oldest pin's local refs; returns its primary blocks.
+    /// Move the pin of window `blocks` to the back of the queue, ranked at
+    /// least `rank`; false when no pin holds it.
+    fn touch(&mut self, blocks: &[u32], rank: PinRank) -> bool {
+        let Some(i) = self.pins.iter().position(|p| p.blocks == blocks) else {
+            return false;
+        };
+        if let Some(mut pin) = self.pins.remove(i) {
+            pin.rank = pin.rank.max(rank);
+            self.pins.push_back(pin);
+        }
+        true
+    }
+
+    /// Drop the local refs of the oldest pin of the lowest rank; returns its
+    /// primary blocks.
     fn evict_pin(&mut self) -> Option<Vec<u32>> {
-        let pin = self.pins.pop_front()?;
-        for &block in &pin {
+        let rank = self.pins.iter().map(|p| p.rank).min()?;
+        let i = self.pins.iter().position(|p| p.rank == rank)?;
+        let pin = self.pins.remove(i)?;
+        for &block in &pin.blocks {
             self.release(block);
         }
-        Some(pin)
+        Some(pin.blocks)
     }
 
     /// Lend local blocks to every unmapped block of `blocks` and add a ref
@@ -367,21 +406,41 @@ impl PagedKvCache {
         Ok(())
     }
 
-    /// Pin a snapshot's window, `blocks` its logical blocks from
-    /// [`WindowPlan::first_block`] through its last row. False (nothing
-    /// pinned) when a row of it is already gone.
-    pub fn window_pin(&mut self, blocks: &[u32]) -> bool {
+    /// Pin a snapshot's window: `path` is the snapshot's block table through
+    /// its last row, and the window its logical blocks from `start`
+    /// ([`WindowPlan::first_block`]); `rank` says whether the snapshot is in
+    /// a prompt or in generated text. False (nothing pinned) when a row of
+    /// it is already gone. A window already pinned is only refreshed; pins
+    /// of the same rank at shallower windows along `path` are superseded.
+    pub fn window_pin(&mut self, path: &[u32], start: usize, rank: PinRank) -> bool {
         let Some(w) = self.window.as_mut() else {
             return false;
         };
+        let blocks = path.get(start..).unwrap_or_default();
         if blocks.is_empty() || blocks.iter().any(|&b| w.mapped(b).is_none()) {
             return false;
+        }
+        if w.touch(blocks, rank) {
+            return true;
+        }
+        for p in w
+            .pins
+            .iter_mut()
+            .filter(|p| p.rank == rank && p.start <= start)
+        {
+            if path.get(p.start..p.start + p.blocks.len()) == Some(p.blocks.as_slice()) {
+                p.rank = PinRank::Superseded;
+            }
         }
         for &block in blocks {
             let local = w.local_of[block as usize];
             w.refs[local as usize] += 1;
         }
-        w.pins.push_back(blocks.to_vec());
+        w.pins.push_back(Pin {
+            start,
+            blocks: blocks.to_vec(),
+            rank,
+        });
         let mut evicted = Vec::new();
         while w.pins.len() > w.plan.pins {
             evicted.extend(w.evict_pin().unwrap_or_default());
@@ -395,15 +454,11 @@ impl PagedKvCache {
         true
     }
 
-    /// A resume read the window pinned as `blocks`: evict it last.
+    /// A resume read the window pinned as `blocks`: it ranks as a prompt's
+    /// and is the newest of its rank.
     pub fn window_touch(&mut self, blocks: &[u32]) {
-        let Some(w) = self.window.as_mut() else {
-            return;
-        };
-        if let Some(i) = w.pins.iter().position(|p| p.as_slice() == blocks)
-            && let Some(pin) = w.pins.remove(i)
-        {
-            w.pins.push_back(pin);
+        if let Some(w) = self.window.as_mut() {
+            w.touch(blocks, PinRank::Prompt);
         }
     }
 

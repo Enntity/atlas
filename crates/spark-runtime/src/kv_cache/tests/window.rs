@@ -132,7 +132,7 @@ fn pins_keep_a_snapshot_window_until_the_pool_needs_it() {
     let mut cache = windowed(64, 5, 4, &gpu);
     let (a, b) = (cache.alloc_block().unwrap(), cache.alloc_block().unwrap());
     cache.window_hold(&[a, b], &gpu, 0).unwrap();
-    assert!(cache.window_pin(&[a, b]));
+    assert!(cache.window_pin(&[a, b], 0, PinRank::Prompt));
     // the pin holds the primary blocks too
     assert_eq!((cache.ref_count(a), cache.ref_count(b)), (2, 2));
     // the sequence leaves; the pin keeps the window
@@ -154,8 +154,8 @@ fn pins_past_their_count_evict_the_oldest() {
     let mut cache = windowed(64, 8, 1, &gpu);
     let (a, b) = (cache.alloc_block().unwrap(), cache.alloc_block().unwrap());
     cache.window_hold(&[a, b], &gpu, 0).unwrap();
-    assert!(cache.window_pin(&[a]));
-    assert!(cache.window_pin(&[b]));
+    assert!(cache.window_pin(&[a], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&[b], 0, PinRank::Prompt));
     assert_eq!(cache.window_pins(), 1);
     assert_eq!((cache.ref_count(a), cache.ref_count(b)), (1, 2));
     cache.window_release(&[a, b], &gpu, 0).unwrap();
@@ -167,7 +167,7 @@ fn a_window_with_unmapped_rows_is_not_pinned() {
     let gpu = MockGpuBackend::new();
     let mut cache = windowed(64, 8, 4, &gpu);
     cache.window_hold(&[1], &gpu, 0).unwrap();
-    assert!(!cache.window_pin(&[1, 2]));
+    assert!(!cache.window_pin(&[1, 2], 0, PinRank::Prompt));
     assert_eq!(cache.window_pins(), 0);
     assert_eq!(cache.ref_count(1), 0);
 }
@@ -202,11 +202,68 @@ fn a_resumed_window_goes_to_the_back_of_the_pin_queue() {
     let mut cache = windowed(64, 8, 2, &gpu);
     let blocks: Vec<u32> = (0..3).map(|_| cache.alloc_block().unwrap()).collect();
     cache.window_hold(&blocks, &gpu, 0).unwrap();
-    assert!(cache.window_pin(&blocks[..1]));
-    assert!(cache.window_pin(&blocks[1..2]));
+    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[1..2], 0, PinRank::Prompt));
     // a resume reads the oldest pin's window: it is now the newest
     cache.window_touch(&blocks[..1]);
-    assert!(cache.window_pin(&blocks[2..]));
+    assert!(cache.window_pin(&blocks[2..], 0, PinRank::Prompt));
+    cache.window_release(&blocks, &gpu, 0).unwrap();
+    assert!(cache.window_mapped(blocks[0]) && cache.window_mapped(blocks[2]));
+    assert!(!cache.window_mapped(blocks[1]));
+}
+
+#[test]
+fn a_deeper_pin_on_the_same_path_sends_the_shallower_one_out_first() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed(64, 12, 3, &gpu);
+    // two sequences: `x` and `y`, each with its own blocks
+    let x: Vec<u32> = (0..4).map(|_| cache.alloc_block().unwrap()).collect();
+    let y: Vec<u32> = (0..2).map(|_| cache.alloc_block().unwrap()).collect();
+    cache.window_hold(&x, &gpu, 0).unwrap();
+    cache.window_hold(&y, &gpu, 0).unwrap();
+    // y pins, x pins at blocks 0..2, then x pins deeper along its own path
+    assert!(cache.window_pin(&y, 0, PinRank::Prompt));
+    assert!(cache.window_pin(&x[..2], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&x, 2, PinRank::Prompt));
+    // the fourth pin evicts x's shallow one, not y's older pin
+    let z = cache.alloc_block().unwrap();
+    cache.window_hold(&[z], &gpu, 0).unwrap();
+    assert!(cache.window_pin(&[z], 0, PinRank::Prompt));
+    cache.window_release(&x, &gpu, 0).unwrap();
+    cache.window_release(&y, &gpu, 0).unwrap();
+    assert!(!cache.window_mapped(x[0]) && !cache.window_mapped(x[1]));
+    assert!(cache.window_mapped(x[2]) && cache.window_mapped(y[0]));
+}
+
+#[test]
+fn pinning_a_window_already_pinned_refreshes_it() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed(64, 8, 2, &gpu);
+    let blocks: Vec<u32> = (0..3).map(|_| cache.alloc_block().unwrap()).collect();
+    cache.window_hold(&blocks, &gpu, 0).unwrap();
+    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[1..2], 0, PinRank::Prompt));
+    // the same window again (a second sequence on the same prefix): one pin,
+    // one ref, and it is now the newest
+    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
+    assert_eq!(cache.window_pins(), 2);
+    assert_eq!(cache.ref_count(blocks[0]), 2);
+    assert!(cache.window_pin(&blocks[2..], 0, PinRank::Prompt));
+    cache.window_release(&blocks, &gpu, 0).unwrap();
+    assert!(cache.window_mapped(blocks[0]) && !cache.window_mapped(blocks[1]));
+}
+
+#[test]
+fn a_window_in_generated_text_goes_before_an_older_prompt_window() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed(64, 8, 2, &gpu);
+    let blocks: Vec<u32> = (0..3).map(|_| cache.alloc_block().unwrap()).collect();
+    cache.window_hold(&blocks, &gpu, 0).unwrap();
+    // a prompt's tail, then the answer's snapshot further along the same
+    // blocks: the answer does not supersede the prompt, it goes first
+    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[..2], 1, PinRank::Generated));
+    assert!(cache.window_pin(&blocks[2..], 0, PinRank::Prompt));
     cache.window_release(&blocks, &gpu, 0).unwrap();
     assert!(cache.window_mapped(blocks[0]) && cache.window_mapped(blocks[2]));
     assert!(!cache.window_mapped(blocks[1]));
