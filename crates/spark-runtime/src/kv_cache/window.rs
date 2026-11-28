@@ -41,11 +41,21 @@ pub use plan::WindowPlan;
 /// Map entry of a primary block that holds no window rows.
 pub const NO_WINDOW: u32 = u32::MAX;
 
-/// A pinned snapshot window: its primary blocks, from logical block `start`.
+/// A pinned snapshot window: its primary blocks, from logical block `start`,
+/// whole through logical block `full` (a later turn shares at most those).
 struct Pin {
     start: usize,
+    full: usize,
     blocks: Vec<u32>,
     rank: PinRank,
+}
+
+impl Pin {
+    /// Whether `path` runs through this window's whole blocks.
+    fn along(&self, path: &[u32]) -> bool {
+        let whole = self.full.min(self.start + self.blocks.len());
+        whole > self.start && path.get(self.start..whole) == self.blocks.get(..whole - self.start)
+    }
 }
 
 /// Eviction order of pins: the lowest rank goes first.
@@ -413,12 +423,14 @@ impl PagedKvCache {
     }
 
     /// Pin a snapshot's window: `path` is the snapshot's block table through
-    /// its last row, and the window its logical blocks from `start`
-    /// ([`WindowPlan::first_block`]); `rank` says whether the snapshot is in
-    /// a prompt or in generated text. False (nothing pinned) when a row of
-    /// it is already gone. A window already pinned is only refreshed; pins
-    /// of the same rank at shallower windows along `path` are superseded.
-    pub fn window_pin(&mut self, path: &[u32], start: usize, rank: PinRank) -> bool {
+    /// its last row, `full` of them whole, and the window its logical blocks
+    /// from `start` ([`WindowPlan::first_block`]); `rank` says whether the
+    /// snapshot is in a prompt or in generated text. False (nothing pinned)
+    /// when a row of it is already gone. A window already pinned is only
+    /// refreshed; pins of the same rank at shallower windows whose whole
+    /// blocks `path` runs through are superseded (a later turn shares only
+    /// whole blocks), or merged with this one when near.
+    pub fn window_pin(&mut self, path: &[u32], start: usize, full: usize, rank: PinRank) -> bool {
         let Some(w) = self.window.as_mut() else {
             return false;
         };
@@ -435,14 +447,13 @@ impl PagedKvCache {
             + WindowPlan::KEY_TILE.div_ceil(self.config.block_size)
             + 1;
         let end = path.len();
-        let mut first = start;
+        let (mut first, mut whole) = (start, full.min(end));
         let mut merged = Vec::new();
         for (i, p) in w.pins.iter_mut().enumerate() {
-            let along = p.rank == rank
-                && p.start <= start
-                && path.get(p.start..p.start + p.blocks.len()) == Some(p.blocks.as_slice());
+            let along = p.rank == rank && p.start <= start && p.along(path);
             if along && end - p.start <= reach {
                 first = first.min(p.start);
+                whole = whole.min(p.full);
                 merged.push(i);
             } else if along {
                 p.rank = PinRank::Superseded;
@@ -464,6 +475,7 @@ impl PagedKvCache {
         }
         w.pins.push_back(Pin {
             start: first,
+            full: whole,
             blocks: blocks.to_vec(),
             rank,
         });

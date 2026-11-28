@@ -25,8 +25,9 @@ use crate::traits::SequenceState;
 /// The cache's window geometry, and snapshot pins waiting for the lock.
 pub(crate) struct KvWindow {
     plan: Option<(WindowPlan, usize)>,
-    /// A snapshot's block table, its window's first block and its rank.
-    pins: Mutex<Vec<(Vec<u32>, usize, PinRank)>>,
+    /// A snapshot's block table, its window's first block, its whole blocks
+    /// and its rank.
+    pins: Mutex<Vec<(Vec<u32>, usize, usize, PinRank)>>,
 }
 
 impl KvWindow {
@@ -55,15 +56,16 @@ impl KvWindow {
             } else {
                 PinRank::Generated
             };
+            let full = seq.seq_len / *bs;
             self.pins
                 .lock()
-                .push((seq.block_table[..end].to_vec(), start, rank));
+                .push((seq.block_table[..end].to_vec(), start, full, rank));
         }
     }
 
     fn apply_pins(&self, kv: &mut PagedKvCache) {
-        for (path, start, rank) in self.pins.lock().drain(..) {
-            kv.window_pin(&path, start, rank);
+        for (path, start, full, rank) in self.pins.lock().drain(..) {
+            kv.window_pin(&path, start, full, rank);
         }
     }
 

@@ -336,3 +336,47 @@ fn an_answer_snapshot_window_goes_before_the_prompt_window() {
     assert_eq!(a_mapped, (4..8).collect::<Vec<_>>());
     assert!(b.block_table.iter().all(|&blk| kv.window_mapped(blk)));
 }
+
+#[test]
+fn the_next_turn_supersedes_the_last_turns_tail_window() {
+    let gpu = MockGpuBackend::new();
+    let mut kv = cache(&gpu, 64, 2);
+    let window = KvWindow::new(&kv);
+    // another conversation's window, pinned first
+    let mut other = seq_with(&mut kv, 64);
+    other.prompt_len = 64;
+    window
+        .sync(&mut other, 0, 63 / BS, &mut kv, &gpu, 0)
+        .unwrap();
+    other.seq_len = 64;
+    window.queue_pin(&other);
+    // turn 1 ends its prompt inside block 15
+    let mut turn1 = seq_with(&mut kv, 250);
+    turn1.prompt_len = 250;
+    window
+        .sync(&mut turn1, 0, 249 / BS, &mut kv, &gpu, 0)
+        .unwrap();
+    turn1.seq_len = 250;
+    window.queue_pin(&turn1);
+    turn1.block_table.iter().for_each(|&b| kv.inc_ref(b)); // the cache's refs
+    window.truncate(&mut turn1, 0, &mut kv, &gpu, 0).unwrap();
+    // turn 2 shares turn 1's 15 whole blocks, resumes at 240 and runs to 400
+    let mut turn2 = SequenceState::host_only(2);
+    turn2.block_table = turn1.block_table[..15].to_vec();
+    turn2.block_table.iter().for_each(|&b| kv.inc_ref(b));
+    turn2
+        .block_table
+        .extend((0..10).map(|_| kv.alloc_block().unwrap()));
+    turn2.prompt_len = 400;
+    window
+        .sync(&mut turn2, 240, 399 / BS, &mut kv, &gpu, 0)
+        .unwrap();
+    turn2.seq_len = 400;
+    window.queue_pin(&turn2);
+    window.truncate(&mut turn2, 0, &mut kv, &gpu, 0).unwrap();
+    window.truncate(&mut other, 0, &mut kv, &gpu, 0).unwrap();
+    // turn 1's tail went, not the other conversation's older window
+    assert!(other.block_table.iter().all(|&b| kv.window_mapped(b)));
+    assert!(!kv.window_mapped(turn1.block_table[15]));
+    assert!((20..25).all(|i| kv.window_mapped(turn2.block_table[i])));
+}

@@ -143,7 +143,7 @@ fn pins_keep_a_snapshot_window_until_the_pool_needs_it() {
     let mut cache = windowed(64, 5, 4, &gpu);
     let (a, b) = (cache.alloc_block().unwrap(), cache.alloc_block().unwrap());
     cache.window_hold(&[a, b], &gpu, 0).unwrap();
-    assert!(cache.window_pin(&[a, b], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&[a, b], 0, usize::MAX, PinRank::Prompt));
     // the pin holds the primary blocks too
     assert_eq!((cache.ref_count(a), cache.ref_count(b)), (2, 2));
     // the sequence leaves; the pin keeps the window
@@ -165,8 +165,8 @@ fn pins_past_their_count_evict_the_oldest() {
     let mut cache = windowed(64, 8, 1, &gpu);
     let (a, b) = (cache.alloc_block().unwrap(), cache.alloc_block().unwrap());
     cache.window_hold(&[a, b], &gpu, 0).unwrap();
-    assert!(cache.window_pin(&[a], 0, PinRank::Prompt));
-    assert!(cache.window_pin(&[b], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&[a], 0, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&[b], 0, usize::MAX, PinRank::Prompt));
     assert_eq!(cache.window_pins(), 1);
     assert_eq!((cache.ref_count(a), cache.ref_count(b)), (1, 2));
     cache.window_release(&[a, b], &gpu, 0).unwrap();
@@ -178,7 +178,7 @@ fn a_window_with_unmapped_rows_is_not_pinned() {
     let gpu = MockGpuBackend::new();
     let mut cache = windowed(64, 8, 4, &gpu);
     cache.window_hold(&[1], &gpu, 0).unwrap();
-    assert!(!cache.window_pin(&[1, 2], 0, PinRank::Prompt));
+    assert!(!cache.window_pin(&[1, 2], 0, usize::MAX, PinRank::Prompt));
     assert_eq!(cache.window_pins(), 0);
     assert_eq!(cache.ref_count(1), 0);
 }
@@ -213,11 +213,11 @@ fn a_resumed_window_goes_to_the_back_of_the_pin_queue() {
     let mut cache = windowed(64, 8, 2, &gpu);
     let blocks: Vec<u32> = (0..3).map(|_| cache.alloc_block().unwrap()).collect();
     cache.window_hold(&blocks, &gpu, 0).unwrap();
-    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
-    assert!(cache.window_pin(&blocks[1..2], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[..1], 0, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[1..2], 0, usize::MAX, PinRank::Prompt));
     // a resume reads the oldest pin's window: it is now the newest
     cache.window_touch(&blocks[..1]);
-    assert!(cache.window_pin(&blocks[2..], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[2..], 0, usize::MAX, PinRank::Prompt));
     cache.window_release(&blocks, &gpu, 0).unwrap();
     assert!(cache.window_mapped(blocks[0]) && cache.window_mapped(blocks[2]));
     assert!(!cache.window_mapped(blocks[1]));
@@ -234,13 +234,13 @@ fn a_deeper_pin_on_the_same_path_sends_the_shallower_one_out_first() {
     cache.window_hold(&x, &gpu, 0).unwrap();
     cache.window_hold(&y, &gpu, 0).unwrap();
     // y pins, x pins at blocks 0..2, then x pins far deeper along its own path
-    assert!(cache.window_pin(&y, 0, PinRank::Prompt));
-    assert!(cache.window_pin(&x[..2], 0, PinRank::Prompt));
-    assert!(cache.window_pin(&x, 10, PinRank::Prompt));
+    assert!(cache.window_pin(&y, 0, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&x[..2], 0, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&x, 10, usize::MAX, PinRank::Prompt));
     // the fourth pin evicts x's shallow one, not y's older pin
     let z = cache.alloc_block().unwrap();
     cache.window_hold(&[z], &gpu, 0).unwrap();
-    assert!(cache.window_pin(&[z], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&[z], 0, usize::MAX, PinRank::Prompt));
     cache.window_release(&x, &gpu, 0).unwrap();
     cache.window_release(&y, &gpu, 0).unwrap();
     assert!(!cache.window_mapped(x[0]) && !cache.window_mapped(x[1]));
@@ -257,10 +257,10 @@ fn a_pin_a_tile_deeper_on_the_same_path_merges_with_the_shallower_one() {
     cache.window_hold(&y, &gpu, 0).unwrap();
     // a prompt's checkpoint a block short of its tail, then the tail, whose
     // window starts a key tile later: one pin over both windows
-    assert!(cache.window_pin(&x[..6], 2, PinRank::Prompt));
-    assert!(cache.window_pin(&x, 4, PinRank::Prompt));
+    assert!(cache.window_pin(&x[..6], 2, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&x, 4, usize::MAX, PinRank::Prompt));
     assert_eq!(cache.window_pins(), 1);
-    assert!(cache.window_pin(&y, 0, PinRank::Prompt));
+    assert!(cache.window_pin(&y, 0, usize::MAX, PinRank::Prompt));
     cache.window_release(&x, &gpu, 0).unwrap();
     cache.window_release(&y, &gpu, 0).unwrap();
     // both resume points keep their rows, and the refs balance
@@ -271,7 +271,7 @@ fn a_pin_a_tile_deeper_on_the_same_path_merges_with_the_shallower_one() {
     cache.window_touch(&x[2..6]);
     let z = cache.alloc_block().unwrap();
     cache.window_hold(&[z], &gpu, 0).unwrap();
-    assert!(cache.window_pin(&[z], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&[z], 0, usize::MAX, PinRank::Prompt));
     cache.window_release(&[z], &gpu, 0).unwrap();
     assert!(cache.window_mapped(x[2]) && !cache.window_mapped(y[0]));
 }
@@ -282,14 +282,14 @@ fn pinning_a_window_already_pinned_refreshes_it() {
     let mut cache = windowed(64, 8, 2, &gpu);
     let blocks: Vec<u32> = (0..3).map(|_| cache.alloc_block().unwrap()).collect();
     cache.window_hold(&blocks, &gpu, 0).unwrap();
-    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
-    assert!(cache.window_pin(&blocks[1..2], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[..1], 0, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[1..2], 0, usize::MAX, PinRank::Prompt));
     // the same window again (a second sequence on the same prefix): one pin,
     // one ref, and it is now the newest
-    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[..1], 0, usize::MAX, PinRank::Prompt));
     assert_eq!(cache.window_pins(), 2);
     assert_eq!(cache.ref_count(blocks[0]), 2);
-    assert!(cache.window_pin(&blocks[2..], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[2..], 0, usize::MAX, PinRank::Prompt));
     cache.window_release(&blocks, &gpu, 0).unwrap();
     assert!(cache.window_mapped(blocks[0]) && !cache.window_mapped(blocks[1]));
 }
@@ -302,10 +302,35 @@ fn a_window_in_generated_text_goes_before_an_older_prompt_window() {
     cache.window_hold(&blocks, &gpu, 0).unwrap();
     // a prompt's tail, then the answer's snapshot further along the same
     // blocks: the answer does not supersede the prompt, it goes first
-    assert!(cache.window_pin(&blocks[..1], 0, PinRank::Prompt));
-    assert!(cache.window_pin(&blocks[..2], 1, PinRank::Generated));
-    assert!(cache.window_pin(&blocks[2..], 0, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[..1], 0, usize::MAX, PinRank::Prompt));
+    assert!(cache.window_pin(&blocks[..2], 1, usize::MAX, PinRank::Generated));
+    assert!(cache.window_pin(&blocks[2..], 0, usize::MAX, PinRank::Prompt));
     cache.window_release(&blocks, &gpu, 0).unwrap();
     assert!(cache.window_mapped(blocks[0]) && cache.window_mapped(blocks[2]));
     assert!(!cache.window_mapped(blocks[1]));
+}
+
+#[test]
+fn the_next_turn_supersedes_a_tail_whose_last_block_it_never_shares() {
+    let gpu = MockGpuBackend::new();
+    let mut cache = windowed_over(32, 64, 24, 2, &gpu);
+    // y pins, then turn 1 pins its tail: blocks 2..6 of its path, the last
+    // one partly written (5 whole blocks)
+    let turn1: Vec<u32> = (0..6).map(|_| cache.alloc_block().unwrap()).collect();
+    let y = cache.alloc_block().unwrap();
+    cache.window_hold(&turn1, &gpu, 0).unwrap();
+    cache.window_hold(&[y], &gpu, 0).unwrap();
+    assert!(cache.window_pin(&[y], 0, 1, PinRank::Prompt));
+    assert!(cache.window_pin(&turn1, 2, 5, PinRank::Prompt));
+    // turn 2 shares turn 1's whole blocks, then goes on in blocks of its own
+    let mut turn2 = turn1[..5].to_vec();
+    turn2.extend((0..9).map(|_| cache.alloc_block().unwrap()));
+    cache.window_hold(&turn2[5..], &gpu, 0).unwrap();
+    assert!(cache.window_pin(&turn2, 10, 14, PinRank::Prompt));
+    // turn 1's window is superseded: it goes before y's older pin
+    cache.window_release(&turn1, &gpu, 0).unwrap();
+    cache.window_release(&turn2[5..], &gpu, 0).unwrap();
+    cache.window_release(&[y], &gpu, 0).unwrap();
+    assert!(!cache.window_mapped(turn1[2]) && !cache.window_mapped(turn1[5]));
+    assert!(cache.window_mapped(y) && cache.window_mapped(turn2[10]));
 }
