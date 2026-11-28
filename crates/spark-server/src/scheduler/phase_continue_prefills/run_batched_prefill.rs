@@ -88,6 +88,10 @@ pub(super) fn run_batched_prefill_step(
                 max_prefill_tokens
             };
             let mut chunk_len = remaining.min(effective_max);
+            // A batched pass runs each chunk whole: end the last one at the
+            // tail cut, as the single-stream dispatch splits it.
+            let cut = model.prefill_tail_cut(&p.seq, &p.prompt_tokens);
+            chunk_len = super::super::end_at_tail_cut(p.chunk_offset, chunk_len, cut);
             let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
             // Align intermediate chunks to GDN WY4 boundary (4 tokens).
             if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {

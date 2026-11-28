@@ -31,6 +31,39 @@ pub(in crate::scheduler) fn sp_final_cut(chunk_len: usize, multiple: usize) -> (
     (chunk_len - tail, false)
 }
 
+/// A chunk of `chunk_len` rows from `offset` that straddles the model's
+/// tail cut (`Model::prefill_tail_cut`) ends there instead, so a batched
+/// prefill, which runs each stream's chunk whole, saves the snapshot the
+/// prompt's next turn resumes from as the single-stream split does.
+pub(in crate::scheduler) fn end_at_tail_cut(
+    offset: usize,
+    chunk_len: usize,
+    cut: Option<usize>,
+) -> usize {
+    match cut {
+        Some(cut) if offset < cut && cut < offset + chunk_len => cut - offset,
+        _ => chunk_len,
+    }
+}
+
+#[cfg(test)]
+mod tail_cut_tests {
+    use super::end_at_tail_cut;
+
+    #[test]
+    fn a_chunk_over_the_tail_cut_ends_on_it() {
+        // a 18,018-token prompt's last chunk from 16,384: the cut at 17,984
+        assert_eq!(end_at_tail_cut(16_384, 1_634, Some(17_984)), 1_600);
+        // the rest of the prompt runs as one more chunk
+        assert_eq!(end_at_tail_cut(17_984, 34, Some(17_984)), 34);
+        // a chunk below the cut, a model without one
+        assert_eq!(end_at_tail_cut(0, 8_192, Some(17_984)), 8_192);
+        assert_eq!(end_at_tail_cut(16_384, 1_634, None), 1_634);
+        // a chunk ending on the cut already
+        assert_eq!(end_at_tail_cut(16_384, 1_600, Some(17_984)), 1_600);
+    }
+}
+
 #[cfg(test)]
 mod sp_final_cut_tests {
     use super::sp_final_cut;

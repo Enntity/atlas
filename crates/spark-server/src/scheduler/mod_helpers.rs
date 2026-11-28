@@ -450,4 +450,4 @@ mod send;
 pub use send::*;
 
 mod chunk_alignment;
-pub(super) use chunk_alignment::{chunk_align, sp_final_cut};
+pub(super) use chunk_alignment::{chunk_align, end_at_tail_cut, sp_final_cut};

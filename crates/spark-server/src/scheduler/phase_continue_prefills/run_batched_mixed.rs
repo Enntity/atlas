@@ -68,6 +68,10 @@ pub(super) fn run_batched_mixed_step(
         {
             chunk_len = tb - p.chunk_offset;
         }
+        // A batched pass runs each chunk whole: end the last one at the tail
+        // cut, as the single-stream dispatch splits it.
+        let cut = model.prefill_tail_cut(&p.seq, &p.prompt_tokens);
+        chunk_len = super::super::end_at_tail_cut(p.chunk_offset, chunk_len, cut);
         let is_last = p.chunk_offset + chunk_len >= p.prompt_tokens.len();
         if !is_last && chunk_len >= spark_runtime::prefill_chunk_granule() {
             // (ATLAS_QWEN4EXP_PREFILL_ROWINV: 64, the GDN chunk.)

@@ -63,16 +63,11 @@ impl TransformerModel {
             return r;
         }
         if is_last_chunk
-            && self.config.snapshot_prefix_state()
-            && total >= self.config.tail_split_min_tokens()
-            && self.tail_split_snapshots()
-            && self.prefix_cache.is_active()
-            && self.pc_key(seq, tokens).is_some()
+            && let Some(cut) = self.tail_split_cut(seq, tokens)
+            && cut > chunk_start
         {
-            let bs = self.kv_cache.lock().block_size();
-            // One block below the last block boundary strictly under `total`.
-            let cut = pc_policy::tail_cut(total, bs);
-            // UNCONDITIONAL. This used to additionally require
+            // One block below the last block boundary strictly under `total`
+            // (`tail_split_cut`). UNCONDITIONAL. This used to additionally require
             // `ep_active || peek_matched_tokens(..) > 0`, i.e. it split only on a
             // WARM request (radix already populated) — which made the prompt take a
             // DIFFERENT SHAPE cold vs warm: one N-token pass when cold, two passes
@@ -97,27 +92,19 @@ impl TransformerModel {
             // That is the OTHER way to satisfy the invariant — always one pass — and
             // it keeps the single-pass numerics, at the cost of the warm-turn tail
             // checkpoint this split exists to create.
-            // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
-            let in_pass = self.qwen4exp_ckpt_takes_tail();
-            // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
-            // grid; without the in-pass checkpoint the last chunk stays whole.
-            let split_disabled =
-                pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass);
-            if !split_disabled && !in_pass && cut > chunk_start && cut < total {
-                anyhow::ensure!(
-                    passengers.is_none(),
-                    "GLM fused chunk cannot take the tail-checkpoint split"
-                );
-                self.prefill_chunk_dispatch(
-                    tokens,
-                    seq,
-                    chunk_start,
-                    cut - chunk_start,
-                    false,
-                    stream,
-                )?;
-                return self.prefill_chunk_dispatch(tokens, seq, cut, total - cut, true, stream);
-            }
+            anyhow::ensure!(
+                passengers.is_none(),
+                "GLM fused chunk cannot take the tail-checkpoint split"
+            );
+            self.prefill_chunk_dispatch(
+                tokens,
+                seq,
+                chunk_start,
+                cut - chunk_start,
+                false,
+                stream,
+            )?;
+            return self.prefill_chunk_dispatch(tokens, seq, cut, total - cut, true, stream);
         }
 
         // A pass of this chunk stopped between layers (`pass_slice`): the
@@ -447,5 +434,36 @@ impl TransformerModel {
             trace,
             stream,
         )
+    }
+}
+
+impl TransformerModel {
+    /// The tail-checkpoint split's cut for a `tokens` prompt
+    /// (`prefill_chunk_dispatch_with`), shared with the planners that batch
+    /// prompts (`Model::prefill_tail_cut`): `None` when the model, its cache
+    /// or the prompt takes no split.
+    pub(in crate::model) fn tail_split_cut(
+        &self,
+        seq: &SequenceState,
+        tokens: &[u32],
+    ) -> Option<usize> {
+        let total = tokens.len();
+        if !(self.config.snapshot_prefix_state()
+            && total >= self.config.tail_split_min_tokens()
+            && self.tail_split_snapshots()
+            && self.prefix_cache.is_active()
+            && self.pc_key(seq, tokens).is_some())
+        {
+            return None;
+        }
+        // ATLAS_QWEN4EXP_PREFILL_MIDCHUNK_CKPT: one pass, checkpoint in-pass.
+        let in_pass = self.qwen4exp_ckpt_takes_tail();
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: a block-grid cut is off the GDN
+        // grid; without the in-pass checkpoint the last chunk stays whole.
+        if in_pass || pc_policy::tail_split_disabled() || pc_policy::rowinv_tail_unsplit(in_pass) {
+            return None;
+        }
+        let cut = pc_policy::tail_cut(total, self.kv_cache.lock().block_size());
+        (cut > 0 && cut < total).then_some(cut)
     }
 }

@@ -443,6 +443,10 @@ impl Model for TransformerModel {
         spark_runtime::prefill_grid::cuts().align_chunk(offset, len, total)
     }
 
+    fn prefill_tail_cut(&self, seq: &SequenceState, tokens: &[u32]) -> Option<usize> {
+        self.tail_split_cut(seq, tokens)
+    }
+
     fn normalize_after_chunk(&self, seq: &SequenceState, chunk_end: usize) -> bool {
         // The cold run clamp-normalizes the SSM state at every scheduler chunk
         // end. A warm run restored at `marconi_skip_to` must not normalize at

@@ -495,6 +495,14 @@ pub trait Model: Send + Sync {
         len
     }
 
+    /// Where `tokens`' last chunk is cut so the snapshot the prompt's next
+    /// turn resumes from is saved (the tail-checkpoint split a single-stream
+    /// prefill takes itself), for planners that batch several prompts'
+    /// chunks: `None` when the model takes no such cut.
+    fn prefill_tail_cut(&self, _seq: &SequenceState, _tokens: &[u32]) -> Option<usize> {
+        None
+    }
+
     /// R11 fix 4: whether the scheduler should run `normalize_ssm_states`
     /// after a prefill chunk ending at `chunk_end`. Default: always.
     fn normalize_after_chunk(&self, _seq: &SequenceState, _chunk_end: usize) -> bool {
